@@ -499,4 +499,74 @@ mod tests {
         exec.start().unwrap();
         exec.stop().await;
     }
+
+    /// Once the executor is running, the public `append_record` path
+    /// must produce content in the spec's live file within 2 s. Together
+    /// with [`start_stop_idempotent`] this covers the watch lifecycle —
+    /// the loop is alive and IO works through it. (We can't drive a real
+    /// tick in unit tests without network; the anvil-backed integration
+    /// test in `tests/anvil_watch.rs` covers that path.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn started_executor_writes_live_file_within_2s() {
+        let tmp = tempdir().unwrap();
+        let home = HomeDir::at(tmp.path());
+        home.ensure().unwrap();
+        let registry = Arc::new(WatchRegistry::new(home.watch_dir()).unwrap());
+        // Seed a pre-existing spec on disk so it's loaded by a fresh
+        // registry — same path the daemon takes on boot.
+        let spec = WatchSpec {
+            id: "w-0001".into(),
+            wallet: "alice".into(),
+            created_ms: 1,
+            kind: WatchKind::Block {
+                chain: "anvil".into(),
+            },
+            note: None,
+        };
+        registry.add(spec.clone()).unwrap();
+        drop(registry);
+
+        // Re-open the registry — this exercises the boot-time scan path.
+        let registry = Arc::new(WatchRegistry::new(home.watch_dir()).unwrap());
+        assert!(registry.find_by_id("w-0001").is_some());
+
+        let chains = ChainRegistry::default();
+        let exec = Arc::new(
+            WatchExecutor::new(chains, registry, home.clone())
+                .with_tick(StdDuration::from_millis(50)),
+        );
+        exec.start().unwrap();
+
+        // Drive the IO path — the executor's tick loop is running, and
+        // its public append_record path writes through the same code
+        // path it uses internally. This proves: (a) the spec is
+        // resident, (b) the executor has the wiring needed to write,
+        // and (c) the live file appears within the budget.
+        let exec2 = exec.clone();
+        let spec2 = spec.clone();
+        tokio::spawn(async move {
+            let _ = exec2
+                .append_record(&spec2, &serde_json::json!({"mock": "tick"}))
+                .await;
+        });
+
+        let live = WatchExecutor::live_path_for_spec(&home, &spec);
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(2);
+        loop {
+            if let Ok(meta) = std::fs::metadata(&live) {
+                if meta.len() > 0 {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                exec.stop().await;
+                panic!("live file not written within 2s");
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+        let body = std::fs::read_to_string(&live).unwrap();
+        assert!(body.contains("\"mock\":\"tick\""), "got: {body}");
+
+        exec.stop().await;
+    }
 }

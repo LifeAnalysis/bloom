@@ -363,6 +363,8 @@ async fn run(cli: Cli) -> Result<()> {
             });
             server.serve(&socket).await.context("ipc serve")?;
             shutdown.abort();
+            // Stop background workers (watch executor, etc.) before exit.
+            d.shutdown().await;
             println!("shutting down");
             Ok(())
         }
