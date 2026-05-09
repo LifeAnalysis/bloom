@@ -192,16 +192,35 @@ impl FileSystem for BethFs {
     async fn access(
         &self,
         _ctx: &RequestContext,
-        _handle: &BethHandle,
+        handle: &BethHandle,
         requested: AccessMask,
     ) -> FsResult<AccessMask> {
-        // Strip write-related bits unconditionally for v1 — most of the
-        // tree is read-only and the writable corners (e.g. wallet
-        // outbox, watch subscriptions) handle permission errors at
-        // write-time anyway. Returning the requested bits avoids the
-        // kernel caching a false negative for paths that are actually
-        // writable.
-        Ok(requested)
+        // Per the v1 spec, the great majority of the tree is read-only
+        // (chains/*, status/*, tools/* outputs, prices/*, docs/*, audit
+        // views, wallet metadata, watch outputs). Those entries report
+        // mode 0o444 from the VFS; only a small handful of injection
+        // points (wallets/new, sign/*, outbox writes, watch/new, defi
+        // intents new+confirm, policy.toml) report 0o644. Reflect that
+        // here so clients see a faithful permission view in `stat` /
+        // `access(2)` rather than discovering write rejection only at
+        // write-time.
+        let mode = match handle {
+            BethHandle::Root => 0o755,
+            BethHandle::Path { path, .. } => match self.vfs.lookup(path).await {
+                Ok(e) => e.mode,
+                // If the entry has gone missing between lookup and
+                // access, fall through with a permissive mode and let
+                // the next op surface the real error.
+                Err(_) => 0o644,
+            },
+        };
+        let mut granted = requested;
+        // Owner-write bit absent => mask off MODIFY/EXTEND/DELETE.
+        if mode & 0o200 == 0 {
+            let write_bits = AccessMask::MODIFY | AccessMask::EXTEND | AccessMask::DELETE;
+            granted = AccessMask(granted.bits() & !write_bits.bits());
+        }
+        Ok(granted)
     }
 
     async fn lookup(

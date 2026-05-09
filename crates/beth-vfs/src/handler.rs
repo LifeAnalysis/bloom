@@ -35,15 +35,30 @@ impl Entry {
             link_target: None,
         }
     }
+    /// Build a read-only file entry (mode 0o444). This is the right
+    /// default for almost everything in the bloom-eth tree — chain
+    /// views, status, tools output, prices, docs, audit views, wallet
+    /// metadata files, watch outputs. Per the v1 spec only a small set
+    /// of injection points (wallets/new, sign/*, outbox writes,
+    /// watch/new, defi intents new+confirm, policy.toml) are writable;
+    /// those should use [`Entry::writable_file`].
     pub fn file(name: &str) -> Self {
+        Self::read_only_file(name)
+    }
+    /// Explicit read-only constructor. Equivalent to [`Entry::file`];
+    /// prefer this name in handlers that mix read-only and writable
+    /// entries side-by-side so the intent is loud at the call site.
+    pub fn read_only_file(name: &str) -> Self {
         Self {
             name: name.into(),
             kind: EntryKind::File,
             size: 0,
-            mode: 0o644,
+            mode: 0o444,
             link_target: None,
         }
     }
+    /// Build a writable file entry (mode 0o644). Use for the small set
+    /// of NFS-injectable inputs the daemon accepts.
     pub fn writable_file(name: &str) -> Self {
         Self {
             name: name.into(),
