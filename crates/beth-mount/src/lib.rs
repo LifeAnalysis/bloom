@@ -98,13 +98,12 @@ pub async fn mount(
 ) -> Result<Box<dyn MountHandle>, MountError> {
     #[cfg(feature = "mount")]
     {
-        tracing::warn!(
-            "beth_mount::mount is a placeholder: use beth_mount::serve_nfs with a typed Vfs"
-        );
+        tracing::warn!("mount.placeholder_called: use serve_nfs with a typed Vfs instead");
         Err(MountError::NotEnabled)
     }
     #[cfg(not(feature = "mount"))]
     {
+        tracing::debug!("mount.feature_disabled: build without 'mount' cargo feature");
         Err(MountError::NotEnabled)
     }
 }

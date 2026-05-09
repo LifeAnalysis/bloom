@@ -110,7 +110,9 @@ impl Drop for NfsMountHandle {
                 .stderr(Stdio::null())
                 .spawn()
             {
-                warn!(mount_path = %mp.display(), error = %e, "umount on drop failed");
+                warn!(mount_path = %mp.display(), error = %e, "mount.drop.umount_spawn_failed");
+            } else {
+                debug!(mount_path = %mp.display(), "mount.drop.umount_dispatched");
             }
         }
         if let Some(task) = self.server_task.lock().take() {
@@ -126,6 +128,7 @@ impl MountHandle for NfsMountHandle {
         {
             let mut flag = self.unmounted.lock();
             if *flag {
+                debug!(mount_path = %self.mount_path.display(), "mount.unmount_idempotent");
                 return Ok(());
             }
             *flag = true;
@@ -147,6 +150,7 @@ impl MountHandle for NfsMountHandle {
         if let Some(task) = self.server_task.lock().take() {
             task.abort();
         }
+        info!(mount_path = %self.mount_path.display(), "mount.unmounted");
         Ok(())
     }
 
@@ -198,13 +202,13 @@ pub async fn serve_nfs_with(vfs: Vfs, cfg: MountConfig) -> Result<NfsMountHandle
     // command — `mount.nfs4 port=N` needs the real number.
     let listener = TcpListener::bind(cfg.nfs_listen).await?;
     let local = listener.local_addr()?;
-    info!(addr = %local, mount_path = %cfg.mount_path.display(), "starting embedded nfs server");
+    info!(addr = %local, mount_path = %cfg.mount_path.display(), "mount.nfs_listening");
 
     let fs = BethFs::new(vfs);
     let server = embednfs::NfsServer::new(fs);
     let server_task = tokio::spawn(async move {
         if let Err(e) = server.serve(listener).await {
-            warn!(error = %e, "nfs server exited");
+            warn!(error = %e, "mount.nfs_server_exited");
         }
     });
 
@@ -217,7 +221,7 @@ pub async fn serve_nfs_with(vfs: Vfs, cfg: MountConfig) -> Result<NfsMountHandle
     if cfg!(target_os = "linux") {
         attempts.push(("mount".to_string(), linux_mount_fallback_args(&cfg, local)));
     }
-    debug!(?attempts, "running mount command attempts");
+    debug!(?attempts, "mount.cmd_attempts");
     let mp_for_log = cfg.mount_path.clone();
     let mount_result = tokio::task::spawn_blocking({
         let attempts = attempts.clone();
@@ -260,7 +264,7 @@ pub async fn serve_nfs_with(vfs: Vfs, cfg: MountConfig) -> Result<NfsMountHandle
         )));
     }
 
-    info!(mount_path = %mp_for_log.display(), nfs_addr = %local, "mount established");
+    info!(mount_path = %mp_for_log.display(), nfs_addr = %local, "mount.established");
     Ok(NfsMountHandle::new(local, cfg.mount_path, server_task))
 }
 

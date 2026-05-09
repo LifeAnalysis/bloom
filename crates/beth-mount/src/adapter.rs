@@ -27,6 +27,7 @@ use embednfs::{
     Timestamp, WriteResult, WriteStability,
 };
 use parking_lot::Mutex;
+use tracing::{debug, trace};
 
 use beth_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 
@@ -370,7 +371,13 @@ impl BethFs {
     /// one extra `vfs.list` per `getattr` on a directory; beth's
     /// directories are small so this is fine.
     async fn dir_change(&self, dir_path: &VfsPath) -> u64 {
-        let entries = self.vfs.list(dir_path).await.unwrap_or_default();
+        let entries = match self.vfs.list(dir_path).await {
+            Ok(es) => es,
+            Err(e) => {
+                debug!(path = %dir_path.to_string_path(), error = %e, "mount.adapter.dir_change.list_failed_using_empty");
+                Vec::new()
+            }
+        };
         let mut h: u64 = 0xcbf29ce484222325;
         // Mix a salt derived from the path so two empty directories at
         // different paths don't collide on `change=fnv_empty`.
@@ -414,7 +421,10 @@ impl BethFs {
     /// defensive about it).
     async fn flush_path(&self, path: &VfsPath) -> FsResult<()> {
         if let Some(bytes) = self.take_complete_buffer(path) {
+            trace!(path = %path.to_string_path(), bytes = bytes.len(), "mount.adapter.flush");
             self.vfs.write(path, &bytes).await.map_err(map_err)?;
+        } else {
+            trace!(path = %path.to_string_path(), "mount.adapter.flush.nothing_to_flush");
         }
         Ok(())
     }
@@ -499,7 +509,10 @@ impl FileSystem for BethFs {
                 // If the entry has gone missing between lookup and
                 // access, fall through with a permissive mode and let
                 // the next op surface the real error.
-                Err(_) => 0o644,
+                Err(e) => {
+                    debug!(path = %path.to_string_path(), error = %e, "mount.adapter.access.lookup_failed_using_0644");
+                    0o644
+                }
             },
         };
         let mut granted = requested;
