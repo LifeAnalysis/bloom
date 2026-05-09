@@ -86,6 +86,28 @@ echo 'send 100 USDC to alice on ethereum' \
   > /eth/wallets/alice/chains/ethereum/outbox/new.tx
 ```
 
+NFT writes — three intent kinds, ERC-721 + ERC-1155, ERC-165
+auto-detected:
+
+```sh
+# Transfer ERC-721 #1234 to Bob (encodes `safeTransferFrom`):
+echo 'nft transfer 0xb47e3...3bbb #1234 to 0x70997...79C8' \
+  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+
+# Per-token approve (ERC-721 only — ERC-1155 is rejected):
+echo 'nft approve 0xb47e3...3bbb #1234 operator 0x111...111' \
+  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+
+# Operator-wide approval — always policy-warned:
+echo 'nft set_approval_for_all 0xb47e3...3bbb operator 0x111...111 approved true' \
+  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+```
+
+JSON form supports `"standard": "erc721"|"erc1155"` to skip the
+auto-detect probe, and `"safe": false` on `nft_transfer` to use the
+legacy `transferFrom` selector. ERC-1155 transfers accept an
+`"amount"` (defaults to `"1"`) and an optional `"data"` payload.
+
 Replace / cancel pending tx:
 
 ```sh

@@ -62,3 +62,57 @@ cat /eth/chains/ethereum/addresses/0x.../nfts/0x.../1/balance         # always 1
 ceiling, 5s timeout). For ERC-1155 contracts the `{id}` placeholder in
 the returned URI is substituted with the lowercase 64-char hex form of
 the token id, per spec.
+
+## NFT writes (transfer / approve)
+
+NFT writes go through the same `outbox/new.tx` stage-confirm pipeline
+as native sends. Three intent kinds are wired in. Each one auto-detects
+ERC-721 vs ERC-1155 via ERC-165 (the optional `standard` field skips
+the probe — useful for non-standard contracts).
+
+```sh
+# 1. Transfer ERC-721 #1234 to Bob (encodes safeTransferFrom by default;
+#    set "safe": false to use the legacy `transferFrom`):
+echo '{
+  "kind": "nft_transfer",
+  "contract": "0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb",
+  "to":       "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+  "token_id": "1234"
+}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+
+# Same intent in shell form:
+echo 'nft transfer 0xb47e3...3bbb #1234 to 0x70997...79C8' \
+  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+
+# 2. Per-token approve (ERC-721 only; ERC-1155 has no per-token approval
+#    and the engine rejects it with a clear error):
+echo 'nft approve 0xb47e3...3bbb #1234 operator 0x111...111' \
+  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+
+# 3. setApprovalForAll — operator-wide. This always trips a policy WARN
+#    so the resulting plan.md flags the broad scope before you confirm.
+echo '{
+  "kind": "nft_approve_all",
+  "contract": "0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb",
+  "operator": "0x1111111111111111111111111111111111111111",
+  "approved": true
+}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+
+# 4. ERC-1155 transfer with explicit amount:
+echo '{
+  "kind": "nft_transfer",
+  "contract": "0x495f947276749Ce646f68AC8c248420045cb7b5e",
+  "to":       "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+  "token_id": "0x...id...",
+  "standard": "erc1155",
+  "amount":   "3"
+}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+```
+
+Inspect the plan before confirming — it shows the decoded NFT action,
+the contract / counterparty, the token id, and any policy warnings:
+
+```sh
+cat /eth/wallets/alice/chains/ethereum/outbox/pending/0001-*/plan.md
+echo y > /eth/wallets/alice/chains/ethereum/outbox/pending/0001-*/confirm
+```

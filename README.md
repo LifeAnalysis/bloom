@@ -170,15 +170,22 @@ map and live-network verification log.
 - **Watch executor is poll-based.** `beth-chain` is HTTP-only, so the
   executor polls every 2s. No websocket fast path yet; per-spec
   latency is bounded by the tick interval.
-- **NFT writes are not exposed.** Reads ship: `chains/<c>/addresses/<a>/nfts/`
-  (per-holder transfer history, best-effort `owned.json`, and per-token
-  `owner / uri / metadata.json / balance / is_owner / approved` under
-  `<contract>/<token_id>/`) and `chains/<c>/contracts/<a>/nft/` (collection
-  `kind / name / symbol / total_supply`, `owner_of/<id>`, `token_uri/<id>`,
-  `is_approved_for_all/<o>/<op>`). ERC-721 vs ERC-1155 is auto-detected
-  via ERC-165, with the ERC-1155 `{id}` placeholder substituted for `uri`
-  reads. The write surface (`safeTransferFrom`, `setApprovalForAll`)
-  ships in a follow-up.
+- **NFT surface ships in both directions.** Reads:
+  `chains/<c>/addresses/<a>/nfts/` (per-holder transfer history,
+  best-effort `owned.json`, and per-token
+  `owner / uri / metadata.json / balance / is_owner / approved`
+  under `<contract>/<token_id>/`) and `chains/<c>/contracts/<a>/nft/`
+  (collection `kind / name / symbol / total_supply`, `owner_of/<id>`,
+  `token_uri/<id>`, `is_approved_for_all/<o>/<op>`). ERC-721 vs
+  ERC-1155 is auto-detected via ERC-165 with the ERC-1155 `{id}`
+  placeholder substituted for `uri` reads. Writes flow through the
+  wallet outbox via three intent kinds — `nft_transfer` (encodes
+  `safeTransferFrom` / `transferFrom`, ERC-721 + ERC-1155, optional
+  `safe`/`amount`/`data`), `nft_approve` (per-token, ERC-721 only —
+  ERC-1155 is rejected with a clear error), and `nft_approve_all`
+  (`setApprovalForAll`, policy-warned because it grants operator-wide
+  control). Mints are issued via the generic `call` intent against
+  the contract's mint method.
 - **Hardware wallets, smart accounts (4337), and distributed sync**
   remain stretch goals.
 
