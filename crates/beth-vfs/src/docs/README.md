@@ -41,6 +41,32 @@ cat /eth/prices/spot/eth.usd
 cat /eth/addressbook/alice
 ```
 
+NFT reads (auto-detects ERC-721 vs ERC-1155 via ERC-165):
+
+```sh
+# Per-holder views (transfer history requires etherscan-backed history).
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/erc721_txs
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/erc1155_txs
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/owned.json   # best-effort
+
+# Per-token reads (RPC-only):
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/owner
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/uri
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/metadata.json
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/balance
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/is_owner
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/approved
+
+# Collection-level views:
+cat /eth/chains/ethereum/contracts/<contract>/nft/kind          # erc721 | erc1155 | unknown
+cat /eth/chains/ethereum/contracts/<contract>/nft/name
+cat /eth/chains/ethereum/contracts/<contract>/nft/symbol
+cat /eth/chains/ethereum/contracts/<contract>/nft/total_supply
+cat /eth/chains/ethereum/contracts/<contract>/nft/owner_of/<id>
+cat /eth/chains/ethereum/contracts/<contract>/nft/token_uri/<id>
+cat /eth/chains/ethereum/contracts/<contract>/nft/is_approved_for_all/<owner>/<operator>
+```
+
 ## Writing (stage-confirm)
 
 Native send (canonical):
