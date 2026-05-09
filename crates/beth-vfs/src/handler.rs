@@ -121,4 +121,14 @@ pub trait Handler: Send + Sync {
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         Err(HandlerError::NotADir(path.to_string_path()))
     }
+
+    /// Whether a successful read of `path` has externally-visible side
+    /// effects worth recording in the audit log (signing, broadcast,
+    /// etc). Default: pure-data reads, no audit entry. Handlers that
+    /// emit signatures, perform broadcasts, or otherwise mutate state
+    /// in response to reads should override this and return `true`.
+    fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
+        let _ = path;
+        false
+    }
 }

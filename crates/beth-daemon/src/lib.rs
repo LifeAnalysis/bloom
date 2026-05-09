@@ -110,6 +110,7 @@ impl Daemon {
 
         let audit =
             AuditLog::open(home.audit_path()).map_err(|e| DaemonError::Audit(e.to_string()))?;
+        let audit_arc = Arc::new(audit.clone());
 
         let watch_registry = Arc::new(
             WatchRegistry::new(home.watch_dir()).map_err(|e| DaemonError::Watch(e.to_string()))?,
@@ -153,7 +154,7 @@ impl Daemon {
                     chains.clone(),
                     keystore.clone(),
                     tx_engine.clone(),
-                    Arc::new(audit.clone()),
+                    audit_arc.clone(),
                     Some(prices.clone()),
                     Some(home.cache_dir().join("etherscan")),
                     config
@@ -218,7 +219,7 @@ impl Daemon {
             );
         }
 
-        let vfs = vfs_builder.build();
+        let vfs = vfs_builder.with_audit(audit_arc.clone()).build();
 
         info!(home=%home.root().display(), chains=?config.chains.keys().collect::<Vec<_>>(), "daemon.built");
 
@@ -229,7 +230,7 @@ impl Daemon {
             keystore,
             tx_engine,
             address_book: address_book_arc,
-            audit: Arc::new(audit),
+            audit: audit_arc,
             vfs,
             watch_registry,
             watch_executor,
