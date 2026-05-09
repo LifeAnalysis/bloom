@@ -2,6 +2,7 @@ pub mod addressbook;
 pub mod chains;
 pub mod chains_contracts;
 mod chains_history;
+mod chains_nfts;
 pub mod defi;
 pub mod docs;
 pub mod ens;
