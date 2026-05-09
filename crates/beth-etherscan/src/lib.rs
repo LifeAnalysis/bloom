@@ -229,7 +229,9 @@ pub struct TxRecord {
     pub err_code: String,
 }
 
-/// ERC20/721 transfer record (`tokentx`).
+/// ERC-20 / 721 / 1155 transfer record (`tokentx` / `tokennfttx` /
+/// `token1155tx`). NFT-only fields (`tokenID`, `tokenValue`) are
+/// captured opportunistically; they are empty strings on ERC-20 rows.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct TokenTransfer {
     #[serde(default, rename = "blockNumber")]
@@ -256,6 +258,12 @@ pub struct TokenTransfer {
     pub token_symbol: String,
     #[serde(default, rename = "tokenDecimal")]
     pub token_decimal: String,
+    /// ERC-721 / ERC-1155 token id (decimal string). Empty for ERC-20.
+    #[serde(default, rename = "tokenID")]
+    pub token_id: String,
+    /// ERC-1155 amount (decimal string). Empty for ERC-20 / ERC-721.
+    #[serde(default, rename = "tokenValue")]
+    pub token_value: String,
     #[serde(default, rename = "transactionIndex")]
     pub transaction_index: String,
     #[serde(default)]
@@ -680,6 +688,36 @@ impl EtherscanClient {
         Self::decode(result)
     }
 
+    /// `module=account&action=token1155tx` (ERC-1155 transfers).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_nft1155_tx(
+        &self,
+        chain_id: u64,
+        addr: Address,
+        contract_addr_filter: Option<Address>,
+        start_block: u64,
+        end_block: u64,
+        page: u32,
+        offset: u32,
+        sort: Sort,
+    ) -> Result<Vec<TokenTransfer>, EtherscanError> {
+        let mut extra: Vec<(&str, String)> = vec![
+            ("address", addr.to_string()),
+            ("startblock", start_block.to_string()),
+            ("endblock", end_block.to_string()),
+            ("page", page.to_string()),
+            ("offset", offset.to_string()),
+            ("sort", sort.as_str().to_string()),
+        ];
+        if let Some(ca) = contract_addr_filter {
+            extra.push(("contractaddress", ca.to_string()));
+        }
+        let result = self
+            .raw_call(chain_id, "account", "token1155tx", &extra)
+            .await?;
+        Self::decode(result)
+    }
+
     // --- Block -------------------------------------------------------------
 
     /// `module=block&action=getblocknobytime`.
@@ -1004,6 +1042,57 @@ mod tests {
             .unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].topics.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_nft1155_tx_decodes_records() {
+        // token1155tx returns tokenID + tokenValue alongside the usual
+        // transfer fields. Our typed struct opportunistically captures
+        // both; verify they round-trip.
+        let body = r#"{"status":"1","message":"OK","result":[{
+            "blockNumber":"19000000",
+            "timeStamp":"1700000000",
+            "hash":"0xabc",
+            "nonce":"0",
+            "blockHash":"0xbb",
+            "transactionIndex":"0",
+            "from":"0x1111111111111111111111111111111111111111",
+            "contractAddress":"0x2222222222222222222222222222222222222222",
+            "to":"0x3333333333333333333333333333333333333333",
+            "value":"",
+            "tokenName":"My1155",
+            "tokenSymbol":"M1155",
+            "tokenDecimal":"0",
+            "tokenID":"42",
+            "tokenValue":"7",
+            "gas":"100000",
+            "gasPrice":"1",
+            "gasUsed":"50000",
+            "cumulativeGasUsed":"50000",
+            "input":"0x",
+            "confirmations":"5"
+        }]}"#;
+        let addr = spawn_canned_server(body).await;
+        let c = client_for(addr);
+        let txs = c
+            .get_nft1155_tx(
+                1,
+                "0x0000000000000000000000000000000000000001"
+                    .parse()
+                    .unwrap(),
+                None,
+                0,
+                99_999_999,
+                1,
+                10,
+                Sort::Desc,
+            )
+            .await
+            .unwrap();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].token_id, "42");
+        assert_eq!(txs[0].token_value, "7");
+        assert_eq!(txs[0].token_symbol, "M1155");
     }
 
     #[tokio::test]
