@@ -32,7 +32,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 #[derive(Debug, Error)]
 pub enum IpcError {
@@ -132,6 +132,7 @@ impl IpcServer {
         }
         // Stale socket files survive non-graceful shutdowns; remove first.
         if socket_path.exists() {
+            debug!(socket = %socket_path.display(), "ipc.stale_socket_removed");
             let _ = std::fs::remove_file(socket_path);
         }
         let listener = UnixListener::bind(socket_path)?;
@@ -141,9 +142,11 @@ impl IpcServer {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(socket_path)?.permissions();
             perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(socket_path, perms);
+            if let Err(e) = std::fs::set_permissions(socket_path, perms) {
+                debug!(socket = %socket_path.display(), error = %e, "ipc.chmod_failed");
+            }
         }
-        info!(socket=%socket_path.display(), "ipc.listening");
+        info!(socket = %socket_path.display(), "ipc.listening");
 
         loop {
             tokio::select! {
@@ -154,21 +157,24 @@ impl IpcServer {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _addr)) => {
+                            trace!("ipc.conn_accepted");
                             let me = self.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = me.handle_conn(stream).await {
-                                    warn!("ipc.conn_err: {e}");
+                                match me.handle_conn(stream).await {
+                                    Ok(()) => trace!("ipc.conn_closed"),
+                                    Err(e) => warn!(error = %e, "ipc.conn_err"),
                                 }
                             });
                         }
                         Err(e) => {
-                            warn!("ipc.accept_err: {e}");
+                            warn!(error = %e, "ipc.accept_err");
                         }
                     }
                 }
             }
         }
 
+        info!(socket = %socket_path.display(), "ipc.shutdown");
         let _ = std::fs::remove_file(socket_path);
         Ok(())
     }
@@ -188,10 +194,19 @@ impl IpcServer {
                 continue;
             }
             let resp = match serde_json::from_str::<Request>(trimmed) {
-                Ok(req) => self.dispatch(req).await,
-                Err(e) => Response::err(Value::Null, -32700, format!("parse error: {e}")),
+                Ok(req) => {
+                    trace!(method = %req.method, "ipc.request");
+                    self.dispatch(req).await
+                }
+                Err(e) => {
+                    debug!(error = %e, "ipc.parse_error");
+                    Response::err(Value::Null, -32700, format!("parse error: {e}"))
+                }
             };
-            let mut out = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{}".to_vec());
+            let mut out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
+                debug!(error = %e, "ipc.response_serialise_failed");
+                b"{}".to_vec()
+            });
             out.push(b'\n');
             wr.write_all(&out).await?;
             wr.flush().await?;
@@ -200,6 +215,7 @@ impl IpcServer {
 
     async fn dispatch(&self, req: Request) -> Response {
         if !req.jsonrpc.is_empty() && req.jsonrpc != "2.0" {
+            debug!(version = %req.jsonrpc, "ipc.dispatch.bad_version");
             return Response::err(req.id, -32600, "jsonrpc must be 2.0");
         }
         let id = req.id.clone();
@@ -207,6 +223,7 @@ impl IpcServer {
             "version" => Response::ok(id, Value::String(self.version.clone())),
             "chains" => Response::ok(id, json!(self.chains)),
             "shutdown" => {
+                info!("ipc.shutdown_requested_via_rpc");
                 self.shutdown.notify_waiters();
                 Response::ok(id, Value::Null)
             }
@@ -226,7 +243,10 @@ impl IpcServer {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
             },
-            other => Response::err(id, -32601, format!("method not found: {other}")),
+            other => {
+                debug!(method = %other, "ipc.dispatch.method_not_found");
+                Response::err(id, -32601, format!("method not found: {other}"))
+            }
         }
     }
 
@@ -296,7 +316,7 @@ fn map_handler_err(id: Value, e: HandlerError) -> Response {
         HandlerError::Backend(s) => (-32000, format!("backend: {s}")),
         HandlerError::Io(e) => (-32001, format!("io: {e}")),
     };
-    debug!(code, "ipc.err {msg}");
+    debug!(code, message = %msg, "ipc.handler_err");
     Response::err(id, code, msg)
 }
 
@@ -319,6 +339,7 @@ impl IpcClient {
     }
 
     pub async fn call(&self, method: &str, params: Value) -> std::io::Result<Value> {
+        trace!(socket = %self.socket_path.display(), %method, "ipc.client.call");
         let stream = UnixStream::connect(&self.socket_path).await?;
         let (rd, mut wr) = stream.into_split();
         let mut rd = BufReader::new(rd);
@@ -337,6 +358,7 @@ impl IpcClient {
         let v: Value = serde_json::from_str(line.trim())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if let Some(err) = v.get("error") {
+            debug!(%method, error = %err, "ipc.client.rpc_error");
             return Err(std::io::Error::other(err.to_string()));
         }
         Ok(v.get("result").cloned().unwrap_or(Value::Null))

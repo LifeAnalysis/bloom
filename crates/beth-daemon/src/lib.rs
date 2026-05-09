@@ -35,7 +35,7 @@ use beth_watch::{WatchExecutor, WatchRegistry};
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -78,13 +78,20 @@ impl Daemon {
     /// any missing subdirs as needed.
     pub fn from_home(home: HomeDir) -> Result<Self, DaemonError> {
         home.ensure()?;
-        let config = Config::load_or_init(&home.config_path())?;
+        let config_path = home.config_path();
+        let config_existed = config_path.exists();
+        let config = Config::load_or_init(&config_path)?;
+        if config_existed {
+            debug!(path = %config_path.display(), chains = config.chains.len(), default_chain = %config.default_chain, "config.loaded");
+        } else {
+            debug!(path = %config_path.display(), "config.initialised_default");
+        }
 
         let mut clients: Vec<ChainClient> = Vec::new();
         for spec in config.chains.values() {
             match ChainClient::new(spec.clone()) {
                 Ok(c) => clients.push(c),
-                Err(e) => tracing::warn!(chain=%spec.name, "skipping chain: {e}"),
+                Err(e) => warn!(chain = %spec.name, error = %e, "daemon.chain_skipped"),
             }
         }
         let chains = ChainRegistry::default();
@@ -108,11 +115,23 @@ impl Daemon {
         // 17000 (the ENS canonical-registry chains) for resolution.
         let ens_client = pick_ens_client(&chains);
         if let Some(c) = ens_client.clone() {
+            debug!("daemon.ens_resolver_wired");
             tx_engine = tx_engine.with_resolver(Arc::new(ens_resolver::EnsAdapter::new(c)) as _);
+        } else {
+            debug!("daemon.ens_resolver_skipped: no ENS-capable chain configured");
         }
 
         let address_book_path = home.root().join("addressbook.toml");
-        let address_book = AddressBook::load(&address_book_path).unwrap_or_default();
+        let address_book = match AddressBook::load(&address_book_path) {
+            Ok(b) => {
+                debug!(path = %address_book_path.display(), entries = b.entries.len(), "addressbook.loaded");
+                b
+            }
+            Err(e) => {
+                debug!(path = %address_book_path.display(), error = %e, "addressbook.load_failed_using_empty");
+                AddressBook::default()
+            }
+        };
         let address_book_arc = Arc::new(address_book.clone());
 
         let audit =
@@ -133,9 +152,18 @@ impl Daemon {
             .etherscan
             .as_ref()
             .map(|c| match url::Url::parse(&c.api_url) {
-                Ok(url) => EtherscanClient::with_base_url(c.api_key.clone(), url),
-                Err(_) => EtherscanClient::new(c.api_key.clone()),
+                Ok(url) => {
+                    debug!(api_url = %url, "daemon.etherscan_configured");
+                    EtherscanClient::with_base_url(c.api_key.clone(), url)
+                }
+                Err(e) => {
+                    warn!(api_url = %c.api_url, error = %e, "daemon.etherscan_url_invalid_using_default");
+                    EtherscanClient::new(c.api_key.clone())
+                }
             });
+        if etherscan.is_none() {
+            debug!("daemon.etherscan_skipped: no [etherscan] config");
+        }
         let etherscan_arc = etherscan.map(Arc::new);
 
         let prices = PricesClient::new();
@@ -153,11 +181,16 @@ impl Daemon {
         // Etherscan client is configured. Stages 4 and 5 (Openchain,
         // Heimdall) plug in by appending more decoders here.
         let mut decoder_chain = DecoderChain::new().with(boxed(BuiltinDecoder));
+        debug!("revert.decoder.builtin_pushed");
         if let Some(es) = etherscan_arc.clone() {
             let abi_source: Arc<dyn AbiSource> = Arc::new(EtherscanAbiSource::new(es));
             decoder_chain = decoder_chain.with(boxed(EtherscanAbiDecoder::new(abi_source)));
+            debug!("revert.decoder.etherscan_pushed");
+        } else {
+            debug!("revert.decoder.etherscan_skipped: no etherscan client");
         }
         decoder_chain = decoder_chain.with(boxed(OpenchainDecoder::default()));
+        debug!("revert.decoder.openchain_pushed");
         #[cfg(feature = "bytecode-decompile")]
         {
             let bytecode_source: Arc<dyn beth_revert::BytecodeSource> = Arc::new(
@@ -168,7 +201,10 @@ impl Daemon {
                 beth_revert::HeimdallDecompileDecoder::new(bytecode_source)
                     .with_cache_dir(cache_dir),
             ));
+            debug!(cache_dir = %home.cache_dir().join("heimdall").display(), "revert.decoder.heimdall_pushed");
         }
+        #[cfg(not(feature = "bytecode-decompile"))]
+        debug!("revert.decoder.heimdall_skipped: feature 'bytecode-decompile' off");
         let decoder_chain = Arc::new(decoder_chain);
 
         let mut vfs_builder = Vfs::builder()
@@ -244,12 +280,19 @@ impl Daemon {
         // api_key just means unauthenticated calls (rate-limited).
         if let Some(enso_cfg) = &config.enso {
             let mut enso = EnsoClient::new(&enso_cfg.api_key);
-            if let Ok(url) = url::Url::parse(&enso_cfg.api_url) {
-                enso = enso.with_base_url(url);
+            match url::Url::parse(&enso_cfg.api_url) {
+                Ok(url) => {
+                    debug!(api_url = %url, "daemon.enso_configured");
+                    enso = enso.with_base_url(url);
+                }
+                Err(e) => {
+                    warn!(api_url = %enso_cfg.api_url, error = %e, "daemon.enso_url_invalid_using_default");
+                }
             }
             if enso_cfg.api_key.is_empty() {
                 warn!("enso api_key empty; mounting defi/ for keyless access (rate-limited)");
             }
+            debug!("daemon.defi_mounted");
             vfs_builder = vfs_builder.mount(
                 "defi",
                 Arc::new(
@@ -264,6 +307,8 @@ impl Daemon {
                     .with_revert_decoder(decoder_chain.clone()),
                 ) as _,
             );
+        } else {
+            debug!("daemon.defi_skipped: no [enso] config");
         }
 
         let vfs = vfs_builder
@@ -288,7 +333,16 @@ impl Daemon {
             warn!("watch.executor.skipped: no tokio runtime; call Daemon::start_workers later");
         }
 
-        info!(home=%home.root().display(), chains=?config.chains.keys().collect::<Vec<_>>(), "daemon.built");
+        info!(
+            home = %home.root().display(),
+            chains = ?config.chains.keys().collect::<Vec<_>>(),
+            etherscan = etherscan_arc.is_some(),
+            enso = config.enso.is_some(),
+            ens_resolver = ens_client.is_some(),
+            heimdall = cfg!(feature = "bytecode-decompile"),
+            block_mainnet_broadcast = config.block_mainnet_broadcast,
+            "daemon.built"
+        );
 
         Ok(Self {
             home,
@@ -353,9 +407,9 @@ impl Daemon {
                             .map(|d| d.as_millis())
                             .unwrap_or(0);
                         match outbox.sweep_expired(now_ms) {
-                            Ok(0) => {}
-                            Ok(n) => tracing::info!(swept=n, "outbox.sweep_expired"),
-                            Err(e) => tracing::warn!(error=%e, "outbox.sweep_expired failed"),
+                            Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
+                            Ok(n) => info!(swept = n, "outbox.sweep_expired"),
+                            Err(e) => warn!(error = %e, "outbox.sweep_expired_failed"),
                         }
                     }
                     _ = rx.changed() => {
@@ -431,9 +485,11 @@ fn pick_ens_client(chains: &ChainRegistry) -> Option<EnsClient> {
         };
         let id = c.spec().chain_id;
         if matches!(id, 1 | 5 | 11155111 | 17000) {
+            debug!(chain = %name, chain_id = id, "ens.picker.matched");
             return Some(EnsClient::mainnet(c));
         }
     }
+    debug!("ens.picker.no_match: no chain with id 1/5/11155111/17000 configured");
     None
 }
 
