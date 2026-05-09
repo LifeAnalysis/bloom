@@ -523,10 +523,7 @@ impl ChainClient {
     }
 
     /// `IERC721Enumerable.totalSupply()`. `None` if not enumerable.
-    pub async fn erc721_total_supply(
-        &self,
-        addr: Address,
-    ) -> Result<Option<U256>, ChainError> {
+    pub async fn erc721_total_supply(&self, addr: Address) -> Result<Option<U256>, ChainError> {
         let contract = IERC721Enumerable::new(addr, self.primary.clone());
         match contract.totalSupply().call().await {
             Ok(n) => Ok(Some(n)),
@@ -1744,7 +1741,10 @@ mod mock_rpc_tests {
     async fn erc721_owner_of_happy_path() {
         let owner = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let mut r = responses();
-        r.insert("eth_call".into(), vec![MockResponse::Ok(enc_address(owner))]);
+        r.insert(
+            "eth_call".into(),
+            vec![MockResponse::Ok(enc_address(owner))],
+        );
         let url = spawn_mock(r).await;
         let c = client_at(&url);
         let nft = address!("0x6666666666666666666666666666666666666666");
@@ -1759,7 +1759,11 @@ mod mock_rpc_tests {
         let mut r = responses();
         r.insert(
             "eth_call".into(),
-            vec![MockResponse::Err(3, "ERC721: invalid token ID".into(), None)],
+            vec![MockResponse::Err(
+                3,
+                "ERC721: invalid token ID".into(),
+                None,
+            )],
         );
         let url = spawn_mock(r).await;
         let c = client_at(&url);
