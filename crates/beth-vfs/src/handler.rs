@@ -158,3 +158,166 @@ pub trait Handler: Send + Sync {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dir_constructor_defaults() {
+        let e = Entry::dir("chains");
+        assert_eq!(e.name, "chains");
+        assert_eq!(e.kind, EntryKind::Dir);
+        assert_eq!(e.size, 0);
+        assert_eq!(e.mode, 0o755);
+        assert!(e.link_target.is_none());
+    }
+
+    #[test]
+    fn file_is_read_only_alias() {
+        let a = Entry::file("README.md");
+        let b = Entry::read_only_file("README.md");
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.kind, b.kind);
+        assert_eq!(a.mode, b.mode);
+        assert_eq!(a.size, b.size);
+        assert_eq!(a.link_target, b.link_target);
+    }
+
+    #[test]
+    fn read_only_file_defaults() {
+        let e = Entry::read_only_file("status.json");
+        assert_eq!(e.name, "status.json");
+        assert_eq!(e.kind, EntryKind::File);
+        assert_eq!(e.size, 0);
+        assert_eq!(e.mode, 0o444);
+        assert!(e.link_target.is_none());
+    }
+
+    #[test]
+    fn writable_file_defaults() {
+        let e = Entry::writable_file("policy.toml");
+        assert_eq!(e.name, "policy.toml");
+        assert_eq!(e.kind, EntryKind::File);
+        assert_eq!(e.size, 0);
+        assert_eq!(e.mode, 0o644);
+        assert!(e.link_target.is_none());
+    }
+
+    #[test]
+    fn symlink_records_target() {
+        let e = Entry::symlink("default", "../ethereum");
+        assert_eq!(e.name, "default");
+        assert_eq!(e.kind, EntryKind::Symlink);
+        assert_eq!(e.size, 0);
+        assert_eq!(e.mode, 0o777);
+        assert_eq!(e.link_target.as_deref(), Some("../ethereum"));
+    }
+
+    #[test]
+    fn handler_error_constructors_match_variants() {
+        match HandlerError::not_found("a/b") {
+            HandlerError::NotFound(s) => assert_eq!(s, "a/b"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        match HandlerError::invalid("bad") {
+            HandlerError::Invalid(s) => assert_eq!(s, "bad"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        match HandlerError::backend("upstream") {
+            HandlerError::Backend(s) => assert_eq!(s, "upstream"),
+            other => panic!("expected Backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handler_error_display_strings() {
+        assert_eq!(
+            HandlerError::NotFound("x".into()).to_string(),
+            "not found: x"
+        );
+        assert_eq!(
+            HandlerError::NotADir("x".into()).to_string(),
+            "not a directory: x"
+        );
+        assert_eq!(
+            HandlerError::NotAFile("x".into()).to_string(),
+            "not a file: x"
+        );
+        assert_eq!(
+            HandlerError::PermissionDenied.to_string(),
+            "permission denied"
+        );
+        assert_eq!(
+            HandlerError::Invalid("y".into()).to_string(),
+            "invalid input: y"
+        );
+        assert_eq!(
+            HandlerError::Unsupported("z".into()).to_string(),
+            "unsupported: z"
+        );
+        assert_eq!(
+            HandlerError::Backend("oops".into()).to_string(),
+            "backend: oops"
+        );
+    }
+
+    #[test]
+    fn handler_error_from_io_error_preserves_message() {
+        let io = std::io::Error::other("boom");
+        let e: HandlerError = io.into();
+        match e {
+            HandlerError::Io(inner) => assert!(inner.to_string().contains("boom")),
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    /// A trivial Handler impl so we can exercise the trait defaults
+    /// (`read`/`write`/`list`/`cache_ttl`/`is_read_side_effecting`).
+    struct NoopHandler;
+
+    #[async_trait]
+    impl Handler for NoopHandler {
+        async fn lookup(&self, _path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::dir(""))
+        }
+    }
+
+    #[tokio::test]
+    async fn default_read_returns_not_a_file() {
+        let h = NoopHandler;
+        let p = VfsPath::parse("/foo").unwrap();
+        let err = h.read(&p).await.unwrap_err();
+        match err {
+            HandlerError::NotAFile(s) => assert_eq!(s, "/foo"),
+            other => panic!("expected NotAFile, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_write_returns_permission_denied() {
+        let h = NoopHandler;
+        let p = VfsPath::parse("/foo").unwrap();
+        let err = h.write(&p, b"x").await.unwrap_err();
+        assert!(matches!(err, HandlerError::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn default_list_returns_not_a_dir() {
+        let h = NoopHandler;
+        let p = VfsPath::parse("/foo").unwrap();
+        let err = h.list(&p).await.unwrap_err();
+        match err {
+            HandlerError::NotADir(s) => assert_eq!(s, "/foo"),
+            other => panic!("expected NotADir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_cache_ttl_is_none_and_no_side_effects() {
+        let h = NoopHandler;
+        let p = VfsPath::parse("/foo").unwrap();
+        assert!(h.cache_ttl(&p).is_none());
+        assert!(!h.is_read_side_effecting(&p));
+    }
+}
