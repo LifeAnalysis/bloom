@@ -148,6 +148,7 @@ impl EnsClient {
             .await
             .map_err(|e| EnsError::Decode(format!("addr({name}): {e}")))?;
         if addr.is_zero() {
+            debug!(name, %resolver, "ens.resolve.addr_zero");
             return Err(EnsError::NotFound(format!("addr unset for '{name}'")));
         }
         self.cache.write().forward.insert(
@@ -184,11 +185,13 @@ impl EnsClient {
             .await
             .map_err(|e| EnsError::Decode(format!("name({addr}): {e}")))?;
         if name.is_empty() {
+            debug!(%addr, %resolver, "ens.reverse.name_empty");
             return Err(EnsError::NotFound(format!("no reverse record for {addr}")));
         }
         // Forward-verify: the claimed name must resolve back to `addr`.
         let forward = self.resolve(&name).await?;
         if forward != addr {
+            debug!(%addr, name = %name, %forward, "ens.reverse.forward_mismatch");
             return Err(EnsError::NotFound(format!(
                 "reverse '{name}' does not forward-resolve to {addr} (got {forward})"
             )));
@@ -216,6 +219,7 @@ impl EnsClient {
             .get(&cache_key)
             .and_then(|e| fresh(e, self.ttl))
         {
+            debug!(name, key, "ens.cache.hit text");
             return Ok(hit);
         }
         let node = namehash(name);
@@ -228,6 +232,7 @@ impl EnsClient {
             .await
             .map_err(|e| EnsError::Decode(format!("text({name},{key}): {e}")))?;
         if value.is_empty() {
+            debug!(name, key, %resolver, "ens.text.empty");
             return Err(EnsError::NotFound(format!(
                 "text '{key}' unset for '{name}'"
             )));
@@ -254,6 +259,7 @@ impl EnsClient {
             .get(name)
             .and_then(|e| fresh(e, self.ttl))
         {
+            debug!(name, "ens.cache.hit content_hash");
             return Ok(hit);
         }
         let node = namehash(name);
@@ -266,6 +272,7 @@ impl EnsClient {
             .await
             .map_err(|e| EnsError::Decode(format!("contenthash({name}): {e}")))?;
         if value.is_empty() {
+            debug!(name, %resolver, "ens.content_hash.empty");
             return Err(EnsError::NotFound(format!(
                 "contenthash unset for '{name}'"
             )));
@@ -290,6 +297,7 @@ impl EnsClient {
             .get(&node)
             .and_then(|e| fresh(e, self.ttl))
         {
+            debug!(node = %hex::encode(node), "ens.cache.hit resolver");
             return Ok(hit);
         }
         let provider = self.provider.provider();
@@ -300,6 +308,7 @@ impl EnsClient {
             .await
             .map_err(|e| EnsError::Decode(format!("registry.resolver: {e}")))?;
         if addr.is_zero() {
+            debug!(node = %hex::encode(node), "ens.resolver_for.unset");
             return Err(EnsError::NotFound(format!(
                 "no resolver registered for node 0x{}",
                 hex::encode(node)
