@@ -613,8 +613,10 @@ impl EtherscanClient {
         if let Some(cache) = &self.cache {
             let key = format!("{addr:#x}");
             if let Some(cached) = cache.get::<JsonAbi>(chain_id, "abi", &key, None) {
+                debug!(%addr, chain_id, "json_abi_for.cache.hit");
                 return Ok(Some(cached));
             }
+            trace!(%addr, chain_id, "json_abi_for.cache.miss");
         }
         let mut current = addr;
         let mut hops = 0;
@@ -625,7 +627,9 @@ impl EtherscanClient {
             if let Some(reader) = &self.storage {
                 match reader.read_slot(current, EIP1967_IMPL_SLOT).await {
                     Ok(slot) if !slot.is_zero() => {
-                        next = Some(addr_from_slot(slot));
+                        let impl_addr = addr_from_slot(slot);
+                        debug!(%current, %impl_addr, "json_abi_for.proxy.eip1967");
+                        next = Some(impl_addr);
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -637,17 +641,26 @@ impl EtherscanClient {
             // ABI either way.
             let src = match self.get_source_code(chain_id, current).await {
                 Ok(s) => s,
-                Err(EtherscanError::Api { .. }) | Err(EtherscanError::InvalidResponse(_)) => {
-                    return Ok(None)
+                Err(e @ EtherscanError::Api { .. })
+                | Err(e @ EtherscanError::InvalidResponse(_)) => {
+                    debug!(error = %e, %current, chain_id, "json_abi_for.source_unavailable");
+                    return Ok(None);
                 }
                 Err(e) => return Err(e),
             };
             // If the chain reader didn't already give us a target, look
             // at Etherscan's reported proxy fields.
             if next.is_none() && src.is_proxy() && !src.implementation.is_empty() {
-                if let Ok(impl_addr) = src.implementation.parse::<Address>() {
-                    if impl_addr != Address::ZERO {
+                match src.implementation.parse::<Address>() {
+                    Ok(impl_addr) if impl_addr != Address::ZERO => {
+                        debug!(%current, %impl_addr, "json_abi_for.proxy.etherscan_field");
                         next = Some(impl_addr);
+                    }
+                    Ok(_) => {
+                        debug!(%current, "json_abi_for.proxy.zero_implementation");
+                    }
+                    Err(e) => {
+                        debug!(error = %e, %current, raw = %src.implementation, "json_abi_for.proxy.bad_implementation");
                     }
                 }
             }
@@ -655,23 +668,36 @@ impl EtherscanClient {
                 if hops >= 2 || n == current {
                     // Cap recursion; fall back to the current ABI rather
                     // than chasing further.
-                    break src.parsed_abi().ok();
+                    debug!(%current, hops, next = %n, "json_abi_for.proxy.recursion_capped");
+                    break src.parsed_abi().ok().or_else(|| {
+                        debug!(%current, "json_abi_for.parsed_abi.empty_at_cap");
+                        None
+                    });
                 }
                 hops += 1;
                 current = n;
                 continue;
             }
-            break src.parsed_abi().ok();
+            break match src.parsed_abi() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    debug!(error = %e, %current, "json_abi_for.parsed_abi.failed");
+                    None
+                }
+            };
         };
 
         let abi = match abi {
             Some(v) => v,
-            None => return Ok(None),
+            None => {
+                debug!(%addr, chain_id, "json_abi_for.unavailable");
+                return Ok(None);
+            }
         };
         let abi: JsonAbi = match serde_json::from_value(abi) {
             Ok(v) => v,
             Err(e) => {
-                debug!(error = %e, "json_abi_for.parse_failed");
+                debug!(error = %e, %addr, chain_id, "json_abi_for.parse_failed");
                 return Ok(None);
             }
         };

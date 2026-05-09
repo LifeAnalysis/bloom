@@ -71,15 +71,37 @@ impl EtherscanCache {
         ttl: Option<Duration>,
     ) -> Option<T> {
         let path = self.path_for(chain_id, kind, key);
-        let meta = std::fs::metadata(&path).ok()?;
-        let mtime = meta.modified().ok()?;
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!(?path, "cache.miss");
+                return None;
+            }
+            Err(e) => {
+                warn!(?path, error = %e, "cache.metadata_failed");
+                return None;
+            }
+        };
+        let mtime = match meta.modified() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(?path, error = %e, "cache.modified_unavailable");
+                return None;
+            }
+        };
         let ttl = ttl.unwrap_or(self.default_ttl);
         let age = SystemTime::now().duration_since(mtime).unwrap_or_default();
         if age > ttl {
             debug!(?path, ?age, ?ttl, "cache.expired");
             return None;
         }
-        let bytes = std::fs::read(&path).ok()?;
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(?path, error = %e, "cache.read_failed");
+                return None;
+            }
+        };
         match serde_json::from_slice::<T>(&bytes) {
             Ok(v) => Some(v),
             Err(e) => {
