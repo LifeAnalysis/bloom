@@ -134,7 +134,10 @@ mod tests {
         // transient rate-limit. Pinning the behaviour here keeps a
         // future cleanup of the policy from accidentally widening it.
         let policy = BethRetryPolicy::default();
-        let err = err_resp(-32601, "the method debug_traceCall does not exist/is not available");
+        let err = err_resp(
+            -32601,
+            "the method debug_traceCall does not exist/is not available",
+        );
         assert!(!policy.should_retry(&err));
         let err = err_resp(-32004, "method not supported");
         assert!(!policy.should_retry(&err));

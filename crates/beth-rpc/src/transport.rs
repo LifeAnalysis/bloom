@@ -21,23 +21,44 @@
 //! `RpcEngine::build` is intentionally sync (so `ChainClient::new`
 //! stays sync). WP-4 plumbs in the async WS hand-off; until then, ws
 //! endpoints contribute to `supports_subscriptions()` reporting only.
+//!
+//! ## Active probe loop (WP-3)
+//!
+//! On `RpcEngine::build` we also spawn one tokio task per engine that
+//! periodically probes each HTTP endpoint *directly* — bypassing the
+//! fallback fan-out — with a 2 s `eth_blockNumber` call. Outcomes are
+//! folded into the `HealthRegistry` so the cooldown state machine
+//! reflects actual reachability rather than the alloy layer's
+//! private metrics. The task is cancelled when `RpcEngine` drops via
+//! a `tokio::sync::watch` channel.
+//!
+//! ### Scope note: filtering the fallback pool
+//!
+//! Alloy's `FallbackLayer` does not expose a runtime hook to exclude
+//! transports based on Beth-side health. For WP-3 we therefore record
+//! cooldowns for observability only — the fallback fan-out still
+//! queries cooled-down endpoints in parallel. The eviction story can
+//! land later as either an upstream PR or a thin wrapping layer.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use alloy::network::Ethereum;
+use alloy::primitives::U64;
 use alloy::providers::RootProvider;
 use alloy::rpc::client::RpcClient;
 use alloy::transports::http::{reqwest, Http};
 use alloy::transports::layers::{FallbackLayer, RetryBackoffLayer, ThrottleLayer};
 use alloy::transports::{BoxTransport, IntoBoxTransport};
 use beth_proto::{ChainSpec, EndpointSpec};
+use tokio::sync::watch;
 use tower::ServiceBuilder;
 use tracing::{debug, info, warn};
 
 use crate::endpoint::{classify_endpoint, is_subscription_capable, EndpointScheme};
 use crate::error::BethRpcError;
-use crate::health::EndpointHealthSnapshot;
+use crate::health::{CooldownDecision, EndpointHealthSnapshot, HealthRegistry};
 use crate::policy::BethRetryPolicy;
 
 /// Default compute-units-per-second when the operator hasn't set
@@ -58,6 +79,29 @@ const MAX_RETRIES: u32 = 3;
 /// per-call budget at our scale (200 → 400 → 800).
 const INITIAL_BACKOFF_MS: u64 = 200;
 
+/// Active probe interval. 15 s matches the spec's §C.7 recovery
+/// cadence — frequent enough that a cooled-down endpoint rejoins the
+/// pool quickly, sparse enough that a 50-chain daemon doesn't drown
+/// public RPC frontends in idle traffic.
+const PROBE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Per-call deadline for the active probe. Anything slower than this
+/// is, by definition, no use as a backing transport for live UI
+/// reads.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// One entry in the per-endpoint probe table. The `transport` is the
+/// fully-layered HTTP stack for one endpoint; the `idx` is the slot
+/// in the `HealthRegistry` that owns the corresponding metrics.
+struct ProbeTarget {
+    idx: usize,
+    url: String,
+    /// Pre-built `RpcClient` over a single endpoint's stack. Cloning
+    /// is cheap (Arc inside) and the probe issues one call per round
+    /// per target.
+    client: RpcClient,
+}
+
 /// The layered RPC engine. Built once per `ChainSpec` and shared via
 /// `Arc` by every consumer (the wallet, watch executor, ENS resolver,
 /// VFS handlers). The `provider()` accessor exposes the alloy
@@ -68,6 +112,10 @@ pub struct RpcEngine {
     endpoints: Vec<EndpointSpec>,
     provider: Arc<RootProvider<Ethereum>>,
     supports_subscriptions: bool,
+    health: HealthRegistry,
+    /// Send `true` here to cancel the probe loop on drop. Wrapped in
+    /// `Option` so `Drop` can take ownership cleanly.
+    shutdown_tx: Option<watch::Sender<bool>>,
 }
 
 impl RpcEngine {
@@ -87,6 +135,8 @@ impl RpcEngine {
         }
 
         let mut http_transports: Vec<BoxTransport> = Vec::new();
+        let mut probe_targets: Vec<ProbeTarget> = Vec::new();
+        let mut tracked_urls: Vec<String> = Vec::new();
         let mut supports_subscriptions = false;
 
         for ep in &endpoints {
@@ -97,6 +147,19 @@ impl RpcEngine {
             match scheme {
                 EndpointScheme::Http => {
                     let transport = build_http_stack(&url, ep);
+                    let idx = tracked_urls.len();
+                    tracked_urls.push(ep.url.clone());
+                    // Keep a clone for the probe loop. `BoxTransport`
+                    // is `Clone` (Arc inside), so the per-endpoint
+                    // RpcClient shares connection state with the
+                    // fallback fan-out — probes therefore reflect
+                    // exactly what production traffic would see.
+                    let probe_client = RpcClient::new(transport.clone(), false);
+                    probe_targets.push(ProbeTarget {
+                        idx,
+                        url: ep.url.clone(),
+                        client: probe_client,
+                    });
                     http_transports.push(transport);
                     debug!(
                         chain = %spec.name,
@@ -133,13 +196,24 @@ impl RpcEngine {
         );
         let fallback = FallbackLayer::default().with_active_transport_count(active);
 
-        let service = ServiceBuilder::new().layer(fallback).service(http_transports);
+        let service = ServiceBuilder::new()
+            .layer(fallback)
+            .service(http_transports);
         // Loopback URLs are tagged "local" by alloy's HTTP transport;
         // we don't have visibility into per-endpoint locality at this
         // outer layer, so default to false (the most conservative
         // choice for retry/timeout heuristics).
         let client: RpcClient = RpcClient::new(service, false);
         let provider: RootProvider<Ethereum> = RootProvider::<Ethereum>::new(client);
+
+        let health = HealthRegistry::new(tracked_urls);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        spawn_probe_loop(
+            spec.name.clone(),
+            probe_targets,
+            health.clone(),
+            shutdown_rx,
+        );
 
         info!(
             chain = %spec.name,
@@ -154,6 +228,8 @@ impl RpcEngine {
             endpoints,
             provider: Arc::new(provider),
             supports_subscriptions,
+            health,
+            shutdown_tx: Some(shutdown_tx),
         })
     }
 
@@ -171,10 +247,17 @@ impl RpcEngine {
         self.supports_subscriptions
     }
 
-    /// Per-endpoint health view. Stub for WP-2: the probe loop that
-    /// fills it lives in WP-3, so today this returns an empty Vec.
+    /// Per-endpoint health view. Values reflect the most recent probe
+    /// outcomes; production traffic does not (yet) update this view —
+    /// see the scope note in `health.rs`.
     pub fn endpoints_snapshot(&self) -> Vec<EndpointHealthSnapshot> {
-        Vec::new()
+        self.health.snapshot()
+    }
+
+    /// Number of endpoints currently parked in cooldown. Cheap;
+    /// suitable for status-bar style displays.
+    pub fn cooled_down_count(&self) -> usize {
+        self.health.cooled_down_count()
     }
 
     /// Chain name this engine was built for. Used by error variants
@@ -186,6 +269,155 @@ impl RpcEngine {
     /// Configured endpoints, in source order.
     pub fn endpoints(&self) -> &[EndpointSpec] {
         &self.endpoints
+    }
+}
+
+impl Drop for RpcEngine {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            // Signal the probe loop to exit; ignore the error, which
+            // only fires if every receiver has already dropped (in
+            // which case the task is already gone).
+            let _ = tx.send(true);
+        }
+    }
+}
+
+/// Spawn the active probe loop.
+///
+/// The task pulses every `PROBE_INTERVAL`, issues a single
+/// `eth_blockNumber` against each tracked endpoint with a hard
+/// `PROBE_TIMEOUT`, and folds the outcome into the `HealthRegistry`.
+/// Cancellation is observed via `shutdown_rx`: the loop exits as soon
+/// as the watched value flips to `true`.
+fn spawn_probe_loop(
+    chain: String,
+    targets: Vec<ProbeTarget>,
+    health: HealthRegistry,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    // `RpcEngine::build` is a sync constructor; some unit tests build
+    // a `ChainClient` from a sync `#[test]` without a Tokio runtime
+    // attached. In that mode there's nothing to probe (no async code
+    // would run anyway) so we silently skip the spawn rather than
+    // panicking the test binary.
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        debug!(
+            chain = %chain,
+            "rpc.health.probe_loop_skipped_no_runtime"
+        );
+        return;
+    };
+    handle.spawn(async move {
+        info!(
+            chain = %chain,
+            endpoints = targets.len(),
+            interval_secs = PROBE_INTERVAL.as_secs(),
+            "rpc.health.probe_loop_started"
+        );
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(PROBE_INTERVAL) => {}
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!(chain = %chain, "rpc.health.probe_loop_stopped");
+                        return;
+                    }
+                }
+            }
+            run_probe_round(&chain, &targets, &health).await;
+        }
+    });
+}
+
+/// One probe round across every tracked endpoint. Sequential by
+/// design: the targets share the underlying reqwest connection pool
+/// and we don't want a probe burst to mask a real production call.
+async fn run_probe_round(chain: &str, targets: &[ProbeTarget], health: &HealthRegistry) {
+    for target in targets {
+        let started = Instant::now();
+        debug!(
+            chain = %chain,
+            idx = target.idx,
+            url = %redacted(&target.url),
+            "rpc.health.probe_started"
+        );
+        let call = target.client.request_noparams::<U64>("eth_blockNumber");
+        let result = tokio::time::timeout(PROBE_TIMEOUT, call).await;
+        match result {
+            Ok(Ok(value)) => {
+                let elapsed = started.elapsed();
+                let block = value.try_into().ok();
+                health.record_success(target.idx, elapsed, block);
+                debug!(
+                    chain = %chain,
+                    idx = target.idx,
+                    url = %redacted(&target.url),
+                    latency_ms = elapsed.as_millis() as u64,
+                    block,
+                    "rpc.health.probe_succeeded"
+                );
+                // Was a cooldown cleared by this success? `cooled_down_indices`
+                // is the cheapest way to ask — if the index is no longer
+                // listed and it had been before, log the transition.
+                if !health.cooled_down_indices().contains(&target.idx) {
+                    debug!(
+                        chain = %chain,
+                        idx = target.idx,
+                        "rpc.health.cooldown_cleared"
+                    );
+                }
+            }
+            Ok(Err(err)) => {
+                let decision = health.record_failure(target.idx, true, None);
+                debug!(
+                    chain = %chain,
+                    idx = target.idx,
+                    url = %redacted(&target.url),
+                    error = %err,
+                    "rpc.health.probe_failed"
+                );
+                emit_cooldown_event(chain, target, decision);
+            }
+            Err(_elapsed) => {
+                warn!(
+                    chain = %chain,
+                    idx = target.idx,
+                    url = %redacted(&target.url),
+                    timeout_ms = PROBE_TIMEOUT.as_millis() as u64,
+                    "rpc.health.probe_timeout"
+                );
+                let decision = health.record_failure(target.idx, true, None);
+                emit_cooldown_event(chain, target, decision);
+            }
+        }
+    }
+}
+
+fn emit_cooldown_event(chain: &str, target: &ProbeTarget, decision: CooldownDecision) {
+    match decision {
+        CooldownDecision::None => {}
+        CooldownDecision::Fresh(d) => {
+            warn!(
+                chain = %chain,
+                idx = target.idx,
+                url = %redacted(&target.url),
+                cooldown_secs = d.as_secs(),
+                "rpc.health.cooldown_set"
+            );
+        }
+        CooldownDecision::Chronic(d) => {
+            warn!(
+                chain = %chain,
+                idx = target.idx,
+                url = %redacted(&target.url),
+                cooldown_secs = d.as_secs(),
+                "rpc.health.chronic_failer_escalated"
+            );
+        }
     }
 }
 
@@ -209,7 +441,10 @@ fn build_http_stack(url: &url::Url, ep: &EndpointSpec) -> BoxTransport {
     let http: Http<reqwest::Client> = Http::new(url.clone());
     if let Some(rps) = ep.max_rps {
         let throttle = ThrottleLayer::new(rps);
-        let stack = ServiceBuilder::new().layer(retry).layer(throttle).service(http);
+        let stack = ServiceBuilder::new()
+            .layer(retry)
+            .layer(throttle)
+            .service(http);
         stack.into_box_transport()
     } else {
         let stack = ServiceBuilder::new().layer(retry).service(http);
@@ -222,10 +457,7 @@ fn build_http_stack(url: &url::Url, ep: &EndpointSpec) -> BoxTransport {
 fn redacted(url: &str) -> String {
     if let Ok(u) = url::Url::parse(url) {
         let host = u.host_str().unwrap_or("?");
-        let port = u
-            .port()
-            .map(|p| format!(":{p}"))
-            .unwrap_or_default();
+        let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
         format!("{}://{}{}", u.scheme(), host, port)
     } else {
         url.to_string()

@@ -119,16 +119,12 @@ fn map_rpc_error(e: beth_rpc::BethRpcError) -> ChainError {
     use beth_rpc::BethRpcError;
     match e {
         BethRpcError::NoEndpoints(name) => ChainError::NoEndpoints(name),
-        BethRpcError::InvalidUrl { url, source } => {
-            ChainError::Url(format!("{url}: {source}"))
-        }
+        BethRpcError::InvalidUrl { url, source } => ChainError::Url(format!("{url}: {source}")),
         BethRpcError::Transport(t) => ChainError::Transport(t.to_string()),
         BethRpcError::AllEndpointsFailed { chain, last_error } => {
             ChainError::Transport(format!("all endpoints failed for {chain}: {last_error}"))
         }
-        BethRpcError::SessionNotImplemented => {
-            ChainError::Rpc("session not implemented".into())
-        }
+        BethRpcError::SessionNotImplemented => ChainError::Rpc("session not implemented".into()),
     }
 }
 
@@ -184,6 +180,24 @@ impl ChainClient {
     /// configuration intent rather than runtime capability.
     pub fn supports_subscriptions(&self) -> bool {
         self.engine.supports_subscriptions()
+    }
+
+    /// Snapshot of per-endpoint health for this chain. The returned
+    /// vec mirrors the engine's configured endpoint order — index `i`
+    /// in the snapshot corresponds to `spec().endpoints()[i]`.
+    ///
+    /// This is a snapshot taken at call time. Values may have changed
+    /// by the time the caller reads them; callers that want
+    /// transactional consistency across multiple leaves should
+    /// snapshot once and read all leaves from the snapshot.
+    pub fn endpoints(&self) -> Vec<beth_rpc::EndpointHealthSnapshot> {
+        self.engine.endpoints_snapshot()
+    }
+
+    /// Number of endpoints currently parked in cooldown. Useful for
+    /// status displays that don't need the full snapshot.
+    pub fn cooled_down_count(&self) -> usize {
+        self.engine.cooled_down_count()
     }
 
     pub async fn chain_id(&self) -> Result<u64, ChainError> {

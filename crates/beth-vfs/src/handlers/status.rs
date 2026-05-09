@@ -12,6 +12,10 @@
 //! - `status/chains/<chain>/connected`           — `true`/`false` from RPC ping
 //! - `status/chains/<chain>/block_number`        — latest block (cached briefly)
 //! - `status/chains/<chain>/rpc_url`             — first configured RPC URL (redacted)
+//! - `status/chains/<chain>/endpoints/`          — list of endpoint indices
+//! - `status/chains/<chain>/endpoints/<idx>/`    — leaves per endpoint health snapshot
+//!   - `url` (redacted), `score`, `cooldown_until`, `latency_ms`,
+//!     `success_rate`, `last_block`
 //! - `status/audit/head`                         — hex of head record digest
 //! - `status/audit/count`                        — total entries (decimal)
 //! - `status/audit/last`                         — JSON of the most recent N=10 entries
@@ -397,6 +401,46 @@ impl StatusHandler {
                     "chain_id" | "connected" | "block_number" | "rpc_url"
                 ) {
                     Ok(Entry::file(leaf))
+                } else if leaf == "endpoints" {
+                    Ok(Entry::dir(leaf))
+                } else {
+                    Err(HandlerError::not_found(path.to_string_path()))
+                }
+            }
+            [a, name, eps, idx] if a == "chains" && eps == "endpoints" => {
+                let client = self
+                    .chains
+                    .get(name)
+                    .ok_or_else(|| HandlerError::not_found(name.clone()))?;
+                let i: usize = idx
+                    .parse()
+                    .map_err(|_| HandlerError::not_found(path.to_string_path()))?;
+                if i >= client.endpoints().len() {
+                    return Err(HandlerError::not_found(path.to_string_path()));
+                }
+                Ok(Entry::dir(idx))
+            }
+            [a, name, eps, idx, leaf] if a == "chains" && eps == "endpoints" => {
+                let client = self
+                    .chains
+                    .get(name)
+                    .ok_or_else(|| HandlerError::not_found(name.clone()))?;
+                let i: usize = idx
+                    .parse()
+                    .map_err(|_| HandlerError::not_found(path.to_string_path()))?;
+                if i >= client.endpoints().len() {
+                    return Err(HandlerError::not_found(path.to_string_path()));
+                }
+                if matches!(
+                    leaf.as_str(),
+                    "url"
+                        | "score"
+                        | "cooldown_until"
+                        | "latency_ms"
+                        | "success_rate"
+                        | "last_block"
+                ) {
+                    Ok(Entry::file(leaf))
                 } else {
                     Err(HandlerError::not_found(path.to_string_path()))
                 }
@@ -468,6 +512,44 @@ impl StatusHandler {
                             ))),
                         }
                     }
+                    _ => Err(HandlerError::not_found(path.to_string_path())),
+                }
+            }
+            [a, name, eps, idx, leaf] if a == "chains" && eps == "endpoints" => {
+                let client = self
+                    .chains
+                    .get(name)
+                    .ok_or_else(|| HandlerError::not_found(name.clone()))?;
+                let i: usize = idx
+                    .parse()
+                    .map_err(|_| HandlerError::not_found(path.to_string_path()))?;
+                let snaps = client.endpoints();
+                let snap = snaps
+                    .get(i)
+                    .ok_or_else(|| HandlerError::not_found(path.to_string_path()))?;
+                match leaf.as_str() {
+                    "url" => Ok(format!("{}\n", Self::redact_url(&snap.url)).into_bytes()),
+                    "score" => Ok(format!("{:.3}\n", snap.score).into_bytes()),
+                    "latency_ms" => Ok(format!("{}\n", snap.latency_ms).into_bytes()),
+                    "success_rate" => Ok(format!("{:.3}\n", snap.success_rate).into_bytes()),
+                    "last_block" => match snap.last_block {
+                        Some(b) => Ok(format!("{}\n", b).into_bytes()),
+                        None => Ok(b"\n".to_vec()),
+                    },
+                    "cooldown_until" => match snap.cooldown_until {
+                        Some(t) => {
+                            // Render as Unix-seconds for stability;
+                            // human-readable RFC3339 is built from
+                            // the same source via `started_at` style
+                            // helpers if a future leaf wants it.
+                            let secs = t
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            Ok(format!("{}\n", secs).into_bytes())
+                        }
+                        None => Ok(b"\n".to_vec()),
+                    },
                     _ => Err(HandlerError::not_found(path.to_string_path())),
                 }
             }
@@ -551,6 +633,36 @@ impl StatusHandler {
                     Entry::file("connected"),
                     Entry::file("block_number"),
                     Entry::file("rpc_url"),
+                    Entry::dir("endpoints"),
+                ])
+            }
+            [a, name, eps] if a == "chains" && eps == "endpoints" => {
+                let client = self
+                    .chains
+                    .get(name)
+                    .ok_or_else(|| HandlerError::not_found(name.clone()))?;
+                Ok((0..client.endpoints().len())
+                    .map(|i| Entry::dir(&i.to_string()))
+                    .collect())
+            }
+            [a, name, eps, idx] if a == "chains" && eps == "endpoints" => {
+                let client = self
+                    .chains
+                    .get(name)
+                    .ok_or_else(|| HandlerError::not_found(name.clone()))?;
+                let i: usize = idx
+                    .parse()
+                    .map_err(|_| HandlerError::not_found(path.to_string_path()))?;
+                if i >= client.endpoints().len() {
+                    return Err(HandlerError::not_found(path.to_string_path()));
+                }
+                Ok(vec![
+                    Entry::file("url"),
+                    Entry::file("score"),
+                    Entry::file("cooldown_until"),
+                    Entry::file("latency_ms"),
+                    Entry::file("success_rate"),
+                    Entry::file("last_block"),
                 ])
             }
             [a] if a == "audit" => Ok(vec![
@@ -827,5 +939,43 @@ mod tests {
 
         let red2 = StatusHandler::redact_url("https://api.example.com/api?apikey=topsecret123");
         assert!(!red2.contains("topsecret123"), "got: {red2}");
+    }
+
+    #[tokio::test]
+    async fn endpoints_leaf_url_is_redacted() {
+        use beth_chain::ChainClient;
+        use beth_proto::ChainSpec;
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+        // Configure a chain with a key-shaped URL so we can verify
+        // the leaf surfaces the redacted form rather than the raw
+        // string. The key must be ≥20 alnum chars to trip
+        // `redact_url`'s trailing-segment heuristic.
+        let mut spec = ChainSpec::anvil_default();
+        spec.name = "redact-test".into();
+        spec.rpc_urls =
+            vec!["https://eth-mainnet.g.alchemy.com/v2/abcdefghij1234567890ZZZZZZ".into()];
+        let client = ChainClient::new(spec).unwrap();
+        h.chains.add(client);
+
+        let body = h
+            .read(&VfsPath::parse("chains/redact-test/endpoints/0/url").unwrap())
+            .await
+            .unwrap();
+        let s = String::from_utf8(body).unwrap();
+        assert!(s.ends_with('\n'));
+        // Redaction either drops the path or replaces it with `***`.
+        assert!(!s.contains("abcdefghij1234567890"), "got: {s}");
+        assert!(s.contains("eth-mainnet.g.alchemy.com"), "got: {s}");
+
+        // Listing the chains/<n> dir should advertise the new
+        // `endpoints` directory alongside the legacy leaves.
+        let entries = h
+            .list(&VfsPath::parse("chains/redact-test").unwrap())
+            .await
+            .unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"endpoints"), "missing endpoints dir");
+        assert!(names.contains(&"rpc_url"), "missing rpc_url leaf");
     }
 }

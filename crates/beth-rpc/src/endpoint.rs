@@ -102,11 +102,17 @@ mod tests {
 
         // Unsupported schemes are rejected.
         let err = classify_endpoint(&ep("file:///etc/hosts")).unwrap_err();
-        assert!(matches!(err, BethRpcError::InvalidUrl { .. }), "got {err:?}");
+        assert!(
+            matches!(err, BethRpcError::InvalidUrl { .. }),
+            "got {err:?}"
+        );
 
         // Unparseable garbage is rejected.
         let err = classify_endpoint(&ep("::not a url::")).unwrap_err();
-        assert!(matches!(err, BethRpcError::InvalidUrl { .. }), "got {err:?}");
+        assert!(
+            matches!(err, BethRpcError::InvalidUrl { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
