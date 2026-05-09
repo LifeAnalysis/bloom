@@ -1,0 +1,67 @@
+# Compose stack for the dockerized fork-mode mount integration test
+# (driven by tests/docker/test_fork_mount.sh, host-side launcher
+# tests/docker/run.sh --fork).
+#
+# Mirrors the structure of docker-compose-enso.yml: two services on a
+# shared bridge network so the beth daemon inside beth-test reaches
+# anvil-fork at http://anvil-fork:8545. The only differences from the
+# enso compose are the container names (so `--enso` and `--fork` can
+# coexist on the same host) and the entrypoint script.
+#
+# anvil-fork forks Base mainnet so the daemon's chain client sees real
+# state, but every broadcast lands on a throwaway fork. BASE_FORK_RPC_URL
+# overrides the upstream when the public RPC rate-limits.
+services:
+  anvil-fork:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: beth-fork-anvil
+    entrypoint: ["anvil"]
+    command:
+      - --fork-url
+      - ${BASE_FORK_RPC_URL:-https://base-rpc.publicnode.com}
+      - --chain-id
+      - "8453"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8545"
+      - --block-time
+      - "1"
+      - --silent
+    ports:
+      # Exposed for host-side debugging (cast, curl). Not required by
+      # the in-network beth-test client, which goes via the bridge.
+      - "127.0.0.1:8547:8545"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cast chain-id --rpc-url http://localhost:8545 >/dev/null 2>&1 ||
+          exit 1
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+
+  beth-test:
+    image: ${BETH_TEST_IMAGE:-bloom-eth-mount-test:latest}
+    container_name: beth-fork-driver
+    depends_on:
+      anvil-fork:
+        condition: service_healthy
+    # Same mount privileges as the enso/mount tests.
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
+      - seccomp=unconfined
+    devices:
+      - /dev/fuse
+    environment:
+      - BETH_TEST_WALLET_PASSPHRASE=test
+      - BASE_FORK_INTERNAL_URL=http://anvil-fork:8545
+      - RUST_LOG=info
+    volumes:
+      - ${REPO_ROOT}:/workspace
+    working_dir: /workspace
+    command: ["bash", "tests/docker/test_fork_mount.sh"]

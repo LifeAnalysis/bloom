@@ -3,7 +3,7 @@
 # integration suite.
 #
 # Usage:
-#   ./tests/docker/run.sh [--rebuild] [--workspace|--mount|--enso|--enso-live]
+#   ./tests/docker/run.sh [--rebuild] [--workspace|--mount|--enso|--enso-live|--fork]
 #
 # Modes:
 #   default       — runs tests/docker/test.sh (NFS mount integration test).
@@ -25,6 +25,13 @@
 #                   read-only and copied into a throwaway home inside
 #                   the container — the canonical keystore is never
 #                   written to from this script.
+#   --fork        — runs tests/docker/test_fork_mount.sh inside a
+#                   docker-compose stack with an anvil --fork-url=Base
+#                   sidecar. Like --enso but skips DeFi: stages and
+#                   broadcasts a plain native-ETH send via the wallet
+#                   outbox, then exercises the chain read paths
+#                   (head/tx/blocks/gas) against the resulting hash.
+#                   No Enso key required.
 #
 # `--rebuild` forces `docker build --no-cache`. The default reuses the
 # cached image so iterative loops stay fast.
@@ -42,14 +49,16 @@ for arg in "$@"; do
         --mount) MODE=mount ;;
         --enso) MODE=enso ;;
         --enso-live) MODE=enso-live ;;
+        --fork) MODE=fork ;;
         -h|--help)
             cat <<EOF
-Usage: $0 [--rebuild] [--workspace|--mount|--enso|--enso-live]
+Usage: $0 [--rebuild] [--workspace|--mount|--enso|--enso-live|--fork]
 
 Default mode runs the NFS mount integration test.
 --workspace runs \`cargo test --workspace --lib\` inside the same image.
 --enso runs the Enso -> Aave integration test against an anvil fork.
 --enso-live runs the same flow against Base mainnet (spends real ETH).
+--fork runs the wallet outbox + chain reads test against an anvil fork.
 --rebuild forces \`docker build --no-cache\`.
 EOF
             exit 0
@@ -124,6 +133,31 @@ case "$MODE" in
         # stale anvil fork can't leak state into a new test.
         "${COMPOSE[@]}" -f "$compose_file" down --remove-orphans >/dev/null 2>&1 || true
         # `up --abort-on-container-exit` returns the driver's exit code.
+        rc=0
+        "${COMPOSE[@]}" -f "$compose_file" up \
+            --abort-on-container-exit --exit-code-from beth-test \
+            || rc=$?
+        "${COMPOSE[@]}" -f "$compose_file" down --remove-orphans >/dev/null 2>&1 || true
+        echo "::endgroup::"
+        exit "$rc"
+        ;;
+    fork)
+        # Compose-driven: anvil-fork sidecar + beth-test driver, same
+        # privilege flags as --enso. No Enso key needed; the test
+        # exercises the wallet/outbox + chain read paths only.
+        if command -v docker-compose >/dev/null 2>&1; then
+            COMPOSE=(docker-compose)
+        else
+            COMPOSE=(docker compose)
+        fi
+        echo "::group::docker compose up ($MODE)"
+        export REPO_ROOT
+        export BETH_TEST_IMAGE="$IMAGE_TAG"
+        export BASE_FORK_RPC_URL="${BASE_FORK_RPC_URL:-https://base-rpc.publicnode.com}"
+        compose_file="$REPO_ROOT/tests/docker/docker-compose-fork.yml"
+        # Tear down any previous run so a stale anvil fork can't leak
+        # state into a new test run.
+        "${COMPOSE[@]}" -f "$compose_file" down --remove-orphans >/dev/null 2>&1 || true
         rc=0
         "${COMPOSE[@]}" -f "$compose_file" up \
             --abort-on-container-exit --exit-code-from beth-test \
