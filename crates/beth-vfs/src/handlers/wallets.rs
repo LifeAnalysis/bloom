@@ -502,19 +502,28 @@ impl WalletsHandler {
                         "replace requires a non-empty intent body",
                     ));
                 }
-                let _intent: RawIntent = intent_parser::parse(body).map_err(err_be)?;
+                let intent: RawIntent = intent_parser::parse(body).map_err(err_be)?;
                 let signer = self
                     .keystore
                     .signer(wallet)
                     .map_err(|_| HandlerError::PermissionDenied)?;
-                // The current `TxEngine::replace` bumps fees on the
-                // original; we pass a 10% floor as the spec/mempool
-                // require. Caller can always cancel + re-stage if the body
-                // has materially changed (different to/value/data).
-                // TODO(replace): consume the body to substitute calldata.
+                // Bump at >= 10% (mempool floor) and substitute the
+                // calldata derived from the new intent — same nonce,
+                // possibly different to / value / data. Use the
+                // address book the handler holds so name lookups in
+                // the body resolve identically to a fresh stage.
                 let _ = self
                     .tx_engine
-                    .replace(wallet, chain, id, &client, &signer, 10)
+                    .replace_with_intent(
+                        wallet,
+                        chain,
+                        id,
+                        &client,
+                        &signer,
+                        10,
+                        Some(intent),
+                        Some(self.address_book.as_ref()),
+                    )
                     .await
                     .map_err(err_be)?;
                 Ok(())

@@ -220,6 +220,86 @@ impl TxEngine {
         Ok(meta)
     }
 
+    /// Resolve a parsed intent body into the on-wire fields a staged tx
+    /// needs: destination, value, calldata, and optional ERC-20 metadata
+    /// for plan rendering. Shared by [`Self::stage`] and
+    /// [`Self::replace_with_intent`] so the calldata-substitution path is
+    /// guaranteed to encode identically to the original stage.
+    async fn resolve_intent_body(
+        &self,
+        body: &RawIntentBody,
+        chain: &ChainClient,
+        chain_id: u64,
+        address_book: Option<&AddressBook>,
+    ) -> Result<(Address, U256, String, Option<TokenRef>), TxEngineError> {
+        match body {
+            RawIntentBody::Send {
+                to,
+                value,
+                token,
+                data,
+            } => {
+                let to_addr = self.resolve_recipient_async(to, address_book).await?;
+                if let Some(v) = Self::resolve_native_value(value, token)? {
+                    let data = data.clone().unwrap_or_else(|| "0x".into());
+                    Ok((to_addr, v, data, None))
+                } else {
+                    let token_str = token.as_deref().unwrap_or("");
+                    let (token_addr, sym_hint) = Self::resolve_token_address(token_str, chain_id)?;
+                    let meta = self.token_meta(chain, token_addr, &sym_hint).await?;
+                    let parsed =
+                        parse_amount(value).map_err(|e| TxEngineError::Amount(e.to_string()))?;
+                    let amount = parse_units(&parsed.number, meta.decimals)
+                        .map_err(|e| TxEngineError::Amount(e.to_string()))?;
+                    let calldata = beth_tools::encode_call(
+                        "transfer(address,uint256)",
+                        &serde_json::json!([
+                            beth_proto::checksum_address(&to_addr),
+                            amount.to_string(),
+                        ]),
+                    )
+                    .map_err(|e| TxEngineError::Amount(format!("encode_call: {e}")))?;
+                    let token_ref = TokenRef {
+                        address: beth_proto::checksum_address(&meta.address),
+                        symbol: meta.symbol.clone(),
+                        decimals: meta.decimals,
+                        recipient: beth_proto::checksum_address(&to_addr),
+                        amount: parsed.number.clone(),
+                    };
+                    Ok((token_addr, U256::ZERO, calldata, Some(token_ref)))
+                }
+            }
+            RawIntentBody::Raw { to, value, data } => {
+                let to_addr = self.resolve_recipient_async(to, address_book).await?;
+                let v = if value.is_empty() {
+                    U256::ZERO
+                } else {
+                    parse_eth(value).map_err(|e| TxEngineError::Amount(e.to_string()))?
+                };
+                Ok((to_addr, v, data.clone(), None))
+            }
+            RawIntentBody::Call {
+                contract,
+                method,
+                args,
+                value,
+            } => {
+                let contract_addr = self.resolve_recipient_async(contract, address_book).await?;
+                let v = if value.is_empty() {
+                    U256::ZERO
+                } else {
+                    parse_eth(value).map_err(|e| TxEngineError::Amount(e.to_string()))?
+                };
+                let data = beth_tools::encode_call(method, &serde_json::json!(args))
+                    .map_err(|e| TxEngineError::Amount(format!("encode_call: {e}")))?;
+                Ok((contract_addr, v, data, None))
+            }
+            RawIntentBody::Enso { .. } => Err(TxEngineError::Unimplemented(
+                "Enso intents flow through beth-defi (not in v1 stage path)".into(),
+            )),
+        }
+    }
+
     /// Stage a tx for a wallet on a chain. The caller is responsible for
     /// looking up the wallet's address.
     pub async fn stage(
@@ -236,78 +316,8 @@ impl TxEngine {
 
         // (to, value_wei, data_hex, optional token metadata for plan)
         let (to, value_wei, data_hex, token_for_plan): (Address, U256, String, Option<TokenRef>) =
-            match &intent.body {
-                RawIntentBody::Send {
-                    to,
-                    value,
-                    token,
-                    data,
-                } => {
-                    let to_addr = self.resolve_recipient_async(to, address_book).await?;
-                    if let Some(v) = Self::resolve_native_value(value, token)? {
-                        // Native send.
-                        let data = data.clone().unwrap_or_else(|| "0x".into());
-                        (to_addr, v, data, None)
-                    } else {
-                        // ERC-20 path.
-                        let token_str = token.as_deref().unwrap_or("");
-                        let (token_addr, sym_hint) =
-                            Self::resolve_token_address(token_str, chain_id)?;
-                        let meta = self.token_meta(chain, token_addr, &sym_hint).await?;
-                        let parsed = parse_amount(value)
-                            .map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                        let amount = parse_units(&parsed.number, meta.decimals)
-                            .map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                        let calldata = beth_tools::encode_call(
-                            "transfer(address,uint256)",
-                            &serde_json::json!([
-                                beth_proto::checksum_address(&to_addr),
-                                amount.to_string(),
-                            ]),
-                        )
-                        .map_err(|e| TxEngineError::Amount(format!("encode_call: {e}")))?;
-                        let token_ref = TokenRef {
-                            address: beth_proto::checksum_address(&meta.address),
-                            symbol: meta.symbol.clone(),
-                            decimals: meta.decimals,
-                            recipient: beth_proto::checksum_address(&to_addr),
-                            amount: parsed.number.clone(),
-                        };
-                        (token_addr, U256::ZERO, calldata, Some(token_ref))
-                    }
-                }
-                RawIntentBody::Raw { to, value, data } => {
-                    let to_addr = self.resolve_recipient_async(to, address_book).await?;
-                    let v = if value.is_empty() {
-                        U256::ZERO
-                    } else {
-                        parse_eth(value).map_err(|e| TxEngineError::Amount(e.to_string()))?
-                    };
-                    (to_addr, v, data.clone(), None)
-                }
-                RawIntentBody::Call {
-                    contract,
-                    method,
-                    args,
-                    value,
-                } => {
-                    let contract_addr =
-                        self.resolve_recipient_async(contract, address_book).await?;
-                    let v = if value.is_empty() {
-                        U256::ZERO
-                    } else {
-                        parse_eth(value).map_err(|e| TxEngineError::Amount(e.to_string()))?
-                    };
-                    let data = beth_tools::encode_call(method, &serde_json::json!(args))
-                        .map_err(|e| TxEngineError::Amount(format!("encode_call: {e}")))?;
-                    (contract_addr, v, data, None)
-                }
-                RawIntentBody::Enso { .. } => {
-                    return Err(TxEngineError::Unimplemented(
-                        "Enso intents flow through beth-defi (not in v1 stage path)".into(),
-                    ));
-                }
-            };
+            self.resolve_intent_body(&intent.body, chain, chain_id, address_book)
+                .await?;
 
         // Build a request to estimate gas; choose 1559 vs legacy fields.
         let data_bytes = decode_data(&data_hex)?;
@@ -612,6 +622,38 @@ impl TxEngine {
         signer: &PrivateKeySigner,
         bump_pct: u32,
     ) -> Result<StagedTx, TxEngineError> {
+        self.replace_with_intent(
+            wallet,
+            chain_name,
+            original_id,
+            chain,
+            signer,
+            bump_pct,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Same-nonce replacement that optionally substitutes the calldata
+    /// (fix #10 carry-over). When `substitute` is `Some(intent)`, the
+    /// new (`to`, `value`, `data`) are derived from it via the same
+    /// encoding pipeline `stage` uses, but the original nonce is
+    /// preserved. Fees are bumped at least `bump_pct%` (floored at 10).
+    /// Enso-flavoured intents are rejected here for the same reason
+    /// they're rejected in stage — they need beth-defi's HTTP path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_with_intent(
+        &self,
+        wallet: &str,
+        chain_name: &str,
+        original_id: &str,
+        chain: &ChainClient,
+        signer: &PrivateKeySigner,
+        bump_pct: u32,
+        substitute: Option<RawIntent>,
+        address_book: Option<&AddressBook>,
+    ) -> Result<StagedTx, TxEngineError> {
         let bump = bump_pct.max(10);
         let entry =
             self.outbox
@@ -621,6 +663,17 @@ impl TxEngine {
         let mut bumped = original.clone();
         bumped.status = TxStatus::Pending;
         bumped.tx_hash = None;
+
+        if let Some(intent) = substitute.as_ref() {
+            let chain_id = chain.chain_id().await?;
+            let (to, value_wei, data_hex, token) = self
+                .resolve_intent_body(&intent.body, chain, chain_id, address_book)
+                .await?;
+            bumped.to = beth_proto::checksum_address(&to);
+            bumped.value_wei = value_wei.to_string();
+            bumped.data_hex = data_hex;
+            bumped.token = token;
+        }
         bump_fees_in_place(&mut bumped, bump);
 
         let tx_hash = self.broadcast(&bumped, chain, signer).await?;
@@ -640,6 +693,7 @@ impl TxEngine {
         info!(
             id = %original.id,
             replacement = %bumped.tx_hash.as_deref().unwrap_or(""),
+            substituted = substitute.is_some(),
             "tx.replace"
         );
         Ok(bumped)
