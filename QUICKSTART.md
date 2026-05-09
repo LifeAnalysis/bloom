@@ -175,8 +175,11 @@ it expire after the configured TTL) cancels the stage.
   via the canonical mainnet registry; forward resolution is also
   exposed at `ens/<name>.eth`.
 - **DeFi intents** — `defi/intents/<wallet>/...` (Enso shortcuts).
-  Mounted whenever an `[enso]` block is present in `config.toml`;
-  Enso's keyless quote/route on Base mainnet works without an API key.
+  Mounted whenever an `[enso]` block is present in `config.toml`.
+  Requires an Enso API key (`BETH_ENSO_KEY` or `ENSO_API_KEY`); the
+  client returns `MissingKey` otherwise. ERC-20 token-in routes
+  auto-stage an `approve(spender, max)` ahead of the swap when
+  needed; default slippage is 50 bps.
 - **Prices** — keyless DefiLlama at `prices/spot/<coin>(.usd)` and
   `prices/change_24h/<coin>`.
 - **Address book** — `addressbook/<alias>` round-trips via FS.
@@ -210,7 +213,23 @@ drives a native ETH send and an ERC-20 transfer through the
 stage-confirm-broadcast loop on a local devnet. Optional Uniswap V2 /
 Enso scenarios on a mainnet fork run when `BETH_MAINNET_RPC` is set.
 
-`tests/docker/run.sh --enso-live` exercises the Enso + Aave flow
-against Base mainnet with real funds through the mounted filesystem
-surface. It is gated on a sourced `test.env` with `BETH_ENSO_KEY`,
-`BETH_LIVE_HOME`, `BETH_LIVE_DEST1`, and `BETH_PASSPHRASE`.
+`tests/docker/run.sh` is the dockerized harness with five modes:
+
+- `--mount` (default) — privileged container exercising the NFS
+  kernel mount (`tests/docker/test.sh`).
+- `--workspace` — runs `cargo test --workspace --lib` in the build
+  image; no privileges needed.
+- `--fork` — sandboxed end-to-end via `docker compose --profile fork`:
+  spins up an anvil fork of Base, exercises wallet/outbox + chain
+  reads through the mount. No Enso key required.
+- `--enso` — `docker compose --profile enso`: same anvil fork, runs
+  the full Enso → Aave intent flow. Requires `BETH_ENSO_KEY`.
+- `--enso-live` — runs the Enso + Aave flow against Base **mainnet**
+  with real funds through the mounted filesystem surface. Gated on
+  a sourced `test.env` with `BETH_ENSO_KEY`, `BETH_LIVE_HOME`,
+  `BETH_LIVE_DEST1`, and `BETH_PASSPHRASE`.
+
+Shared scaffolding (logging, mount lifecycle, pending-stage helpers,
+receipt assertions, deterministic Anvil constants) lives in
+`tests/docker/lib.sh`; the unified `docker-compose.yml` selects modes
+via Compose profiles.

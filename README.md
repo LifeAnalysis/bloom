@@ -26,11 +26,11 @@ The workspace is split into 15 crates:
 | `beth-defi` | Enso Shortcuts client + natural-language intent parser. |
 | `beth-watch` | Subscription registry + polling executor task with rotated event logs. |
 | `beth-mount` | NFSv4 mount adapter (feature `mount`). |
-| `beth-tools` | Pure helpers: keccak / sha256 / blake3 / hex / base64 / units / ABI / RLP / EIP-712 hash. |
+| `beth-tools` | Pure helpers: keccak / sha256 / blake3 / hex / base64 / ABI / RLP / EIP-712 hash. |
 | `beth-etherscan` | Etherscan v2 multichain client + on-disk TTL cache. |
 | `beth-ens` | ENS namehash + forward / reverse / text / contenthash resolution. |
 | `beth-prices` | DefiLlama keyless price oracle. |
-| `beth-proto` | Shared types: paths, configs, audit records, address book, intents. |
+| `beth-proto` | Shared types: paths, configs (`Config`/`BackendsConfig`), audit records, address book, intents, policy, plan, units. |
 | `beth-it` | Integration-test harness crate. |
 
 See `docs/specs/2026-05-08-bloom-eth-design.md` for the full design and
@@ -88,13 +88,17 @@ top-level trees:
   EIP-191 / raw / EIP-712 signatures.
 - `defi/intents/<wallet>/` — Enso shortcuts: write a natural-language
   intent, read the routed `plan.md`, then `confirm` to stage into the
-  wallet outbox.
+  wallet outbox. ERC-20 token-in routes auto-prepend an
+  `approve(spender, max)` intent when the current allowance is
+  insufficient. Default slippage is 50 bps (overridable per-request).
 - `watch/<id>/` — subscriptions; tail `live` for the in-process state
-  or read rotated `history.jsonl[.n]` archives.
+  or read rotated `history.jsonl[.n]` archives. Kinds: `balance`,
+  `block`, `gas_price`, `event`. Live files rotate at 1 MiB.
 - `simulate/<session>/` — `eth_call` + state-override sandbox; no
   signing, no broadcast.
-- `tools/` — pure helpers (`keccak`, `sha256`, `blake3`, `hex`,
-  `base64`, `units`, `abi`, `rlp`, `eip712`).
+- `tools/` — pure helpers (`keccak`, `selector`, `address/checksum`,
+  `sha256`, `blake3`, `hex`, `base64`, `unit/{parse,format}`, `abi`,
+  `rlp`, `eip712`).
 - `prices/{spot,change_24h}/<coin>` — DefiLlama keyless price oracle.
 - `addressbook/<alias>` — local petname directory.
 - `ens/<name>.eth` — ENS forward resolution as a read surface.
@@ -125,8 +129,10 @@ map and live-network verification log.
 - **Stage-confirm is the only write mode.** A staged tx becomes a
   transaction only when a non-empty confirm file is written.
 - **Policy enforcement** runs before signing — per-wallet
-  `policy.toml` enforces caps (max ETH per tx, daily totals),
-  recipient allow / deny lists, and contract-call gating.
+  `policy.toml` enforces caps (max ETH per tx, per-tx USD,
+  rolling-24h USD totals priced via DefiLlama), recipient allow /
+  deny lists, contract-call gating, and an automation surface
+  (`auto_confirm_below_eth`, configurable override sentinel).
 
 ## Limitations
 

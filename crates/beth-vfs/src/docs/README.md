@@ -5,7 +5,8 @@ This is the help file vendored into the daemon.
 ## Top-level layout
 
 - `chains/<chain>/` — read-only chain views: head, blocks, tx, addresses,
-  contracts, gas oracle.
+  contracts (`source`/`abi`/`methods`/`events`/`storage`/`proxy`),
+  gas oracle, ERC-20 balances under `addresses/<a>/tokens/<token>/...`.
 - `wallets/<name>/` — managed wallets, outbox write surface, history,
   allowances, ENS reverse, sign / EIP-712 surfaces.
 - `defi/intents/` — Enso-mediated DeFi intents (write `quote` / `execute`).
@@ -13,8 +14,9 @@ This is the help file vendored into the daemon.
   daemon and persisted to JSONL.
 - `simulate/` — out-of-band tx simulation with state overrides
   (`eth_call` / `debug_traceCall`).
-- `tools/` — pure helpers: keccak, address checksum, units, ABI encode /
-  decode, EIP-712 hash, RLP, hex, base64.
+- `tools/` — pure helpers: `keccak`, `selector`, `address/checksum`,
+  `sha256`, `blake3`, `hex`, `base64`, `unit/{parse,format}`, `abi`,
+  `rlp`, `eip712`.
 - `status/` — daemon health, RPC pool, audit head, cache stats, version.
 - `docs/` — this file and examples.
 - `ens/` — forward / reverse / text / contenthash resolution.
@@ -35,7 +37,7 @@ cat /eth/tools/abi/decode/<sig>/<hex>
 cat /eth/ens/vitalik.eth/address
 cat /eth/ens/vitalik.eth/avatar
 cat /eth/ens/vitalik.eth/text/url
-cat /eth/prices/spot/eth-usd
+cat /eth/prices/spot/eth.usd
 cat /eth/addressbook/alice
 ```
 
@@ -65,29 +67,40 @@ echo replace > /eth/wallets/alice/chains/ethereum/outbox/pending/<id>/replace
 echo cancel  > /eth/wallets/alice/chains/ethereum/outbox/pending/<id>/cancel
 ```
 
-DeFi intent (Enso):
+DeFi intent (Enso shortcuts) — natural language is the canonical input;
+JSON works too. Requires an `[enso]` block in `~/.bloom-eth/config.toml`
+with an API key (`BETH_ENSO_KEY`):
 
 ```sh
-cat <<'EOF' > /eth/defi/intents/new.json
-{ "from": "alice", "chain": "ethereum",
-  "swap": { "in": "1 ETH", "out": "USDC" } }
+echo 'swap 0.1 eth to USDC on base' \
+  > /eth/defi/intents/alice/new
+ls /eth/defi/intents/alice/
+cat /eth/defi/intents/alice/<sess>/plan.md
+echo y > /eth/defi/intents/alice/<sess>/confirm
+```
+
+ERC-20 token-in routes auto-prepend an `approve(spender, max)` ahead
+of the swap when the current allowance is insufficient.
+
+Subscribe + read (TOML body, kinds: `block`, `balance`, `gas_price`,
+`event`):
+
+```sh
+cat <<'EOF' > /eth/watch/new
+kind = "block"
+chain = "anvil"
 EOF
-ls /eth/defi/intents/pending/
+tail -f /eth/watch/<id>/live              # in-process running state
+cat    /eth/watch/<id>/history.jsonl     # rotated archive (1 MiB each)
 ```
 
-Subscribe + read:
+Sign arbitrary message / raw hash / EIP-712 typed data:
 
 ```sh
-echo '{"kind":"head","chain":"anvil"}' > /eth/watch/new.json
-tail -f /eth/watch/<id>/events.jsonl
-```
-
-Sign arbitrary message / EIP-712:
-
-```sh
-echo 'hello world' > /eth/wallets/alice/sign/personal
-cat /eth/wallets/alice/sign/last.sig
-echo "$(cat eip712.json)" > /eth/wallets/alice/sign/eip712
+echo 'hello world' > /eth/wallets/alice/sign/message
+cat /eth/wallets/alice/sign/message.sig
+cat eip712.json     > /eth/wallets/alice/sign/typed_data
+cat /eth/wallets/alice/sign/typed_data.sig
 ```
 
 Address book petnames:

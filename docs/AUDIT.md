@@ -78,7 +78,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | DeFi (Enso intents, route quoting, stage-confirm) | `defi/intents/<wallet>/{new,<sess>/{intent.txt,route.json,plan.md,tx.json,simulation.json,confirm}}` | shipped | `crates/beth-vfs/src/handlers/defi.rs` + `crates/beth-defi/src/lib.rs` |
 | Watch (subscriptions, executor task, events tail) | `watch/{new,<id>/{spec.toml,live,history.jsonl[.n],delete}}` | shipped | `crates/beth-vfs/src/handlers/watch.rs` + `crates/beth-watch/src/{lib.rs,executor.rs}`; executor started by `Daemon::from_home` |
 | Simulate (eth_call + state override + best-effort trace) | `simulate/{new,last,<id>/{intent.json,state-override.json,simulation.json,plan.md,trace.json}}` | shipped | `crates/beth-vfs/src/handlers/simulate.rs` |
-| Tools (keccak, sha256, blake3, hex, base64, units, ABI encode/decode, RLP, EIP-712 hash) | `tools/{keccak,sha256,blake3,hex,base64,units,abi,rlp,eip712}/...` | shipped | `crates/beth-vfs/src/handlers/tools.rs` + `crates/beth-tools/src/lib.rs` |
+| Tools (keccak, selector, address checksum, sha256, blake3, hex, base64, units, ABI encode/decode, RLP, EIP-712 hash) | `tools/{keccak,selector,address/checksum,sha256,blake3,hex,base64,unit/{parse,format},abi,rlp,eip712}/...` | shipped | `crates/beth-vfs/src/handlers/tools.rs` + `crates/beth-tools/src/lib.rs` (units helpers come from `crates/beth-proto/src/units.rs`). |
 | Status / diagnostics | `status/{version,uptime,started_at,home,daemon.json,chains/<c>/{connected,block_number,rpc_url},audit/{head,count,last},cache/{etherscan,prices}_entries,policies/block_mainnet_broadcast,wallets/count,outbox/pending_count}` | shipped | `crates/beth-vfs/src/handlers/status.rs` |
 | Docs (embedded examples for each surface) | `docs/...` | shipped | `crates/beth-vfs/src/handlers/docs.rs` + `crates/beth-vfs/src/docs/` |
 | Address book (petname round-trip) | `addressbook/{<alias>,new}` | shipped | `crates/beth-vfs/src/handlers/addressbook.rs` + `crates/beth-proto/src/address.rs` |
@@ -99,7 +99,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | VFS auto-routes through socket when present | shipped | `crates/beth/src/main.rs` checks `default_socket_path` for `Vfs::{Cat,Ls,Write}` |
 | Audit log wired into the router | shipped | `AuditLog` opened by `Daemon::from_home`; VFS router appends a hash-chained record on every write and on side-effecting reads. Read head/count/last via `status/audit/...`. |
 | Per-path TTL cache exposed via status | shipped | `status/cache/{etherscan,prices}_entries` (`crates/beth-vfs/src/handlers/status.rs`) |
-| Optional NFS mount adapter | shipped (feature-gated) | `crates/beth-mount/src/{lib.rs,adapter.rs,server.rs}` behind `mount`; re-exported via `beth-daemon/Cargo.toml` `mount = ["beth-mount/mount"]`; `Daemon::mount(path).await` returns an unmount handle. |
+| Optional NFS mount adapter | shipped (feature-gated) | `crates/beth-mount/src/{lib.rs,adapter.rs,server.rs}` behind `mount`; re-exported via `beth-daemon/Cargo.toml` `mount = ["beth-mount/mount"]`. `Daemon::mount(path).await` delegates to `beth_mount::serve_nfs` and returns an `NfsMountHandle`. The adapter buffers out-of-order NFS WRITE chunks (8 MiB cap), refreshes the directory `change` attribute on every getattr (out-of-band entries become visible without remount), and the handle's `Drop` issues a best-effort `umount -l -f` if `unmount()` was not called. |
 
 ## §5–§6 — Indexing, ENS, token metadata
 
@@ -147,8 +147,10 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Anvil-backed tests (RPC, no mocks) | passing — `simulate::tests::anvil_*`, `acceptance.sh` |
 | Acceptance demo (native + ERC-20 on Anvil) | passing — `scripts/acceptance.sh` |
 | Acceptance demo (Uniswap V2 + Enso on mainnet fork) | gated on `BETH_MAINNET_RPC`; auto-skips with a clear message. |
-| Dockerized NFS kernel-mount test | harness at `tests/docker/{Dockerfile,test.sh,run.sh}`. Native suite `cargo test -p beth-mount --features mount` passing. |
+| Dockerized NFS kernel-mount test | harness at `tests/docker/{Dockerfile,docker-compose.yml,lib.sh,run.sh,test*.sh}`. Native suite `cargo test -p beth-mount --features mount` passing. |
 | Dockerized workspace tests | passing — `tests/docker/run.sh --workspace`. |
+| Dockerized fork-mode end-to-end | passing — `tests/docker/run.sh --fork` (compose profile `fork`) drives a native send + chain reads through the mount against an anvil fork of Base; no Enso key needed. |
+| Dockerized Enso/Aave on a fork | passing — `tests/docker/run.sh --enso` (compose profile `enso`) exercises the Enso → Aave flow against an anvil fork; gated on `BETH_ENSO_KEY`. |
 | Live broadcast on Base mainnet | passing — `tests/docker/run.sh --enso-live` exercises Enso + Aave with real Base broadcasts. |
 
 ## Live-network verification (Base mainnet)
@@ -164,7 +166,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Native ETH send (live) | Base, chain_id 8453 | `0xd4a496fb…3c40` — 0.001 ETH dest1→dest2 |
 | Enso swap (live) | Base, ETH → USDC via Enso router | `0x016fc370…9fc3` — 0.001 ETH → 2.306996 USDC |
 | Enso swap + Aave V3 deposit (live) | Base, ETH → aBaseUSDC | `0xab687461…e3ce` — 0.001 ETH → 2.308456 aBaseUSDC |
-| Aave V3 unwind | Base, aBaseUSDC → ETH via Enso route | exercised by `tests/docker/run.sh --enso-live` cleanup path. |
+| Aave V3 unwind | Base, aBaseUSDC → ETH via Enso route | exercised by `tests/docker/run.sh --enso-live` cleanup path. No Aave-specific code path: aToken→ETH goes through the same `EnsoClient::route` surface as any other swap; the auto-approve hop in `defi.rs` covers the aToken allowance. |
 
 ## Known limitations / deferred items
 
@@ -195,7 +197,7 @@ crates/
 ├── beth-daemon         # Daemon orchestration + UDS IPC + ENS adapter + watch start
 ├── beth-vfs            # Path router + 11 handler modules
 ├── beth-chain          # alloy provider pool, ChainRegistry, ERC-20 reads
-├── beth-tx             # Tx engine, intent parser, policy_engine, RecipientResolver
+├── beth-tx             # Tx engine, intent parser, policy_engine, RecipientResolver, PriceOracle, Outbox (rolling-USD)
 ├── beth-keystore       # argon2id + chacha20poly1305 encrypted keystore
 ├── beth-defi           # Enso shortcuts client + natural-language intent parser
 ├── beth-watch          # Subscription registry + executor task + event log rotation
@@ -204,7 +206,7 @@ crates/
 ├── beth-ens            # ENS namehash + forward / reverse / text / contenthash
 ├── beth-prices         # DefiLlama keyless price oracle
 ├── beth-mount          # NFSv4 adapter (feature `mount`)
-├── beth-proto          # Shared types: AddressBook, AuditLog, Config, HomeDir, ChainSpec, RawIntent
+├── beth-proto          # Shared types: AddressBook, AuditLog, Config, BackendsConfig, HomeDir, ChainSpec, RawIntent, Policy, StagedTx, units
 └── beth-it             # Integration-test harness
 ```
 
@@ -217,6 +219,9 @@ cargo test --workspace --lib
 cargo build --release -p beth
 scripts/acceptance.sh                              # native + ERC-20 on Anvil
 BETH_MAINNET_RPC=... scripts/acceptance.sh          # adds Uniswap V2 + Enso scenarios
-tests/docker/run.sh --enso-live                    # live Base broadcasts
-tests/docker/run.sh --workspace                    # workspace tests inside container
+tests/docker/run.sh                                 # NFS kernel-mount harness (default)
+tests/docker/run.sh --workspace                     # workspace tests inside container
+tests/docker/run.sh --fork                          # native send + chain reads via anvil-fork
+tests/docker/run.sh --enso                          # Enso → Aave flow via anvil-fork (needs BETH_ENSO_KEY)
+tests/docker/run.sh --enso-live                     # live Base broadcasts
 ```
