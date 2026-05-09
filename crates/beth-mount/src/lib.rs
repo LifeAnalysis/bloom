@@ -162,13 +162,14 @@ pub fn detect_mount_command() -> &'static str {
 /// caching that interferes with reactive VFS updates, `vers=4.1`,
 /// `proto=tcp`, `nolocks` (no NLM — the embedded server doesn't speak
 /// it), explicit `mountport`/`port` so we can target the auto-assigned
-/// ephemeral port, small `rsize`/`wsize` to keep latency tight on a
-/// loopback server, and `timeo=10` for snappy failure on a wedged
-/// server.
+/// ephemeral port, generous `rsize`/`wsize` so most JSON/TOML payloads
+/// fit in a single op (the adapter buffers multi-block writes anyway
+/// but a single op stays simpler for the common case), and `timeo=10`
+/// for snappy failure on a wedged server.
 pub fn build_mount_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
     let port = server.port();
     let mut opts = format!(
-        "noac,lookupcache=none,vers=4.1,proto=tcp,nolocks,mountport={port},port={port},rsize=4096,wsize=4096,timeo=10"
+        "noac,lookupcache=none,vers=4.1,proto=tcp,nolocks,mountport={port},port={port},rsize=65536,wsize=65536,timeo=10"
     );
     if cfg.readonly {
         opts.push_str(",ro");

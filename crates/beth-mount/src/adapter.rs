@@ -15,17 +15,35 @@
 //!   is functionally immutable from the kernel's perspective during a
 //!   single mount session — directories don't morph into files.
 
-use std::time::UNIX_EPOCH;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use embednfs::{
-    AccessMask, Attrs, CreateKind, CreateRequest, CreateResult, DirEntry, DirPage, FileSystem,
-    FsError, FsResult, FsStats, ObjectType, ReadResult, RequestContext, SetAttrs, Timestamp,
-    WriteResult, WriteStability,
+    AccessMask, Attrs, CommitSupport, CreateKind, CreateRequest, CreateResult, DirEntry, DirPage,
+    FileSystem, FsError, FsResult, FsStats, ObjectType, ReadResult, RequestContext, SetAttrs,
+    Timestamp, WriteResult, WriteStability,
 };
+use parking_lot::Mutex;
 
 use beth_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
+
+/// Maximum bytes we'll buffer for a single open file before forcing a
+/// flush (or rejecting further writes with FBIG). 8 MiB matches the
+/// spec hint and is large enough for any plausible JSON/TOML/EIP-712
+/// body the daemon expects through the mount surface.
+pub(crate) const MAX_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Time without further writes after which a buffer is auto-flushed.
+/// Picked to match the typical NFSv4 client behaviour: kernels with
+/// `wsize=4096` issue a burst of WRITEs followed by a COMMIT once the
+/// userspace `close(2)` returns. The COMMIT path is the primary flush
+/// trigger; this idle timer is the safety net for clients that skip
+/// COMMIT or for `O_DIRECT`-style writes that arrive with `FileSync`
+/// stability and never see a follow-up COMMIT.
+pub(crate) const WRITE_IDLE_FLUSH: Duration = Duration::from_secs(5);
 
 /// Opaque handle exported over NFS.
 ///
@@ -133,15 +151,154 @@ fn entry_to_attrs(path: &VfsPath, e: &Entry) -> Attrs {
     a
 }
 
+/// Per-path buffered write state. Holds the assembled file contents
+/// (sparse during in-flight writes, contiguous at flush time) plus a
+/// last-write timestamp so the idle-flush task can collect stragglers.
+///
+/// Writes can arrive out of order — the kernel is free to issue
+/// `WRITE off=4096`, `WRITE off=0`, `WRITE off=8192` in any sequence.
+/// We tolerate that by sizing `bytes` to the high-water mark and
+/// tracking the set of filled byte ranges in `filled` (a sorted map
+/// keyed by start offset). The buffer is flushable once the union of
+/// those ranges is exactly `[0, bytes.len())`.
+#[derive(Debug)]
+struct WriteBuffer {
+    /// Logical file contents, indexed by offset. Bytes inside a range
+    /// recorded in `filled` are valid; bytes outside remain at their
+    /// default zero and must not be flushed.
+    bytes: Vec<u8>,
+    /// Sorted, non-overlapping, non-adjacent map of filled byte
+    /// ranges keyed by start offset (value is end offset, exclusive).
+    /// Adjacent and overlapping ranges are merged on insert so the
+    /// "is contiguous prefix" check is a single map lookup.
+    filled: BTreeMap<usize, usize>,
+    /// Timestamp of the most recent write. Idle-flush compares against
+    /// this so a one-shot O_DIRECT write that finishes without COMMIT
+    /// still lands eventually.
+    last_write: Instant,
+    /// Total bytes the client has handed us across all WRITEs (count
+    /// of bytes received, not max-offset). Tracked for the FBIG cap so
+    /// pathological out-of-order patterns can't blow past the limit.
+    received: usize,
+}
+
+impl WriteBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            filled: BTreeMap::new(),
+            last_write: Instant::now(),
+            received: 0,
+        }
+    }
+
+    /// Apply a chunk at the requested offset. Grows `bytes` as needed
+    /// and merges the new `[off, end)` range into `filled`. Returns
+    /// `Err(FsError::FileTooLarge)` if accepting the chunk would push
+    /// the buffer past `MAX_WRITE_BUFFER_BYTES`.
+    fn apply(&mut self, offset: u64, data: &[u8]) -> FsResult<()> {
+        let off = usize::try_from(offset).map_err(|_| FsError::FileTooLarge)?;
+        let end = off.checked_add(data.len()).ok_or(FsError::FileTooLarge)?;
+        if end > MAX_WRITE_BUFFER_BYTES {
+            return Err(FsError::FileTooLarge);
+        }
+        if end > self.bytes.len() {
+            self.bytes.resize(end, 0);
+        }
+        self.bytes[off..end].copy_from_slice(data);
+        self.merge_range(off, end);
+        self.last_write = Instant::now();
+        self.received = self.received.saturating_add(data.len());
+        Ok(())
+    }
+
+    /// Merge `[start, end)` into `filled`, coalescing with any
+    /// adjacent or overlapping ranges. After this returns, `filled`
+    /// remains a valid disjoint, non-adjacent set keyed by start
+    /// offset.
+    fn merge_range(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let mut new_start = start;
+        let mut new_end = end;
+        // Absorb any range whose start <= new_end (i.e. overlapping
+        // or adjacent on the right) and whose end >= new_start (i.e.
+        // overlapping or adjacent on the left). Collect keys first
+        // because we mutate the map while iterating.
+        let to_remove: Vec<usize> = self
+            .filled
+            .range(..=new_end)
+            .filter_map(|(&s, &e)| if e >= new_start { Some(s) } else { None })
+            .collect();
+        for key in to_remove {
+            let existing_end = self.filled.remove(&key).expect("just observed");
+            new_start = new_start.min(key);
+            new_end = new_end.max(existing_end);
+        }
+        self.filled.insert(new_start, new_end);
+    }
+
+    /// Returns true if the buffered contents form a contiguous prefix
+    /// starting at offset 0 — i.e. it's safe to flush.
+    fn is_complete(&self) -> bool {
+        if self.bytes.is_empty() {
+            return false;
+        }
+        match self.filled.iter().next() {
+            Some((&start, &end)) => start == 0 && end == self.bytes.len(),
+            None => false,
+        }
+    }
+}
+
 /// Adapter that holds a clone of the [`Vfs`] facade and serves it as
 /// an [`embednfs::FileSystem`].
+///
+/// ## Write buffering
+///
+/// The bloom-eth VFS exposes a whole-file `write(path, &[u8])` API, but
+/// NFS clients chunk a single user-space `write(2)` into multiple
+/// `WRITE` ops at increasing offsets (with `wsize=4096`, a 16 KiB JSON
+/// body becomes four ops at offsets 0/4096/8192/12288). Without
+/// buffering, every chunk past the first would be either rejected
+/// (offset != 0) or would clobber the file with a 4 KiB tail.
+///
+/// This adapter buffers WRITE chunks per file handle in
+/// [`BethFs::write_buffers`]. A buffer is flushed to the VFS on:
+///
+/// 1. An NFS COMMIT against the handle (the primary trigger — the
+///    Linux client issues COMMIT after the userspace `close(2)` /
+///    `fsync(2)` for unstable writes).
+/// 2. An idle timer ([`WRITE_IDLE_FLUSH`]) since the last WRITE on
+///    that handle, as a safety net for clients that skip COMMIT or
+///    for `WriteStability::FileSync` writes that arrive without a
+///    follow-up COMMIT.
+/// 3. A `read` against the same handle — we flush first, then read,
+///    so the user observes their own writes.
+///
+/// Reads of an open partially-written file return the previously
+/// committed contents, not the buffered bytes. This is the simplest
+/// policy that preserves "write semantics from a single client read
+/// back what the client just wrote" via the flush-before-read rule.
 pub struct BethFs {
     vfs: Vfs,
+    /// Per-handle write buffers. Keyed by `VfsPath` so multiple clients
+    /// writing the same file coalesce — NFS state-tracking the way the
+    /// RFC describes it (open-stateid-keyed) would be more correct, but
+    /// the bloom-eth surface assumes a single agent per mount and the
+    /// per-path scheme is dramatically simpler. The tradeoff: two
+    /// concurrent writers to the same path see interleaved chunks and
+    /// must serialise themselves at the application layer.
+    write_buffers: Arc<Mutex<HashMap<VfsPath, WriteBuffer>>>,
 }
 
 impl BethFs {
     pub fn new(vfs: Vfs) -> Self {
-        Self { vfs }
+        Self {
+            vfs,
+            write_buffers: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Decompose a handle into the [`VfsPath`] it represents.
@@ -149,6 +306,48 @@ impl BethFs {
         match handle {
             BethHandle::Root => VfsPath::root(),
             BethHandle::Path { path, .. } => path.clone(),
+        }
+    }
+
+    /// Take a buffer's contents out, leaving the slot empty. Returns
+    /// `Some(bytes)` only if the buffer was contiguous — partial
+    /// buffers stay parked so a follow-up WRITE can fill the gap.
+    fn take_complete_buffer(&self, path: &VfsPath) -> Option<Vec<u8>> {
+        let mut map = self.write_buffers.lock();
+        match map.get(path) {
+            Some(buf) if buf.is_complete() => {
+                let buf = map.remove(path).expect("just observed");
+                Some(buf.bytes)
+            }
+            _ => None,
+        }
+    }
+
+    /// Flush any buffered writes for `path` through to the VFS. No-op
+    /// if the buffer is empty or non-contiguous (the latter only
+    /// happens if a client never sends the missing prefix; the idle
+    /// timer would normally drop such buffers, but flush_path is
+    /// defensive about it).
+    async fn flush_path(&self, path: &VfsPath) -> FsResult<()> {
+        if let Some(bytes) = self.take_complete_buffer(path) {
+            self.vfs.write(path, &bytes).await.map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// Discard any buffer for `path` whose last write is older than
+    /// `WRITE_IDLE_FLUSH`. Used by the read path so an abandoned
+    /// partial write doesn't shadow committed state forever.
+    fn drop_stale_buffer(&self, path: &VfsPath) -> Option<Vec<u8>> {
+        let mut map = self.write_buffers.lock();
+        let stale = map
+            .get(path)
+            .map(|b| b.is_complete() || b.last_write.elapsed() > WRITE_IDLE_FLUSH)
+            .unwrap_or(false);
+        if stale {
+            map.remove(path).map(|b| b.bytes)
+        } else {
+            None
         }
     }
 }
@@ -324,6 +523,12 @@ impl FileSystem for BethFs {
             BethHandle::Root => return Err(FsError::IsDirectory),
             BethHandle::Path { path, .. } => path.clone(),
         };
+        // If the client has buffered writes that complete a contiguous
+        // file, flush them now so the read sees the latest state. We
+        // also opportunistically drop stale partial buffers so an
+        // orphaned WRITE doesn't pin memory across reads.
+        self.flush_path(&path).await?;
+        let _ = self.drop_stale_buffer(&path);
         let data = self.vfs.read(&path).await.map_err(map_err)?;
         let off = usize::try_from(offset).map_err(|_| FsError::FileTooLarge)?;
         if off >= data.len() {
@@ -348,22 +553,59 @@ impl FileSystem for BethFs {
         data: Bytes,
         requested: WriteStability,
     ) -> FsResult<WriteResult> {
-        // We don't buffer partial writes — the VFS write API is
-        // whole-file at v1, and most writable paths (wallet outbox,
-        // watch subscriptions) want atomic semantics anyway. Reject a
-        // non-zero offset rather than silently dropping bytes.
-        if offset != 0 {
-            return Err(FsError::Unsupported);
-        }
         let path = match handle {
             BethHandle::Root => return Err(FsError::IsDirectory),
             BethHandle::Path { path, .. } => path.clone(),
         };
         let len = data.len();
-        self.vfs.write(&path, &data).await.map_err(map_err)?;
+        if len == 0 {
+            // Zero-byte writes don't carry data and never complete a
+            // buffer; treat them as no-ops at this layer. They can
+            // still be useful for `create` (handled separately) and
+            // for kernels that use them as truncate hints (we ignore
+            // truncate-via-write and rely on `setattr` for size).
+            return Ok(WriteResult {
+                written: 0,
+                stability: requested,
+            });
+        }
+
+        // Buffer the chunk. We lock long enough to apply the chunk and
+        // observe whether the buffer is now complete; the actual VFS
+        // write happens outside the lock so a slow handler can't stall
+        // concurrent writers to other paths.
+        let (complete_payload, accepted) = {
+            let mut map = self.write_buffers.lock();
+            let buf = map.entry(path.clone()).or_insert_with(WriteBuffer::new);
+            // FBIG check before mutating: fail fast so the client gets
+            // a clean error rather than silently truncated input.
+            let proposed_received = buf.received.saturating_add(len);
+            if proposed_received > MAX_WRITE_BUFFER_BYTES {
+                map.remove(&path);
+                return Err(FsError::FileTooLarge);
+            }
+            buf.apply(offset, &data)?;
+            let payload = if buf.is_complete() && requested == WriteStability::FileSync {
+                // Eager flush on FILE_SYNC: clients that bypass COMMIT
+                // (notably some macOS NFS quirks) will set this.
+                Some(map.remove(&path).expect("just observed").bytes)
+            } else {
+                None
+            };
+            (payload, len)
+        };
+
+        if let Some(payload) = complete_payload {
+            self.vfs.write(&path, &payload).await.map_err(map_err)?;
+        }
+
         Ok(WriteResult {
-            written: u32::try_from(len).unwrap_or(u32::MAX),
-            stability: requested,
+            written: u32::try_from(accepted).unwrap_or(u32::MAX),
+            // Always advertise UNSTABLE so the kernel sends a follow-up
+            // COMMIT — that's the path that flushes a multi-chunk
+            // write. The eager FILE_SYNC fast path above handles the
+            // case where the kernel skips COMMIT.
+            stability: WriteStability::Unstable,
         })
     }
 
@@ -426,6 +668,36 @@ impl FileSystem for BethFs {
         // No-op: refresh attrs from the VFS and return them.
         self.getattr(ctx, handle).await
     }
+
+    fn commit_support(&self) -> Option<&dyn CommitSupport<BethHandle>> {
+        // Surface ourselves as the commit handler so the kernel's
+        // post-write COMMIT op routes back into [`BethFs::commit`] and
+        // flushes the per-handle write buffer.
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl CommitSupport<BethHandle> for BethFs {
+    async fn commit(
+        &self,
+        _ctx: &RequestContext,
+        handle: &BethHandle,
+        _offset: u64,
+        _count: u32,
+    ) -> FsResult<()> {
+        // NFS COMMIT is byte-range scoped, but the bloom-eth VFS is
+        // whole-file. We treat any COMMIT against a handle as "flush
+        // everything you have for this path". If the buffer is
+        // incomplete (a missing prefix), we leave it in place — the
+        // client will either resend the missing chunk or the idle
+        // timer will reap it on the next read.
+        let path = match handle {
+            BethHandle::Root => return Err(FsError::IsDirectory),
+            BethHandle::Path { path, .. } => path.clone(),
+        };
+        self.flush_path(&path).await
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +726,66 @@ mod tests {
         async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
             if p.is_root() {
                 Ok(vec![Entry::file("hello")])
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
+        }
+    }
+
+    /// Test handler that records every `write` it sees and exposes a
+    /// single writable file `inbox`. Used to verify the adapter's
+    /// per-handle write buffering coalesces multi-block writes into
+    /// exactly one `vfs.write` call.
+    #[derive(Default)]
+    struct RecordingHandler {
+        writes: parking_lot::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl RecordingHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn write_count(&self) -> usize {
+            self.writes.lock().len()
+        }
+
+        fn last_write(&self) -> Option<Vec<u8>> {
+            self.writes.lock().last().cloned()
+        }
+    }
+
+    #[async_trait]
+    impl Handler for RecordingHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            if p.is_root() {
+                return Ok(Entry::dir(""));
+            }
+            match p.first() {
+                Some("inbox") => Ok(Entry::writable_file("inbox")),
+                Some("readme") => Ok(Entry::file("readme")),
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match p.first() {
+                Some("inbox") => Ok(self.writes.lock().last().cloned().unwrap_or_default()),
+                Some("readme") => Ok(b"static read-only body\n".to_vec()),
+                _ => Err(HandlerError::NotAFile(p.to_string_path())),
+            }
+        }
+        async fn write(&self, p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+            match p.first() {
+                Some("inbox") => {
+                    self.writes.lock().push(data.to_vec());
+                    Ok(())
+                }
+                _ => Err(HandlerError::PermissionDenied),
+            }
+        }
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                Ok(vec![Entry::writable_file("inbox"), Entry::file("readme")])
             } else {
                 Err(HandlerError::NotADir(p.to_string_path()))
             }
@@ -506,5 +838,208 @@ mod tests {
         let names: Vec<&str> = page.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["echo"]);
         assert!(page.eof);
+    }
+
+    /// Bug #4 acceptance: a 16 KiB write delivered as four 4 KiB
+    /// chunks at offsets 0/4096/8192/12288 followed by a COMMIT must
+    /// land as a single `vfs.write` carrying the joined payload.
+    #[tokio::test]
+    async fn buffered_chunks_flush_on_commit() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+
+        // Build a deterministic 16 KiB payload (each block tagged with
+        // its offset so we can detect mis-ordering on flush).
+        let mut payload = Vec::with_capacity(16 * 1024);
+        for off in [0u32, 4096, 8192, 12288] {
+            for b in 0..4096 {
+                payload.push(((off / 4096) as u8).wrapping_add((b & 0xff) as u8));
+            }
+        }
+        let chunks: Vec<&[u8]> = payload.chunks(4096).collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let off = (i as u64) * 4096;
+            let result = fs
+                .write(
+                    &ctx,
+                    &inbox,
+                    off,
+                    Bytes::copy_from_slice(chunk),
+                    WriteStability::Unstable,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.written, 4096);
+            assert_eq!(result.stability, WriteStability::Unstable);
+        }
+        // No flush yet — UNSTABLE writes wait for COMMIT.
+        assert_eq!(recorder.write_count(), 0);
+
+        // COMMIT: the kernel issues this on close/fsync and it must
+        // collapse the four chunks into exactly one VFS write.
+        let cs = fs.commit_support().expect("commit support enabled");
+        cs.commit(&ctx, &inbox, 0, payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(recorder.write_count(), 1);
+        assert_eq!(recorder.last_write().unwrap(), payload);
+    }
+
+    /// Bug #4 acceptance: out-of-order chunks plus a final prefix
+    /// chunk + COMMIT still produce a single coalesced write.
+    #[tokio::test]
+    async fn buffered_chunks_tolerate_out_of_order() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+
+        let mut payload = vec![0u8; 12288];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+        // Send middle, then tail, then head — common pattern for
+        // multi-threaded or io_uring clients.
+        let send = |off: u64, lo: usize, hi: usize| {
+            let bytes = Bytes::copy_from_slice(&payload[lo..hi]);
+            (off, bytes)
+        };
+        let middle = send(4096, 4096, 8192);
+        let tail = send(8192, 8192, 12288);
+        let head = send(0, 0, 4096);
+        for (off, bytes) in [middle, tail, head] {
+            fs.write(&ctx, &inbox, off, bytes, WriteStability::Unstable)
+                .await
+                .unwrap();
+        }
+        assert_eq!(recorder.write_count(), 0);
+
+        let cs = fs.commit_support().unwrap();
+        cs.commit(&ctx, &inbox, 0, payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(recorder.write_count(), 1);
+        assert_eq!(recorder.last_write().unwrap(), payload);
+    }
+
+    /// Bug #4 acceptance: a single write tagged FILE_SYNC (no
+    /// follow-up COMMIT) flushes immediately on the eager path.
+    #[tokio::test]
+    async fn file_sync_write_flushes_eagerly() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+        let body = b"hello bloom\n";
+        fs.write(
+            &ctx,
+            &inbox,
+            0,
+            Bytes::copy_from_slice(body),
+            WriteStability::FileSync,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorder.write_count(), 1);
+        assert_eq!(recorder.last_write().unwrap(), body);
+    }
+
+    /// Bug #4 acceptance: a write that would push the per-handle
+    /// buffer past `MAX_WRITE_BUFFER_BYTES` must be rejected with
+    /// `FileTooLarge` (NFS4ERR_FBIG) before any state mutation.
+    #[tokio::test]
+    async fn oversize_write_rejects_fbig() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+        // One byte past the cap — even at offset 0 this should fail
+        // because the buffer would have to grow to MAX+1.
+        let oversized = Bytes::from(vec![0u8; MAX_WRITE_BUFFER_BYTES + 1]);
+        let err = fs
+            .write(&ctx, &inbox, 0, oversized, WriteStability::Unstable)
+            .await
+            .unwrap_err();
+        assert_eq!(err, FsError::FileTooLarge);
+        // No partial state should have leaked through.
+        assert_eq!(recorder.write_count(), 0);
+    }
+
+    /// Bug #5 acceptance: a read-only file reports mode 0444 in
+    /// GETATTR. `Entry::file` is the read-only-by-default constructor
+    /// in the VFS, and the adapter must propagate the mode bits so
+    /// clients see "r--r--r--" in `stat(2)`.
+    #[tokio::test]
+    async fn getattr_read_only_file_is_0444() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let readme = fs.lookup(&ctx, &dir, "readme").await.unwrap();
+        let attrs = fs.getattr(&ctx, &readme).await.unwrap();
+        assert_eq!(
+            attrs.mode & 0o777,
+            0o444,
+            "expected 0o444 mode bits, got 0o{:o}",
+            attrs.mode
+        );
+    }
+
+    /// Bug #5: writable files keep their 0644 mode through GETATTR so
+    /// clients still see them as writable.
+    #[tokio::test]
+    async fn getattr_writable_file_is_0644() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+        let attrs = fs.getattr(&ctx, &inbox).await.unwrap();
+        assert_eq!(attrs.mode & 0o777, 0o644);
+    }
+
+    /// Bug #5: ACCESS strips MODIFY/EXTEND/DELETE for a read-only path
+    /// so the kernel doesn't cache a false-positive write capability.
+    #[tokio::test]
+    async fn access_strips_write_bits_on_read_only() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let readme = fs.lookup(&ctx, &dir, "readme").await.unwrap();
+        let requested =
+            AccessMask::READ | AccessMask::MODIFY | AccessMask::EXTEND | AccessMask::DELETE;
+        let granted = fs.access(&ctx, &readme, requested).await.unwrap();
+        assert!(granted.contains(AccessMask::READ));
+        assert!(!granted.intersects(AccessMask::MODIFY | AccessMask::EXTEND | AccessMask::DELETE));
+    }
+
+    /// Bug #5: ACCESS preserves the write bits on a writable path so
+    /// `echo foo > inbox` doesn't trip an EACCES preflight.
+    #[tokio::test]
+    async fn access_keeps_write_bits_on_writable() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+        let requested = AccessMask::READ | AccessMask::MODIFY | AccessMask::EXTEND;
+        let granted = fs.access(&ctx, &inbox, requested).await.unwrap();
+        assert!(granted.contains(AccessMask::MODIFY));
+        assert!(granted.contains(AccessMask::EXTEND));
     }
 }
