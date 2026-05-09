@@ -41,7 +41,7 @@ use async_trait::async_trait;
 
 use beth_chain::{ChainClient, ChainRegistry};
 use beth_ens::{EnsClient, EnsError};
-use beth_etherscan::EtherscanClient;
+use beth_etherscan::{AddressHistorySource, ContractMetadataSource, EtherscanClient};
 use beth_proto::{checksum_address, format_units, Backend, BackendsConfig};
 
 use crate::handler::{Entry, Handler, HandlerError};
@@ -55,7 +55,13 @@ use super::chains_history;
 #[derive(Clone)]
 pub struct ChainsHandler {
     pub registry: ChainRegistry,
-    pub etherscan: Option<Arc<EtherscanClient>>,
+    /// Source for verified contract source + ABI lookups. Today this is
+    /// always an `EtherscanClient` injected via [`with_etherscan`], but
+    /// any [`ContractMetadataSource`] (e.g. a future local indexer) can
+    /// be wired in via [`with_contract_metadata`].
+    pub contract_metadata: Option<Arc<dyn ContractMetadataSource>>,
+    /// Source for paginated address history feeds (txs / token transfers).
+    pub address_history: Option<Arc<dyn AddressHistorySource>>,
     pub ens: Option<EnsClient>,
     pub backends: BackendsConfig,
     /// Short-TTL ABI cache shared across method/event reads. Lives on
@@ -76,7 +82,8 @@ impl ChainsHandler {
     pub fn new(registry: ChainRegistry) -> Self {
         Self {
             registry,
-            etherscan: None,
+            contract_metadata: None,
+            address_history: None,
             ens: None,
             backends: BackendsConfig::default(),
             abi_cache: Arc::new(AbiCache::new()),
@@ -85,10 +92,26 @@ impl ChainsHandler {
         }
     }
 
-    /// Builder: attach an Etherscan client. Without one, the etherscan-backed
+    /// Builder: attach an Etherscan client. Convenience for the common
+    /// case — wires the same client as both the contract-metadata source
+    /// and the address-history source. Without one, the etherscan-backed
     /// paths return `NotFound` and existing chain reads are unaffected.
     pub fn with_etherscan(mut self, client: Option<Arc<EtherscanClient>>) -> Self {
-        self.etherscan = client;
+        self.contract_metadata = client.clone().map(|c| c as Arc<dyn ContractMetadataSource>);
+        self.address_history = client.map(|c| c as Arc<dyn AddressHistorySource>);
+        self
+    }
+
+    /// Builder: install a custom contract-metadata source (e.g. an
+    /// embedded indexer). Overrides what `with_etherscan` set.
+    pub fn with_contract_metadata(mut self, src: Option<Arc<dyn ContractMetadataSource>>) -> Self {
+        self.contract_metadata = src;
+        self
+    }
+
+    /// Builder: install a custom address-history source.
+    pub fn with_address_history(mut self, src: Option<Arc<dyn AddressHistorySource>>) -> Self {
+        self.address_history = src;
         self
     }
 
@@ -113,47 +136,67 @@ impl ChainsHandler {
             .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", name)))
     }
 
-    /// Resolve the etherscan client for a feature whose configured
-    /// backend is `Backend::Etherscan`. Returns `NotFound` with an
+    /// Resolve the contract-metadata source. Returns `NotFound` with an
     /// explicit message when the feature is configured for etherscan
     /// but no credentials are wired.
-    fn require_etherscan(&self, feature: &str) -> Result<&Arc<EtherscanClient>, HandlerError> {
-        self.etherscan.as_ref().ok_or_else(|| {
-            HandlerError::not_found(format!(
-                "{feature} backend = \"etherscan\" but [etherscan] is not configured"
-            ))
+    fn require_contract_metadata_source(
+        &self,
+    ) -> Result<&Arc<dyn ContractMetadataSource>, HandlerError> {
+        self.contract_metadata.as_ref().ok_or_else(|| {
+            HandlerError::not_found(
+                "contract_metadata backend = \"etherscan\" but [etherscan] is not configured"
+                    .to_string(),
+            )
         })
     }
 
-    /// Gate a feature surface based on its declared backend. Returns
-    /// `Ok(())` if the configured backend is etherscan and credentials
-    /// are present. Returns a clear error otherwise (rpc-not-supported,
-    /// indexer-not-implemented, or etherscan-not-configured).
-    ///
-    /// Used by surfaces that today only work via etherscan
-    /// (`contract_metadata`, `address_history`).
-    fn require_etherscan_backend(
+    /// Resolve the address-history source.
+    fn require_address_history_source(
         &self,
-        feature: &str,
-    ) -> Result<&Arc<EtherscanClient>, HandlerError> {
-        let backend = match feature {
-            "contract_metadata" => self.backends.contract_metadata,
-            "address_history" => self.backends.address_history,
-            _ => {
-                return Err(HandlerError::backend(format!(
-                    "unknown feature '{feature}'"
-                )));
-            }
-        };
-        match backend {
-            Backend::Etherscan => self.require_etherscan(feature),
-            Backend::Rpc => Err(HandlerError::not_found(format!(
-                "{feature} configured as backend = \"rpc\"; this surface requires \"etherscan\" \
+    ) -> Result<&Arc<dyn AddressHistorySource>, HandlerError> {
+        self.address_history.as_ref().ok_or_else(|| {
+            HandlerError::not_found(
+                "address_history backend = \"etherscan\" but [etherscan] is not configured"
+                    .to_string(),
+            )
+        })
+    }
+
+    /// Gate the contract-metadata surfaces based on the declared
+    /// backend. Returns the source on success; a clear error on a
+    /// backend mismatch or missing credentials.
+    fn require_contract_metadata_backend(
+        &self,
+    ) -> Result<&Arc<dyn ContractMetadataSource>, HandlerError> {
+        match self.backends.contract_metadata {
+            Backend::Etherscan => self.require_contract_metadata_source(),
+            Backend::Rpc => Err(HandlerError::not_found(
+                "contract_metadata configured as backend = \"rpc\"; this surface requires \"etherscan\" \
                  (or a future \"indexer\")"
-            ))),
-            Backend::Indexer => Err(HandlerError::not_found(format!(
-                "{feature} configured as backend = \"indexer\" but the embedded indexer is not yet implemented"
-            ))),
+                    .to_string(),
+            )),
+            Backend::Indexer => Err(HandlerError::not_found(
+                "contract_metadata configured as backend = \"indexer\" but the embedded indexer is not yet implemented"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Gate the address-history surfaces based on the declared backend.
+    fn require_address_history_backend(
+        &self,
+    ) -> Result<&Arc<dyn AddressHistorySource>, HandlerError> {
+        match self.backends.address_history {
+            Backend::Etherscan => self.require_address_history_source(),
+            Backend::Rpc => Err(HandlerError::not_found(
+                "address_history configured as backend = \"rpc\"; this surface requires \"etherscan\" \
+                 (or a future \"indexer\")"
+                    .to_string(),
+            )),
+            Backend::Indexer => Err(HandlerError::not_found(
+                "address_history configured as backend = \"indexer\" but the embedded indexer is not yet implemented"
+                    .to_string(),
+            )),
         }
     }
 
@@ -167,12 +210,14 @@ impl ChainsHandler {
     /// etherscan with credentials wired). Used by `list()` to decide
     /// whether to advertise the etherscan-backed entries.
     fn address_history_ready(&self) -> bool {
-        matches!(self.backends.address_history, Backend::Etherscan) && self.etherscan.is_some()
+        matches!(self.backends.address_history, Backend::Etherscan)
+            && self.address_history.is_some()
     }
 
     /// Whether `contract_metadata` is currently usable.
     fn contract_metadata_ready(&self) -> bool {
-        matches!(self.backends.contract_metadata, Backend::Etherscan) && self.etherscan.is_some()
+        matches!(self.backends.contract_metadata, Backend::Etherscan)
+            && self.contract_metadata.is_some()
     }
 
     /// Decompose `methods/<name>.<leaf>` into (`name`, `leaf`). Returns
@@ -199,7 +244,7 @@ impl ChainsHandler {
         match segs.len() {
             2 => Ok(Entry::dir("contracts")),
             3 => {
-                self.require_etherscan_backend("contract_metadata")?;
+                self.require_contract_metadata_backend()?;
                 Ok(Entry::dir(&segs[2]))
             }
             n if n >= 4 => {
@@ -210,11 +255,11 @@ impl ChainsHandler {
                         if n != 4 {
                             return Err(HandlerError::not_found(path.to_string_path()));
                         }
-                        self.require_etherscan_backend("contract_metadata")?;
+                        self.require_contract_metadata_backend()?;
                         Ok(Entry::file(kind))
                     }
                     "methods" => {
-                        self.require_etherscan_backend("contract_metadata")?;
+                        self.require_contract_metadata_backend()?;
                         match n {
                             4 => Ok(Entry::dir("methods")),
                             5 => {
@@ -233,7 +278,7 @@ impl ChainsHandler {
                         }
                     }
                     "events" => {
-                        self.require_etherscan_backend("contract_metadata")?;
+                        self.require_contract_metadata_backend()?;
                         match n {
                             4 => Ok(Entry::dir("events")),
                             5 => Ok(Entry::dir(&segs[4])),
@@ -355,7 +400,7 @@ impl Handler for ChainsHandler {
                     } else if ADDRESS_FILES_ETHERSCAN.contains(&f) {
                         // Surface only mounts when address_history is
                         // backed by etherscan and credentials are wired.
-                        self.require_etherscan_backend("address_history")?;
+                        self.require_address_history_backend()?;
                         Ok(Entry::file(f))
                     } else if ADDRESS_FILES_ENS.contains(&f) {
                         self.ens_or_404()?;
@@ -467,19 +512,19 @@ impl Handler for ChainsHandler {
                         Ok(format!("{}\n", !code.is_empty()).into_bytes())
                     }
                     "txs" => {
-                        let es = self.require_etherscan_backend("address_history")?;
+                        let es = self.require_address_history_backend()?;
                         chains_history::read_txs(es, spec.chain_id, addr).await
                     }
                     "internal_txs" => {
-                        let es = self.require_etherscan_backend("address_history")?;
+                        let es = self.require_address_history_backend()?;
                         chains_history::read_internal_txs(es, spec.chain_id, addr).await
                     }
                     "erc20_txs" => {
-                        let es = self.require_etherscan_backend("address_history")?;
+                        let es = self.require_address_history_backend()?;
                         chains_history::read_erc20_txs(es, spec.chain_id, addr).await
                     }
                     "erc721_txs" => {
-                        let es = self.require_etherscan_backend("address_history")?;
+                        let es = self.require_address_history_backend()?;
                         chains_history::read_erc721_txs(es, spec.chain_id, addr).await
                     }
                     "ens" => {
@@ -745,15 +790,15 @@ impl ChainsHandler {
         let kind = segs[3].as_str();
         match kind {
             "source" if segs.len() == 4 => {
-                let es = self.require_etherscan_backend("contract_metadata")?;
+                let es = self.require_contract_metadata_backend()?;
                 chains_history::read_contract_source(es, chain_id, addr).await
             }
             "abi" if segs.len() == 4 => {
-                let es = self.require_etherscan_backend("contract_metadata")?;
+                let es = self.require_contract_metadata_backend()?;
                 chains_history::read_contract_abi(es, chain_id, addr).await
             }
             "methods" if segs.len() == 5 => {
-                let es = self.require_etherscan_backend("contract_metadata")?;
+                let es = self.require_contract_metadata_backend()?;
                 let leaf = segs[4].as_str();
                 let (name, suffix) = Self::split_method_leaf(leaf)
                     .ok_or_else(|| HandlerError::not_found(path.to_string_path()))?;
@@ -788,7 +833,7 @@ impl ChainsHandler {
                 }
             }
             "events" if segs.len() == 6 => {
-                let es = self.require_etherscan_backend("contract_metadata")?;
+                let es = self.require_contract_metadata_backend()?;
                 let abi = chains_contracts::fetch_abi(&self.abi_cache, es, chain_id, addr).await?;
                 let event_name = segs[4].as_str();
                 let event = chains_contracts::pick_event(&abi, event_name)?;
@@ -885,7 +930,7 @@ impl ChainsHandler {
     async fn list_contracts(&self, segs: &[String]) -> Result<Vec<Entry>, HandlerError> {
         match segs.len() {
             3 => {
-                self.require_etherscan_backend("contract_metadata")?;
+                self.require_contract_metadata_backend()?;
                 let mut out: Vec<Entry> = CONTRACT_FILES_ETHERSCAN
                     .iter()
                     .map(|n| Entry::file(n))
@@ -898,7 +943,7 @@ impl ChainsHandler {
             }
             4 => match segs[3].as_str() {
                 "methods" => {
-                    let _es = self.require_etherscan_backend("contract_metadata")?;
+                    let _es = self.require_contract_metadata_backend()?;
                     // We don't pre-enumerate the ABI for `ls methods/`;
                     // it would require a fresh etherscan hit per
                     // listing. The shell still allows direct
@@ -906,7 +951,7 @@ impl ChainsHandler {
                     Ok(Vec::new())
                 }
                 "events" => {
-                    let _es = self.require_etherscan_backend("contract_metadata")?;
+                    let _es = self.require_contract_metadata_backend()?;
                     Ok(Vec::new())
                 }
                 "storage" => Ok(Vec::new()),

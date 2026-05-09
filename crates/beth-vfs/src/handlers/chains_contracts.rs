@@ -44,11 +44,13 @@ use alloy::rpc::types::eth::{Filter, TransactionRequest};
 use parking_lot::{Mutex, RwLock};
 
 use beth_chain::ChainClient;
-use beth_etherscan::{EtherscanClient, EtherscanError};
+use beth_etherscan::{ContractMetadataSource, DataSourceError};
 use beth_proto::checksum_address;
 use beth_tools::abi::{json_to_sol, sol_to_json};
 
 use crate::handler::{Entry, HandlerError};
+
+use super::chains_history::map_err as map_data_err;
 
 /// Logical leaves under `methods/<name>` that we expose. Stored as a
 /// constant so the `list` and `lookup` paths agree.
@@ -143,14 +145,14 @@ impl LiveTailState {
 /// short-TTL cache. Errors map onto sensible `HandlerError` variants.
 pub async fn fetch_abi(
     cache: &AbiCache,
-    es: &Arc<EtherscanClient>,
+    src: &Arc<dyn ContractMetadataSource>,
     chain_id: u64,
     addr: Address,
 ) -> Result<Arc<JsonAbi>, HandlerError> {
     if let Some(a) = cache.get(&(chain_id, addr)) {
         return Ok(a);
     }
-    let raw = es.get_abi(chain_id, addr).await.map_err(map_es_err)?;
+    let raw = src.get_abi(chain_id, addr).await.map_err(map_es_err)?;
     let s = match raw {
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => raw.to_string(),
         serde_json::Value::String(s) => s,
@@ -167,22 +169,8 @@ pub async fn fetch_abi(
     Ok(arc)
 }
 
-fn map_es_err(e: EtherscanError) -> HandlerError {
-    match e {
-        EtherscanError::Disabled => {
-            HandlerError::Unsupported("etherscan endpoint not supported on this chain".into())
-        }
-        EtherscanError::RateLimit => HandlerError::backend("etherscan rate limited"),
-        EtherscanError::Api { status, message } => {
-            let m = message.to_ascii_lowercase();
-            if m.contains("not verified") || m.contains("not found") {
-                HandlerError::not_found(format!("{status}: {message}"))
-            } else {
-                HandlerError::backend(format!("etherscan {status}: {message}"))
-            }
-        }
-        other => HandlerError::backend(other.to_string()),
-    }
+fn map_es_err(e: DataSourceError) -> HandlerError {
+    map_data_err(e)
 }
 
 fn parse_addr(s: &str) -> Result<Address, HandlerError> {
@@ -732,18 +720,19 @@ pub trait ContractsRouter: Send + Sync {
     ) -> Result<Vec<Entry>, HandlerError>;
 }
 
-/// Concrete dispatcher used by `ChainsHandler`. Holds the etherscan
-/// client (already resolved by the gating layer) and shared caches.
+/// Concrete dispatcher used by `ChainsHandler`. Holds the contract
+/// metadata source (already resolved by the gating layer) and shared
+/// caches.
 pub struct ContractDispatcher {
-    pub etherscan: Arc<EtherscanClient>,
+    pub metadata: Arc<dyn ContractMetadataSource>,
     pub abi_cache: Arc<AbiCache>,
     pub live_state: Arc<LiveTailState>,
 }
 
 impl ContractDispatcher {
-    pub fn new(etherscan: Arc<EtherscanClient>) -> Self {
+    pub fn new(metadata: Arc<dyn ContractMetadataSource>) -> Self {
         Self {
-            etherscan,
+            metadata,
             abi_cache: Arc::new(AbiCache::new()),
             live_state: Arc::new(LiveTailState::new()),
         }

@@ -1,12 +1,16 @@
-//! Etherscan-backed history helpers for the `chains/` subtree.
+//! Backend-neutral history helpers for the `chains/` subtree.
 //!
 //! Split out of `chains.rs` to keep the main handler readable. All
 //! functions return JSON byte payloads ready to be served by the VFS;
 //! lookups for these paths are performed by `chains.rs` directly.
+//!
+//! Helpers take trait objects ([`AddressHistorySource`] /
+//! [`ContractMetadataSource`]) so a future local indexer can drop in
+//! without touching this module.
 
 use std::sync::Arc;
 
-use beth_etherscan::{EtherscanClient, EtherscanError, Sort};
+use beth_etherscan::{AddressHistorySource, ContractMetadataSource, DataSourceError, Sort};
 use beth_proto::prelude::Address;
 
 use crate::handler::HandlerError;
@@ -15,22 +19,13 @@ use crate::handler::HandlerError;
 /// and keeps free-tier Etherscan callers well below the 10k row cap.
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
 
-fn map_err(e: EtherscanError) -> HandlerError {
+pub(crate) fn map_err(e: DataSourceError) -> HandlerError {
     match e {
-        EtherscanError::Disabled => {
-            HandlerError::Unsupported("etherscan endpoint not supported on this chain".into())
-        }
-        EtherscanError::RateLimit => HandlerError::backend("etherscan rate limited"),
-        EtherscanError::Api { status, message } => {
-            // "not verified" / "not found" should surface as NotFound.
-            let m = message.to_ascii_lowercase();
-            if m.contains("not verified") || m.contains("not found") {
-                HandlerError::not_found(format!("{status}: {message}"))
-            } else {
-                HandlerError::backend(format!("etherscan {status}: {message}"))
-            }
-        }
-        other => HandlerError::backend(other.to_string()),
+        DataSourceError::Unsupported(s) => HandlerError::Unsupported(s),
+        DataSourceError::RateLimit => HandlerError::backend("etherscan rate limited"),
+        DataSourceError::NotFound(s) => HandlerError::not_found(s),
+        DataSourceError::Backend(s) => HandlerError::backend(s),
+        DataSourceError::Transport(s) => HandlerError::backend(s),
     }
 }
 
@@ -42,11 +37,11 @@ fn json_bytes<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, HandlerError> {
 }
 
 pub async fn read_txs(
-    client: &Arc<EtherscanClient>,
+    src: &Arc<dyn AddressHistorySource>,
     chain_id: u64,
     addr: Address,
 ) -> Result<Vec<u8>, HandlerError> {
-    let txs = client
+    let txs = src
         .get_tx_list(
             chain_id,
             addr,
@@ -62,11 +57,11 @@ pub async fn read_txs(
 }
 
 pub async fn read_internal_txs(
-    client: &Arc<EtherscanClient>,
+    src: &Arc<dyn AddressHistorySource>,
     chain_id: u64,
     addr: Address,
 ) -> Result<Vec<u8>, HandlerError> {
-    let txs = client
+    let txs = src
         .get_internal_tx_list(
             chain_id,
             addr,
@@ -82,11 +77,11 @@ pub async fn read_internal_txs(
 }
 
 pub async fn read_erc20_txs(
-    client: &Arc<EtherscanClient>,
+    src: &Arc<dyn AddressHistorySource>,
     chain_id: u64,
     addr: Address,
 ) -> Result<Vec<u8>, HandlerError> {
-    let txs = client
+    let txs = src
         .get_token_tx(
             chain_id,
             addr,
@@ -103,11 +98,11 @@ pub async fn read_erc20_txs(
 }
 
 pub async fn read_erc721_txs(
-    client: &Arc<EtherscanClient>,
+    src: &Arc<dyn AddressHistorySource>,
     chain_id: u64,
     addr: Address,
 ) -> Result<Vec<u8>, HandlerError> {
-    let txs = client
+    let txs = src
         .get_nft_tx(
             chain_id,
             addr,
@@ -124,29 +119,27 @@ pub async fn read_erc721_txs(
 }
 
 pub async fn read_contract_source(
-    client: &Arc<EtherscanClient>,
+    src: &Arc<dyn ContractMetadataSource>,
     chain_id: u64,
     addr: Address,
 ) -> Result<Vec<u8>, HandlerError> {
-    let src = client
-        .get_source_code(chain_id, addr)
-        .await
-        .map_err(map_err)?;
-    json_bytes(&src)
+    let s = src.get_source_code(chain_id, addr).await.map_err(map_err)?;
+    json_bytes(&s)
 }
 
 pub async fn read_contract_abi(
-    client: &Arc<EtherscanClient>,
+    src: &Arc<dyn ContractMetadataSource>,
     chain_id: u64,
     addr: Address,
 ) -> Result<Vec<u8>, HandlerError> {
-    let abi = client.get_abi(chain_id, addr).await.map_err(map_err)?;
+    let abi = src.get_abi(chain_id, addr).await.map_err(map_err)?;
     json_bytes(&abi)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beth_etherscan::{EtherscanClient, EtherscanError};
     use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -174,7 +167,12 @@ mod tests {
         addr
     }
 
-    fn client_for(addr: SocketAddr) -> Arc<EtherscanClient> {
+    fn history_for(addr: SocketAddr) -> Arc<dyn AddressHistorySource> {
+        let url = Url::parse(&format!("http://{addr}/api")).unwrap();
+        Arc::new(EtherscanClient::with_base_url("test_key".into(), url))
+    }
+
+    fn metadata_for(addr: SocketAddr) -> Arc<dyn ContractMetadataSource> {
         let url = Url::parse(&format!("http://{addr}/api")).unwrap();
         Arc::new(EtherscanClient::with_base_url("test_key".into(), url))
     }
@@ -189,7 +187,7 @@ mod tests {
 
     #[test]
     fn map_err_disabled_to_unsupported() {
-        match map_err(EtherscanError::Disabled) {
+        match map_err(DataSourceError::from(EtherscanError::Disabled)) {
             HandlerError::Unsupported(s) => assert!(s.contains("not supported")),
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -197,7 +195,7 @@ mod tests {
 
     #[test]
     fn map_err_rate_limit_to_backend() {
-        match map_err(EtherscanError::RateLimit) {
+        match map_err(DataSourceError::from(EtherscanError::RateLimit)) {
             HandlerError::Backend(s) => assert!(s.contains("rate limited")),
             other => panic!("expected Backend, got {other:?}"),
         }
@@ -206,10 +204,10 @@ mod tests {
     #[test]
     fn map_err_api_not_found_phrases() {
         for msg in ["Contract source code not Verified", "Address NOT FOUND"] {
-            let e = map_err(EtherscanError::Api {
+            let e = map_err(DataSourceError::from(EtherscanError::Api {
                 status: "0".into(),
                 message: msg.into(),
-            });
+            }));
             match e {
                 HandlerError::NotFound(s) => assert!(s.to_ascii_lowercase().contains("not")),
                 other => panic!("expected NotFound for {msg:?}, got {other:?}"),
@@ -219,10 +217,10 @@ mod tests {
 
     #[test]
     fn map_err_api_other_to_backend() {
-        let e = map_err(EtherscanError::Api {
+        let e = map_err(DataSourceError::from(EtherscanError::Api {
             status: "0".into(),
             message: "Invalid API Key".into(),
-        });
+        }));
         match e {
             HandlerError::Backend(s) => {
                 assert!(s.contains("Invalid API Key"));
@@ -234,7 +232,9 @@ mod tests {
 
     #[test]
     fn map_err_invalid_response_to_backend() {
-        let e = map_err(EtherscanError::InvalidResponse("garbage".into()));
+        let e = map_err(DataSourceError::from(EtherscanError::InvalidResponse(
+            "garbage".into(),
+        )));
         assert!(matches!(e, HandlerError::Backend(_)));
     }
 
@@ -262,7 +262,7 @@ mod tests {
             "functionName":""
         }]}"#;
         let addr = spawn_canned(body).await;
-        let client = client_for(addr);
+        let client = history_for(addr);
         let bytes = read_txs(&client, 1, fixed_addr()).await.unwrap();
 
         // payload must be valid JSON, terminated with a newline.
@@ -281,7 +281,7 @@ mod tests {
         // client converts it into a successful empty array.
         let body = r#"{"status":"0","message":"No transactions found","result":[]}"#;
         let addr = spawn_canned(body).await;
-        let client = client_for(addr);
+        let client = history_for(addr);
         let bytes = read_txs(&client, 1, fixed_addr()).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.as_array().map(|a| a.len()), Some(0));
@@ -291,7 +291,7 @@ mod tests {
     async fn read_txs_rate_limit_maps_to_backend() {
         let body = r#"{"status":"0","message":"NOTOK","result":"Max rate limit reached"}"#;
         let addr = spawn_canned(body).await;
-        let client = client_for(addr);
+        let client = history_for(addr);
         let err = read_txs(&client, 1, fixed_addr()).await.unwrap_err();
         match err {
             HandlerError::Backend(s) => assert!(s.contains("rate limited")),
@@ -303,7 +303,7 @@ mod tests {
     async fn read_txs_api_error_maps_to_backend() {
         let body = r#"{"status":"0","message":"NOTOK","result":"Invalid API Key"}"#;
         let addr = spawn_canned(body).await;
-        let client = client_for(addr);
+        let client = history_for(addr);
         let err = read_txs(&client, 1, fixed_addr()).await.unwrap_err();
         match err {
             HandlerError::Backend(s) => assert!(s.contains("Invalid API Key")),
@@ -335,7 +335,7 @@ mod tests {
             "functionName":""
         }]}"#;
         let addr = spawn_canned(body).await;
-        let client = client_for(addr);
+        let client = history_for(addr);
         let bytes = read_internal_txs(&client, 1, fixed_addr()).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed[0]["hash"], "0xinternal");
@@ -362,7 +362,7 @@ mod tests {
             "input":"0x"
         }]}"#;
         let addr = spawn_canned(body).await;
-        let client = client_for(addr);
+        let client = history_for(addr);
         let bytes = read_erc20_txs(&client, 1, fixed_addr()).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed[0]["tokenSymbol"], "MCK");
@@ -389,7 +389,7 @@ mod tests {
             "input":"0x"
         }]}"#;
         let addr = spawn_canned(body).await;
-        let client = client_for(addr);
+        let client = history_for(addr);
         let bytes = read_erc721_txs(&client, 1, fixed_addr()).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed[0]["hash"], "0xnft");
@@ -415,7 +415,7 @@ mod tests {
             "SwarmSource":""
         }]}"#;
         let addr = spawn_canned(body).await;
-        let client = client_for(addr);
+        let client = metadata_for(addr);
         let bytes = read_contract_source(&client, 1, fixed_addr())
             .await
             .unwrap();
@@ -430,7 +430,7 @@ mod tests {
         let body =
             r#"{"status":"0","message":"NOTOK","result":"Contract source code not verified"}"#;
         let addr = spawn_canned(body).await;
-        let client = client_for(addr);
+        let client = metadata_for(addr);
         let err = read_contract_source(&client, 1, fixed_addr())
             .await
             .unwrap_err();
@@ -446,7 +446,7 @@ mod tests {
     async fn read_contract_abi_emits_array_payload() {
         let body = r#"{"status":"1","message":"OK","result":"[{\"type\":\"function\",\"name\":\"foo\"}]"}"#;
         let addr = spawn_canned(body).await;
-        let client = client_for(addr);
+        let client = metadata_for(addr);
         let bytes = read_contract_abi(&client, 1, fixed_addr()).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(parsed.is_array());
@@ -460,7 +460,7 @@ mod tests {
         // when the result is the literal sentinel. map_err should surface NotFound.
         let body = r#"{"status":"1","message":"OK","result":"Contract source code not verified"}"#;
         let addr = spawn_canned(body).await;
-        let client = client_for(addr);
+        let client = metadata_for(addr);
         let err = read_contract_abi(&client, 1, fixed_addr())
             .await
             .unwrap_err();

@@ -37,7 +37,9 @@ use url::Url;
 use beth_proto::prelude::{Address, B256, U256};
 
 pub mod cache;
+pub mod traits;
 pub use cache::EtherscanCache;
+pub use traits::{AddressHistorySource, ContractMetadataSource, DataSourceError};
 
 /// Default base URL for Etherscan v2 multichain API.
 pub const DEFAULT_BASE_URL: &str = "https://api.etherscan.io/v2/api";
