@@ -19,6 +19,21 @@ pub enum OutboxError {
     Json(#[from] serde_json::Error),
     #[error("not found: {0}")]
     NotFound(String),
+    /// Caller asked for `id` in `expected` but it actually lives in `actual`.
+    /// The op was refused so the caller can't accidentally operate on a tx
+    /// that has already moved past the expected state.
+    #[error("staged tx '{id}' is in '{actual}', not '{expected}'")]
+    StateMismatch {
+        id: String,
+        expected: &'static str,
+        actual: &'static str,
+    },
+    #[error("staged tx '{id}' expired at {expired_at} (now {now})")]
+    StagedExpired {
+        id: String,
+        expired_at: u128,
+        now: u128,
+    },
     #[error("invalid id '{0}'")]
     InvalidId(String),
     #[error("invalid wallet '{0}'")]
@@ -47,6 +62,15 @@ impl OutboxState {
             TxStatus::Pending => OutboxState::Pending,
             TxStatus::Sent | TxStatus::Success | TxStatus::Reverted => OutboxState::Sent,
             TxStatus::Failed | TxStatus::Cancelled => OutboxState::Failed,
+        }
+    }
+    /// Parse the on-disk dir name back into an [`OutboxState`].
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(OutboxState::Pending),
+            "sent" => Some(OutboxState::Sent),
+            "failed" => Some(OutboxState::Failed),
+            _ => None,
         }
     }
 }
@@ -134,6 +158,10 @@ impl Outbox {
         Ok(dir)
     }
 
+    /// Search for `id` across pending/sent/failed and return the first hit.
+    /// Prefer [`Self::read_in_state`] when the caller knows where the entry
+    /// is supposed to be — this method exists for diagnostics and is the
+    /// reason fix #2 had to plumb state through confirm/replace/cancel.
     pub fn read(&self, wallet: &str, chain: &str, id: &str) -> Result<OutboxEntry, OutboxError> {
         for state in [OutboxState::Pending, OutboxState::Sent, OutboxState::Failed] {
             let dir = self.state_dir(wallet, chain, state)?.join(id);
@@ -141,6 +169,46 @@ impl Outbox {
             if intent.exists() {
                 let staged: StagedTx = serde_json::from_slice(&fs::read(&intent)?)?;
                 return Ok(OutboxEntry { state, staged, dir });
+            }
+        }
+        Err(OutboxError::NotFound(id.into()))
+    }
+
+    /// Read `id` only if it currently lives in `expected`. Returns
+    /// `NotFound` if the id doesn't exist in *that* state — even if it
+    /// exists elsewhere — and `StateMismatch` if it lives in a different
+    /// state. Callers that must guarantee a tx is still pending (confirm,
+    /// replace, cancel) MUST use this rather than [`Self::read`].
+    pub fn read_in_state(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+        expected: OutboxState,
+    ) -> Result<OutboxEntry, OutboxError> {
+        let dir = self.state_dir(wallet, chain, expected)?.join(id);
+        let intent = dir.join("intent.json");
+        if intent.exists() {
+            let staged: StagedTx = serde_json::from_slice(&fs::read(&intent)?)?;
+            return Ok(OutboxEntry {
+                state: expected,
+                staged,
+                dir,
+            });
+        }
+        // Differentiate "exists in another state" vs "totally absent" so
+        // callers (and humans reading errors) can tell which case it is.
+        for other in [OutboxState::Pending, OutboxState::Sent, OutboxState::Failed] {
+            if other == expected {
+                continue;
+            }
+            let other_dir = self.state_dir(wallet, chain, other)?.join(id);
+            if other_dir.join("intent.json").exists() {
+                return Err(OutboxError::StateMismatch {
+                    id: id.to_string(),
+                    expected: expected.dirname(),
+                    actual: other.dirname(),
+                });
             }
         }
         Err(OutboxError::NotFound(id.into()))
@@ -347,5 +415,36 @@ mod tests {
         assert_eq!(n, 1);
         let entry = ob.read("alice", "anvil", "x").unwrap();
         assert_eq!(entry.state, OutboxState::Failed);
+    }
+
+    /// Fix #8: `read_in_state` must NotFound an id that exists in a
+    /// different state, even though the older `read` would have returned
+    /// it. This protects callers from accidentally operating on a tx
+    /// that has already moved on.
+    #[test]
+    fn read_in_state_rejects_wrong_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        ob.write_pending(&fake_staged("a"), "p").unwrap();
+        let entry = ob.read("alice", "anvil", "a").unwrap();
+        ob.transition(&entry, OutboxState::Sent).unwrap();
+        // Same id but asking for pending — must NotFound (StateMismatch
+        // technically, depending on whether other states have it).
+        let r = ob.read_in_state("alice", "anvil", "a", OutboxState::Pending);
+        assert!(matches!(r, Err(OutboxError::StateMismatch { .. })));
+        // And the sent state must succeed.
+        let r2 = ob
+            .read_in_state("alice", "anvil", "a", OutboxState::Sent)
+            .unwrap();
+        assert_eq!(r2.state, OutboxState::Sent);
+    }
+
+    /// Fix #8: A nonexistent id is NotFound (not StateMismatch).
+    #[test]
+    fn read_in_state_missing_id_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let r = ob.read_in_state("alice", "anvil", "ghost", OutboxState::Pending);
+        assert!(matches!(r, Err(OutboxError::NotFound(_))));
     }
 }
