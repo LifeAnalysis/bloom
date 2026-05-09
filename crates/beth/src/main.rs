@@ -17,6 +17,7 @@ use beth_daemon::Daemon;
 use beth_proto::HomeDir;
 use beth_vfs::{handler::Handler, VfsPath};
 use clap::{Parser, Subcommand};
+use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -150,9 +151,13 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<()> {
     let home = match cli.home {
-        Some(p) => HomeDir::at(p),
+        Some(p) => {
+            debug!(path = %p.display(), "cli.home.override");
+            HomeDir::at(p)
+        }
         None => HomeDir::resolve("~/.bloom-eth").context("resolving home dir")?,
     };
+    trace!(cmd = ?cli.cmd, home = %home.root().display(), "cli.dispatch");
 
     match cli.cmd {
         Cmd::Init => {
@@ -177,6 +182,7 @@ async fn run(cli: Cli) -> Result<()> {
             let socket = default_socket_path(home.root());
             let p = VfsPath::parse(&path).context("parse path")?;
             let bytes = if socket.exists() {
+                debug!(socket = %socket.display(), "cli.vfs.cat.via_ipc");
                 let client = IpcClient::new(&socket);
                 let res = client
                     .call("read", serde_json::json!({ "path": path }))
@@ -190,6 +196,7 @@ async fn run(cli: Cli) -> Result<()> {
                 use base64::Engine as _;
                 B64.decode(b64).context("ipc read: bad base64")?
             } else {
+                debug!("cli.vfs.cat.via_inproc: no daemon socket present");
                 let d = Daemon::from_home(home).context("build daemon")?;
                 d.vfs.read(&p).await.context("vfs read")?
             };
@@ -200,6 +207,7 @@ async fn run(cli: Cli) -> Result<()> {
             let socket = default_socket_path(home.root());
             let p = VfsPath::parse(&path).context("parse path")?;
             if socket.exists() {
+                debug!(socket = %socket.display(), "cli.vfs.ls.via_ipc");
                 let client = IpcClient::new(&socket);
                 let res = client
                     .call("list", serde_json::json!({ "path": path }))
@@ -216,6 +224,7 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("{}\t{}", name, kind);
                 }
             } else {
+                debug!("cli.vfs.ls.via_inproc: no daemon socket present");
                 let d = Daemon::from_home(home).context("build daemon")?;
                 let entries = d.vfs.list(&p).await.context("vfs list")?;
                 for e in entries {
@@ -236,6 +245,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             };
             if socket.exists() {
+                debug!(socket = %socket.display(), "cli.vfs.write.via_ipc");
                 use base64::engine::general_purpose::STANDARD as B64;
                 use base64::Engine as _;
                 let client = IpcClient::new(&socket);
@@ -247,6 +257,7 @@ async fn run(cli: Cli) -> Result<()> {
                     .await
                     .context("ipc write")?;
             } else {
+                debug!("cli.vfs.write.via_inproc: no daemon socket present");
                 let d = Daemon::from_home(home).context("build daemon")?;
                 d.vfs.write(&p, &body).await.context("vfs write")?;
             }
@@ -359,11 +370,13 @@ async fn run(cli: Cli) -> Result<()> {
             );
             let socket = default_socket_path(d.home.root());
             println!("ipc socket: {}", socket.display());
+            info!(home = %d.home.root().display(), chains = ?chains, socket = %socket.display(), "cli.serve.starting");
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains);
             let server2 = server.clone();
             // Trigger graceful shutdown on Ctrl-C.
             let shutdown = tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
+                info!("cli.serve.ctrl_c_received");
                 server2.trigger_shutdown();
             });
             server.serve(&socket).await.context("ipc serve")?;
@@ -372,16 +385,21 @@ async fn run(cli: Cli) -> Result<()> {
             // daemon-owned workers (watch executor, etc., fix #6).
             sweeper.shutdown().await;
             d.shutdown().await;
+            info!("cli.serve.shutdown_complete");
             println!("shutting down");
             Ok(())
         }
         Cmd::Ipc(IpcCmd::Call { method, params }) => {
             let socket = default_socket_path(home.root());
+            if !socket.exists() {
+                debug!(socket = %socket.display(), "cli.ipc.call.no_socket: daemon may not be running");
+            }
             let client = IpcClient::new(&socket);
             let v: serde_json::Value = match params {
                 Some(s) => serde_json::from_str(&s).context("parse params JSON")?,
                 None => serde_json::Value::Null,
             };
+            debug!(%method, socket = %socket.display(), "cli.ipc.call");
             let result = client
                 .call(&method, v)
                 .await
