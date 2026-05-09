@@ -407,6 +407,7 @@ mod tests {
             status: TxStatus::Pending,
             tx_hash: None,
             token: None,
+            nft: None,
             usd_value: None,
         }
     }
