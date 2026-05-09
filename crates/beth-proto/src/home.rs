@@ -128,3 +128,98 @@ fn shellexpand_local(raw: &str) -> String {
     }
     raw.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn at_constructs_all_child_paths() {
+        let td = tempdir().unwrap();
+        let home = HomeDir::at(td.path());
+        assert_eq!(home.root(), td.path());
+        assert_eq!(home.config_path(), td.path().join("config.toml"));
+        assert_eq!(home.audit_path(), td.path().join("audit.jsonl"));
+        assert_eq!(home.admin_socket(), td.path().join("beth.sock"));
+        assert_eq!(home.events_socket(), td.path().join("events.sock"));
+        assert_eq!(home.keystore_dir(), td.path().join("keystore"));
+        assert_eq!(home.cache_dir(), td.path().join("cache"));
+        assert_eq!(home.blobs_dir(), td.path().join("blobs"));
+        assert_eq!(home.outbox_dir(), td.path().join("outbox"));
+        assert_eq!(home.watch_dir(), td.path().join("watch"));
+        assert_eq!(home.logs_dir(), td.path().join("logs"));
+    }
+
+    #[test]
+    fn wallet_dir_joins_under_keystore() {
+        let td = tempdir().unwrap();
+        let home = HomeDir::at(td.path());
+        assert_eq!(
+            home.wallet_dir("alice"),
+            td.path().join("keystore").join("alice")
+        );
+    }
+
+    #[test]
+    fn ensure_creates_all_subdirs_idempotently() {
+        let td = tempdir().unwrap();
+        let home = HomeDir::at(td.path().join("nested"));
+        assert!(!home.root().exists());
+
+        home.ensure().unwrap();
+        for d in [
+            home.root().to_path_buf(),
+            home.keystore_dir(),
+            home.cache_dir(),
+            home.blobs_dir(),
+            home.outbox_dir(),
+            home.watch_dir(),
+            home.logs_dir(),
+        ] {
+            assert!(d.is_dir(), "expected dir to exist: {}", d.display());
+        }
+
+        // ensure() is idempotent — second call should not error.
+        home.ensure().unwrap();
+    }
+
+    #[test]
+    fn ensure_does_not_create_files_only_dirs() {
+        let td = tempdir().unwrap();
+        let home = HomeDir::at(td.path());
+        home.ensure().unwrap();
+        // Files like config.toml / audit.jsonl / sockets should NOT exist
+        // just because we ensured the dir tree.
+        assert!(!home.config_path().exists());
+        assert!(!home.audit_path().exists());
+        assert!(!home.admin_socket().exists());
+        assert!(!home.events_socket().exists());
+    }
+
+    #[test]
+    fn resolve_with_explicit_path_does_not_touch_home() {
+        // A non-tilde, non-default path should be used as-is.
+        let raw = "/tmp/bloom-eth-test-resolve";
+        let home = HomeDir::resolve(raw).unwrap();
+        assert_eq!(home.root(), Path::new(raw));
+    }
+
+    #[test]
+    fn resolve_default_uses_home_dir() {
+        // The documented sentinel "~/.bloom-eth" expands via dirs::home_dir.
+        // dirs::home_dir() returning None on a CI box is rare, but tolerate it.
+        if let Some(real_home) = dirs::home_dir() {
+            let home = HomeDir::resolve("~/.bloom-eth").unwrap();
+            assert_eq!(home.root(), real_home.join(".bloom-eth"));
+        }
+    }
+
+    #[test]
+    fn resolve_expands_tilde_prefix() {
+        if let Some(real_home) = dirs::home_dir() {
+            let home = HomeDir::resolve("~/foo/bar").unwrap();
+            assert_eq!(home.root(), real_home.join("foo").join("bar"));
+        }
+    }
+}

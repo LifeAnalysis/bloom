@@ -284,3 +284,315 @@ impl Config {
         c.allow_broadcast
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn assert_configs_equivalent(a: &Config, b: &Config) {
+        // Config doesn't derive PartialEq (chains has custom inner types
+        // that do). Compare via a stable serialised form.
+        let sa = toml::to_string_pretty(a).unwrap();
+        let sb = toml::to_string_pretty(b).unwrap();
+        assert_eq!(sa, sb);
+    }
+
+    #[test]
+    fn local_default_shape() {
+        let cfg = Config::local_default();
+        assert_eq!(cfg.default_chain, "anvil");
+        assert_eq!(cfg.mount_path, "/eth");
+        assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
+        assert!(cfg.block_mainnet_broadcast);
+        assert!(cfg.etherscan.is_none());
+        assert!(cfg.enso.is_none());
+        assert_eq!(cfg.chains.len(), 1);
+        let anvil = cfg.chains.get("anvil").expect("anvil entry");
+        assert_eq!(anvil.chain_id, 31337);
+        assert!(!anvil.rpc_urls.is_empty());
+        // Default backends: metadata + history -> Etherscan, rest -> RPC.
+        assert_eq!(cfg.backends.contract_metadata, Backend::Etherscan);
+        assert_eq!(cfg.backends.address_history, Backend::Etherscan);
+        assert_eq!(cfg.backends.event_logs, Backend::Rpc);
+        assert_eq!(cfg.backends.storage_reads, Backend::Rpc);
+        assert_eq!(cfg.backends.proxy_detection, Backend::Rpc);
+    }
+
+    #[test]
+    fn local_default_validates() {
+        Config::local_default().validate().unwrap();
+    }
+
+    #[test]
+    fn toml_round_trip_default() {
+        let cfg = Config::local_default();
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_configs_equivalent(&cfg, &back);
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("nested").join("config.toml");
+        let cfg = Config::local_default();
+        cfg.save(&path).unwrap();
+        assert!(path.exists());
+        let loaded = Config::load(&path).unwrap();
+        assert_configs_equivalent(&cfg, &loaded);
+    }
+
+    #[test]
+    fn load_missing_file_returns_io_error() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("does-not-exist.toml");
+        let err = Config::load(&path).unwrap_err();
+        match err {
+            ConfigError::Io(_) => {}
+            other => panic!("expected Io error for missing file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_malformed_toml_returns_toml_error() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        std::fs::write(&path, "this is not valid toml = = =").unwrap();
+        let err = Config::load(&path).unwrap_err();
+        match err {
+            ConfigError::Toml(_) => {}
+            other => panic!("expected Toml error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_or_init_creates_default_when_missing() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("subdir").join("config.toml");
+        assert!(!path.exists());
+        let cfg = Config::load_or_init(&path).unwrap();
+        assert!(path.exists());
+        assert_eq!(cfg.default_chain, "anvil");
+        // Second call should load, not overwrite — round-trip equivalent.
+        let cfg2 = Config::load_or_init(&path).unwrap();
+        assert_configs_equivalent(&cfg, &cfg2);
+    }
+
+    #[test]
+    fn validate_rejects_empty_chains() {
+        let mut cfg = Config::local_default();
+        cfg.chains.clear();
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::Invalid(m) => assert!(m.contains("at least one"), "msg: {m}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_default_chain_not_in_chains() {
+        let mut cfg = Config::local_default();
+        cfg.default_chain = "ghost".to_string();
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::Invalid(m) => assert!(m.contains("default_chain=ghost"), "msg: {m}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_key_name_mismatch() {
+        let mut cfg = Config::local_default();
+        let mut spec = cfg.chains.remove("anvil").unwrap();
+        spec.name = "renamed".to_string();
+        cfg.chains.insert("anvil".to_string(), spec);
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::Invalid(m) => {
+                assert!(m.contains("anvil") && m.contains("renamed"), "msg: {m}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_chain_with_no_rpc_urls() {
+        let mut cfg = Config::local_default();
+        cfg.chains.get_mut("anvil").unwrap().rpc_urls.clear();
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::Invalid(m) => assert!(m.contains("no rpc_urls"), "msg: {m}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_lookup_by_name() {
+        let cfg = Config::local_default();
+        assert!(cfg.chain("anvil").is_some());
+        assert!(cfg.chain("ethereum").is_none());
+    }
+
+    #[test]
+    fn is_mainnet_id_matches_known_ids() {
+        for id in [
+            1, 10, 137, 8453, 42161, 56, 43114, 100, 250, 324, 59144, 534352,
+        ] {
+            assert!(Config::is_mainnet_id(id), "{id} should be mainnet");
+        }
+        assert!(!Config::is_mainnet_id(31337));
+        assert!(!Config::is_mainnet_id(11155111)); // sepolia
+        assert!(!Config::is_mainnet_id(0));
+    }
+
+    #[test]
+    fn broadcast_permitted_blocked_on_mainnet_when_killswitch_on() {
+        let cfg = Config::local_default(); // block_mainnet_broadcast = true
+        let mainnet = ChainSpec {
+            name: "ethereum".to_string(),
+            chain_id: 1,
+            rpc_urls: vec!["https://x".into()],
+            allow_broadcast: true,
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+        };
+        assert!(!cfg.broadcast_permitted(&mainnet));
+    }
+
+    #[test]
+    fn broadcast_permitted_when_killswitch_off_and_chain_allows() {
+        let mut cfg = Config::local_default();
+        cfg.block_mainnet_broadcast = false;
+        let mainnet = ChainSpec {
+            name: "ethereum".to_string(),
+            chain_id: 1,
+            rpc_urls: vec!["https://x".into()],
+            allow_broadcast: true,
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+        };
+        assert!(cfg.broadcast_permitted(&mainnet));
+    }
+
+    #[test]
+    fn broadcast_permitted_respects_chain_allow_flag_on_testnet() {
+        let cfg = Config::local_default();
+        let mut anvil = ChainSpec::anvil_default();
+        anvil.allow_broadcast = false;
+        assert!(!cfg.broadcast_permitted(&anvil));
+        anvil.allow_broadcast = true;
+        assert!(cfg.broadcast_permitted(&anvil));
+    }
+
+    #[test]
+    fn backend_kebab_case_serde() {
+        // Serde rename_all = "kebab-case" → indexer/etherscan/rpc.
+        assert_eq!(
+            serde_json::to_string(&Backend::Etherscan).unwrap(),
+            "\"etherscan\""
+        );
+        assert_eq!(serde_json::to_string(&Backend::Rpc).unwrap(), "\"rpc\"");
+        assert_eq!(
+            serde_json::to_string(&Backend::Indexer).unwrap(),
+            "\"indexer\""
+        );
+        assert_eq!(Backend::Etherscan.as_str(), "etherscan");
+        assert_eq!(Backend::Etherscan.to_string(), "etherscan");
+        let b: Backend = serde_json::from_str("\"rpc\"").unwrap();
+        assert_eq!(b, Backend::Rpc);
+    }
+
+    #[test]
+    fn backends_config_entries_and_get() {
+        let b = BackendsConfig::default();
+        let entries = b.entries();
+        let names: Vec<&'static str> = entries.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "contract_metadata",
+                "address_history",
+                "event_logs",
+                "storage_reads",
+                "proxy_detection",
+            ]
+        );
+        assert_eq!(b.get("event_logs"), Some(Backend::Rpc));
+        assert_eq!(b.get("contract_metadata"), Some(Backend::Etherscan));
+        assert_eq!(b.get("does_not_exist"), None);
+    }
+
+    #[test]
+    fn parses_explicit_per_feature_backend_overrides() {
+        let toml_text = r#"
+default_chain = "anvil"
+
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+allow_broadcast = true
+
+[backends]
+contract_metadata = "rpc"
+address_history = "indexer"
+event_logs = "etherscan"
+storage_reads = "indexer"
+proxy_detection = "etherscan"
+"#;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.backends.contract_metadata, Backend::Rpc);
+        assert_eq!(cfg.backends.address_history, Backend::Indexer);
+        assert_eq!(cfg.backends.event_logs, Backend::Etherscan);
+        assert_eq!(cfg.backends.storage_reads, Backend::Indexer);
+        assert_eq!(cfg.backends.proxy_detection, Backend::Etherscan);
+    }
+
+    #[test]
+    fn missing_backends_block_uses_defaults() {
+        let toml_text = r#"
+default_chain = "anvil"
+
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+"#;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.backends.contract_metadata, Backend::Etherscan);
+        assert_eq!(cfg.backends.event_logs, Backend::Rpc);
+    }
+
+    #[test]
+    fn etherscan_and_enso_blocks_parse() {
+        let toml_text = r#"
+default_chain = "anvil"
+
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+
+[etherscan]
+api_key = "ESKEY"
+
+[enso]
+api_key = "ENKEY"
+"#;
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        let es = cfg.etherscan.expect("etherscan parsed");
+        assert_eq!(es.api_key, "ESKEY");
+        assert_eq!(es.api_url, "https://api.etherscan.io/v2/api");
+        let en = cfg.enso.expect("enso parsed");
+        assert_eq!(en.api_key, "ENKEY");
+        assert_eq!(en.api_url, "https://api.enso.finance");
+    }
+}

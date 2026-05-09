@@ -106,3 +106,100 @@ impl ChainSpec {
         ChainRef::new(&self.name)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_id_display_and_from() {
+        let id: ChainId = 8453u64.into();
+        assert_eq!(id.0, 8453);
+        assert_eq!(id.to_string(), "8453");
+    }
+
+    #[test]
+    fn chain_ref_new_and_display() {
+        let r = ChainRef::new("ethereum");
+        assert_eq!(r.as_str(), "ethereum");
+        assert_eq!(r.to_string(), "ethereum");
+    }
+
+    #[test]
+    fn chain_id_serializes_transparently_as_number() {
+        let id = ChainId(1);
+        let s = serde_json::to_string(&id).unwrap();
+        assert_eq!(s, "1");
+        let back: ChainId = serde_json::from_str("1").unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn chain_ref_serializes_transparently_as_string() {
+        let r = ChainRef::new("base");
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(s, "\"base\"");
+        let back: ChainRef = serde_json::from_str("\"base\"").unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn anvil_default_shape() {
+        let c = ChainSpec::anvil_default();
+        assert_eq!(c.name, "anvil");
+        assert_eq!(c.chain_id, 31337);
+        assert_eq!(c.id(), ChainId(31337));
+        assert_eq!(c.r#ref().as_str(), "anvil");
+        assert!(c.allow_broadcast);
+        assert_eq!(c.rpc_urls, vec!["http://127.0.0.1:8545".to_string()]);
+        assert_eq!(c.native_symbol, "ETH");
+        assert_eq!(c.native_decimals, 18);
+        assert!(!c.legacy_tx);
+        assert!(c.etherscan_api_url.is_none());
+    }
+
+    #[test]
+    fn chain_spec_toml_round_trip() {
+        let original = ChainSpec::anvil_default();
+        let s = toml::to_string(&original).unwrap();
+        let back: ChainSpec = toml::from_str(&s).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn chain_spec_json_round_trip() {
+        let original = ChainSpec {
+            name: "ethereum".to_string(),
+            chain_id: 1,
+            rpc_urls: vec!["https://rpc.example".to_string()],
+            allow_broadcast: false,
+            etherscan_api_url: Some("https://api.etherscan.io/v2/api".to_string()),
+            display_name: Some("Ethereum Mainnet".to_string()),
+            native_symbol: "ETH".to_string(),
+            native_decimals: 18,
+            legacy_tx: false,
+        };
+        let s = serde_json::to_string(&original).unwrap();
+        let back: ChainSpec = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn chain_spec_defaults_apply_when_missing_fields() {
+        let toml_text = r#"
+            name = "minimal"
+            chain_id = 42
+            rpc_urls = ["http://x"]
+        "#;
+        let c: ChainSpec = toml::from_str(toml_text).unwrap();
+        assert_eq!(c.name, "minimal");
+        assert_eq!(c.chain_id, 42);
+        // serde defaults should fill in everything else
+        assert!(!c.allow_broadcast);
+        assert_eq!(c.native_symbol, "ETH");
+        assert_eq!(c.native_decimals, 18);
+        assert!(!c.legacy_tx);
+        assert!(c.etherscan_api_url.is_none());
+        assert!(c.display_name.is_none());
+    }
+}

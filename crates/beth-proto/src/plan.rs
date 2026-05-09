@@ -151,3 +151,225 @@ impl PlanRender {
         s
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{PolicyCheck, PolicyOutcome};
+
+    fn base_eth_send() -> StagedTx {
+        StagedTx {
+            id: "tx_001".to_string(),
+            wallet: "alice".to_string(),
+            chain: "ethereum".to_string(),
+            chain_id: 1,
+            from: "0xfromfromfromfromfromfromfromfromfromfrom".to_string(),
+            to: "0xtotototototototototototototototototototo".to_string(),
+            // 1.5 ETH
+            value_wei: "1500000000000000000".to_string(),
+            data_hex: "0x".to_string(),
+            gas_limit: 21000,
+            max_fee_per_gas: Some("30000000000".to_string()),
+            max_priority_fee_per_gas: Some("2000000000".to_string()),
+            gas_price: None,
+            nonce: 7,
+            policy_checks: vec![],
+            created_ms: 1_700_000_000_000,
+            expires_ms: 1_700_000_003_600,
+            status: TxStatus::Pending,
+            tx_hash: None,
+            token: None,
+            usd_value: None,
+        }
+    }
+
+    #[test]
+    fn tx_status_display() {
+        assert_eq!(TxStatus::Pending.to_string(), "pending");
+        assert_eq!(TxStatus::Sent.to_string(), "sent");
+        assert_eq!(TxStatus::Success.to_string(), "success");
+        assert_eq!(TxStatus::Reverted.to_string(), "reverted");
+        assert_eq!(TxStatus::Failed.to_string(), "failed");
+        assert_eq!(TxStatus::Cancelled.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn tx_status_serde_snake_case() {
+        let s = serde_json::to_string(&TxStatus::Cancelled).unwrap();
+        assert_eq!(s, "\"cancelled\"");
+        let back: TxStatus = serde_json::from_str("\"reverted\"").unwrap();
+        assert_eq!(back, TxStatus::Reverted);
+    }
+
+    #[test]
+    fn render_eth_send_eip1559_no_policy_no_data() {
+        let staged = base_eth_send();
+        let out = PlanRender::render(&staged, "ETH", 18);
+        let expected = "\
+# Staged tx tx_001
+
+Wallet: alice
+From:   0xfromfromfromfromfromfromfromfromfromfrom
+To:     0xtotototototototototototototototototototo
+Chain:  ethereum (id 1)
+Value:  1.5 ETH (1500000000000000000 wei)
+Nonce:  7
+Gas:    limit=21000 max_fee=30000000000 prio=2000000000
+Data:   (none)
+
+## Policy
+- No policy rules configured.
+
+## Confirm
+Write `y` to `confirm` to broadcast, `cancel` to discard, `override` to bypass soft policy warnings.
+";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn render_with_policy_checks() {
+        let mut staged = base_eth_send();
+        staged.policy_checks = vec![
+            PolicyCheck {
+                rule: "max_value".to_string(),
+                outcome: PolicyOutcome::Pass,
+                message: "ok".to_string(),
+            },
+            PolicyCheck {
+                rule: "allowlist".to_string(),
+                outcome: PolicyOutcome::Warn,
+                message: "recipient not on allowlist".to_string(),
+            },
+            PolicyCheck {
+                rule: "block_mainnet".to_string(),
+                outcome: PolicyOutcome::Deny,
+                message: "broadcast denied".to_string(),
+            },
+        ];
+        let out = PlanRender::render(&staged, "ETH", 18);
+        assert!(out.contains("- [Pass] max_value: ok"));
+        assert!(out.contains("- [Warn] allowlist: recipient not on allowlist"));
+        assert!(out.contains("- [Deny] block_mainnet: broadcast denied"));
+        // The "no rules" stub should NOT appear once we have rules.
+        assert!(!out.contains("No policy rules configured"));
+    }
+
+    #[test]
+    fn render_legacy_gas_price() {
+        let mut staged = base_eth_send();
+        staged.max_fee_per_gas = None;
+        staged.max_priority_fee_per_gas = None;
+        staged.gas_price = Some("12000000000".to_string());
+        let out = PlanRender::render(&staged, "ETH", 18);
+        assert!(out.contains("Gas:    limit=21000 gas_price=12000000000 (legacy)"));
+        assert!(!out.contains("max_fee="));
+        assert!(!out.contains("prio="));
+    }
+
+    #[test]
+    fn render_eip1559_with_auto_when_fields_absent() {
+        let mut staged = base_eth_send();
+        staged.max_fee_per_gas = None;
+        staged.max_priority_fee_per_gas = None;
+        // gas_price also None → should fall through to EIP-1559 branch
+        // and print "auto" placeholders.
+        let out = PlanRender::render(&staged, "ETH", 18);
+        assert!(out.contains("max_fee=auto"));
+        assert!(out.contains("prio=auto"));
+    }
+
+    #[test]
+    fn render_data_byte_count_strips_0x_prefix() {
+        let mut staged = base_eth_send();
+        // 4-byte selector; 8 hex chars after 0x.
+        staged.data_hex = "0xa9059cbb".to_string();
+        let out = PlanRender::render(&staged, "ETH", 18);
+        assert!(out.contains("Data:   4 bytes"), "rendered: {out}");
+    }
+
+    #[test]
+    fn render_token_transfer_view() {
+        let mut staged = base_eth_send();
+        staged.value_wei = "0".to_string();
+        staged.token = Some(TokenRef {
+            address: "0xtoken".to_string(),
+            symbol: "USDC".to_string(),
+            decimals: 6,
+            recipient: "0xbob".to_string(),
+            amount: "100".to_string(),
+        });
+        let out = PlanRender::render(&staged, "ETH", 18);
+        assert!(out.contains("To:     0xtotototototototototototototototototototo (token contract)"));
+        assert!(out.contains("Token:  USDC (0xtoken)"));
+        assert!(out.contains("Action: Transfer 100 USDC to 0xbob"));
+        // The plain "To:" line should not appear in the absence of a token block.
+        // (We verified the qualifier above.)
+    }
+
+    #[test]
+    fn render_invalid_value_wei_falls_back_to_zero() {
+        let mut staged = base_eth_send();
+        staged.value_wei = "not-a-number".to_string();
+        let out = PlanRender::render(&staged, "ETH", 18);
+        // Render should not panic and should display 0 for the human form,
+        // while echoing the raw string in the (wei) suffix.
+        assert!(
+            out.contains("Value:  0 ETH (not-a-number wei)"),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn render_uses_native_symbol_and_decimals() {
+        let mut staged = base_eth_send();
+        staged.chain = "polygon".to_string();
+        staged.chain_id = 137;
+        // 2 MATIC at 18 decimals.
+        staged.value_wei = "2000000000000000000".to_string();
+        let out = PlanRender::render(&staged, "MATIC", 18);
+        assert!(out.contains("Chain:  polygon (id 137)"));
+        assert!(out.contains("Value:  2 MATIC (2000000000000000000 wei)"));
+    }
+
+    #[test]
+    fn staged_tx_json_round_trip_minimal() {
+        // Build a minimal serialised form that exercises serde defaults
+        // for token, tx_hash, gas_price, usd_value.
+        let json = r#"{
+            "id":"x","wallet":"w","chain":"anvil","chain_id":31337,
+            "from":"0xa","to":"0xb","value_wei":"0","data_hex":"0x",
+            "gas_limit":21000,"max_fee_per_gas":null,"max_priority_fee_per_gas":null,
+            "nonce":0,"policy_checks":[],"created_ms":0,"expires_ms":0,
+            "status":"pending"
+        }"#;
+        let staged: StagedTx = serde_json::from_str(json).unwrap();
+        assert_eq!(staged.id, "x");
+        assert_eq!(staged.status, TxStatus::Pending);
+        assert!(staged.gas_price.is_none());
+        assert!(staged.token.is_none());
+        assert!(staged.tx_hash.is_none());
+        assert!(staged.usd_value.is_none());
+
+        // Round-trip back.
+        let s = serde_json::to_string(&staged).unwrap();
+        let back: StagedTx = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.id, staged.id);
+        assert_eq!(back.status, staged.status);
+    }
+
+    #[test]
+    fn render_includes_id_wallet_from_to() {
+        // Edge case: "empty plan" in this codebase = no policy_checks +
+        // no token + empty data. The render still emits the standard
+        // header, gas, and confirm sections.
+        let staged = base_eth_send();
+        let out = PlanRender::render(&staged, "ETH", 18);
+        assert!(out.starts_with("# Staged tx tx_001\n"));
+        assert!(out.contains("Wallet: alice"));
+        assert!(out.contains("From:   0xfromfromfromfromfromfromfromfromfromfrom"));
+        assert!(out.ends_with(
+            "## Confirm\nWrite `y` to `confirm` to broadcast, `cancel` to discard, \
+             `override` to bypass soft policy warnings.\n"
+        ));
+    }
+}
