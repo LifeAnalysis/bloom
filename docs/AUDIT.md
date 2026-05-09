@@ -86,7 +86,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | ENS forward resolution surface | `ens/<name>.eth` | shipped | ENS handler (forward resolve via `crates/beth-ens` against the canonical mainnet registry) |
 | NFTs (`addresses/<a>/nfts/...`) | — | deferred | Spec §3.2 surface; not implemented. |
 | Mempool (`chains/<c>/mempool/...`) | — | deferred | Spec §3.2 surface; depends on provider-specific APIs. |
-| Contract methods / events / storage subtrees | `chains/<c>/contracts/<a>/{methods,events,storage}/...` | partial | `source` and `abi` shipped via Etherscan; live `methods/<m>.{read,tx,sig}` + `events/<e>/{recent,live,query}` + `storage/<slot>` deferred. |
+| Contract methods / events / storage / proxy subtrees | `chains/<c>/contracts/<a>/{methods,events,storage,proxy}/...` | shipped | `crates/beth-vfs/src/handlers/chains_contracts.rs` — ABI-driven `methods/<m>.{read,tx,sig}` (writable JSON body, eth_call + decode, no broadcast), `events/<e>/{recent,query,live}` (eth_getLogs + alloy log decoding, per-(chain,addr,event) live cursor), `storage/<slot>` and `proxy/{implementation,admin,beacon}` (EIP-1967 + EIP-1822). Methods/events gated behind `contract_metadata = etherscan` (ABI source); storage/proxy stay RPC-only. ABI cache TTL 60s. |
 
 ## §4 — Daemon
 
@@ -172,17 +172,20 @@ data or rely on their own internal caches, e.g. the etherscan client).
    implemented.
 2. **Mempool subtree** (`chains/<c>/mempool/...`) — not implemented;
    depends on provider-specific APIs.
-3. **Contract methods / events / storage subtrees** — `source` and
-   `abi` are shipped via Etherscan; the `methods/`, `events/`, and
-   `storage/` subtrees from §3.2 are deferred.
-4. **Embedded block indexer** — activity / history rely on Etherscan
+3. **Embedded block indexer** — activity / history rely on Etherscan
    v2; without an `[etherscan]` config block, those paths return
    `NotFound`.
-5. **Mainnet-fork acceptance scenarios.** `acceptance.sh` skips
+4. **Mainnet-fork acceptance scenarios.** `acceptance.sh` skips
    scenarios 3 + 4 unless `BETH_MAINNET_RPC` is set.
-6. **Multi-user daemon auth** — single-user only.
-7. **Hardware wallets, smart accounts (4337), distributed sync** —
+5. **Multi-user daemon auth** — single-user only.
+6. **Hardware wallets, smart accounts (4337), distributed sync** —
    all spec stretch goals; not started.
+7. **Live event tail cursor is per-handler-process, not per-client.**
+   `events/<e>/live` reuses a single `(chain,addr,event)` cursor
+   across readers; concurrent tails will race for "what's new since
+   last read". Documented in
+   `crates/beth-vfs/src/handlers/chains_contracts.rs` under "Live tail
+   caveat".
 
 ## Files map
 

@@ -8,11 +8,14 @@
 
 use std::sync::Arc;
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, BlockHash, Bytes, B256, U256};
 use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::eth::state::StateOverride;
-use alloy::rpc::types::eth::{Block, Transaction, TransactionReceipt, TransactionRequest};
+use alloy::rpc::types::eth::{
+    Block, Filter, Log, Transaction, TransactionReceipt, TransactionRequest,
+};
 use alloy::transports::TransportError;
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -251,6 +254,38 @@ impl ChainClient {
             .map(|s| s.trim_matches('\0').to_string()))
     }
 
+    /// Read a single 32-byte storage slot at `addr`, optionally pinning
+    /// the read to a specific block (defaults to `latest`). The `block`
+    /// arg accepts `"latest"`, a decimal block number, or `0x`-prefixed
+    /// hex. Surfaces `eth_getStorageAt` directly so callers can read raw
+    /// state (EIP-1967 proxy slots, ERC-20 internals, packed structs).
+    pub async fn eth_get_storage_at(
+        &self,
+        addr: Address,
+        slot: U256,
+        block: Option<&str>,
+    ) -> Result<B256, ChainError> {
+        let req = self.primary.get_storage_at(addr, slot);
+        let val: U256 = match block {
+            None | Some("latest") | Some("") => req.await?,
+            Some("earliest") => req.block_id(BlockNumberOrTag::Earliest.into()).await?,
+            Some("pending") => req.block_id(BlockNumberOrTag::Pending.into()).await?,
+            Some(s) => {
+                let n = parse_block_arg(s)?;
+                req.block_id(BlockNumberOrTag::Number(n).into()).await?
+            }
+        };
+        Ok(B256::from(val.to_be_bytes::<32>()))
+    }
+
+    /// Fetch logs for a fully-formed `Filter`. Thin wrapper over
+    /// `eth_getLogs`; the contract handler builds the `Filter` from
+    /// user-supplied `from_block`/`to_block`/topics so the wrapper stays
+    /// transport-agnostic.
+    pub async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>, ChainError> {
+        Ok(self.primary.get_logs(filter).await?)
+    }
+
     /// Run `eth_call` against the latest block, optionally applying a set of
     /// state overrides (account balance / nonce / code / storage). This is the
     /// simulator's main hammer — never broadcasts.
@@ -263,6 +298,28 @@ impl ChainClient {
         let bytes = match overrides {
             Some(o) => call.overrides(o).await?,
             None => call.await?,
+        };
+        Ok(bytes)
+    }
+
+    /// Run `eth_call` against an explicit block tag/number. Used by the
+    /// `methods/<m>.read` surface so users can read state at a historical
+    /// block. `block` accepts the same vocabulary as
+    /// [`Self::eth_get_storage_at`].
+    pub async fn eth_call_at_block(
+        &self,
+        req: TransactionRequest,
+        block: Option<&str>,
+    ) -> Result<Bytes, ChainError> {
+        let call = self.primary.call(req);
+        let bytes = match block {
+            None | Some("latest") | Some("") => call.await?,
+            Some("earliest") => call.block(BlockNumberOrTag::Earliest.into()).await?,
+            Some("pending") => call.block(BlockNumberOrTag::Pending.into()).await?,
+            Some(s) => {
+                let n = parse_block_arg(s)?;
+                call.block(BlockNumberOrTag::Number(n).into()).await?
+            }
         };
         Ok(bytes)
     }
@@ -338,6 +395,19 @@ pub fn parse_block_hash(s: &str) -> Result<BlockHash, ChainError> {
         .map_err(|e| ChainError::Decode(e.to_string()))
 }
 
+/// Parse a block-number argument as decimal or `0x`-prefixed hex.
+/// Used by the storage / methods surfaces so users can write either
+/// `latest`, `123`, or `0x7b` interchangeably.
+pub fn parse_block_arg(s: &str) -> Result<u64, ChainError> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).map_err(|e| ChainError::Decode(format!("block hex: {e}")))
+    } else {
+        s.parse::<u64>()
+            .map_err(|e| ChainError::Decode(format!("block dec: {e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +427,15 @@ mod tests {
         let mut s = ChainSpec::anvil_default();
         s.rpc_urls.clear();
         assert!(ChainClient::new(s).is_err());
+    }
+
+    #[test]
+    fn parse_block_arg_dec_and_hex() {
+        assert_eq!(parse_block_arg("0").unwrap(), 0);
+        assert_eq!(parse_block_arg("123").unwrap(), 123);
+        assert_eq!(parse_block_arg("0x7b").unwrap(), 123);
+        assert_eq!(parse_block_arg("0X7B").unwrap(), 123);
+        assert!(parse_block_arg("nope").is_err());
+        assert!(parse_block_arg("0xZZ").is_err());
     }
 }

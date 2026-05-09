@@ -63,7 +63,26 @@ The VFS is rooted at `/eth/` (the default NFS mount path) with these
 top-level trees:
 
 - `chains/<chain>/` — read-only chain views: head, blocks, addresses,
-  ERC-20 balances, txs, receipts, gas, etherscan-backed history.
+  ERC-20 balances, txs, receipts, gas, etherscan-backed history. The
+  contract surface lives under `chains/<c>/contracts/<a>/`:
+  - `source`, `abi` — verified Etherscan source / ABI (cached 7 days).
+  - `methods/<name>.{read,tx,sig}` — ABI-driven calldata. `.read`
+    encodes args, runs `eth_call`, and decodes the return value;
+    `.tx` returns `{to, selector, calldata}` without broadcasting
+    (pipe into the wallet outbox to send); `.sig` is the canonical
+    Solidity signature plus selector. `.read` and `.tx` accept a
+    JSON body `{"args":[…], "selector"?, "block"?, "from"?}` — pass
+    `selector` to disambiguate overloads.
+  - `events/<name>/{recent,query,live}` — ABI-decoded `eth_getLogs`.
+    `recent` returns the last ~200 logs over the last ~10_000 blocks;
+    `query` accepts `{from_block?, to_block?, topics?, where?}` for
+    custom filters; `live` is a long-poll tail with a per-handler
+    cursor.
+  - `storage/<slot>` — raw `eth_getStorageAt` (slot is decimal or
+    `0x`-hex).
+  - `proxy/{implementation,admin,beacon}` — well-known EIP-1967 /
+    EIP-1822 slot reads, returning a checksummed address or
+    `not a proxy\n` when the slot is empty.
 - `wallets/<name>/` — managed wallets, per-chain balances/nonce, the
   `outbox/` write surface, and `sign/{message,hash,typed_data}` for
   EIP-191 / raw / EIP-712 signatures.

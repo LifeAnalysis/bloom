@@ -134,7 +134,7 @@ fn split_tuple(s: &str) -> Result<Vec<String>, ToolsError> {
     Ok(out)
 }
 
-pub(crate) fn json_to_sol(ty: &DynSolType, v: &serde_json::Value) -> Result<DynSolValue, String> {
+pub fn json_to_sol(ty: &DynSolType, v: &serde_json::Value) -> Result<DynSolValue, String> {
     use serde_json::Value;
     match ty {
         DynSolType::Address => {
@@ -230,7 +230,7 @@ fn decode_hex_str(s: &str) -> Result<Vec<u8>, String> {
     hex::decode(s).map_err(|e| e.to_string())
 }
 
-pub(crate) fn sol_to_json(v: &DynSolValue) -> serde_json::Value {
+pub fn sol_to_json(v: &DynSolValue) -> serde_json::Value {
     use serde_json::Value;
     match v {
         DynSolValue::Address(a) => Value::String(a.to_checksum(None)),

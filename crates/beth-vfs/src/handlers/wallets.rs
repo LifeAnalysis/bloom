@@ -1089,11 +1089,7 @@ mod tests {
     async fn list_pending_returns_seeded_ids() {
         let f = make_handler_with_chain(true);
         seed_pending(&f, "0001-21699");
-        let p = VfsPath::parse(&format!(
-            "/{}/chains/anvil/outbox/pending",
-            f.wallet_name
-        ))
-        .unwrap();
+        let p = VfsPath::parse(&format!("/{}/chains/anvil/outbox/pending", f.wallet_name)).unwrap();
         let entries = f.handler.list(&p).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"0001-21699"), "names={names:?}");

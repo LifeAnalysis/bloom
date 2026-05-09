@@ -22,6 +22,17 @@
 //! - `chains/<chain>/addresses/<addr>/erc721_txs` — ERC-721 transfers
 //! - `chains/<chain>/contracts/<addr>/source` — verified source
 //! - `chains/<chain>/contracts/<addr>/abi` — verified ABI
+//! - `chains/<chain>/contracts/<addr>/methods/<name>.{read,tx,sig}` —
+//!   ABI-driven calldata + `eth_call` interaction.
+//! - `chains/<chain>/contracts/<addr>/events/<name>/{recent,query,live}` —
+//!   ABI-driven log decoding (RPC).
+//!
+//! RPC-only (always available):
+//! - `chains/<chain>/contracts/<addr>/storage/<slot>` — `eth_getStorageAt`
+//!   (slot is decimal or `0x`-hex). Backend default `rpc`.
+//! - `chains/<chain>/contracts/<addr>/proxy/{implementation,admin,beacon}` —
+//!   well-known EIP-1967 / EIP-1822 slot reads. Returns a checksummed
+//!   address or `not a proxy\n` when the slot is empty.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +47,9 @@ use beth_proto::{checksum_address, format_units, Backend, BackendsConfig};
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
 
+use super::chains_contracts::{
+    self, AbiCache, LiveTailState, PendingBodies, EVENT_LEAVES, METHOD_LEAVES, PROXY_LEAVES,
+};
 use super::chains_history;
 
 #[derive(Clone)]
@@ -44,6 +58,18 @@ pub struct ChainsHandler {
     pub etherscan: Option<Arc<EtherscanClient>>,
     pub ens: Option<EnsClient>,
     pub backends: BackendsConfig,
+    /// Short-TTL ABI cache shared across method/event reads. Lives on
+    /// the handler so the dispatcher's caches stick around between
+    /// requests; `Clone` of the handler is cheap because both fields
+    /// are `Arc`.
+    abi_cache: Arc<AbiCache>,
+    /// Per-(chain, addr, event) cursor for the `events/<name>/live`
+    /// long-poll surface. See `chains_contracts::LiveTailState` doc.
+    live_state: Arc<LiveTailState>,
+    /// Last-written body for each writable methods/events file. Reads
+    /// fall back to an empty `{"args":[]}` body when nothing has been
+    /// posted yet; this makes the surface ergonomic from the shell.
+    pending: Arc<PendingBodies>,
 }
 
 impl ChainsHandler {
@@ -53,6 +79,9 @@ impl ChainsHandler {
             etherscan: None,
             ens: None,
             backends: BackendsConfig::default(),
+            abi_cache: Arc::new(AbiCache::new()),
+            live_state: Arc::new(LiveTailState::new()),
+            pending: Arc::new(PendingBodies::new()),
         }
     }
 
@@ -103,7 +132,10 @@ impl ChainsHandler {
     ///
     /// Used by surfaces that today only work via etherscan
     /// (`contract_metadata`, `address_history`).
-    fn require_etherscan_backend(&self, feature: &str) -> Result<&Arc<EtherscanClient>, HandlerError> {
+    fn require_etherscan_backend(
+        &self,
+        feature: &str,
+    ) -> Result<&Arc<EtherscanClient>, HandlerError> {
         let backend = match feature {
             "contract_metadata" => self.backends.contract_metadata,
             "address_history" => self.backends.address_history,
@@ -141,6 +173,106 @@ impl ChainsHandler {
     /// Whether `contract_metadata` is currently usable.
     fn contract_metadata_ready(&self) -> bool {
         matches!(self.backends.contract_metadata, Backend::Etherscan) && self.etherscan.is_some()
+    }
+
+    /// Decompose `methods/<name>.<leaf>` into (`name`, `leaf`). Returns
+    /// `None` if the trailing segment doesn't look like one of our
+    /// `.read`/`.tx`/`.sig` leaves.
+    fn split_method_leaf(seg: &str) -> Option<(&str, &str)> {
+        for leaf in METHOD_LEAVES {
+            let pat = format!(".{leaf}");
+            if let Some(name) = seg.strip_suffix(&pat) {
+                if !name.is_empty() {
+                    return Some((name, leaf));
+                }
+            }
+        }
+        None
+    }
+
+    async fn lookup_contracts(
+        &self,
+        path: &VfsPath,
+        segs: &[String],
+    ) -> Result<Entry, HandlerError> {
+        // segs = ["<chain>", "contracts", "<addr>", ...rest]
+        match segs.len() {
+            2 => Ok(Entry::dir("contracts")),
+            3 => {
+                self.require_etherscan_backend("contract_metadata")?;
+                Ok(Entry::dir(&segs[2]))
+            }
+            n if n >= 4 => {
+                let _addr = parse_addr(&segs[2])?;
+                let kind = segs[3].as_str();
+                match kind {
+                    "source" | "abi" => {
+                        if n != 4 {
+                            return Err(HandlerError::not_found(path.to_string_path()));
+                        }
+                        self.require_etherscan_backend("contract_metadata")?;
+                        Ok(Entry::file(kind))
+                    }
+                    "methods" => {
+                        self.require_etherscan_backend("contract_metadata")?;
+                        match n {
+                            4 => Ok(Entry::dir("methods")),
+                            5 => {
+                                let leaf = segs[4].as_str();
+                                let (_, suffix) =
+                                    Self::split_method_leaf(leaf).ok_or_else(|| {
+                                        HandlerError::not_found(path.to_string_path())
+                                    })?;
+                                Ok(if suffix == "sig" {
+                                    Entry::file(leaf)
+                                } else {
+                                    Entry::writable_file(leaf)
+                                })
+                            }
+                            _ => Err(HandlerError::not_found(path.to_string_path())),
+                        }
+                    }
+                    "events" => {
+                        self.require_etherscan_backend("contract_metadata")?;
+                        match n {
+                            4 => Ok(Entry::dir("events")),
+                            5 => Ok(Entry::dir(&segs[4])),
+                            6 => {
+                                let leaf = segs[5].as_str();
+                                if !EVENT_LEAVES.contains(&leaf) {
+                                    return Err(HandlerError::not_found(path.to_string_path()));
+                                }
+                                Ok(if leaf == "query" {
+                                    Entry::writable_file(leaf)
+                                } else {
+                                    Entry::file(leaf)
+                                })
+                            }
+                            _ => Err(HandlerError::not_found(path.to_string_path())),
+                        }
+                    }
+                    "storage" => match n {
+                        4 => Ok(Entry::dir("storage")),
+                        5 => Ok(Entry::file(&segs[4])),
+                        _ => Err(HandlerError::not_found(path.to_string_path())),
+                    },
+                    "proxy" => match n {
+                        4 => Ok(Entry::dir("proxy")),
+                        5 => {
+                            let leaf = segs[4].as_str();
+                            if PROXY_LEAVES.contains(&leaf) {
+                                Ok(Entry::file(leaf))
+                            } else {
+                                Err(HandlerError::not_found(path.to_string_path()))
+                            }
+                        }
+                        _ => Err(HandlerError::not_found(path.to_string_path())),
+                    },
+                    _ => Err(HandlerError::not_found(path.to_string_path())),
+                }
+            }
+            _ => Err(HandlerError::not_found(path.to_string_path())),
+        }
     }
 }
 
@@ -258,22 +390,7 @@ impl Handler for ChainsHandler {
                 }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
-            "contracts" => match segs.len() {
-                2 => Ok(Entry::dir("contracts")),
-                3 => {
-                    self.require_etherscan_backend("contract_metadata")?;
-                    Ok(Entry::dir(&segs[2]))
-                }
-                4 => {
-                    let f = segs[3].as_str();
-                    if !CONTRACT_FILES_ETHERSCAN.contains(&f) {
-                        return Err(HandlerError::not_found(path.to_string_path()));
-                    }
-                    self.require_etherscan_backend("contract_metadata")?;
-                    Ok(Entry::file(f))
-                }
-                _ => Err(HandlerError::not_found(path.to_string_path())),
-            },
+            "contracts" => self.lookup_contracts(path, segs).await,
             "gas" => match segs.get(2).map(|s| s.as_str()) {
                 None => Ok(Entry::dir("gas")),
                 Some("current.json") => Ok(Entry::file("current.json")),
@@ -476,16 +593,7 @@ impl Handler for ChainsHandler {
                     _ => Err(HandlerError::NotAFile(path.to_string_path())),
                 }
             }
-            "contracts" if segs.len() == 4 => {
-                let addr = parse_addr(&segs[2])?;
-                let spec = client.spec();
-                let es = self.require_etherscan_backend("contract_metadata")?;
-                match segs[3].as_str() {
-                    "source" => chains_history::read_contract_source(es, spec.chain_id, addr).await,
-                    "abi" => chains_history::read_contract_abi(es, spec.chain_id, addr).await,
-                    _ => Err(HandlerError::NotAFile(path.to_string_path())),
-                }
-            }
+            "contracts" if segs.len() >= 4 => self.read_contracts(path, segs, &client).await,
             "gas" if segs.get(2).map(|s| s.as_str()) == Some("current.json") => {
                 let gp = client.gas_price().await.map_err(err_be)?;
                 let body = serde_json::json!({ "gas_price_wei": gp });
@@ -554,16 +662,20 @@ impl Handler for ChainsHandler {
                 // /chains/<chain>/tx/<hash>
                 Ok(TX_FILES.iter().map(|n| Entry::file(n)).collect())
             }
-            3 if segs[1] == "contracts" => {
-                // /chains/<chain>/contracts/<addr>
-                self.require_etherscan_backend("contract_metadata")?;
-                Ok(CONTRACT_FILES_ETHERSCAN
-                    .iter()
-                    .map(|n| Entry::file(n))
-                    .collect())
-            }
+            n if n >= 3 && segs[1] == "contracts" => self.list_contracts(segs).await,
             _ => Ok(Vec::new()),
         }
+    }
+
+    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        let segs = path.segments();
+        if segs.len() >= 4 && segs[1] == "contracts" {
+            // Validate the chain so the caller doesn't get a permission
+            // error for a non-existent chain.
+            let _ = self.client(&segs[0])?;
+            return self.write_contracts(path, segs, data).await;
+        }
+        Err(HandlerError::PermissionDenied)
     }
 
     /// Per-path TTLs. The router consults this before dispatching the
@@ -599,8 +711,14 @@ impl Handler for ChainsHandler {
                 Some("ens") => Some(Duration::from_secs(300)),
                 _ => None,
             },
-            // Verified source / ABI: effectively immutable.
-            "contracts" => Some(Duration::from_secs(7 * 86_400)),
+            // Verified source / ABI: effectively immutable. Method
+            // and event reads change with chain state so don't cache
+            // them at the router level — the dynamic surfaces enforce
+            // freshness themselves.
+            "contracts" => match segs.get(3).map(|s| s.as_str()) {
+                Some("source" | "abi") => Some(Duration::from_secs(7 * 86_400)),
+                _ => None,
+            },
             // Block by number is permanent past finality; we don't know
             // finality here so use a long but bounded TTL.
             "blocks" => Some(Duration::from_secs(300)),
@@ -611,6 +729,204 @@ impl Handler for ChainsHandler {
 
 // silence unused `checksum_address` lint while still keeping it exported
 const _: fn(&alloy::primitives::Address) -> String = checksum_address;
+
+impl ChainsHandler {
+    /// Routing helper for `contracts/<addr>/...` reads. Splits the
+    /// existing source/abi paths from the new dynamic surfaces. The
+    /// caller has already validated the chain.
+    async fn read_contracts(
+        &self,
+        path: &VfsPath,
+        segs: &[String],
+        client: &ChainClient,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let addr = parse_addr(&segs[2])?;
+        let chain_id = client.spec().chain_id;
+        let kind = segs[3].as_str();
+        match kind {
+            "source" if segs.len() == 4 => {
+                let es = self.require_etherscan_backend("contract_metadata")?;
+                chains_history::read_contract_source(es, chain_id, addr).await
+            }
+            "abi" if segs.len() == 4 => {
+                let es = self.require_etherscan_backend("contract_metadata")?;
+                chains_history::read_contract_abi(es, chain_id, addr).await
+            }
+            "methods" if segs.len() == 5 => {
+                let es = self.require_etherscan_backend("contract_metadata")?;
+                let leaf = segs[4].as_str();
+                let (name, suffix) = Self::split_method_leaf(leaf)
+                    .ok_or_else(|| HandlerError::not_found(path.to_string_path()))?;
+                let abi = chains_contracts::fetch_abi(&self.abi_cache, es, chain_id, addr).await?;
+                // Sniff `selector` from the staged body so overloads
+                // disambiguate before we encode args.
+                let body_str = std::str::from_utf8(&self.pending.peek(&path.to_string_path()))
+                    .ok()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let selector_hint = serde_json::from_str::<serde_json::Value>(&body_str)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("selector")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                    });
+                let func = chains_contracts::pick_function(&abi, name, selector_hint.as_deref())?;
+                match suffix {
+                    "sig" => Ok(chains_contracts::render_method_sig(func)),
+                    "read" => {
+                        let body: chains_contracts::MethodCallBody =
+                            self.read_pending_body(path)?;
+                        chains_contracts::run_method_read(client, addr, func, &body).await
+                    }
+                    "tx" => {
+                        let body: chains_contracts::MethodCallBody =
+                            self.read_pending_body(path)?;
+                        chains_contracts::run_method_tx(addr, func, &body)
+                    }
+                    _ => Err(HandlerError::NotAFile(path.to_string_path())),
+                }
+            }
+            "events" if segs.len() == 6 => {
+                let es = self.require_etherscan_backend("contract_metadata")?;
+                let abi = chains_contracts::fetch_abi(&self.abi_cache, es, chain_id, addr).await?;
+                let event_name = segs[4].as_str();
+                let event = chains_contracts::pick_event(&abi, event_name)?;
+                match segs[5].as_str() {
+                    "recent" => chains_contracts::run_event_recent(client, addr, event).await,
+                    "query" => {
+                        let body: chains_contracts::EventQueryBody =
+                            self.read_pending_body(path)?;
+                        chains_contracts::run_event_query(client, addr, event, &body).await
+                    }
+                    "live" => {
+                        chains_contracts::run_event_live(
+                            &self.live_state,
+                            client,
+                            chain_id,
+                            addr,
+                            event_name,
+                            event,
+                        )
+                        .await
+                    }
+                    _ => Err(HandlerError::NotAFile(path.to_string_path())),
+                }
+            }
+            "storage" if segs.len() == 5 => {
+                chains_contracts::read_storage_slot(client, addr, &segs[4]).await
+            }
+            "proxy" if segs.len() == 5 => {
+                let leaf = segs[4].as_str();
+                let (slot, fb) = chains_contracts::proxy_slot(leaf)
+                    .ok_or_else(|| HandlerError::not_found(path.to_string_path()))?;
+                chains_contracts::read_proxy_slot(client, addr, slot, fb).await
+            }
+            _ => Err(HandlerError::NotAFile(path.to_string_path())),
+        }
+    }
+
+    /// Pull the parsed body posted to `path` (or the empty default).
+    /// Errors if the bytes don't deserialise as `B`.
+    fn read_pending_body<B: serde::de::DeserializeOwned + Default>(
+        &self,
+        path: &VfsPath,
+    ) -> Result<B, HandlerError> {
+        let key = path.to_string_path();
+        let bytes = self.pending.take_or_default(&key);
+        let s = std::str::from_utf8(&bytes).map_err(|e| HandlerError::invalid(e.to_string()))?;
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Ok(B::default());
+        }
+        serde_json::from_str(trimmed).map_err(|e| HandlerError::invalid(format!("body json: {e}")))
+    }
+
+    /// Routing helper for writes under `contracts/<addr>/...`.
+    async fn write_contracts(
+        &self,
+        path: &VfsPath,
+        segs: &[String],
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
+        // Validate addr early.
+        let _ = parse_addr(&segs[2])?;
+        let key = path.to_string_path();
+        // Sniff that the body is well-formed JSON so writes fail loudly
+        // rather than silently storing garbage.
+        let trimmed = std::str::from_utf8(data)
+            .map_err(|e| HandlerError::invalid(e.to_string()))?
+            .trim();
+        if !trimmed.is_empty() {
+            let _: serde_json::Value = serde_json::from_str(trimmed)
+                .map_err(|e| HandlerError::invalid(format!("body json: {e}")))?;
+        }
+        match segs.get(3).map(|s| s.as_str()) {
+            Some("methods") if segs.len() == 5 => {
+                let leaf = segs[4].as_str();
+                let suffix = Self::split_method_leaf(leaf)
+                    .map(|(_, s)| s)
+                    .ok_or(HandlerError::PermissionDenied)?;
+                if suffix == "sig" {
+                    return Err(HandlerError::PermissionDenied);
+                }
+                self.pending.store(key, data.to_vec());
+                Ok(())
+            }
+            Some("events") if segs.len() == 6 && segs[5] == "query" => {
+                self.pending.store(key, data.to_vec());
+                Ok(())
+            }
+            _ => Err(HandlerError::PermissionDenied),
+        }
+    }
+
+    /// Listing helper for `contracts/<addr>/...` directories.
+    async fn list_contracts(&self, segs: &[String]) -> Result<Vec<Entry>, HandlerError> {
+        match segs.len() {
+            3 => {
+                self.require_etherscan_backend("contract_metadata")?;
+                let mut out: Vec<Entry> = CONTRACT_FILES_ETHERSCAN
+                    .iter()
+                    .map(|n| Entry::file(n))
+                    .collect();
+                out.push(Entry::dir("methods"));
+                out.push(Entry::dir("events"));
+                out.push(Entry::dir("storage"));
+                out.push(Entry::dir("proxy"));
+                Ok(out)
+            }
+            4 => match segs[3].as_str() {
+                "methods" => {
+                    let _es = self.require_etherscan_backend("contract_metadata")?;
+                    // We don't pre-enumerate the ABI for `ls methods/`;
+                    // it would require a fresh etherscan hit per
+                    // listing. The shell still allows direct
+                    // `cat methods/<name>.sig`.
+                    Ok(Vec::new())
+                }
+                "events" => {
+                    let _es = self.require_etherscan_backend("contract_metadata")?;
+                    Ok(Vec::new())
+                }
+                "storage" => Ok(Vec::new()),
+                "proxy" => Ok(PROXY_LEAVES.iter().map(|n| Entry::file(n)).collect()),
+                _ => Ok(Vec::new()),
+            },
+            5 if segs[3] == "events" => Ok(EVENT_LEAVES
+                .iter()
+                .map(|n| {
+                    if *n == "query" {
+                        Entry::writable_file(n)
+                    } else {
+                        Entry::file(n)
+                    }
+                })
+                .collect()),
+            _ => Ok(Vec::new()),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -768,8 +1084,10 @@ mod tests {
     /// not appear in directory listings.
     #[tokio::test]
     async fn rpc_backend_for_address_history_gates_paths_with_clear_error() {
-        let mut backends = BackendsConfig::default();
-        backends.address_history = Backend::Rpc;
+        let backends = BackendsConfig {
+            address_history: Backend::Rpc,
+            ..Default::default()
+        };
         let h = ChainsHandler::new(anvil_registry()).with_backends(backends);
         let chain_name = h.registry.list_names()[0].clone();
 
@@ -802,8 +1120,10 @@ mod tests {
     /// must produce a "not yet implemented" error.
     #[tokio::test]
     async fn indexer_backend_returns_not_yet_implemented() {
-        let mut backends = BackendsConfig::default();
-        backends.contract_metadata = Backend::Indexer;
+        let backends = BackendsConfig {
+            contract_metadata: Backend::Indexer,
+            ..Default::default()
+        };
         let h = ChainsHandler::new(anvil_registry()).with_backends(backends);
         let chain_name = h.registry.list_names()[0].clone();
         let p = VfsPath::parse(&format!(
@@ -846,5 +1166,441 @@ mod tests {
             Err(HandlerError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    // ---- contract surface tests ---------------------------------------
+    //
+    // The contract surface tests need a JSON-RPC mock that classifies
+    // requests by `method` and replies appropriately, plus a single-shot
+    // canned Etherscan server for the ABI fetch. We wire both, point a
+    // synthetic `ChainSpec` at the RPC mock, and exercise each path
+    // through the public `Handler` trait so we cover routing + dispatch.
+
+    /// Spawn an HTTP server that handles many JSON-RPC requests on the
+    /// same listener, dispatching by method name. Each entry in `routes`
+    /// is `(method, response_result_value)`. `eth_chainId` is auto-handled
+    /// when present in `chain_id` so callers don't have to repeat it.
+    ///
+    /// Returns when the listener accepts at least one connection; the
+    /// task lives until all routes have been hit at least once or the
+    /// caller's handle is dropped.
+    fn spawn_rpc(
+        chain_id: u64,
+        responses: std::collections::HashMap<String, serde_json::Value>,
+    ) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let mut buf = vec![0u8; 65536];
+                let mut total = 0usize;
+                let mut header_end = None;
+                let mut content_length = 0usize;
+                // Read until we have headers + content_length bytes of body.
+                loop {
+                    let n = s.read(&mut buf[total..]).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                    if header_end.is_none() {
+                        if let Some(idx) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(idx + 4);
+                            // crude content-length parse
+                            let head = std::str::from_utf8(&buf[..idx]).unwrap_or("");
+                            for line in head.split("\r\n") {
+                                if let Some(v) = line
+                                    .strip_prefix("Content-Length:")
+                                    .or_else(|| line.strip_prefix("content-length:"))
+                                {
+                                    content_length = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(he) = header_end {
+                        if total >= he + content_length {
+                            break;
+                        }
+                    }
+                    if total == buf.len() {
+                        break;
+                    }
+                }
+                let body_start = header_end.unwrap_or(total);
+                let body = &buf[body_start..total.min(body_start + content_length)];
+                let req: serde_json::Value =
+                    serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+                let id = req.get("id").cloned().unwrap_or(serde_json::json!(1));
+                let method = req
+                    .get("method")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let result = if method == "eth_chainId" {
+                    serde_json::Value::String(format!("0x{:x}", chain_id))
+                } else {
+                    responses
+                        .get(&method)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                };
+                let resp_body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    /// Build a registry pointed at the supplied RPC mock, with a
+    /// custom chain_id so the handler's `chain_id`-aware caches and
+    /// path coding don't collide with the default 31337 anvil spec.
+    fn registry_for_rpc(rpc: SocketAddr, chain_id: u64) -> ChainRegistry {
+        let spec = ChainSpec {
+            name: "test".into(),
+            chain_id,
+            rpc_urls: vec![format!("http://{rpc}")],
+            allow_broadcast: false,
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+        };
+        let client = ChainClient::new(spec).unwrap();
+        let reg = ChainRegistry::default();
+        reg.add(client);
+        reg
+    }
+
+    /// Minimal ERC-20 ABI: `balanceOf`, `transfer`, `Transfer` event.
+    /// Picked to exercise both function/event paths and overload branches.
+    const ERC20_ABI: &str = r#"[
+        {"type":"function","name":"balanceOf","stateMutability":"view",
+         "inputs":[{"name":"owner","type":"address"}],
+         "outputs":[{"name":"","type":"uint256"}]},
+        {"type":"function","name":"transfer","stateMutability":"nonpayable",
+         "inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],
+         "outputs":[{"name":"","type":"bool"}]},
+        {"type":"event","name":"Transfer","anonymous":false,
+         "inputs":[{"name":"from","type":"address","indexed":true},
+                   {"name":"to","type":"address","indexed":true},
+                   {"name":"value","type":"uint256","indexed":false}]}
+    ]"#;
+
+    /// Spawn a canned Etherscan server returning `ERC20_ABI` for every
+    /// request. The single-shot pattern is fine because the handler's
+    /// AbiCache memoises the result for 60s and we never hit it twice
+    /// in any one test.
+    async fn spawn_erc20_etherscan() -> SocketAddr {
+        let body = format!(
+            r#"{{"status":"1","message":"OK","result":{}}}"#,
+            serde_json::Value::String(ERC20_ABI.to_string())
+        );
+        // Leak the body so the canned server can hold a 'static slice.
+        let body_static: &'static str = Box::leak(body.into_boxed_str());
+        spawn_canned(body_static).await
+    }
+
+    /// Demo address — vitalik.eth, used purely as a stable EIP-55 sample.
+    const SAMPLE_ADDR: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+
+    #[tokio::test]
+    async fn methods_sig_returns_signature_and_selector() {
+        let es = spawn_erc20_etherscan().await;
+        let rpc = spawn_rpc(31338, std::collections::HashMap::new());
+        let h =
+            ChainsHandler::new(registry_for_rpc(rpc, 31338)).with_etherscan(Some(etherscan_to(es)));
+        let p = VfsPath::parse(&format!(
+            "/test/contracts/{SAMPLE_ADDR}/methods/balanceOf.sig"
+        ))
+        .unwrap();
+        let bytes = h.read(&p).await.unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        // alloy's signature_with_outputs is canonical Solidity-style.
+        assert!(s.contains("balanceOf(address)"), "sig output: {s}");
+        // ERC-20 balanceOf selector is 0x70a08231.
+        assert!(s.contains("0x70a08231"), "missing selector: {s}");
+    }
+
+    #[tokio::test]
+    async fn methods_read_decodes_uint256_result() {
+        // Encode 1234 as a 32-byte big-endian uint256 — what `eth_call`
+        // would return for `balanceOf(...) -> uint256`.
+        let mut raw = [0u8; 32];
+        raw[31] = 0xd2;
+        raw[30] = 0x04;
+        let hex_raw = format!("0x{}", hex::encode(raw));
+        let mut routes = std::collections::HashMap::new();
+        routes.insert("eth_call".to_string(), serde_json::Value::String(hex_raw));
+        let es = spawn_erc20_etherscan().await;
+        let rpc = spawn_rpc(31338, routes);
+        let h =
+            ChainsHandler::new(registry_for_rpc(rpc, 31338)).with_etherscan(Some(etherscan_to(es)));
+        let p = VfsPath::parse(&format!(
+            "/test/contracts/{SAMPLE_ADDR}/methods/balanceOf.read"
+        ))
+        .unwrap();
+        // Stage the call args: balanceOf(SAMPLE_ADDR).
+        let body = serde_json::json!({"args": [SAMPLE_ADDR]}).to_string();
+        h.write(&p, body.as_bytes()).await.unwrap();
+        let bytes = h.read(&p).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["selector"], "0x70a08231");
+        // Decoded value is the JSON array form; uint256 1234 serialises
+        // as a string ("1234") via sol_to_json.
+        assert_eq!(v["decoded"], serde_json::json!(["1234"]));
+    }
+
+    #[tokio::test]
+    async fn methods_tx_returns_4byte_selector_and_calldata() {
+        let es = spawn_erc20_etherscan().await;
+        let rpc = spawn_rpc(31338, std::collections::HashMap::new());
+        let h =
+            ChainsHandler::new(registry_for_rpc(rpc, 31338)).with_etherscan(Some(etherscan_to(es)));
+        let p = VfsPath::parse(&format!(
+            "/test/contracts/{SAMPLE_ADDR}/methods/transfer.tx"
+        ))
+        .unwrap();
+        let body = serde_json::json!({"args": [SAMPLE_ADDR, "1000"]}).to_string();
+        h.write(&p, body.as_bytes()).await.unwrap();
+        let bytes = h.read(&p).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // ERC-20 transfer selector is 0xa9059cbb.
+        assert_eq!(v["selector"], "0xa9059cbb");
+        let calldata = v["calldata"].as_str().unwrap();
+        assert!(calldata.starts_with("0xa9059cbb"));
+        // 4-byte selector + 32-byte address + 32-byte amount = 68 bytes
+        // = 136 hex chars + "0x".
+        assert_eq!(calldata.len(), 2 + 4 * 2 + 32 * 2 + 32 * 2);
+        // The "to" comes back checksummed.
+        assert_eq!(v["to"], SAMPLE_ADDR);
+    }
+
+    #[tokio::test]
+    async fn events_recent_decodes_transfer_log() {
+        // Fake a single Transfer log on block 100 in the head=200 window.
+        let from_addr = "0x000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045";
+        let to_addr = "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let value_hex = format!("0x{}", "00".repeat(31) + "2a"); // 42
+                                                                 // Transfer(address,address,uint256) topic0:
+        let topic0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+        let log = serde_json::json!({
+            "address": SAMPLE_ADDR,
+            "topics": [topic0, from_addr, to_addr],
+            "data": value_hex,
+            "blockNumber": "0x64",
+            "transactionHash": format!("0x{}", "22".repeat(32)),
+            "transactionIndex": "0x0",
+            "blockHash": format!("0x{}", "11".repeat(32)),
+            "logIndex": "0x0",
+            "removed": false,
+        });
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_blockNumber".to_string(),
+            serde_json::Value::String("0xc8".to_string()), // 200
+        );
+        routes.insert("eth_getLogs".to_string(), serde_json::json!([log]));
+        let es = spawn_erc20_etherscan().await;
+        let rpc = spawn_rpc(31338, routes);
+        let h =
+            ChainsHandler::new(registry_for_rpc(rpc, 31338)).with_etherscan(Some(etherscan_to(es)));
+        let p = VfsPath::parse(&format!(
+            "/test/contracts/{SAMPLE_ADDR}/events/Transfer/recent"
+        ))
+        .unwrap();
+        let bytes = h.read(&p).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.is_array(), "expected array, got {v}");
+        assert_eq!(v[0]["block_number"], 100);
+        // Indexed `from` decodes back to the original sample address.
+        let decoded_from = v[0]["data"]["from"].as_str().unwrap().to_lowercase();
+        assert_eq!(decoded_from, "0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
+        // value (non-indexed) is in the body data — uint256 42 → "42".
+        assert_eq!(v[0]["data"]["value"], "42");
+    }
+
+    #[tokio::test]
+    async fn storage_slot_returns_eth_get_storage_at_value() {
+        // 32 bytes ending in 0x07.
+        let val_hex = format!("0x{}07", "00".repeat(31));
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_getStorageAt".to_string(),
+            serde_json::Value::String(val_hex.clone()),
+        );
+        // Etherscan isn't called here — storage is RPC-only — but we
+        // still need the handler to build (no-op).
+        let rpc = spawn_rpc(31338, routes);
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338));
+        let p = VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/storage/0x0")).unwrap();
+        let bytes = h.read(&p).await.unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap().trim();
+        assert_eq!(s, val_hex);
+    }
+
+    #[tokio::test]
+    async fn proxy_implementation_returns_checksummed_address() {
+        // Pretend the EIP-1967 implementation slot holds vitalik's
+        // address right-aligned. The handler must trim the leading
+        // 12 zero bytes and EIP-55-checksum the result.
+        let mut padded = [0u8; 32];
+        let want: alloy::primitives::Address = SAMPLE_ADDR.parse().unwrap();
+        padded[12..].copy_from_slice(want.as_slice());
+        let val_hex = format!("0x{}", hex::encode(padded));
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_getStorageAt".to_string(),
+            serde_json::Value::String(val_hex),
+        );
+        let rpc = spawn_rpc(31338, routes);
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338));
+        let p = VfsPath::parse(&format!(
+            "/test/contracts/{SAMPLE_ADDR}/proxy/implementation"
+        ))
+        .unwrap();
+        let bytes = h.read(&p).await.unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap().trim();
+        assert_eq!(s, SAMPLE_ADDR);
+    }
+
+    #[tokio::test]
+    async fn proxy_implementation_zero_slot_returns_not_a_proxy() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_getStorageAt".to_string(),
+            serde_json::Value::String(format!("0x{}", "00".repeat(32))),
+        );
+        let rpc = spawn_rpc(31338, routes);
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338));
+        let p = VfsPath::parse(&format!(
+            "/test/contracts/{SAMPLE_ADDR}/proxy/implementation"
+        ))
+        .unwrap();
+        let bytes = h.read(&p).await.unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(s, "not a proxy\n");
+    }
+
+    /// When two `foo` overloads exist on the ABI, calling `methods/foo.tx`
+    /// without a `selector` hint must fail with a clear "ambiguous"
+    /// error; passing the right selector resolves to the matching ABI.
+    #[tokio::test]
+    async fn method_overload_disambiguates_by_selector() {
+        // ABI with `foo(uint256)` and `foo(address)` overloads.
+        let body = format!(
+            r#"{{"status":"1","message":"OK","result":{}}}"#,
+            serde_json::Value::String(
+                r#"[
+                    {"type":"function","name":"foo","stateMutability":"view",
+                     "inputs":[{"name":"a","type":"uint256"}],"outputs":[]},
+                    {"type":"function","name":"foo","stateMutability":"view",
+                     "inputs":[{"name":"a","type":"address"}],"outputs":[]}
+                ]"#
+                .to_string()
+            )
+        );
+        let body_static: &'static str = Box::leak(body.into_boxed_str());
+        let es = spawn_canned(body_static).await;
+        let rpc = spawn_rpc(31338, std::collections::HashMap::new());
+        let h =
+            ChainsHandler::new(registry_for_rpc(rpc, 31338)).with_etherscan(Some(etherscan_to(es)));
+        let p = VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/methods/foo.tx")).unwrap();
+
+        // Without a selector hint: the read must surface an ambiguity
+        // error rather than encoding against an arbitrary overload.
+        h.write(&p, b"{\"args\":[\"0\"]}").await.unwrap();
+        match h.read(&p).await {
+            Err(HandlerError::Invalid(msg)) => {
+                assert!(msg.contains("overload"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected Invalid(overload), got {other:?}"),
+        }
+
+        // With the selector for `foo(address)` (= 0x9d2cf9d3), the read
+        // succeeds and the response carries the matching selector. We
+        // need a second etherscan + rpc mock since both have been
+        // consumed, but the handler's AbiCache should have memoised the
+        // ABI from the previous attempt — so only the rpc mock matters
+        // here, and we don't need rpc since `foo` has no outputs.
+        // Selector for foo(address):
+        let sel_addr = {
+            use alloy::primitives::keccak256;
+            let h = keccak256(b"foo(address)");
+            format!("0x{}", hex::encode(&h.0[..4]))
+        };
+        let body = serde_json::json!({
+            "args": [SAMPLE_ADDR],
+            "selector": sel_addr,
+        })
+        .to_string();
+        h.write(&p, body.as_bytes()).await.unwrap();
+        let bytes = h.read(&p).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["selector"], sel_addr);
+    }
+
+    /// `methods/...` and `events/...` require `contract_metadata`
+    /// = `etherscan`; configuring it as `rpc` must hide and 404 those
+    /// paths just like the address_history surface.
+    #[tokio::test]
+    async fn methods_and_events_404_when_contract_metadata_is_rpc() {
+        let backends = BackendsConfig {
+            contract_metadata: Backend::Rpc,
+            ..Default::default()
+        };
+        let h = ChainsHandler::new(anvil_registry()).with_backends(backends);
+        let chain_name = h.registry.list_names()[0].clone();
+
+        let p = VfsPath::parse(&format!(
+            "/{chain_name}/contracts/{SAMPLE_ADDR}/methods/balanceOf.sig"
+        ))
+        .unwrap();
+        match h.lookup(&p).await {
+            Err(HandlerError::NotFound(msg)) => {
+                assert!(msg.contains("contract_metadata"), "got: {msg}");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        let p = VfsPath::parse(&format!(
+            "/{chain_name}/contracts/{SAMPLE_ADDR}/events/Transfer/recent"
+        ))
+        .unwrap();
+        match h.lookup(&p).await {
+            Err(HandlerError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        // storage and proxy must remain reachable: they're RPC-only and
+        // unaffected by the contract_metadata backend choice.
+        let p = VfsPath::parse(&format!(
+            "/{chain_name}/contracts/{SAMPLE_ADDR}/storage/0x0"
+        ))
+        .unwrap();
+        h.lookup(&p).await.unwrap();
+        let p = VfsPath::parse(&format!(
+            "/{chain_name}/contracts/{SAMPLE_ADDR}/proxy/implementation"
+        ))
+        .unwrap();
+        h.lookup(&p).await.unwrap();
     }
 }

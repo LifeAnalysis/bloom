@@ -1,5 +1,6 @@
 pub mod addressbook;
 pub mod chains;
+pub mod chains_contracts;
 mod chains_history;
 pub mod defi;
 pub mod docs;
