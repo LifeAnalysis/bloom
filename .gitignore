@@ -7,3 +7,4 @@ Cargo.lock
 test.env
 *.local.toml
 .worktrees/
+.claude/worktrees/

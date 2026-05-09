@@ -456,7 +456,10 @@ mod tests {
             .await
             .expect("aborted task should join within deadline");
         match join {
-            Err(e) => assert!(e.is_cancelled(), "expected JoinError::is_cancelled, got {e:?}"),
+            Err(e) => assert!(
+                e.is_cancelled(),
+                "expected JoinError::is_cancelled, got {e:?}"
+            ),
             Ok(()) => panic!("aborted task should not complete normally"),
         }
     }

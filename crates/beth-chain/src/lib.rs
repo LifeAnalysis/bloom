@@ -1087,14 +1087,15 @@ mod mock_rpc_tests {
     }
 
     #[tokio::test]
-    async fn erc20_symbol_short_response_returns_none() {
-        // Only 1-word response: not enough for offset+len header.
+    async fn erc20_symbol_zero_word_decodes_as_empty_string() {
+        // A single 32-byte zero word is what alloy's sol!-derived decoder
+        // sees as a string with offset 0 / length 0 → empty string.
         let mut r = responses();
         r.insert("eth_call".into(), vec![MockResponse::Ok(enc_uint8(0))]);
         let url = spawn_mock(r).await;
         let c = client_at(&url);
         let token = address!("0x8888888888888888888888888888888888888888");
-        assert_eq!(c.erc20_symbol(token).await.unwrap(), None);
+        assert_eq!(c.erc20_symbol(token).await.unwrap().as_deref(), Some(""));
     }
 
     // -- eth_call helpers -------------------------------------------------
