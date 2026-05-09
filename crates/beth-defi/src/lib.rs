@@ -215,11 +215,18 @@ impl EnsoClient {
 
     /// Try to construct from `BETH_ENSO_KEY` (preferred) or `ENSO_API_KEY`.
     pub fn from_env() -> Result<Self, EnsoError> {
-        let key = std::env::var("BETH_ENSO_KEY")
+        let key = match std::env::var("BETH_ENSO_KEY")
             .ok()
             .or_else(|| std::env::var("ENSO_API_KEY").ok())
-            .ok_or(EnsoError::MissingKey)?;
+        {
+            Some(k) => k,
+            None => {
+                tracing::debug!("enso.from_env.missing_key");
+                return Err(EnsoError::MissingKey);
+            }
+        };
         if key.is_empty() {
+            tracing::debug!("enso.from_env.empty_key");
             return Err(EnsoError::MissingKey);
         }
         Ok(Self::new(key))
@@ -240,6 +247,7 @@ impl EnsoClient {
 
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if self.api_key.is_empty() {
+            tracing::trace!("enso.auth.unconfigured");
             rb
         } else {
             rb.bearer_auth(&self.api_key)
@@ -252,23 +260,53 @@ impl EnsoClient {
     /// (despite being mutating in spirit); we follow that.
     pub async fn route(&self, req: RouteRequest) -> Result<RouteResponse, EnsoError> {
         let url = self.base_url.join("/api/v1/shortcuts/route")?;
+        tracing::trace!(
+            chain_id = req.chain_id,
+            token_in = %req.token_in,
+            token_out = %req.token_out,
+            amount_in = %req.amount_in,
+            slippage_bps = req.slippage_bps,
+            "enso.route.request"
+        );
         let rb = self.http.get(url).query(&req.to_query());
         let resp = self.auth(rb).send().await?;
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
+            tracing::warn!(
+                status = status.as_u16(),
+                chain_id = req.chain_id,
+                token_in = %req.token_in,
+                token_out = %req.token_out,
+                "enso.route.api_error"
+            );
             return Err(EnsoError::Api {
                 status: status.as_u16(),
                 body,
             });
         }
         let v: RouteResponse = serde_json::from_str(&body)?;
+        tracing::debug!(
+            chain_id = req.chain_id,
+            token_in = %req.token_in,
+            token_out = %req.token_out,
+            amount_out = %v.amount_out,
+            gas = v.gas.as_deref().unwrap_or(""),
+            price_impact = v.price_impact.unwrap_or(0.0),
+            "enso.route.ok"
+        );
         Ok(v)
     }
 
     /// `POST /api/v1/shortcuts/bundle` — multi-step.
     pub async fn bundle(&self, req: BundleRequest) -> Result<BundleResponse, EnsoError> {
         let url = self.base_url.join("/api/v1/shortcuts/bundle")?;
+        tracing::trace!(
+            chain_id = req.chain_id,
+            steps = req.steps.len(),
+            slippage_bps = req.slippage_bps,
+            "enso.bundle.request"
+        );
         let body = serde_json::json!({
             "fromAddress": format!("0x{:x}", req.from_address),
             "chainId": req.chain_id,
@@ -283,12 +321,24 @@ impl EnsoClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
+            tracing::warn!(
+                status = status.as_u16(),
+                chain_id = req.chain_id,
+                steps = req.steps.len(),
+                "enso.bundle.api_error"
+            );
             return Err(EnsoError::Api {
                 status: status.as_u16(),
                 body: text,
             });
         }
         let v: BundleResponse = serde_json::from_str(&text)?;
+        tracing::debug!(
+            chain_id = req.chain_id,
+            steps = req.steps.len(),
+            gas = v.gas.as_deref().unwrap_or(""),
+            "enso.bundle.ok"
+        );
         Ok(v)
     }
 
@@ -296,17 +346,40 @@ impl EnsoClient {
     /// Returns `amountOut` without producing tx calldata.
     pub async fn quote(&self, req: RouteRequest) -> Result<QuoteResponse, EnsoError> {
         let url = self.base_url.join("/api/v1/shortcuts/quote")?;
+        tracing::trace!(
+            chain_id = req.chain_id,
+            token_in = %req.token_in,
+            token_out = %req.token_out,
+            amount_in = %req.amount_in,
+            slippage_bps = req.slippage_bps,
+            "enso.quote.request"
+        );
         let rb = self.http.get(url).query(&req.to_query());
         let resp = self.auth(rb).send().await?;
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
+            tracing::warn!(
+                status = status.as_u16(),
+                chain_id = req.chain_id,
+                token_in = %req.token_in,
+                token_out = %req.token_out,
+                "enso.quote.api_error"
+            );
             return Err(EnsoError::Api {
                 status: status.as_u16(),
                 body,
             });
         }
         let v: QuoteResponse = serde_json::from_str(&body)?;
+        tracing::debug!(
+            chain_id = req.chain_id,
+            token_in = %req.token_in,
+            token_out = %req.token_out,
+            amount_out = %v.amount_out,
+            price_impact = v.price_impact.unwrap_or(0.0),
+            "enso.quote.ok"
+        );
         Ok(v)
     }
 }
@@ -380,9 +453,11 @@ pub fn parse_natural_intent(input: &str) -> Option<NaturalIntent> {
     let toks: Vec<&str> = input.split_whitespace().collect();
     // Need at least: verb amount tok_in to tok_out
     if toks.len() < 5 {
+        tracing::debug!(tokens = toks.len(), "enso.intent.parse.too_few_tokens");
         return None;
     }
     if !toks[3].eq_ignore_ascii_case("to") {
+        tracing::debug!(connective = %toks[3], "enso.intent.parse.missing_to");
         return None;
     }
     if !toks[1]
@@ -391,6 +466,7 @@ pub fn parse_natural_intent(input: &str) -> Option<NaturalIntent> {
         .map(|c| c.is_ascii_digit())
         .unwrap_or(false)
     {
+        tracing::debug!(amount = %toks[1], "enso.intent.parse.non_numeric_amount");
         return None;
     }
     let chain = if toks.len() >= 7 && toks[5].eq_ignore_ascii_case("on") {
@@ -415,8 +491,11 @@ pub fn parse_natural_intent(input: &str) -> Option<NaturalIntent> {
 pub fn resolve_token_symbol(chain_id: u64, sym: &str) -> Option<Address> {
     let s = sym.trim();
     if s.starts_with("0x") || s.starts_with("0X") {
-        if let Ok(addr) = s.parse::<Address>() {
-            return Some(addr);
+        match s.parse::<Address>() {
+            Ok(addr) => return Some(addr),
+            Err(e) => {
+                tracing::debug!(input = %s, error = %e, "enso.token.parse_failed");
+            }
         }
     }
     let upper = s.to_ascii_uppercase();
@@ -424,7 +503,7 @@ pub fn resolve_token_symbol(chain_id: u64, sym: &str) -> Option<Address> {
     if matches!(upper.as_str(), "ETH" | "ETHER" | "MATIC" | "BNB" | "AVAX") {
         return NATIVE_TOKEN.parse().ok();
     }
-    match (chain_id, upper.as_str()) {
+    let resolved = match (chain_id, upper.as_str()) {
         (1, "USDC") => "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().ok(),
         (1, "USDT") => "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().ok(),
         (1, "DAI") => "0x6B175474E89094C44Da98b954EedeAC495271d0F".parse().ok(),
@@ -433,7 +512,11 @@ pub fn resolve_token_symbol(chain_id: u64, sym: &str) -> Option<Address> {
         (10, "USDC") => "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85".parse().ok(),
         (8453, "USDC") => "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".parse().ok(),
         _ => None,
+    };
+    if resolved.is_none() {
+        tracing::debug!(chain_id, symbol = %upper, "enso.token.unknown_symbol");
     }
+    resolved
 }
 
 #[cfg(test)]
