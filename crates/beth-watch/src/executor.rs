@@ -40,7 +40,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
-use tracing::{debug, warn};
+use tracing::{debug, info, trace, warn};
 
 use beth_chain::ChainRegistry;
 use beth_proto::HomeDir;
@@ -93,7 +93,10 @@ impl WatchExecutor {
     pub fn live_path(&self, id: &str) -> PathBuf {
         match self.registry.find_by_id(id) {
             Some(spec) => Self::live_path_for_spec(&self.home, &spec),
-            None => self.home.watch_dir().join(id).join("live"),
+            None => {
+                debug!(id, "watch.live_path.spec_not_found");
+                self.home.watch_dir().join(id).join("live")
+            }
         }
     }
 
@@ -101,7 +104,10 @@ impl WatchExecutor {
     pub fn history_path(&self, id: &str) -> PathBuf {
         match self.registry.find_by_id(id) {
             Some(spec) => Self::history_path_for_spec(&self.home, &spec),
-            None => self.home.watch_dir().join(id).join("history.jsonl"),
+            None => {
+                debug!(id, "watch.history_path.spec_not_found");
+                self.home.watch_dir().join(id).join("history.jsonl")
+            }
         }
     }
 
@@ -128,12 +134,18 @@ impl WatchExecutor {
             ))
         })?;
         if guard.is_some() {
+            debug!("watch.executor.start.already_running");
             return Ok(());
         }
 
         let this = Arc::clone(self);
         let mut shutdown_rx = self.shutdown_rx.clone();
         let tick = self.tick;
+        let specs = self.registry.list_all().len();
+        info!(
+            tick_ms = tick.as_millis() as u64,
+            specs, "watch.executor.start"
+        );
         let handle = tokio::spawn(async move {
             let mut state = ExecutorState::default();
             let mut ticker = interval(tick);
@@ -143,6 +155,7 @@ impl WatchExecutor {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
+                        trace!("watch.tick.begin");
                         if let Err(e) = this.tick_once(&mut state).await {
                             warn!(error = %e, "watch.tick.error");
                         }
@@ -168,6 +181,9 @@ impl WatchExecutor {
             // Best-effort: aborting + awaiting is enough for shutdown.
             h.abort();
             let _ = h.await;
+            debug!("watch.executor.stopped");
+        } else {
+            trace!("watch.executor.stop.not_running");
         }
     }
 
@@ -200,11 +216,22 @@ impl WatchExecutor {
                 // we pick the first chain by registered name order.
                 let chain_name = match self.chains.list_names().into_iter().next() {
                     Some(n) => n,
-                    None => return Ok(()),
+                    None => {
+                        debug!(wallet = %spec.wallet, id = %spec.id, "watch.balance.no_chains");
+                        return Ok(());
+                    }
                 };
                 let client = match self.chains.get(&chain_name) {
                     Some(c) => c,
-                    None => return Ok(()),
+                    None => {
+                        debug!(
+                            wallet = %spec.wallet,
+                            id = %spec.id,
+                            chain = %chain_name,
+                            "watch.balance.chain_unavailable"
+                        );
+                        return Ok(());
+                    }
                 };
                 let addr: Address = address.parse().map_err(|e: alloy::hex::FromHexError| {
                     WatchError::InvalidId(format!("bad address {address}: {e}"))
@@ -215,6 +242,14 @@ impl WatchExecutor {
                     .map_err(|e| WatchError::Io(std::io::Error::other(e.to_string())))?;
                 let prev = state.balance.get(&key).copied();
                 if prev != Some(bal) {
+                    debug!(
+                        wallet = %spec.wallet,
+                        id = %spec.id,
+                        chain = %chain_name,
+                        addr = %format!("{:#x}", addr),
+                        balance_wei = %bal,
+                        "watch.balance.changed"
+                    );
                     let record = serde_json::json!({
                         "ts": now_ms(),
                         "kind": "balance",
@@ -230,7 +265,15 @@ impl WatchExecutor {
             WatchKind::Block { chain } => {
                 let client = match self.chains.get(chain) {
                     Some(c) => c,
-                    None => return Ok(()),
+                    None => {
+                        debug!(
+                            wallet = %spec.wallet,
+                            id = %spec.id,
+                            chain = %chain,
+                            "watch.block.chain_unavailable"
+                        );
+                        return Ok(());
+                    }
                 };
                 let head = client
                     .block_number()
@@ -238,6 +281,14 @@ impl WatchExecutor {
                     .map_err(|e| WatchError::Io(std::io::Error::other(e.to_string())))?;
                 let prev = state.block.get(&key).copied().unwrap_or(0);
                 if head > prev {
+                    debug!(
+                        wallet = %spec.wallet,
+                        id = %spec.id,
+                        chain = %chain,
+                        from = prev,
+                        to = head,
+                        "watch.block.advanced"
+                    );
                     for n in (prev + 1)..=head {
                         let record = serde_json::json!({
                             "ts": now_ms(),
@@ -248,6 +299,15 @@ impl WatchExecutor {
                         self.append_record(spec, &record).await?;
                     }
                     state.block.insert(key, head);
+                } else if head < prev {
+                    warn!(
+                        wallet = %spec.wallet,
+                        id = %spec.id,
+                        chain = %chain,
+                        prev,
+                        head,
+                        "watch.block.regressed"
+                    );
                 }
             }
             WatchKind::GasPrice {
@@ -256,7 +316,15 @@ impl WatchExecutor {
             } => {
                 let client = match self.chains.get(chain) {
                     Some(c) => c,
-                    None => return Ok(()),
+                    None => {
+                        debug!(
+                            wallet = %spec.wallet,
+                            id = %spec.id,
+                            chain = %chain,
+                            "watch.gas_price.chain_unavailable"
+                        );
+                        return Ok(());
+                    }
                 };
                 let gp = client
                     .gas_price()
@@ -268,6 +336,14 @@ impl WatchExecutor {
                     Some(prev_gp) => prev_gp != gp,
                 };
                 if crossed {
+                    debug!(
+                        wallet = %spec.wallet,
+                        id = %spec.id,
+                        chain = %chain,
+                        gas_price_wei = gp,
+                        threshold_gwei = threshold_gwei,
+                        "watch.gas_price.changed"
+                    );
                     let record = serde_json::json!({
                         "ts": now_ms(),
                         "kind": "gas_price",
@@ -287,7 +363,15 @@ impl WatchExecutor {
             } => {
                 let client = match self.chains.get(chain) {
                     Some(c) => c,
-                    None => return Ok(()),
+                    None => {
+                        debug!(
+                            wallet = %spec.wallet,
+                            id = %spec.id,
+                            chain = %chain,
+                            "watch.event.chain_unavailable"
+                        );
+                        return Ok(());
+                    }
                 };
                 let head = client
                     .block_number()
@@ -296,6 +380,14 @@ impl WatchExecutor {
                 let from_block = state.event_block.get(&key).copied().map(|b| b + 1);
                 let from_block = from_block.unwrap_or(head.saturating_sub(0));
                 if from_block > head {
+                    trace!(
+                        wallet = %spec.wallet,
+                        id = %spec.id,
+                        chain = %chain,
+                        from = from_block,
+                        head,
+                        "watch.event.no_new_blocks"
+                    );
                     return Ok(());
                 }
                 let addr: Address = contract.parse().map_err(|e: alloy::hex::FromHexError| {
@@ -315,6 +407,18 @@ impl WatchExecutor {
                     .get_logs(&filter)
                     .await
                     .map_err(|e| WatchError::Io(std::io::Error::other(e.to_string())))?;
+                if !logs.is_empty() {
+                    debug!(
+                        wallet = %spec.wallet,
+                        id = %spec.id,
+                        chain = %chain,
+                        contract = %contract,
+                        from = from_block,
+                        to = head,
+                        logs = logs.len(),
+                        "watch.event.logs_yielded"
+                    );
+                }
                 for log in logs {
                     let record = serde_json::json!({
                         "ts": now_ms(),
@@ -371,6 +475,7 @@ impl WatchExecutor {
         tokio::fs::create_dir_all(&dir).await?;
         let live = Self::live_path_for_spec(&self.home, spec);
         if !live.exists() {
+            trace!(wallet = %spec.wallet, id = %spec.id, "watch.rotate.live_missing");
             return Ok(());
         }
         let history = Self::history_path_for_spec(&self.home, spec);
@@ -400,6 +505,12 @@ impl WatchExecutor {
         });
 
         tokio::fs::rename(&live, &target).await?;
+        debug!(
+            wallet = %spec.wallet,
+            id = %spec.id,
+            target = %target.file_name().and_then(|s| s.to_str()).unwrap_or("history.jsonl"),
+            "watch.rotate.done"
+        );
         let mut new_live = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)

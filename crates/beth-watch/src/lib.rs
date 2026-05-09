@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -131,13 +132,18 @@ impl WatchRegistry {
         for wallet_entry in fs::read_dir(&root)? {
             let wallet_entry = wallet_entry?;
             if !wallet_entry.file_type()?.is_dir() {
+                debug!(path = %wallet_entry.path().display(), "watch.registry.scan.skip_non_dir");
                 continue;
             }
             let wallet_name = match wallet_entry.file_name().into_string() {
                 Ok(n) => n,
-                Err(_) => continue,
+                Err(os) => {
+                    debug!(name = ?os, "watch.registry.scan.non_utf8_wallet");
+                    continue;
+                }
             };
             if !is_valid_segment(&wallet_name) {
+                debug!(wallet = %wallet_name, "watch.registry.scan.invalid_wallet_name");
                 continue;
             }
             for spec_entry in fs::read_dir(wallet_entry.path())? {
@@ -151,6 +157,7 @@ impl WatchRegistry {
                 specs.insert(key(&spec.wallet, &spec.id), spec);
             }
         }
+        debug!(count = specs.len(), "watch.registry.loaded");
 
         Ok(Self {
             inner: Arc::new(Inner {
