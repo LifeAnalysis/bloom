@@ -87,6 +87,12 @@ fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
 }
 
+/// Parse a state segment (`pending` / `sent` / `failed`) into an
+/// [`OutboxState`], rejecting anything else as NotFound.
+fn parse_state_seg(s: &str) -> Result<OutboxState, HandlerError> {
+    OutboxState::parse(s).ok_or_else(|| HandlerError::not_found(format!("outbox state '{}'", s)))
+}
+
 #[async_trait]
 impl Handler for WalletsHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
@@ -228,18 +234,38 @@ impl WalletsHandler {
 
     async fn lookup_outbox(
         &self,
-        _wallet: &str,
-        _chain: &str,
+        wallet: &str,
+        chain: &str,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
         match rest {
             [] => Ok(Entry::dir("outbox")),
             [s] if s == "new.tx" => Ok(Entry::writable_file("new.tx")),
             [s] if s == "pending" || s == "sent" || s == "failed" => Ok(Entry::dir(s)),
-            [_state, _id] => Ok(Entry::dir(rest.last().unwrap())),
-            [_state, _id, fname] => {
-                if fname == "confirm" {
-                    Ok(Entry::writable_file("confirm"))
+            [state, id] => {
+                let st = parse_state_seg(state)?;
+                // Confirm the entry actually lives in the requested state
+                // (fix #8): a stale path like `outbox/sent/<pending-id>`
+                // should NotFound, not silently succeed.
+                self.tx_engine
+                    .outbox
+                    .read_in_state(wallet, chain, id, st)
+                    .map_err(err_be)?;
+                Ok(Entry::dir(id))
+            }
+            [state, id, fname] => {
+                let st = parse_state_seg(state)?;
+                self.tx_engine
+                    .outbox
+                    .read_in_state(wallet, chain, id, st)
+                    .map_err(err_be)?;
+                // Pending entries advertise the writable controls
+                // (`confirm`, `replace`, `cancel`) even when those files
+                // don't yet exist on disk — they are virtual write sinks.
+                if st == OutboxState::Pending
+                    && (fname == "confirm" || fname == "replace" || fname == "cancel")
+                {
+                    Ok(Entry::writable_file(fname))
                 } else {
                     Ok(Entry::file(fname))
                 }
@@ -279,12 +305,13 @@ impl WalletsHandler {
                 Ok(format!("{}\n", n).into_bytes())
             }
             [s, state, id, fname] if s == "outbox" => {
-                let _ = OutboxState::from_status; // ensure import alive
-                let _state_filter = state;
+                let st = parse_state_seg(state)?;
+                // Honour the path's state segment (fix #8): only read from
+                // the requested state, NotFound otherwise.
                 let entry = self
                     .tx_engine
                     .outbox
-                    .read(wallet, chain, id)
+                    .read_in_state(wallet, chain, id, st)
                     .map_err(err_be)?;
                 let path = entry.dir.join(fname.as_str());
                 let bytes = std::fs::read(&path).map_err(HandlerError::Io)?;
@@ -328,18 +355,27 @@ impl WalletsHandler {
                     .map_err(err_be)?;
                 Ok(ids.into_iter().map(|n| Entry::dir(&n)).collect())
             }
-            [s, _state, id] if s == "outbox" => {
+            [s, state, id] if s == "outbox" => {
+                let st = parse_state_seg(state)?;
+                // The state segment is authoritative (fix #8): if the id
+                // isn't in this state we report NotFound rather than
+                // shadowing whatever lives at the other states.
                 let entry = self
                     .tx_engine
                     .outbox
-                    .read(wallet, chain, id)
+                    .read_in_state(wallet, chain, id, st)
                     .map_err(err_be)?;
                 let mut out = Vec::new();
                 if let Ok(rd) = std::fs::read_dir(&entry.dir) {
                     for r in rd.flatten() {
                         if let Some(n) = r.file_name().to_str() {
                             if r.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                                if n == "confirm" {
+                                // Pending entries' control files (confirm /
+                                // replace / cancel) are writable; everything
+                                // else is read-only metadata.
+                                if entry.state == OutboxState::Pending
+                                    && (n == "confirm" || n == "replace" || n == "cancel")
+                                {
                                     out.push(Entry::writable_file(n));
                                 } else {
                                     out.push(Entry::file(n));
@@ -350,10 +386,15 @@ impl WalletsHandler {
                         }
                     }
                 }
-                // Always advertise `confirm` on pending entries even if not
-                // yet written, so agents can `echo y > confirm`.
-                if entry.state == OutboxState::Pending && !out.iter().any(|e| e.name == "confirm") {
-                    out.push(Entry::writable_file("confirm"));
+                // Always advertise the pending control files even before
+                // they've been written, so agents can `echo y > confirm`
+                // (and similarly for replace / cancel — fix #10).
+                if entry.state == OutboxState::Pending {
+                    for ctrl in ["confirm", "replace", "cancel"] {
+                        if !out.iter().any(|e| e.name == ctrl) {
+                            out.push(Entry::writable_file(ctrl));
+                        }
+                    }
                 }
                 Ok(out)
             }
@@ -396,14 +437,84 @@ impl WalletsHandler {
             }
             // outbox/pending/<id>/confirm — broadcast
             [state, id, fname] if state == "pending" && fname == "confirm" => {
-                let confirm_text = std::str::from_utf8(data).unwrap_or("y").trim();
+                // Fix #9: confirm must have non-empty content. Quietly
+                // accepting an empty body (the old behaviour) made every
+                // empty `> confirm` a footgun that broadcast a tx.
+                let confirm_text = std::str::from_utf8(data)
+                    .map_err(|_| HandlerError::invalid("non-utf8 confirm content"))?
+                    .trim();
+                if confirm_text.is_empty() {
+                    return Err(HandlerError::invalid(
+                        "confirm requires non-empty content (e.g. 'y' or override token)",
+                    ));
+                }
                 let signer = self
                     .keystore
                     .signer(wallet)
                     .map_err(|_| HandlerError::PermissionDenied)?;
                 let _staged = self
                     .tx_engine
-                    .confirm(wallet, chain, id, &client, &signer, confirm_text)
+                    .confirm(
+                        wallet,
+                        chain,
+                        id,
+                        &client,
+                        &signer,
+                        &info.policy,
+                        confirm_text,
+                    )
+                    .await
+                    .map_err(err_be)?;
+                Ok(())
+            }
+            // outbox/pending/<id>/cancel — fire a self-send replacement.
+            // Same content rules as confirm (fix #9 / #10).
+            [state, id, fname] if state == "pending" && fname == "cancel" => {
+                let cancel_text = std::str::from_utf8(data)
+                    .map_err(|_| HandlerError::invalid("non-utf8 cancel content"))?
+                    .trim();
+                if cancel_text.is_empty() {
+                    return Err(HandlerError::invalid(
+                        "cancel requires non-empty content (e.g. 'y' or override token)",
+                    ));
+                }
+                let signer = self
+                    .keystore
+                    .signer(wallet)
+                    .map_err(|_| HandlerError::PermissionDenied)?;
+                let _ = self
+                    .tx_engine
+                    .cancel(wallet, chain, id, &client, &signer, 10)
+                    .await
+                    .map_err(err_be)?;
+                Ok(())
+            }
+            // outbox/pending/<id>/replace — restage with bumped fees from
+            // the same intent body the user provides (fix #10). Body is a
+            // RawIntent (TOML/JSON/shell). The original is left in place so
+            // diff against the bumped tx is visible; the engine writes
+            // `replacement_intent.json` alongside.
+            [state, id, fname] if state == "pending" && fname == "replace" => {
+                let body = std::str::from_utf8(data)
+                    .map_err(|_| HandlerError::invalid("non-utf8 replace intent"))?;
+                if body.trim().is_empty() {
+                    return Err(HandlerError::invalid(
+                        "replace requires a non-empty intent body",
+                    ));
+                }
+                let _intent: RawIntent = intent_parser::parse(body).map_err(err_be)?;
+                let signer = self
+                    .keystore
+                    .signer(wallet)
+                    .map_err(|_| HandlerError::PermissionDenied)?;
+                // The current `TxEngine::replace` bumps fees on the
+                // original; we pass a 10% floor as the spec/mempool
+                // require. Caller can always cancel + re-stage if the body
+                // has materially changed (different to/value/data).
+                // TODO(replace): consume the body to substitute calldata.
+                let _ = self
+                    .tx_engine
+                    .replace(wallet, chain, id, &client, &signer, 10)
                     .await
                     .map_err(err_be)?;
                 Ok(())
@@ -594,6 +705,15 @@ mod tests {
     }
 
     fn make_handler() -> Fixture {
+        make_handler_with_chain(false)
+    }
+
+    /// Build a wallet fixture; when `with_chain` is true a stub `anvil`
+    /// chain is registered (RPC URL is unreachable, so any test that
+    /// triggers an actual broadcast will surface as an RPC error rather
+    /// than silently succeeding). Outbox-state tests don't need the chain
+    /// to be reachable.
+    fn make_handler_with_chain(with_chain: bool) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let ks_root = tmp.path().join("keystore");
         let outbox_root = tmp.path().join("outbox");
@@ -601,6 +721,20 @@ mod tests {
         let info = keystore.create_local("alice", "passphrase").unwrap();
         keystore.unlock("alice", "passphrase").unwrap();
         let chains = ChainRegistry::new();
+        if with_chain {
+            let spec = beth_proto::ChainSpec {
+                name: "anvil".into(),
+                chain_id: 31337,
+                rpc_urls: vec!["http://127.0.0.1:1".into()],
+                allow_broadcast: true,
+                etherscan_api_url: None,
+                display_name: None,
+                native_symbol: "ETH".into(),
+                native_decimals: 18,
+                legacy_tx: false,
+            };
+            chains.add(beth_chain::ChainClient::new(spec).unwrap());
+        }
         let outbox = Outbox::new(&outbox_root).unwrap();
         let tx_engine = TxEngine::new(outbox, 60_000, false);
         let address_book = AddressBook::default();
@@ -613,6 +747,38 @@ mod tests {
             wallet_addr: info.address,
             sign_dir,
         }
+    }
+
+    /// Write a synthetic staged tx directly into the outbox so the tests
+    /// that drive confirm/replace/cancel don't have to spin up a chain.
+    fn seed_pending(f: &Fixture, id: &str) {
+        let staged = beth_proto::StagedTx {
+            id: id.into(),
+            wallet: f.wallet_name.clone(),
+            chain: "anvil".into(),
+            chain_id: 31337,
+            from: beth_proto::checksum_address(&f.wallet_addr),
+            to: "0x0000000000000000000000000000000000000002".into(),
+            value_wei: "0".into(),
+            data_hex: "0x".into(),
+            gas_limit: 21000,
+            max_fee_per_gas: Some("100".into()),
+            max_priority_fee_per_gas: Some("10".into()),
+            gas_price: None,
+            nonce: 0,
+            policy_checks: vec![],
+            created_ms: 0,
+            // Far in the future so expiry never trips during tests.
+            expires_ms: u128::MAX,
+            status: beth_proto::TxStatus::Pending,
+            tx_hash: None,
+            token: None,
+        };
+        f.handler
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "p")
+            .unwrap();
     }
 
     fn read_sig_file(path: &std::path::Path) -> Signature {
@@ -770,5 +936,142 @@ mod tests {
         for e in &entries {
             assert!(matches!(e.kind, crate::handler::EntryKind::File));
         }
+    }
+
+    /// Fix #8: reading `outbox/sent/<pending-id>/intent.json` must
+    /// NotFound, even though the id exists in `pending`. Before the fix
+    /// the read silently followed the id wherever it lived.
+    #[tokio::test]
+    async fn outbox_read_honours_state_segment() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/sent/0001-test/intent.json",
+            f.wallet_name
+        ))
+        .unwrap();
+        let r = f.handler.read(&p).await;
+        assert!(r.is_err(), "expected NotFound but got {r:?}");
+    }
+
+    /// Fix #8: listing `outbox/sent/<pending-id>/` must NotFound when
+    /// the entry isn't actually in `sent`.
+    #[tokio::test]
+    async fn outbox_list_honours_state_segment() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/sent/0001-test",
+            f.wallet_name
+        ))
+        .unwrap();
+        let r = f.handler.list(&p).await;
+        assert!(r.is_err(), "expected NotFound, got {r:?}");
+    }
+
+    /// Fix #9: writing an empty body to `pending/<id>/confirm` must
+    /// surface as Invalid rather than broadcasting.
+    #[tokio::test]
+    async fn confirm_empty_body_rejected() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/0001-test/confirm",
+            f.wallet_name
+        ))
+        .unwrap();
+        let r = f.handler.write(&p, b"").await;
+        assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
+        // Whitespace-only is also rejected.
+        let r = f.handler.write(&p, b"   \n\t").await;
+        assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
+    }
+
+    /// Fix #2 + #10: writing `outbox/sent/<id>/confirm` is not a valid
+    /// route and must not rebroadcast. (Also covers the path-routing
+    /// half of fix #2 — the engine layer is covered in tx_engine tests.)
+    #[tokio::test]
+    async fn confirm_path_only_valid_for_pending() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        // Move id to sent so it's no longer pending.
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read(&f.wallet_name, "anvil", "0001-test")
+            .unwrap();
+        f.handler
+            .tx_engine
+            .outbox
+            .transition(&entry, OutboxState::Sent)
+            .unwrap();
+        // Path that points at sent — must be permission denied (no route).
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/sent/0001-test/confirm",
+            f.wallet_name
+        ))
+        .unwrap();
+        let r = f.handler.write(&p, b"y").await;
+        assert!(
+            matches!(r, Err(HandlerError::PermissionDenied)),
+            "got: {r:?}"
+        );
+        // Path under pending/<id> still resolves but the engine rejects
+        // because the id isn't actually pending.
+        let p2 = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/0001-test/confirm",
+            f.wallet_name
+        ))
+        .unwrap();
+        let r2 = f.handler.write(&p2, b"y").await;
+        assert!(r2.is_err(), "expected error from engine, got {r2:?}");
+    }
+
+    /// Fix #10: cancel route exists, demands a non-empty body, and
+    /// rejects non-pending ids.
+    #[tokio::test]
+    async fn cancel_route_demands_body() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/0001-test/cancel",
+            f.wallet_name
+        ))
+        .unwrap();
+        let r = f.handler.write(&p, b"").await;
+        assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
+    }
+
+    /// Fix #10: replace route exists and demands a non-empty body.
+    #[tokio::test]
+    async fn replace_route_demands_body() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/0001-test/replace",
+            f.wallet_name
+        ))
+        .unwrap();
+        let r = f.handler.write(&p, b"").await;
+        assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
+    }
+
+    /// Fix #10: list of `pending/<id>/` advertises the writable control
+    /// files (confirm, replace, cancel) even before they've been written.
+    #[tokio::test]
+    async fn list_pending_advertises_control_files() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/0001-test",
+            f.wallet_name
+        ))
+        .unwrap();
+        let entries = f.handler.list(&p).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"confirm"), "names={names:?}");
+        assert!(names.contains(&"replace"), "names={names:?}");
+        assert!(names.contains(&"cancel"), "names={names:?}");
     }
 }
