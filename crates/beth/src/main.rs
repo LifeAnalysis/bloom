@@ -329,13 +329,14 @@ async fn run(cli: Cli) -> Result<()> {
             let d = Daemon::from_home(home).context("build daemon")?;
             d.keystore.unlock(&wallet, &passphrase)?;
             let signer = d.keystore.signer(&wallet)?;
+            let info = d.keystore.info(&wallet)?;
             let client = d
                 .chains
                 .get(&chain)
                 .with_context(|| format!("chain '{}'", chain))?;
             let staged = d
                 .tx_engine
-                .confirm(&wallet, &chain, &id, &client, &signer, &text)
+                .confirm(&wallet, &chain, &id, &client, &signer, &info.policy, &text)
                 .await?;
             println!(
                 "broadcast {} hash={}",
@@ -346,6 +347,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Serve => {
             let d = Daemon::from_home(home).context("build daemon")?;
+            // Spawn the outbox expiry sweeper for the lifetime of the
+            // serve command (fix #3). The handle is dropped (and the task
+            // signalled to stop) right before the function returns.
+            let sweeper = d.spawn_background_tasks();
             let chains: Vec<String> = d.chains.list_names();
             println!(
                 "beth serve: home={} chains={:?}",
@@ -363,6 +368,7 @@ async fn run(cli: Cli) -> Result<()> {
             });
             server.serve(&socket).await.context("ipc serve")?;
             shutdown.abort();
+            sweeper.shutdown().await;
             println!("shutting down");
             Ok(())
         }

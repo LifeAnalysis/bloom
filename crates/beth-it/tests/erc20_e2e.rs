@@ -189,7 +189,15 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
         .parse()?;
 
     let confirmed = engine
-        .confirm("alice", "anvil", &staged.id, &chain, &signer, "y")
+        .confirm(
+            "alice",
+            "anvil",
+            &staged.id,
+            &chain,
+            &signer,
+            &Policy::permissive(),
+            "y",
+        )
         .await
         .map_err(|e| anyhow!("confirm: {e}"))?;
     assert!(confirmed.tx_hash.is_some(), "confirm produced no tx hash");
