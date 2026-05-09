@@ -61,6 +61,10 @@ pub struct StagedTx {
     /// contract.
     #[serde(default)]
     pub token: Option<TokenRef>,
+    /// Optional NFT metadata for plan rendering. Set for NFT transfer
+    /// and approval intents. Mutually exclusive with `token`.
+    #[serde(default)]
+    pub nft: Option<NftRef>,
     /// USD-denominated value at stage time, when a price oracle was
     /// available. Persisted so the per-day rolling-window enforcement
     /// can sum historical sends without re-querying prices.
@@ -79,6 +83,41 @@ pub struct TokenRef {
     pub recipient: String,
     /// Human-readable amount in token units (e.g. "100" for 100 USDC).
     pub amount: String,
+}
+
+/// What kind of NFT-write action this staged tx encodes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NftAction {
+    Transfer,
+    Approve,
+    SetApprovalForAll,
+}
+
+/// Lightweight NFT reference embedded in a `StagedTx` for display.
+/// `kind` is `"erc721"` or `"erc1155"`; `symbol` falls back to the
+/// contract address when name/symbol aren't available.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NftRef {
+    pub action: NftAction,
+    pub contract: String,
+    pub kind: String,
+    /// Best-effort token symbol, e.g. `BAYC`. Empty string when not
+    /// resolvable.
+    pub symbol: String,
+    /// Token id (decimal). Empty for `set_approval_for_all`.
+    #[serde(default)]
+    pub token_id: String,
+    /// Recipient (transfer) or the approved operator (approve /
+    /// set_approval_for_all). Checksummed.
+    #[serde(default)]
+    pub counterparty: String,
+    /// Amount, ERC-1155 only.
+    #[serde(default)]
+    pub amount: String,
+    /// `set_approval_for_all` boolean payload.
+    #[serde(default)]
+    pub approved: Option<bool>,
 }
 
 /// Helpers to render plan.md from a StagedTx.
@@ -102,6 +141,58 @@ impl PlanRender {
                 "Action: Transfer {} {} to {}\n",
                 tok.amount, tok.symbol, tok.recipient
             ));
+        } else if let Some(nft) = &staged.nft {
+            s.push_str(&format!("To:     {} (NFT contract)\n", staged.to));
+            let label = if nft.symbol.is_empty() {
+                nft.contract.clone()
+            } else {
+                format!("{} ({})", nft.symbol, nft.contract)
+            };
+            s.push_str(&format!("NFT:    {} [{}]\n", label, nft.kind));
+            let line = match nft.action {
+                NftAction::Transfer => {
+                    if nft.kind.eq_ignore_ascii_case("erc1155") {
+                        format!(
+                            "Action: transfer ERC-1155 #{} x{} from {} to {}\n",
+                            nft.token_id, nft.amount, staged.from, nft.counterparty
+                        )
+                    } else {
+                        let label_inner = if nft.symbol.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{} ", nft.symbol)
+                        };
+                        format!(
+                            "Action: transfer ERC-721 {}#{} from {} to {}\n",
+                            label_inner, nft.token_id, staged.from, nft.counterparty
+                        )
+                    }
+                }
+                NftAction::Approve => {
+                    let label_inner = if nft.symbol.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{} ", nft.symbol)
+                    };
+                    format!(
+                        "Action: approve ERC-721 {}#{} to {}\n",
+                        label_inner, nft.token_id, nft.counterparty
+                    )
+                }
+                NftAction::SetApprovalForAll => {
+                    let approved = nft.approved.unwrap_or(false);
+                    let label_inner = if nft.symbol.is_empty() {
+                        nft.contract.clone()
+                    } else {
+                        nft.symbol.clone()
+                    };
+                    format!(
+                        "Action: set approval for all on {} -> {} ({})\n",
+                        label_inner, nft.counterparty, approved
+                    )
+                }
+            };
+            s.push_str(&line);
         } else {
             s.push_str(&format!("To:     {}\n", staged.to));
         }
@@ -179,6 +270,7 @@ mod tests {
             status: TxStatus::Pending,
             tx_hash: None,
             token: None,
+            nft: None,
             usd_value: None,
         }
     }

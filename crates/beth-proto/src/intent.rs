@@ -73,8 +73,44 @@ pub enum RawIntentBody {
         spender: String,
         amount: String,
     },
+    /// ERC-721 / ERC-1155 transfer. Encodes `safeTransferFrom(...)` when
+    /// `safe = true` (default), `transferFrom(...)` for ERC-721 when
+    /// `safe = false`. `standard` is auto-detected via ERC-165 when
+    /// `None`. `amount` and `data` apply only to ERC-1155.
+    NftTransfer {
+        contract: String,
+        to: String,
+        token_id: String,
+        #[serde(default)]
+        standard: Option<String>,
+        #[serde(default)]
+        amount: Option<String>,
+        #[serde(default = "default_true")]
+        safe: bool,
+        #[serde(default)]
+        data: Option<String>,
+    },
+    /// ERC-721 single-token approval — `approve(address,uint256)`.
+    /// Pass the zero address as `operator` to revoke. Errors against
+    /// ERC-1155 (no per-token approval).
+    NftApprove {
+        contract: String,
+        operator: String,
+        token_id: String,
+    },
+    /// `setApprovalForAll(address,bool)` — operator-wide approval.
+    /// Same selector for ERC-721 and ERC-1155.
+    NftApproveAll {
+        contract: String,
+        operator: String,
+        approved: bool,
+    },
     /// Enso DeFi intent.
     Enso { intent: String },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// What the user wrote (after normalising format).
@@ -201,5 +237,94 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn json_nft_transfer_round_trip() {
+        let s = r#"{"kind":"nft_transfer","contract":"0xnft","to":"0xbob","token_id":"42"}"#;
+        let body: RawIntentBody = serde_json::from_str(s).unwrap();
+        match &body {
+            RawIntentBody::NftTransfer {
+                contract,
+                to,
+                token_id,
+                standard,
+                amount,
+                safe,
+                data,
+            } => {
+                assert_eq!(contract, "0xnft");
+                assert_eq!(to, "0xbob");
+                assert_eq!(token_id, "42");
+                assert!(standard.is_none());
+                assert!(amount.is_none());
+                assert!(*safe, "safe defaults to true");
+                assert!(data.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+        // Round-trip back through serde_json.
+        let back = serde_json::to_string(&body).unwrap();
+        let parsed: RawIntentBody = serde_json::from_str(&back).unwrap();
+        assert_eq!(parsed, body);
+    }
+
+    #[test]
+    fn json_nft_transfer_erc1155_amount() {
+        let s = r#"{"kind":"nft_transfer","contract":"0xnft","to":"0xbob","token_id":"7","standard":"erc1155","amount":"3"}"#;
+        let body: RawIntentBody = serde_json::from_str(s).unwrap();
+        match body {
+            RawIntentBody::NftTransfer {
+                standard, amount, ..
+            } => {
+                assert_eq!(standard.as_deref(), Some("erc1155"));
+                assert_eq!(amount.as_deref(), Some("3"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn toml_nft_approve_round_trip() {
+        let s = r#"
+kind = "nft_approve"
+contract = "0xnft"
+operator = "0xspender"
+token_id = "1"
+"#;
+        let body: RawIntentBody = toml::from_str(s).unwrap();
+        match &body {
+            RawIntentBody::NftApprove {
+                contract,
+                operator,
+                token_id,
+            } => {
+                assert_eq!(contract, "0xnft");
+                assert_eq!(operator, "0xspender");
+                assert_eq!(token_id, "1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn json_nft_approve_all_round_trip() {
+        let s = r#"{"kind":"nft_approve_all","contract":"0xnft","operator":"0xop","approved":true}"#;
+        let body: RawIntentBody = serde_json::from_str(s).unwrap();
+        match &body {
+            RawIntentBody::NftApproveAll {
+                contract,
+                operator,
+                approved,
+            } => {
+                assert_eq!(contract, "0xnft");
+                assert_eq!(operator, "0xop");
+                assert!(*approved);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let back = serde_json::to_string(&body).unwrap();
+        let parsed: RawIntentBody = serde_json::from_str(&back).unwrap();
+        assert_eq!(parsed, body);
     }
 }
