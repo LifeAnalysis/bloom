@@ -1,5 +1,7 @@
 //! The Handler trait — every top-level subtree implements it.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -120,6 +122,15 @@ pub trait Handler: Send + Sync {
     /// List directory children. Default: NotADir.
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         Err(HandlerError::NotADir(path.to_string_path()))
+    }
+
+    /// Optional per-path TTL for the router-level read cache. `None`
+    /// (default) means "never cache at the router". Handlers backing
+    /// volatile or RPC-heavy paths should return a small `Duration`
+    /// here (e.g. 1s for chain head, 30s for etherscan-backed reads).
+    fn cache_ttl(&self, path: &VfsPath) -> Option<Duration> {
+        let _ = path;
+        None
     }
 
     /// Whether a successful read of `path` has externally-visible side

@@ -24,6 +24,7 @@
 //! - `chains/<chain>/contracts/<addr>/abi` — verified ABI
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -471,6 +472,45 @@ impl Handler for ChainsHandler {
                     .collect())
             }
             _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Per-path TTLs. The router consults this before dispatching the
+    /// read; `None` means "always go to the handler". We keep TTLs
+    /// short for live data (head, balance, nonce) and longer for
+    /// immutable data (chain id, mined tx receipt, etherscan-backed
+    /// txs) that doesn't change in practice.
+    fn cache_ttl(&self, path: &VfsPath) -> Option<Duration> {
+        let segs = path.segments();
+        if segs.is_empty() {
+            return None;
+        }
+        match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
+            "chain_id" => Some(Duration::from_secs(86_400)),
+            "head" => Some(Duration::from_secs(1)),
+            "gas" => Some(Duration::from_secs(2)),
+            // `tx/<hash>/...` — once mined these never change, so a
+            // generous 60s TTL keeps us off the RPC during burst polling.
+            "tx" => Some(Duration::from_secs(60)),
+            // Address-scoped reads: balance/nonce/code change with the
+            // chain head. Etherscan-backed history is rate-limited so
+            // we cache it longer.
+            "addresses" => match segs.get(3).map(|s| s.as_str()) {
+                Some("balance" | "balance.eth" | "balance.raw" | "nonce") => {
+                    Some(Duration::from_secs(5))
+                }
+                Some("code" | "is_contract") => Some(Duration::from_secs(86_400)),
+                Some("txs" | "internal_txs" | "erc20_txs" | "erc721_txs") => {
+                    Some(Duration::from_secs(30))
+                }
+                _ => None,
+            },
+            // Verified source / ABI: effectively immutable.
+            "contracts" => Some(Duration::from_secs(7 * 86_400)),
+            // Block by number is permanent past finality; we don't know
+            // finality here so use a long but bounded TTL.
+            "blocks" => Some(Duration::from_secs(300)),
+            _ => None,
         }
     }
 }

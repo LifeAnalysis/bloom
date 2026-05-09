@@ -1,11 +1,16 @@
 //! Top-level path router. Owns the per-prefix handlers and dispatches.
 //!
-//! Wires a hash-chained audit log ([`AuditLog`]) into the dispatch path:
-//! every successful write appends a `vfs.write` record (with sha256 of
-//! the body); every successful read of a *side-effecting* path
-//! (handler-declared via [`Handler::is_read_side_effecting`]) appends a
-//! `vfs.read` record. Failures are not logged; we err on the side of
-//! *fewer* entries to keep the chain useful.
+//! The router optionally wires two cross-cutting concerns:
+//!
+//! 1. A hash-chained audit log ([`AuditLog`]) — every successful write
+//!    appends an `vfs.write` record (with sha256 of the body); every
+//!    successful read of a *side-effecting* path (handler-declared via
+//!    [`Handler::is_read_side_effecting`]) appends an `vfs.read` record.
+//!    Failures are not logged; we err on the side of *fewer* entries to
+//!    keep the chain useful.
+//! 2. A per-path TTL cache ([`PathCache`]) — handlers opt in via
+//!    [`Handler::cache_ttl`]. Reads consult the cache first; writes
+//!    invalidate the exact path and the whole top-level prefix.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -13,6 +18,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use beth_proto::audit::{AuditLog, AuditRecord};
 
+use crate::cache::PathCache;
 use crate::handler::{Entry, EntryKind, Handler, HandlerError};
 use crate::path::VfsPath;
 
@@ -30,6 +36,7 @@ const AUDIT_ACTOR_LOCAL: &str = "local";
 pub struct Vfs {
     handlers: Arc<BTreeMap<String, Arc<dyn Handler>>>,
     audit: Option<Arc<AuditLog>>,
+    cache: Option<Arc<PathCache>>,
 }
 
 impl Default for Vfs {
@@ -43,6 +50,7 @@ impl Vfs {
         Self {
             handlers: Arc::new(BTreeMap::new()),
             audit: None,
+            cache: None,
         }
     }
 
@@ -61,6 +69,11 @@ impl Vfs {
     /// Whether an audit log is wired into this router.
     pub fn has_audit(&self) -> bool {
         self.audit.is_some()
+    }
+
+    /// Whether a router-level path cache is wired.
+    pub fn has_cache(&self) -> bool {
+        self.cache.is_some()
     }
 
     /// Best-effort audit append. Errors are logged at WARN and dropped —
@@ -131,7 +144,24 @@ impl Handler for Vfs {
             .get(head)
             .ok_or_else(|| HandlerError::NotFound(path.to_string_path()))?;
         let rest = path.shift();
+
+        // Cache fast path. We key on the *full* VFS path (including the
+        // top segment) so collisions across handlers are impossible.
+        let key = path_to_cache_key(path);
+        if let Some(cache) = &self.cache {
+            if let Some(bytes) = cache.get(&key) {
+                return Ok(bytes);
+            }
+        }
+
         let bytes = h.read(&rest).await?;
+
+        // Populate cache if the handler declares a TTL for this path.
+        if let (Some(cache), Some(ttl)) = (&self.cache, h.cache_ttl(&rest)) {
+            if !ttl.is_zero() {
+                cache.put(&key, bytes.clone(), ttl);
+            }
+        }
 
         // Side-effecting reads (signing, broadcast triggers, etc) get
         // an audit entry — only on success.
@@ -150,7 +180,13 @@ impl Handler for Vfs {
             .ok_or_else(|| HandlerError::NotFound(path.to_string_path()))?;
         let rest = path.shift();
         h.write(&rest, data).await?;
-        // Successful write — audit it.
+
+        // Successful write — invalidate cache, then audit. Cache
+        // invalidation goes first so a concurrent reader can't observe
+        // a stale value with the audit entry already present.
+        if let Some(cache) = &self.cache {
+            cache.invalidate(&path_to_cache_key(path));
+        }
         self.audit_write(path, data);
         Ok(())
     }
@@ -178,6 +214,7 @@ impl Handler for Vfs {
 pub struct VfsBuilder {
     handlers: BTreeMap<String, Arc<dyn Handler>>,
     audit: Option<Arc<AuditLog>>,
+    cache: Option<Arc<PathCache>>,
 }
 
 impl VfsBuilder {
@@ -194,12 +231,27 @@ impl VfsBuilder {
         self
     }
 
+    /// Wire a router-level path cache. Without this, every read goes
+    /// straight to the handler (the original behaviour).
+    pub fn with_cache(mut self, cache: Arc<PathCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
     pub fn build(self) -> Vfs {
         Vfs {
             handlers: Arc::new(self.handlers),
             audit: self.audit,
+            cache: self.cache,
         }
     }
+}
+
+/// Build a stable cache key from a [`VfsPath`]. We strip the leading
+/// `/` so keys agree with `path.segments().join("/")`; that makes the
+/// `PathCache::invalidate` prefix-match logic correct.
+fn path_to_cache_key(path: &VfsPath) -> String {
+    path.segments().join("/")
 }
 
 /// Convenience: render a value as an `ls -l`-style metadata line.
@@ -217,6 +269,7 @@ mod tests {
     use super::*;
     use crate::handler::Entry;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     struct EchoHandler;
 
@@ -268,17 +321,19 @@ mod tests {
         assert!(matches!(r, Err(HandlerError::NotFound(_))));
     }
 
-    /// Test handler that counts read/write calls and can be configured
-    /// to flag its reads as side-effecting.
+    /// Handler that counts calls so we can prove the cache is short-
+    /// circuiting reads, and supports a writable file at `/wkv/<key>`.
     struct CountingHandler {
+        ttl: Option<Duration>,
         side_effecting_read: bool,
         reads: AtomicUsize,
         writes: AtomicUsize,
     }
 
     impl CountingHandler {
-        fn new() -> Self {
+        fn new(ttl: Option<Duration>) -> Self {
             Self {
+                ttl,
                 side_effecting_read: false,
                 reads: AtomicUsize::new(0),
                 writes: AtomicUsize::new(0),
@@ -305,16 +360,78 @@ mod tests {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+        fn cache_ttl(&self, _p: &VfsPath) -> Option<Duration> {
+            self.ttl
+        }
         fn is_read_side_effecting(&self, _p: &VfsPath) -> bool {
             self.side_effecting_read
         }
     }
 
     #[tokio::test]
+    async fn cache_hit_returns_cached_value_within_ttl() {
+        let h = Arc::new(CountingHandler::new(Some(Duration::from_secs(60))));
+        let cache = Arc::new(PathCache::new());
+        let vfs = Vfs::builder()
+            .mount("k", h.clone())
+            .with_cache(cache.clone())
+            .build();
+        let p = VfsPath::parse("/k/x").unwrap();
+        let a = vfs.read(&p).await.unwrap();
+        let b = vfs.read(&p).await.unwrap();
+        assert_eq!(a, b, "cache should return identical body");
+        assert_eq!(
+            h.reads.load(Ordering::SeqCst),
+            1,
+            "second read must hit cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_expiry_refetches() {
+        let h = Arc::new(CountingHandler::new(Some(Duration::from_millis(30))));
+        let cache = Arc::new(PathCache::new());
+        let vfs = Vfs::builder()
+            .mount("k", h.clone())
+            .with_cache(cache)
+            .build();
+        let p = VfsPath::parse("/k/x").unwrap();
+        let _ = vfs.read(&p).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let _ = vfs.read(&p).await.unwrap();
+        assert_eq!(h.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn write_invalidates_same_prefix() {
+        let h = Arc::new(CountingHandler::new(Some(Duration::from_secs(60))));
+        let cache = Arc::new(PathCache::new());
+        let vfs = Vfs::builder()
+            .mount("k", h.clone())
+            .with_cache(cache)
+            .build();
+        let pa = VfsPath::parse("/k/a").unwrap();
+        let pb = VfsPath::parse("/k/b").unwrap();
+        let _ = vfs.read(&pa).await.unwrap();
+        let _ = vfs.read(&pb).await.unwrap();
+        assert_eq!(h.reads.load(Ordering::SeqCst), 2);
+
+        // Both `a` and `b` are now cached. Writing to `b` should also
+        // invalidate `a` because they share the `k` top-level prefix.
+        vfs.write(&pb, b"new").await.unwrap();
+        let _ = vfs.read(&pa).await.unwrap();
+        assert_eq!(
+            h.reads.load(Ordering::SeqCst),
+            3,
+            "write should evict siblings"
+        );
+    }
+
+    #[tokio::test]
     async fn write_appends_audit_record() {
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let h = Arc::new(CountingHandler::new());
+        let h = Arc::new(CountingHandler::new(None));
         let vfs = Vfs::builder().mount("k", h).with_audit(log.clone()).build();
         let p = VfsPath::parse("/k/x").unwrap();
         vfs.write(&p, b"hello").await.unwrap();
@@ -332,8 +449,8 @@ mod tests {
     async fn pure_read_does_not_audit_but_side_effecting_does() {
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let pure = Arc::new(CountingHandler::new());
-        let signing = Arc::new(CountingHandler::new().with_side_effecting_read());
+        let pure = Arc::new(CountingHandler::new(None));
+        let signing = Arc::new(CountingHandler::new(None).with_side_effecting_read());
         let vfs = Vfs::builder()
             .mount("pure", pure)
             .mount("sign", signing)
@@ -356,7 +473,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let log = Arc::new(AuditLog::open(&path).unwrap());
-        let h = Arc::new(CountingHandler::new());
+        let h = Arc::new(CountingHandler::new(None));
         let vfs = Vfs::builder().mount("k", h).with_audit(log).build();
         for body in ["a", "b", "c"] {
             vfs.write(&VfsPath::parse("/k/x").unwrap(), body.as_bytes())

@@ -57,6 +57,7 @@ humantime-serde = "1"
 tempfile = "3"
 once_cell = "1"
 futures = "0.3"
+lru = "0.12"
 
 # Ethereum stack
 alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract"] }

@@ -25,7 +25,7 @@ use beth_vfs::handlers::{
     AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, PricesHandler, SimulateHandler,
     StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
-use beth_vfs::Vfs;
+use beth_vfs::{PathCache, Vfs};
 use beth_watch::{WatchExecutor, WatchRegistry};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -111,6 +111,7 @@ impl Daemon {
         let audit =
             AuditLog::open(home.audit_path()).map_err(|e| DaemonError::Audit(e.to_string()))?;
         let audit_arc = Arc::new(audit.clone());
+        let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
             WatchRegistry::new(home.watch_dir()).map_err(|e| DaemonError::Watch(e.to_string()))?,
@@ -219,7 +220,10 @@ impl Daemon {
             );
         }
 
-        let vfs = vfs_builder.with_audit(audit_arc.clone()).build();
+        let vfs = vfs_builder
+            .with_audit(audit_arc.clone())
+            .with_cache(path_cache)
+            .build();
 
         info!(home=%home.root().display(), chains=?config.chains.keys().collect::<Vec<_>>(), "daemon.built");
 
