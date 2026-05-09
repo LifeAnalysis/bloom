@@ -75,6 +75,7 @@ pub struct TxEngine {
     pub block_mainnet_broadcast: bool,
     token_cache: TokenCache,
     resolver: Option<Arc<dyn RecipientResolver>>,
+    price_oracle: Option<crate::oracle::DynPriceOracle>,
 }
 
 impl TxEngine {
@@ -85,12 +86,20 @@ impl TxEngine {
             block_mainnet_broadcast,
             token_cache: Arc::new(RwLock::new(HashMap::new())),
             resolver: None,
+            price_oracle: None,
         }
     }
 
     /// Wire a name resolver (typically an ENS adapter) for recipients.
     pub fn with_resolver(mut self, resolver: Arc<dyn RecipientResolver>) -> Self {
         self.resolver = Some(resolver);
+        self
+    }
+
+    /// Wire a price oracle so policy USD caps are evaluated with real
+    /// values instead of the no-data Warn fallback.
+    pub fn with_price_oracle(mut self, oracle: crate::oracle::DynPriceOracle) -> Self {
+        self.price_oracle = Some(oracle);
         self
     }
 
@@ -384,11 +393,23 @@ impl TxEngine {
             }
             RawIntentBody::Enso { .. } => {}
         }
-        // TODO(policy): wire a price oracle so usd_value is populated for
-        // non-zero-value txs. Until then USD caps fire a single Warn check
-        // that surfaces the missing oracle in plan.md, instead of silently
-        // passing dollar-denominated rules.
-        policy_ctx.usd_value = None;
+        // Only call the oracle when the active policy actually evaluates
+        // a dollar-denominated rule — otherwise we'd add HTTP latency to
+        // every stage for nothing.
+        let needs_usd = policy.caps.per_tx_usd.is_some()
+            || policy.caps.require_confirm_above_usd.is_some()
+            || policy.caps.per_day_usd.is_some();
+        policy_ctx.usd_value = if needs_usd && value_wei > U256::ZERO {
+            if let Some(oracle) = &self.price_oracle {
+                oracle
+                    .native_usd(&spec.name, value_wei, spec.native_decimals)
+                    .await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let mut staged = StagedTx {
             id: self.outbox.allocate_id(),

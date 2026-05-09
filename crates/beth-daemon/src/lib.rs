@@ -8,6 +8,7 @@
 pub mod ipc;
 
 mod ens_resolver;
+mod price_oracle;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -134,6 +135,12 @@ impl Daemon {
         let etherscan_arc = etherscan.map(Arc::new);
 
         let prices = PricesClient::new();
+
+        // Wire the prices client into the policy USD-cap path. The trait
+        // lives in beth-tx; the adapter is in this crate so beth-tx
+        // doesn't pull reqwest+rustls.
+        tx_engine =
+            tx_engine.with_price_oracle(Arc::new(price_oracle::PricesOracle::new(prices.clone())));
 
         let mut vfs_builder = Vfs::builder()
             .mount(
