@@ -773,6 +773,7 @@ mod tests {
             status: beth_proto::TxStatus::Pending,
             tx_hash: None,
             token: None,
+            usd_value: None,
         };
         f.handler
             .tx_engine

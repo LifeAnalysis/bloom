@@ -514,6 +514,7 @@ mod tests {
             status: beth_proto::TxStatus::Pending,
             tx_hash: None,
             token: None,
+            usd_value: None,
         };
         d.tx_engine.outbox.write_pending(&staged, "p").unwrap();
         let n = d.tx_engine.outbox.sweep_expired(2).unwrap();

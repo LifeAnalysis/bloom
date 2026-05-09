@@ -410,6 +410,15 @@ impl TxEngine {
         } else {
             None
         };
+        // Trailing 24h USD spend across all chains for this wallet.
+        // Only consulted when the policy actually has a per_day cap;
+        // we still set it whenever a USD rule fires so plan.md / audit
+        // can show the running total (cheap — just walks intent.json).
+        if needs_usd {
+            const DAY_MS: u128 = 24 * 60 * 60 * 1000;
+            let since = now_ms.saturating_sub(DAY_MS);
+            policy_ctx.usd_spent_last_24h = self.outbox.sum_usd_since(wallet, since).ok();
+        }
 
         let mut staged = StagedTx {
             id: self.outbox.allocate_id(),
@@ -431,6 +440,7 @@ impl TxEngine {
             status: TxStatus::Pending,
             tx_hash: None,
             token: token_for_plan,
+            usd_value: policy_ctx.usd_value,
         };
         staged.policy_checks = policy_engine::evaluate(
             policy,
@@ -776,6 +786,7 @@ mod tests {
             status: TxStatus::Pending,
             tx_hash: None,
             token: None,
+            usd_value: None,
         }
     }
 

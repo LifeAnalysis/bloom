@@ -332,6 +332,53 @@ impl Outbox {
         }
         Ok(count)
     }
+
+    /// Sum the `usd_value` of every staged tx for `wallet` whose
+    /// `created_ms >= since_ms`, across all chains and all states.
+    ///
+    /// Used by the policy engine to enforce `caps.per_day_usd`. We
+    /// include pending entries (not just sent) on purpose: a pending
+    /// stage represents committed user intent and should count
+    /// against the rolling cap, otherwise stacking many pending
+    /// stages becomes a trivial bypass.
+    ///
+    /// Entries without a `usd_value` (oracle wasn't available when
+    /// they were staged) contribute zero — the rule then degrades
+    /// to "best-effort sum of priced sends".
+    pub fn sum_usd_since(&self, wallet: &str, since_ms: u128) -> Result<f64, OutboxError> {
+        Self::validate_segment(wallet).map_err(|_| OutboxError::InvalidWallet(wallet.into()))?;
+        let wallet_dir = self.inner.root.join(wallet);
+        if !wallet_dir.exists() {
+            return Ok(0.0);
+        }
+        let mut total = 0.0f64;
+        for c in fs::read_dir(&wallet_dir)? {
+            let c = c?;
+            if !c.file_type()?.is_dir() {
+                continue;
+            }
+            for state in [OutboxState::Pending, OutboxState::Sent, OutboxState::Failed] {
+                let state_dir = c.path().join(state.dirname());
+                if !state_dir.exists() {
+                    continue;
+                }
+                for ent in fs::read_dir(&state_dir)? {
+                    let ent = ent?;
+                    let intent_path = ent.path().join("intent.json");
+                    if !intent_path.exists() {
+                        continue;
+                    }
+                    let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
+                    if staged.created_ms >= since_ms {
+                        if let Some(u) = staged.usd_value {
+                            total += u;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +407,7 @@ mod tests {
             status: TxStatus::Pending,
             tx_hash: None,
             token: None,
+            usd_value: None,
         }
     }
 
@@ -446,5 +494,48 @@ mod tests {
         let ob = Outbox::new(dir.path()).unwrap();
         let r = ob.read_in_state("alice", "anvil", "ghost", OutboxState::Pending);
         assert!(matches!(r, Err(OutboxError::NotFound(_))));
+    }
+
+    /// `sum_usd_since` ignores entries older than the cutoff and entries
+    /// without a usd_value, and aggregates across chains and states.
+    #[test]
+    fn sum_usd_since_aggregates_across_chains_and_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+
+        // Recent: anvil + base, both sent. Stale: too old. Unpriced: no contribution.
+        let mut a = fake_staged("a");
+        a.created_ms = 2_000;
+        a.usd_value = Some(100.0);
+        ob.write_pending(&a, "p").unwrap();
+        ob.transition(&ob.read("alice", "anvil", "a").unwrap(), OutboxState::Sent)
+            .unwrap();
+
+        let mut b = fake_staged("b");
+        b.chain = "base".into();
+        b.created_ms = 2_500;
+        b.usd_value = Some(50.0);
+        ob.write_pending(&b, "p").unwrap();
+
+        let mut c = fake_staged("c");
+        c.created_ms = 100; // before cutoff
+        c.usd_value = Some(999.0);
+        ob.write_pending(&c, "p").unwrap();
+
+        let mut d = fake_staged("d");
+        d.created_ms = 3_000;
+        d.usd_value = None; // unpriced
+        ob.write_pending(&d, "p").unwrap();
+
+        let total = ob.sum_usd_since("alice", 1_000).unwrap();
+        assert!((total - 150.0).abs() < 1e-6, "got {total}");
+    }
+
+    #[test]
+    fn sum_usd_since_unknown_wallet_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let total = ob.sum_usd_since("alice", 0).unwrap();
+        assert_eq!(total, 0.0);
     }
 }

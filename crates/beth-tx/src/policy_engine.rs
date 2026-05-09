@@ -9,9 +9,10 @@
 //!   §6.3, treated alongside the first-class lists. Token symbols (e.g.
 //!   `USDC`) match against `AddressContext::token_symbol`; addresses are
 //!   compared as-hex.
-//! - per-tx USD cap (`caps.per_tx_usd` / `caps.require_confirm_above_usd`)
-//!   when a USD price is provided in the context. Per-day USD is
-//!   currently a no-op — see TODO below.
+//! - per-tx USD caps (`caps.per_tx_usd` / `caps.require_confirm_above_usd`)
+//!   when a USD price is in the context.
+//! - rolling 24h `caps.per_day_usd`, summed from the outbox by
+//!   `tx_engine::stage` and surfaced via `ctx.usd_spent_last_24h`.
 //! - automation: `auto_confirm_below_eth`.
 
 use alloy::primitives::{Address, U256};
@@ -41,6 +42,12 @@ pub struct AddressContext {
     /// any USD-cap checks (so a missing oracle never silently passes a
     /// dollar-denominated rule).
     pub usd_value: Option<f64>,
+    /// USD already spent by this wallet in the trailing 24h window
+    /// (sum of historical staged tx `usd_value` for ids past their
+    /// pending state). `None` when the rolling window can't be
+    /// computed — `caps.per_day_usd` then surfaces a soft Warn rather
+    /// than hard-passing.
+    pub usd_spent_last_24h: Option<f64>,
 }
 
 /// Run policy checks against a staged tx.
@@ -140,18 +147,42 @@ pub fn evaluate(
                     });
                 }
             }
-            // TODO(policy): per_day_usd needs a per-wallet rolling counter
-            // (or a recent-activity feed query). The bookkeeping isn't
-            // wired yet, so we surface a single Pass that names the cap
-            // rather than silently dropping it.
+            // The rolling counter is sourced from the outbox itself by
+            // tx_engine::stage (sum of usd_value across this wallet's
+            // sent / pending entries created in the trailing 24h
+            // window). When it's unavailable the caller has no way to
+            // know whether the proposed send breaks the cap, so we
+            // soft-warn rather than silently passing.
             if let Some(per_day) = effective_caps.per_day_usd {
-                out.push(PolicyCheck {
-                    rule: "caps.per_day_usd".into(),
-                    outcome: PolicyOutcome::Pass,
-                    message: format!(
-                        "per_day_usd cap {per_day:.2} configured (TODO: rolling-window enforcement)"
-                    ),
-                });
+                match ctx.usd_spent_last_24h {
+                    Some(prior) => {
+                        let total = prior + usd;
+                        if total > per_day {
+                            out.push(PolicyCheck {
+                                rule: "caps.per_day_usd".into(),
+                                outcome: PolicyOutcome::Deny,
+                                message: format!(
+                                    "rolling 24h usd {prior:.2} + {usd:.2} > cap {per_day:.2}"
+                                ),
+                            });
+                        } else {
+                            out.push(PolicyCheck {
+                                rule: "caps.per_day_usd".into(),
+                                outcome: PolicyOutcome::Pass,
+                                message: format!(
+                                    "rolling 24h usd {total:.2} <= cap {per_day:.2}"
+                                ),
+                            });
+                        }
+                    }
+                    None => out.push(PolicyCheck {
+                        rule: "caps.per_day_usd".into(),
+                        outcome: PolicyOutcome::Warn,
+                        message: format!(
+                            "per_day_usd cap {per_day:.2} configured but rolling-window state unavailable"
+                        ),
+                    }),
+                }
             }
         }
         (true, None) => {
@@ -647,5 +678,72 @@ mod tests {
         };
         let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx_pass);
         assert!(!has_hard_violation(&checks), "{checks:?}");
+    }
+
+    /// per_day_usd: total of (rolling spend + this tx) over the cap is
+    /// a hard block; under is a Pass that names the running total.
+    #[test]
+    fn usd_per_day_cap_uses_rolling_window() {
+        let p = Policy {
+            caps: PolicyCaps {
+                per_day_usd: Some(200.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Rolling 180 + new 50 = 230 → over cap.
+        let ctx_over = AddressContext {
+            usd_value: Some(50.0),
+            usd_spent_last_24h: Some(180.0),
+            ..Default::default()
+        };
+        let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx_over);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.rule == "caps.per_day_usd" && matches!(c.outcome, PolicyOutcome::Deny)),
+            "{checks:?}"
+        );
+
+        // Rolling 100 + new 50 = 150 → fine.
+        let ctx_under = AddressContext {
+            usd_value: Some(50.0),
+            usd_spent_last_24h: Some(100.0),
+            ..Default::default()
+        };
+        let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx_under);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.rule == "caps.per_day_usd" && matches!(c.outcome, PolicyOutcome::Pass)),
+            "{checks:?}"
+        );
+    }
+
+    /// per_day_usd configured but the rolling counter is unavailable
+    /// must Warn rather than silently pass — operators need to see
+    /// that the cap was unenforced.
+    #[test]
+    fn usd_per_day_cap_warns_when_state_missing() {
+        let p = Policy {
+            caps: PolicyCaps {
+                per_day_usd: Some(200.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx = AddressContext {
+            usd_value: Some(50.0),
+            usd_spent_last_24h: None,
+            ..Default::default()
+        };
+        let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.rule == "caps.per_day_usd" && matches!(c.outcome, PolicyOutcome::Warn)),
+            "{checks:?}"
+        );
     }
 }

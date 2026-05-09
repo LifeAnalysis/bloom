@@ -61,6 +61,11 @@ pub struct StagedTx {
     /// contract.
     #[serde(default)]
     pub token: Option<TokenRef>,
+    /// USD-denominated value at stage time, when a price oracle was
+    /// available. Persisted so the per-day rolling-window enforcement
+    /// can sum historical sends without re-querying prices.
+    #[serde(default)]
+    pub usd_value: Option<f64>,
 }
 
 /// Lightweight token reference embedded in a `StagedTx` for display.
