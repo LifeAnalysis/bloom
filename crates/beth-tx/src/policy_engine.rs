@@ -3,17 +3,24 @@
 //!
 //! Rules covered:
 //! - global + per-chain caps (the *more restrictive* of the two wins).
-//! - allow / deny lists for contracts, tokens, recipients (case-
-//!   insensitive address compares).
+//! - first-class allow / deny lists for contracts, tokens, recipients
+//!   (case-insensitive address compares).
+//! - legacy `[contracts]` / `[tokens]` allow/deny blocks from the spec
+//!   §6.3, treated alongside the first-class lists. Token symbols (e.g.
+//!   `USDC`) match against `AddressContext::token_symbol`; addresses are
+//!   compared as-hex.
+//! - per-tx USD cap (`caps.per_tx_usd` / `caps.require_confirm_above_usd`)
+//!   when a USD price is provided in the context. Per-day USD is
+//!   currently a no-op — see TODO below.
 //! - automation: `auto_confirm_below_eth`.
 
 use alloy::primitives::{Address, U256};
-use beth_proto::policy::{PolicyCaps, PolicyLists};
+use beth_proto::policy::{PolicyAllowDeny, PolicyCaps, PolicyLists};
 use beth_proto::{format_units, Policy, PolicyCheck, PolicyOutcome};
 
 const ETHER: u128 = 1_000_000_000_000_000_000;
 
-/// Addresses involved in a tx, used by allow/deny list checks.
+/// Addresses + tags involved in a tx, used by allow/deny list checks.
 #[derive(Debug, Clone, Default)]
 pub struct AddressContext {
     /// The contract being called (if any).
@@ -23,6 +30,17 @@ pub struct AddressContext {
     /// The user-facing recipient. For ERC-20 sends this is the
     /// address inside the calldata, not the contract `to`.
     pub recipient: Option<Address>,
+    /// Best-effort symbol for the token being moved (e.g. `USDC`,
+    /// `WETH`). Used for spec-style `[tokens] allow=["USDC"]` matches.
+    pub token_symbol: Option<String>,
+    /// Whether the destination is a contract — `true` for ERC-20 / call /
+    /// raw-data txs, `false` for plain native sends. Drives `[contracts]`
+    /// allow/deny evaluation.
+    pub destination_is_contract: bool,
+    /// Per-tx USD value of this tx, when prices are wired. `None` skips
+    /// any USD-cap checks (so a missing oracle never silently passes a
+    /// dollar-denominated rule).
+    pub usd_value: Option<f64>,
 }
 
 /// Run policy checks against a staged tx.
@@ -85,6 +103,67 @@ pub fn evaluate(
         }
     }
 
+    // ----- USD caps -----------------------------------------------------------
+    // Only enforced when the caller has a quote. Without prices we leave
+    // these rules silent rather than auto-passing or auto-failing — the
+    // spec wants the cap respected; an absent oracle is the operator's
+    // problem to resolve, not a license to skip the rule. We surface a
+    // single "skipped" pass-result so plan.md makes the gap visible.
+    let any_usd_rule = effective_caps.per_tx_usd.is_some()
+        || effective_caps.require_confirm_above_usd.is_some()
+        || effective_caps.per_day_usd.is_some();
+    match (any_usd_rule, ctx.usd_value) {
+        (true, Some(usd)) => {
+            if let Some(max_usd) = effective_caps.per_tx_usd {
+                if usd > max_usd {
+                    out.push(PolicyCheck {
+                        rule: "caps.per_tx_usd".into(),
+                        outcome: PolicyOutcome::Deny,
+                        message: format!("usd {usd:.2} > max {max_usd:.2}"),
+                    });
+                } else {
+                    out.push(PolicyCheck {
+                        rule: "caps.per_tx_usd".into(),
+                        outcome: PolicyOutcome::Pass,
+                        message: format!("usd {usd:.2} <= max {max_usd:.2}"),
+                    });
+                }
+            }
+            if let Some(soft_usd) = effective_caps.require_confirm_above_usd {
+                if usd > soft_usd {
+                    out.push(PolicyCheck {
+                        rule: "caps.require_confirm_above_usd".into(),
+                        outcome: PolicyOutcome::Warn,
+                        message: format!(
+                            "usd {usd:.2} > soft {soft_usd:.2} — write override token to confirm"
+                        ),
+                    });
+                }
+            }
+            // TODO(policy): per_day_usd needs a per-wallet rolling counter
+            // (or a recent-activity feed query). The bookkeeping isn't
+            // wired yet, so we surface a single Pass that names the cap
+            // rather than silently dropping it.
+            if let Some(per_day) = effective_caps.per_day_usd {
+                out.push(PolicyCheck {
+                    rule: "caps.per_day_usd".into(),
+                    outcome: PolicyOutcome::Pass,
+                    message: format!(
+                        "per_day_usd cap {per_day:.2} configured (TODO: rolling-window enforcement)"
+                    ),
+                });
+            }
+        }
+        (true, None) => {
+            out.push(PolicyCheck {
+                rule: "caps.usd".into(),
+                outcome: PolicyOutcome::Warn,
+                message: "USD caps configured but no price quote available; rule skipped".into(),
+            });
+        }
+        (false, _) => {}
+    }
+
     // ----- allow / deny lists -------------------------------------------------
     check_lists(
         &mut out,
@@ -130,9 +209,110 @@ pub fn evaluate(
         ListMode::Allow,
     );
 
+    // ----- spec §6.3 legacy `[contracts]` / `[tokens]` blocks ---------------
+    // The spec describes:
+    //
+    //   [contracts]
+    //   allow = ["uniswap-v2", "0x..."]
+    //   deny  = ["0xevilcontract..."]
+    //   [tokens]
+    //   allow = ["ETH", "USDC", ...]
+    //
+    // These are honoured for tx kinds where they make sense:
+    //  - `[contracts]` only fires when the destination is a contract
+    //    (i.e. `destination_is_contract` is true: ERC-20 / call / raw
+    //    data). A plain native send to an EOA bypasses contract lists
+    //    even if the lists are non-empty.
+    //  - `[tokens]` fires for ERC-20 transfers; the symbol or token
+    //    address must appear in the allow set (when non-empty), and
+    //    must not appear in the deny set.
+    if ctx.destination_is_contract {
+        check_allow_deny(
+            &mut out,
+            "contracts",
+            &policy.contracts,
+            // Match by contract address only; symbol matching is for
+            // tokens.
+            address_lc(ctx.contract).as_deref(),
+            None,
+        );
+    }
+    if ctx.token.is_some() {
+        check_allow_deny(
+            &mut out,
+            "tokens",
+            &policy.tokens,
+            address_lc(ctx.token).as_deref(),
+            ctx.token_symbol.as_deref(),
+        );
+    }
+
     let _ = ETHER;
     let _ = PolicyLists::default; // make import deterministic
     out
+}
+
+fn address_lc(a: Option<Address>) -> Option<String> {
+    a.map(|x| format!("{x:#x}").to_ascii_lowercase())
+}
+
+/// Enforce a spec-style `[section] allow=[..] deny=[..]` block. `target`
+/// is the address (lower-cased hex) of the contract or token; `symbol`
+/// is an optional secondary key (e.g. `USDC`) checked alongside.
+fn check_allow_deny(
+    out: &mut Vec<PolicyCheck>,
+    section: &str,
+    block: &PolicyAllowDeny,
+    target: Option<&str>,
+    symbol: Option<&str>,
+) {
+    let matches_one = |entry: &str| -> bool {
+        let e = entry.trim();
+        if let Some(t) = target {
+            if e.eq_ignore_ascii_case(t) {
+                return true;
+            }
+        }
+        if let Some(s) = symbol {
+            if e.eq_ignore_ascii_case(s) {
+                return true;
+            }
+        }
+        false
+    };
+
+    if !block.deny.is_empty() && block.deny.iter().any(|s| matches_one(s)) {
+        out.push(PolicyCheck {
+            rule: format!("{section}.deny"),
+            outcome: PolicyOutcome::Deny,
+            message: format!(
+                "{} on deny list",
+                target.unwrap_or_else(|| symbol.unwrap_or("(unknown)"))
+            ),
+        });
+    }
+    if !block.allow.is_empty() {
+        let hit = block.allow.iter().any(|s| matches_one(s));
+        if hit {
+            out.push(PolicyCheck {
+                rule: format!("{section}.allow"),
+                outcome: PolicyOutcome::Pass,
+                message: format!(
+                    "{} on allow list",
+                    target.unwrap_or_else(|| symbol.unwrap_or("(unknown)"))
+                ),
+            });
+        } else {
+            out.push(PolicyCheck {
+                rule: format!("{section}.allow"),
+                outcome: PolicyOutcome::Deny,
+                message: format!(
+                    "{} not on allow list",
+                    target.unwrap_or_else(|| symbol.unwrap_or("(unknown)"))
+                ),
+            });
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -353,5 +533,119 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p2.override_sentinel(), "yolo");
+    }
+
+    /// Fix #11: spec §6.3 `[contracts] deny=[..]` must hard-block any tx
+    /// whose destination is a contract listed in deny. Plain native sends
+    /// (`destination_is_contract=false`) bypass the contracts block.
+    #[test]
+    fn legacy_contracts_deny_blocks_contract_call() {
+        let mut deny = std::collections::BTreeSet::new();
+        deny.insert("0x000000000000000000000000000000000000beef".to_string());
+        let p = Policy {
+            contracts: PolicyAllowDeny {
+                deny,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let target = addr("0x000000000000000000000000000000000000beef");
+        // As contract call → blocked.
+        let ctx = AddressContext {
+            contract: Some(target),
+            destination_is_contract: true,
+            ..Default::default()
+        };
+        let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx);
+        assert!(has_hard_violation(&checks), "{checks:?}");
+
+        // As plain EOA send (heuristic says not a contract) → allowed.
+        let ctx2 = AddressContext {
+            recipient: Some(target),
+            destination_is_contract: false,
+            ..Default::default()
+        };
+        let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx2);
+        assert!(!has_hard_violation(&checks), "{checks:?}");
+    }
+
+    /// Fix #11: `[tokens] allow=[..]` accepts symbol matches as well as
+    /// hex-address matches. A non-listed token must hard-block.
+    #[test]
+    fn legacy_tokens_allow_matches_symbol() {
+        let mut allow = std::collections::BTreeSet::new();
+        allow.insert("USDC".to_string());
+        let p = Policy {
+            tokens: PolicyAllowDeny {
+                allow,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Symbol match passes.
+        let usdc = addr("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        let ctx_pass = AddressContext {
+            token: Some(usdc),
+            token_symbol: Some("USDC".into()),
+            ..Default::default()
+        };
+        let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx_pass);
+        assert!(!has_hard_violation(&checks), "{checks:?}");
+
+        // Different token symbol — blocked.
+        let weth = addr("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        let ctx_fail = AddressContext {
+            token: Some(weth),
+            token_symbol: Some("WETH".into()),
+            ..Default::default()
+        };
+        let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx_fail);
+        assert!(has_hard_violation(&checks), "{checks:?}");
+    }
+
+    /// Fix #11: USD caps configured but no price fires a Warn rather
+    /// than silently passing.
+    #[test]
+    fn usd_cap_without_price_warns() {
+        let p = Policy {
+            caps: PolicyCaps {
+                per_tx_usd: Some(100.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx = AddressContext {
+            usd_value: None,
+            ..Default::default()
+        };
+        let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx);
+        assert!(checks
+            .iter()
+            .any(|c| c.rule == "caps.usd" && matches!(c.outcome, PolicyOutcome::Warn)));
+    }
+
+    /// Fix #11: USD caps with a quote enforce per-tx max as a hard cap.
+    #[test]
+    fn usd_per_tx_cap_blocks_when_over() {
+        let p = Policy {
+            caps: PolicyCaps {
+                per_tx_usd: Some(100.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx_fail = AddressContext {
+            usd_value: Some(150.0),
+            ..Default::default()
+        };
+        let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx_fail);
+        assert!(has_hard_violation(&checks), "{checks:?}");
+
+        let ctx_pass = AddressContext {
+            usd_value: Some(50.0),
+            ..Default::default()
+        };
+        let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx_pass);
+        assert!(!has_hard_violation(&checks), "{checks:?}");
     }
 }
