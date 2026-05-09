@@ -63,6 +63,8 @@ pub enum TxEngineError {
     Parse(#[from] ParseError),
     #[error("chain: {0}")]
     Chain(#[from] ChainError),
+    #[error("rpc: {0}")]
+    Rpc(#[from] beth_rpc::BethRpcError),
     #[error("outbox: {0}")]
     Outbox(#[from] OutboxError),
     #[error("address: {0}")]
@@ -536,9 +538,26 @@ impl TxEngine {
 
         // Build a request to estimate gas; choose 1559 vs legacy fields.
         let data_bytes = decode_data(&data_hex)?;
+
+        // Open a pinned read session for the nonce + code reads so the
+        // staging fanout sees a self-consistent block even when the
+        // layered fallback transport rotates upstreams between calls.
+        // Sessions are unconditional per the spec's Decisions Ratified
+        // #2 — there is no opt-out. `gas_price` and `estimate_gas`
+        // intentionally stay on the bare client because they target
+        // pending-block semantics that don't fit the pinned model;
+        // `chain_id` uses the cached value and doesn't need pinning.
+        let session = chain.open_session().await?;
+        if session.is_degraded() {
+            tracing::warn!(
+                chain = %spec.name,
+                pinned_number = session.block_number(),
+                "tx.staging.session_degraded"
+            );
+        }
         let nonce = match intent.nonce {
             Some(n) => n,
-            None => chain.nonce(from).await?,
+            None => session.nonce(from).await?,
         };
         let gas_price = match chain.gas_price().await {
             Ok(g) => g,
@@ -619,7 +638,11 @@ impl TxEngine {
                     // Native send: if data is non-empty or the destination
                     // has bytecode, treat as contract call.
                     let data_nonempty = !data_bytes.is_empty();
-                    let to_has_code = chain.code(to).await.map(|c| !c.is_empty()).unwrap_or(false);
+                    let to_has_code = session
+                        .code(to)
+                        .await
+                        .map(|c| !c.is_empty())
+                        .unwrap_or(false);
                     policy_ctx.destination_is_contract = data_nonempty || to_has_code;
                     if policy_ctx.destination_is_contract {
                         policy_ctx.contract = Some(to);

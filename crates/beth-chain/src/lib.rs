@@ -24,6 +24,8 @@ use tracing::{debug, warn};
 
 use beth_proto::{ChainId, ChainSpec};
 
+pub use beth_rpc::Session;
+
 sol! {
     #[sol(rpc)]
     #[allow(missing_docs)]
@@ -113,6 +115,12 @@ impl From<TransportError> for ChainError {
     }
 }
 
+impl From<beth_rpc::BethRpcError> for ChainError {
+    fn from(e: beth_rpc::BethRpcError) -> Self {
+        map_rpc_error(e)
+    }
+}
+
 /// Translate a `beth_rpc::BethRpcError` into the historical `ChainError`
 /// surface so existing matchers in the workspace keep working.
 fn map_rpc_error(e: beth_rpc::BethRpcError) -> ChainError {
@@ -124,7 +132,6 @@ fn map_rpc_error(e: beth_rpc::BethRpcError) -> ChainError {
         BethRpcError::AllEndpointsFailed { chain, last_error } => {
             ChainError::Transport(format!("all endpoints failed for {chain}: {last_error}"))
         }
-        BethRpcError::SessionNotImplemented => ChainError::Rpc("session not implemented".into()),
     }
 }
 
@@ -198,6 +205,41 @@ impl ChainClient {
     /// status displays that don't need the full snapshot.
     pub fn cooled_down_count(&self) -> usize {
         self.engine.cooled_down_count()
+    }
+
+    /// Open a new pinned read session at the current `latest` block.
+    ///
+    /// The returned [`Session`] borrows the engine's provider and
+    /// freezes a `(block_number, block_hash)` pair so multi-call
+    /// logical operations (tx staging, aggregate VFS reads) observe a
+    /// consistent state even when the layered fallback transport
+    /// rotates upstreams between calls. Sessions are unconditional
+    /// (Decisions Ratified #2 in the spec): there is no toggle.
+    ///
+    /// On failure to read the head block this returns
+    /// `ChainError::Transport`; on a successful open with a `null`
+    /// block result (extremely rare; only on a brand-new chain before
+    /// genesis is queryable) it returns `ChainError::NotFound`.
+    pub async fn open_session(&self) -> Result<Session<'_>, ChainError> {
+        let block = self
+            .primary
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await?
+            .ok_or_else(|| ChainError::NotFound("latest block".into()))?;
+        let pinned_number = block.header.number;
+        let pinned_hash = block.header.hash;
+        debug!(
+            chain = %self.spec.name,
+            pinned_number,
+            pinned_hash = %pinned_hash,
+            "rpc.session.opened"
+        );
+        Ok(Session::from_pinned(
+            self.primary.as_ref(),
+            self.spec.name.clone(),
+            pinned_number,
+            pinned_hash,
+        ))
     }
 
     pub async fn chain_id(&self) -> Result<u64, ChainError> {
@@ -1935,6 +1977,304 @@ mod mock_rpc_tests {
         assert_eq!(
             c.is_approved_for_all(nft, owner, operator).await.unwrap(),
             Some(true)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session tests
+// ---------------------------------------------------------------------------
+//
+// Lifted from `beth-rpc` per the WP-5 spec note: mocking through
+// `ChainClient` is the natural seam since `Session` is opened via
+// `ChainClient::open_session`, and the existing mock_rpc_tests pattern
+// already handles the JSON-RPC dispatch shape we need. The dispatcher
+// here is a slimmed copy that records request params so each test can
+// assert the session passed `BlockId::Hash(pinned_hash)` (or fell
+// through to `BlockId::Number(pinned_number)` on the degraded path).
+//
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Either a canned JSON `result` payload or a JSON-RPC error tuple.
+    #[derive(Clone, Debug)]
+    enum Resp {
+        Ok(String),
+        Err(i64, String),
+    }
+
+    /// Recorded request: `(method, params_json)`. Tests pop these to
+    /// assert what the session actually sent.
+    type Recorded = Arc<parking_lot::Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// Spawn a tiny dispatcher that records `(method, params)` and
+    /// pops a per-method response queue. Same TCP/HTTP shape as the
+    /// `mock_rpc_tests` dispatcher above; intentionally not shared
+    /// because we need params capture and the original was
+    /// method-only. Returns `(url, recorded)`.
+    async fn spawn(responses: HashMap<String, Vec<Resp>>) -> (String, Recorded) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let state = Arc::new(parking_lot::Mutex::new(responses));
+        let recorded: Recorded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded_writer = recorded.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let state = state.clone();
+                let rec = recorded_writer.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::with_capacity(16 * 1024);
+                    let mut tmp = [0u8; 4096];
+                    let body = loop {
+                        let n = match sock.read(&mut tmp).await {
+                            Ok(0) => break String::new(),
+                            Ok(n) => n,
+                            Err(_) => return,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = match std::str::from_utf8(&buf[..end]) {
+                                Ok(s) => s,
+                                Err(_) => return,
+                            };
+                            let cl = headers
+                                .lines()
+                                .find_map(|l| {
+                                    let mut p = l.trim().splitn(2, ':');
+                                    let k = p.next()?.trim();
+                                    if k.eq_ignore_ascii_case("content-length") {
+                                        p.next()?.trim().parse::<usize>().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            let body_start = end + 4;
+                            while buf.len() < body_start + cl {
+                                let n = match sock.read(&mut tmp).await {
+                                    Ok(0) => break,
+                                    Ok(n) => n,
+                                    Err(_) => return,
+                                };
+                                buf.extend_from_slice(&tmp[..n]);
+                            }
+                            break String::from_utf8_lossy(&buf[body_start..body_start + cl])
+                                .to_string();
+                        }
+                    };
+                    let req: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                    let id = req.get("id").cloned().unwrap_or(serde_json::json!(1));
+                    let method = req
+                        .get("method")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let params = req
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    rec.lock().push((method.clone(), params));
+
+                    let resp = {
+                        let mut g = state.lock();
+                        g.get_mut(&method).and_then(|q| {
+                            if q.is_empty() {
+                                None
+                            } else {
+                                Some(q.remove(0))
+                            }
+                        })
+                    };
+                    let body = match resp {
+                        Some(Resp::Ok(result)) => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}",
+                            serde_json::to_string(&id).unwrap(),
+                            result
+                        ),
+                        Some(Resp::Err(code, msg)) => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{},\"message\":{}}}}}",
+                            serde_json::to_string(&id).unwrap(),
+                            code,
+                            serde_json::to_string(&msg).unwrap()
+                        ),
+                        None => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":-32601,\"message\":\"unmocked: {}\"}}}}",
+                            serde_json::to_string(&id).unwrap(),
+                            method
+                        ),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), recorded)
+    }
+
+    fn client_at(url: &str) -> ChainClient {
+        let mut spec = ChainSpec::anvil_default();
+        spec.rpc_urls = vec![url.to_string()];
+        ChainClient::new(spec).unwrap()
+    }
+
+    /// Build a JSON `Block` payload at `(number, hash)`. The session
+    /// only consumes `header.number` and `header.hash` so we keep this
+    /// minimal. Other required fields are filled with zero/empty
+    /// values so the alloy decoder accepts it.
+    fn block_payload(number: u64, hash: B256) -> String {
+        let zero32 = format!("0x{}", "00".repeat(32));
+        let zero8 = "0x0000000000000000".to_string();
+        let zero_addr = format!("0x{}", "00".repeat(20));
+        let zero_bloom = format!("0x{}", "00".repeat(256));
+        let hash_hex = format!("0x{}", hex::encode(hash.as_slice()));
+        let num_hex = format!("0x{:x}", number);
+        serde_json::json!({
+            "number": num_hex,
+            "hash": hash_hex,
+            "parentHash": zero32,
+            "sha3Uncles": zero32,
+            "logsBloom": zero_bloom,
+            "transactionsRoot": zero32,
+            "stateRoot": zero32,
+            "receiptsRoot": zero32,
+            "miner": zero_addr,
+            "difficulty": "0x0",
+            "totalDifficulty": "0x0",
+            "extraData": "0x",
+            "size": "0x0",
+            "gasLimit": "0x0",
+            "gasUsed": "0x0",
+            "timestamp": "0x0",
+            "uncles": [],
+            "transactions": [],
+            "mixHash": zero32,
+            "nonce": zero8,
+            "baseFeePerGas": "0x0",
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn session_pins_block_hash() {
+        // Open a session at block 100/hash A. The next call must carry
+        // `BlockId::Hash(A)` in its params, even if the chain head has
+        // moved on by the time we read.
+        let pinned_hash = B256::repeat_byte(0xaa);
+        let pinned_number = 100u64;
+
+        let mut r: HashMap<String, Vec<Resp>> = HashMap::new();
+        r.insert(
+            "eth_getBlockByNumber".into(),
+            vec![Resp::Ok(block_payload(pinned_number, pinned_hash))],
+        );
+        // Two `eth_getBalance` responses queued — alloy's fallback layer
+        // races top-N transports in parallel, but with one URL only one
+        // gets popped per call. Two queued lets the session's single
+        // `balance` call drain reliably regardless of internal retries.
+        r.insert(
+            "eth_getBalance".into(),
+            vec![Resp::Ok("\"0x539\"".into()), Resp::Ok("\"0x539\"".into())],
+        );
+
+        let (url, recorded) = spawn(r).await;
+        let client = client_at(&url);
+
+        let session = client.open_session().await.expect("open session");
+        assert_eq!(session.block_number(), pinned_number);
+        assert_eq!(session.block_hash(), pinned_hash);
+        assert!(!session.is_degraded());
+
+        let addr = Address::repeat_byte(0x11);
+        let _ = session.balance(addr).await.expect("session balance");
+
+        // Inspect the recorded eth_getBalance call. Params shape is
+        // `[address, blockId]` where `blockId` for a hash pin is an
+        // object `{ "blockHash": "0x..." }`. Permissive match: walk
+        // the JSON and find the pinned hash anywhere.
+        let calls = recorded.lock();
+        let bal = calls
+            .iter()
+            .find(|(m, _)| m == "eth_getBalance")
+            .expect("eth_getBalance recorded");
+        let params_str = bal.1.to_string();
+        let want_hex = format!("0x{}", hex::encode(pinned_hash.as_slice()));
+        assert!(
+            params_str.contains(&want_hex),
+            "expected pinned hash in eth_getBalance params, got {params_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_degrades_when_pinned_hash_unavailable() {
+        // First eth_getBalance returns "block not found" (vendor-style).
+        // The session must retry with a number-based block id and flip
+        // `is_degraded` to true. The second call delivers a real
+        // balance so the test asserts the round-trip.
+        let pinned_hash = B256::repeat_byte(0xbb);
+        let pinned_number = 99u64;
+
+        let mut r: HashMap<String, Vec<Resp>> = HashMap::new();
+        r.insert(
+            "eth_getBlockByNumber".into(),
+            vec![Resp::Ok(block_payload(pinned_number, pinned_hash))],
+        );
+        r.insert(
+            "eth_getBalance".into(),
+            vec![
+                Resp::Err(-32000, "block not found".into()),
+                Resp::Ok("\"0x2a\"".into()),
+            ],
+        );
+
+        let (url, recorded) = spawn(r).await;
+        let client = client_at(&url);
+
+        let session = client.open_session().await.expect("open session");
+        let addr = Address::repeat_byte(0x22);
+        let value = session.balance(addr).await.expect("session balance");
+        assert_eq!(value, U256::from(0x2au64));
+        assert!(session.is_degraded(), "session must mark itself degraded");
+
+        // Recorded params: first call sent the hash, second sent the
+        // number — pin the retry shape so a future refactor doesn't
+        // accidentally retry with `latest`.
+        let calls = recorded.lock();
+        let balance_calls: Vec<_> = calls
+            .iter()
+            .filter(|(m, _)| m == "eth_getBalance")
+            .collect();
+        assert_eq!(
+            balance_calls.len(),
+            2,
+            "expected exactly two eth_getBalance calls"
+        );
+        let first = balance_calls[0].1.to_string();
+        let second = balance_calls[1].1.to_string();
+        let hash_hex = format!("0x{}", hex::encode(pinned_hash.as_slice()));
+        let num_hex = format!("0x{:x}", pinned_number);
+        assert!(
+            first.contains(&hash_hex),
+            "first call should target hash, got {first}"
+        );
+        assert!(
+            second.contains(&num_hex) && !second.contains(&hash_hex),
+            "second call should target number and not the hash, got {second}"
         );
     }
 }

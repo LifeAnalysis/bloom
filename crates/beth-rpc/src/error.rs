@@ -36,10 +36,4 @@ pub enum BethRpcError {
         /// The last error surfaced by the fallback layer.
         last_error: String,
     },
-
-    /// Sessions are not yet implemented (WP-5 owns the real
-    /// implementation). Returned by `ChainClient::open_session` until
-    /// then so callers wired now still compile and route the error.
-    #[error("rpc session is not implemented yet (WP-5)")]
-    SessionNotImplemented,
 }

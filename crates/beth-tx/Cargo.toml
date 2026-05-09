@@ -8,6 +8,7 @@ description = "Tx engine, intent parser, policy for bloom-eth"
 [dependencies]
 beth-proto.workspace = true
 beth-chain.workspace = true
+beth-rpc.workspace = true
 beth-keystore.workspace = true
 beth-tools.workspace = true
 serde.workspace = true
