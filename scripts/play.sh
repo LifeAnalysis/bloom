@@ -16,38 +16,21 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO_ROOT/scripts/lib.sh"
+
 BETH_BIN="${BETH_BIN:-$REPO_ROOT/target/release/beth}"
 PLAY_HOME="${BETH_PLAY_HOME:-$HOME/.bloom-eth-play}"
 COMPOSE_FILE="$REPO_ROOT/docker/playground/docker-compose.yml"
 DAEMON_LOG="${BETH_PLAY_DAEMON_LOG:-/tmp/beth-play-daemon.log}"
 
-# anvil's deterministic accounts (default mnemonic) — the first three
-# are imported into the playground keystore so the user has wallets to
-# work with immediately.
-ANVIL_KEY_0=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-ANVIL_KEY_1=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
-ANVIL_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
-
 log()  { printf '\033[1;36m[play]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[play:fail]\033[0m %s\n' "$*"; exit 1; }
-
-require_cmd() {
-    for c in "$@"; do
-        command -v "$c" >/dev/null 2>&1 || fail "missing required command: $c"
-    done
-}
 
 require_cmd docker curl
 
 # docker compose v2 lives under the `docker` plugin namespace; v1 is the
 # standalone `docker-compose` binary. Pick whichever is available.
-if docker compose version >/dev/null 2>&1; then
-    DC=(docker compose)
-elif command -v docker-compose >/dev/null 2>&1; then
-    DC=(docker-compose)
-else
-    fail "neither 'docker compose' nor 'docker-compose' is available"
-fi
+detect_docker_compose
 
 # Build beth on demand. Release build keeps the playground responsive.
 if [ ! -x "$BETH_BIN" ]; then
@@ -76,18 +59,7 @@ trap cleanup EXIT INT TERM
 
 # Wait for anvil's JSON-RPC to answer eth_chainId.
 log "waiting for anvil rpc"
-ready=0
-for _ in $(seq 1 30); do
-    if curl -fs -X POST http://127.0.0.1:8545 \
-        -H 'content-type: application/json' \
-        -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
-        >/dev/null 2>&1; then
-        ready=1
-        break
-    fi
-    sleep 1
-done
-[ "$ready" -eq 1 ] || fail "anvil did not become ready on :8545"
+wait_eth_rpc http://127.0.0.1:8545 30 1 || fail "anvil did not become ready on :8545"
 
 # Initialize the play home. Wipe by default so each session starts clean.
 if [ "${BETH_PLAY_PERSIST:-0}" != "1" ]; then

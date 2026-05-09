@@ -210,8 +210,7 @@ drives a native ETH send and an ERC-20 transfer through the
 stage-confirm-broadcast loop on a local devnet. Optional Uniswap V2 /
 Enso scenarios on a mainnet fork run when `BETH_MAINNET_RPC` is set.
 
-`scripts/live_test.sh` exercises the same flow against Base mainnet
-with real funds: ETH ↔ USDC roundtrip via Enso, ETH ↔ aBaseUSDC
-roundtrip via Enso + Aave V3, and a sweep back to a single wallet.
-Gated on `BETH_LIVE=1` and a sourced `test.env` with funded
-addresses.
+`tests/docker/run.sh --enso-live` exercises the Enso + Aave flow
+against Base mainnet with real funds through the mounted filesystem
+surface. It is gated on a sourced `test.env` with `BETH_ENSO_KEY`,
+`BETH_LIVE_HOME`, `BETH_LIVE_DEST1`, and `BETH_PASSPHRASE`.

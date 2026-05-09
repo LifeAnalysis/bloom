@@ -8,8 +8,8 @@
 send) + 2 (ERC-20 transfer) end-to-end against Anvil. Scenarios 3 + 4
 (Uniswap V2 + Enso on a mainnet fork) auto-skip without
 `BETH_MAINNET_RPC`.
-**Live:** `scripts/live_test.sh` round-trips ETH ↔ USDC and ETH ↔
-aBaseUSDC on Base mainnet via Enso + Aave V3.
+**Live:** `tests/docker/run.sh --enso-live` exercises Enso + Aave on
+Base mainnet through the mounted filesystem surface.
 
 This document is the prompt-to-artifact checklist required by the
 goal's quality gates. Statuses below: **shipped**, **partial**, or
@@ -119,7 +119,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 |---|---|---|
 | Native ETH sends | shipped | `tx_engine.rs`; `acceptance.sh` scenario 1; live verified on Base. |
 | ERC-20 sends | shipped | `tx_engine.rs` (`RawIntent.token` branch); `acceptance.sh` scenario 2; live verified via Enso roundtrip. |
-| Direct contract `call` intents | shipped | `RawIntent::call` (method + args); used by `live_test.sh` for ERC-20 approvals and Aave V3 withdraw. |
+| Direct contract `call` intents | shipped | `RawIntent::call` (method + args); covered by tx-engine tests and mount-driven transaction flows. |
 | EIP-1559 + legacy fallback per chain spec | shipped | `crates/beth-proto/src/chain.rs::ChainSpec.legacy_tx`; `tx_engine.rs` branches accordingly. |
 | Replacement / cancel | shipped | `tx_engine.rs::replace_with_intent` substitutes (to/value/data) from the posted body and bumps fees ≥10%; cancel is a same-nonce self-send. |
 | Per-wallet `policy.toml` enforcement | shipped | `crates/beth-tx/src/policy_engine.rs` — per-tx + rolling 24h USD caps backed by `Outbox::sum_usd_since`, allow/deny lists, contract-call gating; results land at `pending/<id>/policy_check.json`. |
@@ -149,7 +149,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Acceptance demo (Uniswap V2 + Enso on mainnet fork) | gated on `BETH_MAINNET_RPC`; auto-skips with a clear message. |
 | Dockerized NFS kernel-mount test | harness at `tests/docker/{Dockerfile,test.sh,run.sh}`. Native suite `cargo test -p beth-mount --features mount` passing. |
 | Dockerized workspace tests | passing — `tests/docker/run.sh --workspace`. |
-| Live broadcast on Base mainnet | passing — `scripts/live_test.sh` rounds ETH ↔ USDC ↔ aBaseUSDC and sweeps back. |
+| Live broadcast on Base mainnet | passing — `tests/docker/run.sh --enso-live` exercises Enso + Aave with real Base broadcasts. |
 
 ## Live-network verification (Base mainnet)
 
@@ -164,7 +164,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Native ETH send (live) | Base, chain_id 8453 | `0xd4a496fb…3c40` — 0.001 ETH dest1→dest2 |
 | Enso swap (live) | Base, ETH → USDC via Enso router | `0x016fc370…9fc3` — 0.001 ETH → 2.306996 USDC |
 | Enso swap + Aave V3 deposit (live) | Base, ETH → aBaseUSDC | `0xab687461…e3ce` — 0.001 ETH → 2.308456 aBaseUSDC |
-| Aave V3 withdraw via direct `call` intent | Base, Pool.withdraw(asset, max, to) | exercised by `scripts/live_test.sh` phase 3. |
+| Aave V3 unwind | Base, aBaseUSDC → ETH via Enso route | exercised by `tests/docker/run.sh --enso-live` cleanup path. |
 
 ## Known limitations / deferred items
 
@@ -217,6 +217,6 @@ cargo test --workspace --lib
 cargo build --release -p beth
 scripts/acceptance.sh                              # native + ERC-20 on Anvil
 BETH_MAINNET_RPC=... scripts/acceptance.sh          # adds Uniswap V2 + Enso scenarios
-BETH_LIVE=1 source test.env && bash scripts/live_test.sh  # live Base broadcasts
+tests/docker/run.sh --enso-live                    # live Base broadcasts
 tests/docker/run.sh --workspace                    # workspace tests inside container
 ```

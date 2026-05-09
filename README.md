@@ -9,7 +9,7 @@ paths so an agent can drive onchain workflows with `cat`, `ls`, and
 
 **Status:** v1 functional. Long-running daemon (`beth serve`) with a UDS
 JSON-RPC IPC, in-process VFS, and an optional NFSv4 mount adapter. Live
-verified end-to-end on Base mainnet (`scripts/live_test.sh`).
+verified end-to-end on Base mainnet (`tests/docker/run.sh --enso-live`).
 
 ## Architecture
 

@@ -20,6 +20,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO_ROOT/scripts/lib.sh"
+
 BETH_BIN="${BETH_BIN:-$REPO_ROOT/target/release/beth}"
 HOME_DIR="$(mktemp -d -t beth-acceptance.XXXXXX)"
 trap 'rm -rf "$HOME_DIR"; pkill -P $$ anvil 2>/dev/null || true' EXIT
@@ -29,21 +31,16 @@ log() { printf '\033[1;36m[acceptance]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[fail]\033[0m %s\n' "$*"; exit 1; }
 ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 
-require() {
-  for c in "$@"; do
-    command -v "$c" >/dev/null 2>&1 || { echo "missing: $c"; exit 2; }
-  done
-}
-
 beth() { RUST_LOG=error "$BETH_BIN" --home "$HOME_DIR" "$@" 2>/dev/null; }
 
 # Anvil's default mnemonic — first account, 10000 ETH.
-ANVIL_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-ANVIL_ADDR=0xf39Fd6e51aad88F6F4ce6aB8827279cfFFb92266
-DEST_ADDR=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+ANVIL_KEY=$ANVIL_KEY_0
+ANVIL_ADDR=$ANVIL_ADDR_0
+DEST_ADDR=$ANVIL_ADDR_1
 
 # ---------------------------------------------------------------- main
-require anvil cast jq "$BETH_BIN"
+REQUIRE_CMD_EXIT=2
+require_cmd anvil cast jq "$BETH_BIN"
 
 log "home dir: $HOME_DIR"
 
