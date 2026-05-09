@@ -40,6 +40,13 @@ impl AnvilGuard {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// Anvil serves WebSocket pubsub on the same TCP port as HTTP, so
+    /// we just rewrite the scheme. Used by the `rpc_ws_subscriptions`
+    /// integration test (WP-4).
+    pub fn ws_url(&self) -> String {
+        format!("ws://127.0.0.1:{}", self.port)
+    }
+
     pub fn port(&self) -> u16 {
         self.port
     }

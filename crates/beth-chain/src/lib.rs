@@ -181,10 +181,10 @@ impl ChainClient {
     }
 
     /// True when at least one configured endpoint is `ws://` or
-    /// `wss://` and not flagged `http_only`. WP-4 wires this into the
-    /// watch executor's WS subscription fast path; today the engine
-    /// only attaches HTTP transports, so this method reports
-    /// configuration intent rather than runtime capability.
+    /// `wss://` and not flagged `http_only`. The watch executor uses
+    /// this to gate the WS subscription fast path; the actual
+    /// `RootProvider` for subscriptions is opened lazily by
+    /// [`Self::ws_provider`].
     pub fn supports_subscriptions(&self) -> bool {
         self.engine.supports_subscriptions()
     }
@@ -205,6 +205,21 @@ impl ChainClient {
     /// status displays that don't need the full snapshot.
     pub fn cooled_down_count(&self) -> usize {
         self.engine.cooled_down_count()
+    }
+
+    /// Lazily-opened WS provider for `subscribe_*` calls. Returns
+    /// `None` when no WS endpoints are configured (callers should fall
+    /// back to polling via [`Self::provider`]). The first call opens
+    /// the connection and caches the resulting provider; subsequent
+    /// callers share the same `Arc`. Failure to open is logged via
+    /// `rpc.transport.ws_provider_open_failed` and surfaces as `None`
+    /// so the caller can retry on the next watchdog tick.
+    ///
+    /// This is intentionally distinct from [`Self::provider`] — the
+    /// HTTP-fallback provider is the engine's request/response
+    /// pool, while this one exists exclusively for pubsub.
+    pub async fn ws_provider(&self) -> Option<Arc<RootProvider<Ethereum>>> {
+        self.engine.ws_provider().await
     }
 
     /// Open a new pinned read session at the current `latest` block.

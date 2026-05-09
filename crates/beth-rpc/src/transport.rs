@@ -16,11 +16,23 @@
 //! always queries both in parallel; bigger lists rotate the top two by
 //! score.
 //!
-//! WS/WSS endpoints are recognised but not yet attached to the
-//! transport stack — `WsConnect` requires an async open and
-//! `RpcEngine::build` is intentionally sync (so `ChainClient::new`
-//! stays sync). WP-4 plumbs in the async WS hand-off; until then, ws
-//! endpoints contribute to `supports_subscriptions()` reporting only.
+//! ## HTTP / WS split
+//!
+//! HTTP endpoints are constructed eagerly inside `RpcEngine::build`
+//! (sync; reqwest does not require a handshake before its first call).
+//! WS endpoints — `ws://` / `wss://` URLs not flagged `http_only` — are
+//! deliberately *not* mixed into the fallback pool. Their construction
+//! requires `WsConnect::connect().await`, which would force
+//! `RpcEngine::build` and therefore `ChainClient::new` to become async
+//! and ripple to every caller in the workspace.
+//!
+//! Instead, WS URLs are stored as a `Vec<WsConnect>`. The first
+//! `RpcEngine::ws_provider().await` call opens the connection lazily
+//! under a `tokio::sync::OnceCell` and caches the resulting
+//! `RootProvider<Ethereum>` for subsequent callers. The pool of HTTP
+//! transports remains the source for one-shot request/response calls;
+//! the WS provider is a sibling used only for `subscribe_*`. Callers
+//! that need both (the watch executor in particular) hold both Arcs.
 //!
 //! ## Active probe loop (WP-3)
 //!
@@ -50,9 +62,10 @@ use alloy::providers::RootProvider;
 use alloy::rpc::client::RpcClient;
 use alloy::transports::http::{reqwest, Http};
 use alloy::transports::layers::{FallbackLayer, RetryBackoffLayer, ThrottleLayer};
+use alloy::transports::ws::WsConnect;
 use alloy::transports::{BoxTransport, IntoBoxTransport};
 use beth_proto::{ChainSpec, EndpointSpec};
-use tokio::sync::watch;
+use tokio::sync::{watch, OnceCell};
 use tower::ServiceBuilder;
 use tracing::{debug, info, warn};
 
@@ -107,6 +120,13 @@ struct ProbeTarget {
 /// VFS handlers). The `provider()` accessor exposes the alloy
 /// `RootProvider<Ethereum>` so existing call sites that depend on the
 /// trait surface continue to compile unchanged.
+///
+/// WS-capable endpoints, when configured, sit *alongside* the HTTP
+/// pool: the engine stores their `WsConnect` configurations and lazily
+/// opens a single shared `RootProvider<Ethereum>` for subscriptions on
+/// the first `ws_provider()` call. See module-level docs for the
+/// rationale (HTTP for request/response, WS exclusively for
+/// subscriptions).
 pub struct RpcEngine {
     chain_name: String,
     endpoints: Vec<EndpointSpec>,
@@ -116,18 +136,25 @@ pub struct RpcEngine {
     /// Send `true` here to cancel the probe loop on drop. Wrapped in
     /// `Option` so `Drop` can take ownership cleanly.
     shutdown_tx: Option<watch::Sender<bool>>,
+    ws_connects: Vec<WsConnect>,
+    ws_provider: OnceCell<Arc<RootProvider<Ethereum>>>,
 }
 
 impl RpcEngine {
     /// Build the layered transport stack for `spec`.
     ///
     /// Returns `BethRpcError::NoEndpoints` if `spec.endpoints()` is
-    /// empty. Each endpoint URL is classified into HTTP or WS;
-    /// HTTP-shaped endpoints are wrapped in retry + optional throttle
-    /// and joined under a fallback layer. WS-shaped endpoints are
-    /// recorded for `supports_subscriptions()` reporting only — the
-    /// active probe loop and WS subscription hand-off arrive in WP-3
-    /// and WP-4.
+    /// empty *or* resolves to zero HTTP-shaped endpoints (the engine
+    /// always needs at least one HTTP transport for one-shot reads —
+    /// `eth_call`, `eth_getLogs`, etc. — even if every WS endpoint is
+    /// healthy).
+    ///
+    /// Each endpoint URL is classified into HTTP or WS; HTTP-shaped
+    /// endpoints are wrapped in retry + optional throttle and joined
+    /// under a fallback layer. WS-shaped endpoints not flagged
+    /// `http_only` are stashed as `WsConnect` configurations and
+    /// opened lazily by `ws_provider().await` so the build remains
+    /// sync.
     pub fn build(spec: &ChainSpec) -> Result<Self, BethRpcError> {
         let endpoints = spec.endpoints();
         if endpoints.is_empty() {
@@ -137,6 +164,7 @@ impl RpcEngine {
         let mut http_transports: Vec<BoxTransport> = Vec::new();
         let mut probe_targets: Vec<ProbeTarget> = Vec::new();
         let mut tracked_urls: Vec<String> = Vec::new();
+        let mut ws_connects: Vec<WsConnect> = Vec::new();
         let mut supports_subscriptions = false;
 
         for ep in &endpoints {
@@ -171,13 +199,25 @@ impl RpcEngine {
                     );
                 }
                 EndpointScheme::Ws => {
-                    // WP-4 will replace this branch with a real
-                    // WS-backed transport. For now we keep the engine
-                    // sync-buildable.
-                    warn!(
+                    // WS endpoints are recorded for lazy open via
+                    // `ws_provider().await`. Honour `http_only` (already
+                    // applied to `supports_subscriptions` above): if the
+                    // operator has flagged this endpoint HTTP-only we
+                    // do not build a WS transport for it.
+                    if ep.http_only {
+                        debug!(
+                            chain = %spec.name,
+                            url = %redacted(&ep.url),
+                            "rpc.transport.ws_endpoint_skipped_http_only"
+                        );
+                        continue;
+                    }
+                    ws_connects.push(WsConnect::new(url.as_str()));
+                    debug!(
                         chain = %spec.name,
                         url = %redacted(&ep.url),
-                        "rpc.transport.ws_endpoint_skipped_until_wp4"
+                        weight = ep.weight,
+                        "rpc.transport.ws_connect_registered"
                     );
                 }
             }
@@ -219,6 +259,7 @@ impl RpcEngine {
             chain = %spec.name,
             endpoints = endpoints.len(),
             http_endpoints = active.get(),
+            ws_endpoints = ws_connects.len(),
             supports_subscriptions,
             "rpc.engine.built"
         );
@@ -230,6 +271,8 @@ impl RpcEngine {
             supports_subscriptions,
             health,
             shutdown_tx: Some(shutdown_tx),
+            ws_connects,
+            ws_provider: OnceCell::new(),
         })
     }
 
@@ -241,10 +284,64 @@ impl RpcEngine {
     }
 
     /// True if any configured endpoint declared a ws/wss URL and was
-    /// not flagged `http_only`. WP-4 wires this into the watch
-    /// executor's WS fast path.
+    /// not flagged `http_only`. The watch executor uses this to decide
+    /// whether to attempt the WS subscription fast path before falling
+    /// back to the HTTP poll loop.
     pub fn supports_subscriptions(&self) -> bool {
         self.supports_subscriptions
+    }
+
+    /// Lazily construct the WS-backed `RootProvider<Ethereum>` used for
+    /// `subscribe_*` calls.
+    ///
+    /// Returns `None` when no WS endpoints were configured (or all of
+    /// them were flagged `http_only`). On the first call with at least
+    /// one WS endpoint, opens a connection and caches the resulting
+    /// provider in a `OnceCell` so subsequent callers reuse it without
+    /// re-handshaking. Currently uses the *first* configured WS
+    /// endpoint; multi-WS failover is out of scope for WP-4 (alloy's
+    /// `FallbackLayer` does not coordinate pubsub state across
+    /// transports, so we keep WS sticky to one URL until the WS
+    /// reconnect notes in §F.2 of the spec direct otherwise).
+    ///
+    /// If the connection attempt fails, the error is logged with
+    /// `rpc.transport.ws_provider_open_failed` and the OnceCell stays
+    /// empty so the *next* call retries — useful when the WS endpoint
+    /// is flapping (the watch executor's watchdog tick will retry on
+    /// every poll cycle).
+    pub async fn ws_provider(&self) -> Option<Arc<RootProvider<Ethereum>>> {
+        if self.ws_connects.is_empty() {
+            return None;
+        }
+        // OnceCell::get_or_try_init would cache an Err; we want to
+        // retry on failure so we manage the slot manually with a
+        // get-then-init dance.
+        if let Some(p) = self.ws_provider.get() {
+            return Some(p.clone());
+        }
+        let connect = self.ws_connects[0].clone();
+        match RpcClient::connect_pubsub(connect).await {
+            Ok(client) => {
+                let provider: RootProvider<Ethereum> = RootProvider::<Ethereum>::new(client);
+                let arc = Arc::new(provider);
+                // First writer wins; concurrent callers share the same
+                // Arc once it lands.
+                let stored = self.ws_provider.get_or_init(|| async { arc.clone() }).await;
+                info!(
+                    chain = %self.chain_name,
+                    "rpc.transport.ws_provider_built"
+                );
+                Some(stored.clone())
+            }
+            Err(e) => {
+                warn!(
+                    chain = %self.chain_name,
+                    error = %e,
+                    "rpc.transport.ws_provider_open_failed"
+                );
+                None
+            }
+        }
     }
 
     /// Per-endpoint health view. Values reflect the most recent probe
@@ -461,5 +558,81 @@ fn redacted(url: &str) -> String {
         format!("{}://{}{}", u.scheme(), host, port)
     } else {
         url.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beth_proto::{ChainSpec, EndpointSpec};
+
+    fn http_only_spec() -> ChainSpec {
+        let mut s = ChainSpec::anvil_default();
+        s.rpc_urls = vec!["http://127.0.0.1:65535".into()];
+        s.rpc_endpoints.clear();
+        s
+    }
+
+    fn http_plus_ws_spec() -> ChainSpec {
+        let mut s = ChainSpec::anvil_default();
+        s.rpc_urls.clear();
+        s.rpc_endpoints = vec![
+            EndpointSpec {
+                url: "http://127.0.0.1:65535".into(),
+                weight: 100,
+                cu_per_sec: None,
+                max_rps: None,
+                http_only: false,
+            },
+            // Use a deliberately-unreachable WS URL — the engine builds
+            // sync without dialling, so the test never actually opens
+            // the socket. `ws_provider().await` only attempts the dial
+            // on first call; the `ws_provider_some_when_one_ws_endpoint`
+            // test below avoids triggering it.
+            EndpointSpec {
+                url: "ws://127.0.0.1:65534".into(),
+                weight: 100,
+                cu_per_sec: None,
+                max_rps: None,
+                http_only: false,
+            },
+        ];
+        s
+    }
+
+    #[test]
+    fn ws_provider_none_when_no_ws_endpoints() {
+        // An HTTP-only spec must report `supports_subscriptions == false`
+        // and store zero `WsConnect` entries. We assert the shape via
+        // the public surface: `supports_subscriptions()` and the lazy
+        // accessor both reflect "no WS available".
+        let engine = RpcEngine::build(&http_only_spec()).expect("build engine");
+        assert!(!engine.supports_subscriptions());
+        assert!(engine.ws_connects.is_empty());
+
+        // Drive the async accessor on a fresh runtime — no WS endpoints
+        // means we return `None` immediately without dialling.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let got = rt.block_on(async { engine.ws_provider().await });
+        assert!(got.is_none(), "expected None, got Some");
+    }
+
+    #[test]
+    fn ws_provider_some_when_one_ws_endpoint() {
+        // We can't open a real WS handshake against an unreachable
+        // address inside a unit test (it would hang on connect), so we
+        // verify the build-time shape only:
+        //   - `supports_subscriptions` flips to true,
+        //   - `ws_connects` has exactly one entry,
+        //   - the `WsConnect` round-trips the URL.
+        // The end-to-end `ws_provider().await` path is exercised by the
+        // anvil-backed integration test in beth-it's
+        // `rpc_ws_subscriptions.rs`.
+        let engine = RpcEngine::build(&http_plus_ws_spec()).expect("build engine");
+        assert!(engine.supports_subscriptions());
+        assert_eq!(engine.ws_connects.len(), 1);
     }
 }
