@@ -177,9 +177,21 @@ impl Keystore {
             })?;
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 if let Some(name) = entry.file_name().to_str() {
-                    if let Ok(info) = self.info(name) {
-                        out.push(info);
+                    match self.info(name) {
+                        Ok(info) => out.push(info),
+                        Err(e) => {
+                            tracing::debug!(
+                                wallet = name,
+                                error = %e,
+                                "keystore.list_skipped"
+                            );
+                        }
                     }
+                } else {
+                    tracing::debug!(
+                        file_name = ?entry.file_name(),
+                        "keystore.list_non_utf8_skipped"
+                    );
                 }
             }
         }
@@ -320,27 +332,64 @@ impl Keystore {
         Self::validate_name(name)?;
         let dir = self.wallet_path(name);
         if !dir.exists() {
+            tracing::debug!(wallet = name, "keystore.unlock_not_found");
             return Err(KeystoreError::NotFound(name.into()));
         }
         let kind: WalletKind = match read_trim(&dir.join("kind"))?.as_str() {
             "local" => WalletKind::Local,
-            "watch" => return Err(KeystoreError::Locked(name.into())),
-            other => return Err(KeystoreError::Malformed(format!("kind: {other}"))),
+            "watch" => {
+                tracing::debug!(wallet = name, "keystore.unlock_watch_only");
+                return Err(KeystoreError::Locked(name.into()));
+            }
+            other => {
+                tracing::debug!(
+                    wallet = name,
+                    kind = other,
+                    "keystore.unlock_malformed_kind"
+                );
+                return Err(KeystoreError::Malformed(format!("kind: {other}")));
+            }
         };
         let _ = kind;
-        let blob = fs::read(dir.join("encrypted.key")).map_err(|source| KeystoreError::Io {
-            path: dir.join("encrypted.key"),
-            source,
+        let blob = fs::read(dir.join("encrypted.key")).map_err(|source| {
+            tracing::debug!(
+                wallet = name,
+                error = %source,
+                "keystore.unlock_read_failed"
+            );
+            KeystoreError::Io {
+                path: dir.join("encrypted.key"),
+                source,
+            }
         })?;
-        let enc: EncryptedFile =
-            serde_json::from_slice(&blob).map_err(|e| KeystoreError::Malformed(e.to_string()))?;
-        let key_bytes = decrypt_key(&enc, passphrase)?;
-        let signer = PrivateKeySigner::from_bytes(&key_bytes.into())
-            .map_err(|e| KeystoreError::Signer(e.to_string()))?;
+        let enc: EncryptedFile = serde_json::from_slice(&blob).map_err(|e| {
+            tracing::debug!(
+                wallet = name,
+                error = %e,
+                "keystore.unlock_blob_malformed"
+            );
+            KeystoreError::Malformed(e.to_string())
+        })?;
+        let key_bytes = decrypt_key(&enc, passphrase).inspect_err(|e| {
+            tracing::debug!(
+                wallet = name,
+                error = %e,
+                "keystore.unlock_decrypt_failed"
+            );
+        })?;
+        let signer = PrivateKeySigner::from_bytes(&key_bytes.into()).map_err(|e| {
+            tracing::debug!(
+                wallet = name,
+                error = %e,
+                "keystore.unlock_signer_failed"
+            );
+            KeystoreError::Signer(e.to_string())
+        })?;
         self.inner
             .unlocked
             .write()
             .insert(name.to_string(), Arc::new(signer));
+        tracing::debug!(wallet = name, "keystore.unlocked");
         Ok(())
     }
 
@@ -353,18 +402,20 @@ impl Keystore {
     }
 
     pub fn signer(&self, name: &str) -> Result<Arc<PrivateKeySigner>, KeystoreError> {
-        self.inner
-            .unlocked
-            .read()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| KeystoreError::Locked(name.into()))
+        match self.inner.unlocked.read().get(name).cloned() {
+            Some(s) => Ok(s),
+            None => {
+                tracing::debug!(wallet = name, "keystore.signer_locked");
+                Err(KeystoreError::Locked(name.into()))
+            }
+        }
     }
 
     pub fn delete(&self, name: &str) -> Result<(), KeystoreError> {
         Self::validate_name(name)?;
         let dir = self.wallet_path(name);
         if !dir.exists() {
+            tracing::debug!(wallet = name, "keystore.delete_not_found");
             return Err(KeystoreError::NotFound(name.into()));
         }
         fs::remove_dir_all(&dir).map_err(|source| KeystoreError::Io {
@@ -372,6 +423,7 @@ impl Keystore {
             source,
         })?;
         self.inner.unlocked.write().remove(name);
+        tracing::debug!(wallet = name, "keystore.deleted");
         Ok(())
     }
 }
