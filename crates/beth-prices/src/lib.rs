@@ -280,9 +280,10 @@ impl PricesClient {
             return Ok(q);
         }
         let mut got = self.fetch_current(std::slice::from_ref(&key)).await?;
-        let quote = got
-            .remove(&key)
-            .ok_or_else(|| PricesError::NotFound(key.clone()))?;
+        let quote = got.remove(&key).ok_or_else(|| {
+            debug!(%key, "prices.current.coin_missing");
+            PricesError::NotFound(key.clone())
+        })?;
         self.cache_put(&key, &quote);
         Ok(quote)
     }
@@ -320,6 +321,11 @@ impl PricesClient {
                 if let Some(q) = fetched.get(&key) {
                     self.cache_put(&key, q);
                     out.insert(coin, q.clone());
+                } else {
+                    // The upstream silently omits unknown coins from the
+                    // response; surface so callers can tell a miss apart
+                    // from a transport failure.
+                    debug!(%key, "prices.current_many.coin_missing");
                 }
             }
         }
@@ -336,7 +342,10 @@ impl PricesClient {
             .into_iter()
             .find(|(k, _)| k == &key)
             .map(|(_, e)| e.into_quote())
-            .ok_or_else(|| PricesError::NotFound(key))
+            .ok_or_else(|| {
+                debug!(%key, ts, "prices.historical.coin_missing");
+                PricesError::NotFound(key)
+            })
     }
 
     /// Fetch a price chart between two timestamps.
@@ -366,7 +375,10 @@ impl PricesClient {
             .into_iter()
             .find(|(k, _)| k == &key)
             .map(|(_, e)| e)
-            .ok_or_else(|| PricesError::NotFound(key))?;
+            .ok_or_else(|| {
+                debug!(%key, start_ts, end_ts, period, "prices.chart.coin_missing");
+                PricesError::NotFound(key)
+            })?;
         Ok(entry
             .prices
             .into_iter()
@@ -389,7 +401,10 @@ impl PricesClient {
             .into_iter()
             .find(|(k, _)| k == &key)
             .map(|(_, v)| v)
-            .ok_or_else(|| PricesError::NotFound(key))
+            .ok_or_else(|| {
+                debug!(%key, "prices.change_24h.coin_missing");
+                PricesError::NotFound(key)
+            })
     }
 
     // ----- internals -------------------------------------------------------
@@ -425,7 +440,9 @@ impl PricesClient {
     fn cache_get(&self, key: &str) -> Option<PriceQuote> {
         let g = self.cache.read();
         let entry = g.get(key)?;
-        if entry.fetched_at.elapsed() > self.ttl {
+        let age = entry.fetched_at.elapsed();
+        if age > self.ttl {
+            debug!(%key, ?age, ttl = ?self.ttl, "prices.cache.expired");
             return None;
         }
         Some(entry.quote.clone())
