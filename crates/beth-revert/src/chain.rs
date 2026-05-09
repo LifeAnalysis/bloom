@@ -42,10 +42,12 @@ impl DecoderChain {
             return DecodedRevert::empty();
         }
         for d in &self.decoders {
+            tracing::trace!(decoder = d.name(), "revert.try");
             if let Some(out) = d.try_decode(ctx).await {
                 tracing::debug!(decoder = d.name(), "revert.decoded");
                 return out;
             }
+            tracing::debug!(decoder = d.name(), "revert.declined");
         }
         DecodedRevert::unknown(ctx.returndata.clone())
     }

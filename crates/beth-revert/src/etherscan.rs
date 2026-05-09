@@ -34,9 +34,19 @@ impl RevertDecoder for EtherscanAbiDecoder {
     }
 
     async fn try_decode(&self, ctx: &DecodeContext) -> Option<DecodedRevert> {
-        let to = ctx.to?;
-        let sel = selector_of(&ctx.returndata)?;
-        let abi = self.source.abi_for(ctx.chain_id, to).await?;
+        let Some(to) = ctx.to else {
+            tracing::debug!("etherscan_abi.no_to_address");
+            return None;
+        };
+        let Some(sel) = selector_of(&ctx.returndata) else {
+            tracing::debug!(len = ctx.returndata.len(), "etherscan_abi.no_selector");
+            return None;
+        };
+        let sel_hex = format!("0x{}", hex::encode(sel));
+        let Some(abi) = self.source.abi_for(ctx.chain_id, to).await else {
+            tracing::debug!(%to, selector = %sel_hex, "etherscan_abi.no_abi");
+            return None;
+        };
         for err in abi.errors() {
             if err.selector() == sel {
                 let payload = &ctx.returndata[4..];
@@ -70,6 +80,14 @@ impl RevertDecoder for EtherscanAbiDecoder {
                 });
             }
         }
+        let abi_error_names: Vec<&str> = abi.errors().map(|e| e.name.as_str()).collect();
+        tracing::debug!(
+            %to,
+            selector = %sel_hex,
+            abi_errors = abi_error_names.len(),
+            known = ?abi_error_names,
+            "etherscan_abi.selector_not_in_abi"
+        );
         None
     }
 }

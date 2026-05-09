@@ -39,7 +39,19 @@ impl EtherscanAbiSource {
 impl AbiSource for EtherscanAbiSource {
     async fn abi_for(&self, chain_id: u64, addr: Address) -> Option<JsonAbi> {
         match self.client.json_abi_for(chain_id, addr).await {
-            Ok(opt) => opt,
+            Ok(Some(abi)) => {
+                tracing::debug!(
+                    %addr,
+                    chain_id,
+                    errors = abi.errors().count(),
+                    "abi_for.fetched"
+                );
+                Some(abi)
+            }
+            Ok(None) => {
+                tracing::debug!(%addr, chain_id, "abi_for.unavailable");
+                None
+            }
             Err(e) => {
                 tracing::debug!(error = %e, %addr, chain_id, "abi_for.fetch_failed");
                 None
