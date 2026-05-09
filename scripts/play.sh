@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# scripts/play.sh — interactive bloom-eth playground.
+#
+# Brings up a containerized anvil and drops the user into a subshell
+# wired up to a fresh beth home with two chains:
+#   - anvil (chain_id 31337, broadcast enabled, points at the docker anvil)
+#   - base  (chain_id 8453, broadcast disabled — read-only mainnet)
+#
+# The play home defaults to ~/.bloom-eth-play. Set BETH_PLAY_HOME to
+# override. Each invocation wipes and recreates the home so previous
+# stages don't leak in (set BETH_PLAY_PERSIST=1 to keep the existing
+# home).
+#
+# Cleanup: on exit, the local daemon and the anvil container are both
+# stopped. Docker volumes/images are not removed.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BETH_BIN="${BETH_BIN:-$REPO_ROOT/target/release/beth}"
+PLAY_HOME="${BETH_PLAY_HOME:-$HOME/.bloom-eth-play}"
+COMPOSE_FILE="$REPO_ROOT/docker/playground/docker-compose.yml"
+DAEMON_LOG="${BETH_PLAY_DAEMON_LOG:-/tmp/beth-play-daemon.log}"
+
+# anvil's deterministic accounts (default mnemonic) — the first three
+# are imported into the playground keystore so the user has wallets to
+# work with immediately.
+ANVIL_KEY_0=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+ANVIL_KEY_1=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+ANVIL_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
+
+log()  { printf '\033[1;36m[play]\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31m[play:fail]\033[0m %s\n' "$*"; exit 1; }
+
+require_cmd() {
+    for c in "$@"; do
+        command -v "$c" >/dev/null 2>&1 || fail "missing required command: $c"
+    done
+}
+
+require_cmd docker curl
+
+# docker compose v2 lives under the `docker` plugin namespace; v1 is the
+# standalone `docker-compose` binary. Pick whichever is available.
+if docker compose version >/dev/null 2>&1; then
+    DC=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+    DC=(docker-compose)
+else
+    fail "neither 'docker compose' nor 'docker-compose' is available"
+fi
+
+# Build beth on demand. Release build keeps the playground responsive.
+if [ ! -x "$BETH_BIN" ]; then
+    log "building beth (release)..."
+    (cd "$REPO_ROOT" && cargo build --release -p beth)
+fi
+[ -x "$BETH_BIN" ] || fail "beth binary not found at $BETH_BIN"
+
+# Bring up the anvil container.
+log "starting docker stack ($(basename "$COMPOSE_FILE"))"
+"${DC[@]}" -f "$COMPOSE_FILE" up -d anvil
+
+cleanup() {
+    log "tearing down playground"
+    if [ -n "${DAEMON_PID:-}" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+        kill -TERM "$DAEMON_PID" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do
+            kill -0 "$DAEMON_PID" 2>/dev/null || break
+            sleep 1
+        done
+        kill -KILL "$DAEMON_PID" 2>/dev/null || true
+    fi
+    "${DC[@]}" -f "$COMPOSE_FILE" down --remove-orphans >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+# Wait for anvil's JSON-RPC to answer eth_chainId.
+log "waiting for anvil rpc"
+ready=0
+for _ in $(seq 1 30); do
+    if curl -fs -X POST http://127.0.0.1:8545 \
+        -H 'content-type: application/json' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
+        >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    sleep 1
+done
+[ "$ready" -eq 1 ] || fail "anvil did not become ready on :8545"
+
+# Initialize the play home. Wipe by default so each session starts clean.
+if [ "${BETH_PLAY_PERSIST:-0}" != "1" ]; then
+    rm -rf "$PLAY_HOME"
+fi
+mkdir -p "$PLAY_HOME"
+"$BETH_BIN" --home "$PLAY_HOME" init >/dev/null 2>&1 || true
+
+# Overwrite config.toml with the playground topology. We disable
+# block_mainnet_broadcast at the top level so the operator decides per
+# chain via allow_broadcast — anvil broadcasts, base does not.
+cat > "$PLAY_HOME/config.toml" <<'EOF'
+stage_ttl = "30m"
+block_mainnet_broadcast = false
+default_chain = "anvil"
+
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+allow_broadcast = true
+display_name = "Anvil (local docker)"
+native_symbol = "ETH"
+native_decimals = 18
+legacy_tx = false
+
+[chains.base]
+name = "base"
+chain_id = 8453
+rpc_urls = ["https://mainnet.base.org"]
+allow_broadcast = false
+display_name = "Base (read-only)"
+native_symbol = "ETH"
+native_decimals = 18
+legacy_tx = false
+EOF
+
+# Import anvil's deterministic accounts as alice/bob/carol so the user
+# has spendable test ETH on chain anvil. Skip if the wallet already
+# exists (BETH_PLAY_PERSIST=1 case).
+import_if_missing() {
+    local name=$1
+    local key=$2
+    if "$BETH_BIN" --home "$PLAY_HOME" wallet list 2>/dev/null \
+        | awk '{print $1}' | grep -qx "$name"; then
+        return 0
+    fi
+    BETH_PASSPHRASE=play "$BETH_BIN" --home "$PLAY_HOME" wallet import \
+        "$name" "$key" --passphrase play >/dev/null
+}
+
+log "importing anvil keys (passphrase: play)"
+import_if_missing alice "$ANVIL_KEY_0"
+import_if_missing bob   "$ANVIL_KEY_1"
+import_if_missing carol "$ANVIL_KEY_2"
+
+# Start the daemon. We use `serve` so VFS reads/writes from the play
+# subshell hit the same in-memory state.
+log "starting beth daemon (log: $DAEMON_LOG)"
+"$BETH_BIN" --home "$PLAY_HOME" serve >"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+
+# Daemon needs a moment to bind the IPC socket.
+SOCKET="$PLAY_HOME/run/beth.sock"
+ready=0
+for _ in $(seq 1 30); do
+    if [ -S "$SOCKET" ]; then
+        ready=1
+        break
+    fi
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        log "daemon log:"
+        cat "$DAEMON_LOG" >&2
+        fail "daemon exited before opening $SOCKET"
+    fi
+    sleep 0.25
+done
+[ "$ready" -eq 1 ] || fail "daemon did not open $SOCKET within 7.5s"
+
+# Drop the user into an interactive shell with BETH_HOME pointing at
+# the play home. The custom rcfile keeps the user's normal aliases
+# while making `beth` resolve to the playground binary and home.
+RCFILE="$(mktemp -t beth-play-rc.XXXXXX)"
+cat > "$RCFILE" <<EOF
+# Sourced by the bloom-eth playground subshell.
+[ -f "\$HOME/.bashrc" ] && . "\$HOME/.bashrc"
+
+export BETH_PLAY_HOME='$PLAY_HOME'
+export BETH_BIN='$BETH_BIN'
+
+beth() {
+    "\$BETH_BIN" --home "\$BETH_PLAY_HOME" "\$@"
+}
+export -f beth
+
+PS1='\[\033[1;35m\](beth-play)\[\033[0m\] \w\$ '
+EOF
+trap 'rm -f "$RCFILE"; cleanup' EXIT INT TERM
+
+cat <<EOF
+
+┌──────────────────────────────────────────────────────────────────┐
+│  bloom-eth playground                                            │
+│                                                                  │
+│  Home:    $PLAY_HOME
+│  Anvil:   http://127.0.0.1:8545  (chain_id 31337, broadcasts ok) │
+│  Base:    mainnet RPC            (chain_id 8453, read-only)      │
+│  Wallets: alice / bob / carol    (passphrase: play)              │
+│                                                                  │
+│  Try:                                                            │
+│    beth status                                                   │
+│    beth vfs ls /                                                 │
+│    beth vfs ls /chains                                           │
+│    beth vfs cat /chains/anvil/head/number                        │
+│    beth vfs cat /chains/base/head/number                         │
+│    beth wallet list                                              │
+│    beth wallet stage alice anvil --intent \\                     │
+│      '{"to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8",        │
+│        "value":"1 ETH","chain":"anvil"}'                         │
+│                                                                  │
+│  Type 'exit' to leave (anvil + daemon will stop).                │
+└──────────────────────────────────────────────────────────────────┘
+
+EOF
+
+# Use bash --rcfile to inherit the user's environment but layer the
+# playground-specific bits on top. -i keeps it interactive.
+bash --rcfile "$RCFILE" -i || true

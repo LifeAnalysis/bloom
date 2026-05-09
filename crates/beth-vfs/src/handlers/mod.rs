@@ -1,0 +1,22 @@
+pub mod addressbook;
+pub mod chains;
+mod chains_history;
+pub mod defi;
+pub mod docs;
+pub mod prices;
+pub mod simulate;
+pub mod status;
+pub mod tools;
+pub mod wallets;
+pub mod watch;
+
+pub use addressbook::AddressBookHandler;
+pub use chains::ChainsHandler;
+pub use defi::DefiHandler;
+pub use docs::DocsHandler;
+pub use prices::PricesHandler;
+pub use simulate::SimulateHandler;
+pub use status::StatusHandler;
+pub use tools::ToolsHandler;
+pub use wallets::WalletsHandler;
+pub use watch::WatchHandler;

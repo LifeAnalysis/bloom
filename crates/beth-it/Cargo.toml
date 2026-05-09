@@ -1,0 +1,22 @@
+[package]
+name = "beth-it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "End-to-end integration tests for bloom-eth"
+publish = false
+
+[dependencies]
+beth-proto.workspace = true
+beth-keystore.workspace = true
+beth-chain.workspace = true
+beth-tx.workspace = true
+beth-vfs.workspace = true
+beth-daemon.workspace = true
+alloy.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time"] }
+serde_json.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true

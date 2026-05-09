@@ -1,0 +1,82 @@
+[workspace]
+members = [
+  "crates/beth",
+  "crates/beth-daemon",
+  "crates/beth-vfs",
+  "crates/beth-chain",
+  "crates/beth-tx",
+  "crates/beth-keystore",
+  "crates/beth-defi",
+  "crates/beth-watch",
+  "crates/beth-mount",
+  "crates/beth-proto",
+  "crates/beth-tools",
+  "crates/beth-etherscan",
+  "crates/beth-ens",
+  "crates/beth-prices",
+  "crates/beth-it",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bloom-directory/bloom-eth"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3"
+toml = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+async-trait = "0.1"
+parking_lot = "0.12"
+dirs = "5"
+shellexpand = "3"
+hex = "0.4"
+blake3 = "1"
+sha3 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+rand = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"
+humantime = "2"
+humantime-serde = "1"
+tempfile = "3"
+once_cell = "1"
+futures = "0.3"
+
+# Ethereum stack
+alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract"] }
+alloy-dyn-abi = { version = "1.5", features = ["eip712"] }
+
+# Internal crates
+beth-proto    = { path = "crates/beth-proto" }
+beth-keystore = { path = "crates/beth-keystore" }
+beth-chain    = { path = "crates/beth-chain" }
+beth-tx       = { path = "crates/beth-tx" }
+beth-vfs      = { path = "crates/beth-vfs" }
+beth-tools    = { path = "crates/beth-tools" }
+beth-defi     = { path = "crates/beth-defi" }
+beth-watch    = { path = "crates/beth-watch" }
+beth-mount    = { path = "crates/beth-mount" }
+beth-etherscan = { path = "crates/beth-etherscan" }
+beth-ens      = { path = "crates/beth-ens" }
+beth-prices   = { path = "crates/beth-prices" }
+beth-daemon   = { path = "crates/beth-daemon" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

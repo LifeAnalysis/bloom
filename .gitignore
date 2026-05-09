@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+Cargo.lock
+.DS_Store
+~/.bloom-eth
+.env
+test.env
+*.local.toml
