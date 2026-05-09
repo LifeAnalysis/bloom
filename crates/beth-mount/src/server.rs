@@ -15,7 +15,8 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
+use std::time::{Duration, Instant};
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -25,6 +26,53 @@ use beth_vfs::Vfs;
 
 use crate::adapter::BethFs;
 use crate::{build_mount_args, MountConfig, MountError, MountHandle};
+
+const MOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const UMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn run_command_with_timeout(
+    cmd_name: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<Output, MountError> {
+    let mut child = std::process::Command::new(cmd_name)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map_err(MountError::from);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err(MountError::Mount(format!(
+                "{cmd_name} timed out after {}s",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn linux_mount_fallback_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
+    let port = server.port();
+    let mut opts = format!(
+        "vers=4.1,proto=tcp,port={port},noac,lookupcache=none,rsize=65536,wsize=65536,timeo=10"
+    );
+    if cfg.readonly {
+        opts.push_str(",ro");
+    }
+    vec![
+        "-t".to_string(),
+        "nfs4".to_string(),
+        "-o".to_string(),
+        opts,
+        format!("{}:/", server.ip()),
+        cfg.mount_path.display().to_string(),
+    ]
+}
 
 /// Handle to a live mount established by [`serve_nfs`]. Holds the bound
 /// NFS server task plus the mount path so `unmount` can tear both down.
@@ -55,10 +103,12 @@ impl Drop for NfsMountHandle {
         if !already {
             let mp = self.mount_path.clone();
             if let Err(e) = std::process::Command::new("umount")
+                .arg("-l")
+                .arg("-f")
                 .arg(&mp)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
+                .spawn()
             {
                 warn!(mount_path = %mp.display(), error = %e, "umount on drop failed");
             }
@@ -82,10 +132,8 @@ impl MountHandle for NfsMountHandle {
         }
         let mp = self.mount_path.clone();
         let status = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("umount")
-                .arg(&mp)
-                .output()
-                .map_err(MountError::from)
+            let args = vec!["-l".to_string(), "-f".to_string(), mp.display().to_string()];
+            run_command_with_timeout("umount", &args, UMOUNT_COMMAND_TIMEOUT)
         })
         .await
         .map_err(|e| MountError::Mount(format!("umount join: {e}")))??;
@@ -165,16 +213,31 @@ pub async fn serve_nfs_with(vfs: Vfs, cfg: MountConfig) -> Result<NfsMountHandle
     // the client struct) doesn't pin the runtime worker.
     let args = build_mount_args(&cfg, local);
     let cmd_name = crate::detect_mount_command();
-    debug!(cmd = cmd_name, ?args, "running mount command");
+    let mut attempts = vec![(cmd_name.to_string(), args)];
+    if cfg!(target_os = "linux") {
+        attempts.push(("mount".to_string(), linux_mount_fallback_args(&cfg, local)));
+    }
+    debug!(?attempts, "running mount command attempts");
     let mp_for_log = cfg.mount_path.clone();
     let mount_result = tokio::task::spawn_blocking({
-        let cmd_name = cmd_name.to_string();
-        let args = args.clone();
+        let attempts = attempts.clone();
         move || {
-            std::process::Command::new(&cmd_name)
-                .args(&args)
-                .output()
-                .map_err(MountError::from)
+            let mut errors = Vec::new();
+            for (cmd_name, args) in attempts {
+                match run_command_with_timeout(&cmd_name, &args, MOUNT_COMMAND_TIMEOUT) {
+                    Ok(output) if output.status.success() => return Ok(output),
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        errors.push(format!(
+                            "{} {:?} exited {}: stdout={} stderr={}",
+                            cmd_name, args, output.status, stdout, stderr
+                        ));
+                    }
+                    Err(e) => errors.push(format!("{} {:?}: {}", cmd_name, args, e)),
+                }
+            }
+            Err(MountError::Mount(errors.join("; ")))
         }
     })
     .await
@@ -192,8 +255,8 @@ pub async fn serve_nfs_with(vfs: Vfs, cfg: MountConfig) -> Result<NfsMountHandle
         let stdout = String::from_utf8_lossy(&output.stdout);
         server_task.abort();
         return Err(MountError::Mount(format!(
-            "{} exited {}: stdout={} stderr={}",
-            cmd_name, output.status, stdout, stderr
+            "mount exited {}: stdout={} stderr={}",
+            output.status, stdout, stderr
         )));
     }
 

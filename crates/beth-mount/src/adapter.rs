@@ -36,6 +36,12 @@ use beth_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 /// body the daemon expects through the mount surface.
 pub(crate) const MAX_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
+/// Synthetic VFS files often cannot know their size without performing
+/// the read itself. Linux's NFS client treats a regular file with
+/// size=0 as EOF and may never issue READ, so expose a conservative
+/// window for zero-size file entries and let `read` return the real EOF.
+pub(crate) const SYNTHETIC_READ_SIZE_HINT: u64 = 8 * 1024 * 1024;
+
 /// Time without further writes after which a buffer is auto-flushed.
 /// Picked to match the typical NFSv4 client behaviour: kernels with
 /// `wsize=4096` issue a burst of WRITEs followed by a COMMIT once the
@@ -141,8 +147,13 @@ fn entry_to_attrs(path: &VfsPath, e: &Entry) -> Attrs {
         EntryKind::Symlink => ObjectType::Symlink,
     };
     let mut a = Attrs::new(ot, fileid_for(path));
-    a.size = e.size;
-    a.space_used = e.size;
+    let size = if e.kind == EntryKind::File && e.size == 0 {
+        SYNTHETIC_READ_SIZE_HINT
+    } else {
+        e.size
+    };
+    a.size = size;
+    a.space_used = size;
     a.mode = e.mode;
     let ts = epoch_ts();
     a.mtime = ts;
@@ -309,6 +320,42 @@ impl BethFs {
         }
     }
 
+    /// Compute a content-derived change id for `dir_path`. The default
+    /// `Attrs::new` change is a function of fileid (path), so it stays
+    /// constant for a given directory across its lifetime — and Linux's
+    /// NFS client uses the change attribute to validate its dir cache:
+    /// "change unchanged ⇒ my cached listing is still good." That makes
+    /// state mutated outside the NFS write path (e.g. the daemon
+    /// dropping a new entry into `outbox/pending/`) invisible to clients
+    /// that already saw the directory empty. Hashing the current listing
+    /// makes change move whenever entries are added, removed, or
+    /// renamed, which forces the kernel to re-issue READDIR. The cost is
+    /// one extra `vfs.list` per `getattr` on a directory; beth's
+    /// directories are small so this is fine.
+    async fn dir_change(&self, dir_path: &VfsPath) -> u64 {
+        let entries = self.vfs.list(dir_path).await.unwrap_or_default();
+        let mut h: u64 = 0xcbf29ce484222325;
+        // Mix a salt derived from the path so two empty directories at
+        // different paths don't collide on `change=fnv_empty`.
+        for &b in dir_path.to_string_path().as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100000001b3);
+        for e in &entries {
+            for &b in e.name.as_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h ^= 0x00;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        // 0 is a poor change id (some clients treat it specially); also
+        // keep us above the Attrs::new default of fileid.max(1).
+        h.max(2)
+    }
+
     /// Take a buffer's contents out, leaving the slot empty. Returns
     /// `Some(bytes)` only if the buffer was contiguous — partial
     /// buffers stay parked so a follow-up WRITE can fill the gap.
@@ -373,6 +420,7 @@ impl FileSystem for BethFs {
                 a.mtime = ts;
                 a.atime = ts;
                 a.ctime = ts;
+                a.change = self.dir_change(&VfsPath::root()).await;
                 Ok(a)
             }
             BethHandle::Path { kind, path } => {
@@ -383,7 +431,11 @@ impl FileSystem for BethFs {
                 // If the kind has somehow drifted, prefer the live
                 // value over the cached one.
                 let _ = kind;
-                Ok(entry_to_attrs(path, &e))
+                let mut attrs = entry_to_attrs(path, &e);
+                if e.kind == EntryKind::Dir {
+                    attrs.change = self.dir_change(path).await;
+                }
+                Ok(attrs)
             }
         }
     }
@@ -497,7 +549,18 @@ impl FileSystem for BethFs {
                 path: child_path.clone(),
             };
             let attrs = if with_attrs {
-                Some(entry_to_attrs(&child_path, &e))
+                let mut a = entry_to_attrs(&child_path, &e);
+                if e.kind == EntryKind::Dir {
+                    // See `dir_change`: for child directories returned
+                    // inline with READDIR's attr_request, the kernel
+                    // uses `change` to validate any cached listing of
+                    // that subdirectory. Without this, a `find` walk
+                    // populates the cache with stale `change=fileid`
+                    // and never refreshes when the daemon mutates the
+                    // subdirectory out-of-band.
+                    a.change = self.dir_change(&child_path).await;
+                }
+                Some(a)
             } else {
                 None
             };
@@ -574,6 +637,25 @@ impl FileSystem for BethFs {
         // observe whether the buffer is now complete; the actual VFS
         // write happens outside the lock so a slow handler can't stall
         // concurrent writers to other paths.
+        //
+        // We must honour the kernel's requested stability: the embednfs
+        // server enforces `actual >= requested` and returns SERVERFAULT
+        // (kernel surfaces this as EREMOTEIO) on mismatch. Linux's NFSv4
+        // client routinely upgrades small writes to DATA_SYNC/FILE_SYNC
+        // (e.g. when `wsize` covers the whole body) so we cannot blindly
+        // advertise UNSTABLE for every reply.
+        //
+        // Strategy:
+        // - DATA_SYNC / FILE_SYNC requested: flush eagerly when the
+        //   buffer is contiguous and report back the requested level so
+        //   the kernel doesn't need to follow up with a COMMIT.
+        // - DATA_SYNC / FILE_SYNC requested but buffer is incomplete
+        //   (mid-stream chunk): we keep buffering and downgrade the
+        //   reply to UNSTABLE — the embednfs server will reject this,
+        //   so this case is intentionally rare. In practice clients
+        //   issuing sync writes pack the whole payload into a single op.
+        // - UNSTABLE requested: buffer and reply UNSTABLE; the kernel
+        //   sends a COMMIT after CLOSE that triggers `flush_path`.
         let (complete_payload, accepted) = {
             let mut map = self.write_buffers.lock();
             let buf = map.entry(path.clone()).or_insert_with(WriteBuffer::new);
@@ -585,14 +667,26 @@ impl FileSystem for BethFs {
                 return Err(FsError::FileTooLarge);
             }
             buf.apply(offset, &data)?;
-            let payload = if buf.is_complete() && requested == WriteStability::FileSync {
-                // Eager flush on FILE_SYNC: clients that bypass COMMIT
-                // (notably some macOS NFS quirks) will set this.
+            let needs_eager_flush = matches!(
+                requested,
+                WriteStability::DataSync | WriteStability::FileSync
+            ) && buf.is_complete();
+            let payload = if needs_eager_flush {
                 Some(map.remove(&path).expect("just observed").bytes)
             } else {
                 None
             };
             (payload, len)
+        };
+
+        let actual_stability = if complete_payload.is_some() {
+            // We persisted the buffer through to the VFS, so we can
+            // honour whatever sync level the kernel asked for.
+            requested
+        } else {
+            // Still buffering: only safe to advertise UNSTABLE so the
+            // kernel sends a follow-up COMMIT.
+            WriteStability::Unstable
         };
 
         if let Some(payload) = complete_payload {
@@ -601,11 +695,7 @@ impl FileSystem for BethFs {
 
         Ok(WriteResult {
             written: u32::try_from(accepted).unwrap_or(u32::MAX),
-            // Always advertise UNSTABLE so the kernel sends a follow-up
-            // COMMIT — that's the path that flushes a multi-chunk
-            // write. The eager FILE_SYNC fast path above handles the
-            // case where the kernel skips COMMIT.
-            stability: WriteStability::Unstable,
+            stability: actual_stability,
         })
     }
 
@@ -930,6 +1020,13 @@ mod tests {
 
     /// Bug #4 acceptance: a single write tagged FILE_SYNC (no
     /// follow-up COMMIT) flushes immediately on the eager path.
+    ///
+    /// Regression: the embednfs server enforces
+    /// `actual_stability >= requested_stability` and returns
+    /// SERVERFAULT (kernel surface: EREMOTEIO) on mismatch. The
+    /// adapter used to advertise UNSTABLE for every reply, so a
+    /// kernel-issued FILE_SYNC write through the mount silently
+    /// flushed the body but failed userspace `write(2)` with EIO.
     #[tokio::test]
     async fn file_sync_write_flushes_eagerly() {
         let recorder = RecordingHandler::new();
@@ -939,17 +1036,50 @@ mod tests {
         let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
         let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
         let body = b"hello bloom\n";
-        fs.write(
-            &ctx,
-            &inbox,
-            0,
-            Bytes::copy_from_slice(body),
-            WriteStability::FileSync,
-        )
-        .await
-        .unwrap();
+        let result = fs
+            .write(
+                &ctx,
+                &inbox,
+                0,
+                Bytes::copy_from_slice(body),
+                WriteStability::FileSync,
+            )
+            .await
+            .unwrap();
         assert_eq!(recorder.write_count(), 1);
         assert_eq!(recorder.last_write().unwrap(), body);
+        assert_eq!(
+            result.stability,
+            WriteStability::FileSync,
+            "must echo the requested sync level back so embednfs accepts the WRITE"
+        );
+    }
+
+    /// DATA_SYNC mirrors FILE_SYNC: kernel asks the server to
+    /// persist data before replying. We flush eagerly and report
+    /// DATA_SYNC back so the embednfs stability check passes.
+    #[tokio::test]
+    async fn data_sync_write_flushes_eagerly() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+        let body = b"datasync body\n";
+        let result = fs
+            .write(
+                &ctx,
+                &inbox,
+                0,
+                Bytes::copy_from_slice(body),
+                WriteStability::DataSync,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorder.write_count(), 1);
+        assert_eq!(recorder.last_write().unwrap(), body);
+        assert_eq!(result.stability, WriteStability::DataSync);
     }
 
     /// Bug #4 acceptance: a write that would push the per-handle
@@ -1041,5 +1171,113 @@ mod tests {
         let granted = fs.access(&ctx, &inbox, requested).await.unwrap();
         assert!(granted.contains(AccessMask::MODIFY));
         assert!(granted.contains(AccessMask::EXTEND));
+    }
+
+    /// Handler whose `pending/` subdirectory has a mutable listing,
+    /// driven by the `entries` mutex. Mirrors how the real wallets
+    /// outbox works: the daemon writes new pending tx ids into a
+    /// directory out-of-band, and listings via the mount must reflect
+    /// those additions.
+    #[derive(Default)]
+    struct MutableDirHandler {
+        entries: parking_lot::Mutex<Vec<String>>,
+    }
+    impl MutableDirHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+        fn push(&self, name: &str) {
+            self.entries.lock().push(name.into());
+        }
+    }
+    #[async_trait]
+    impl Handler for MutableDirHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments() {
+                [] => Ok(Entry::dir("")),
+                [s] if s == "pending" => Ok(Entry::dir("pending")),
+                [s, name] if s == "pending" => {
+                    if self.entries.lock().iter().any(|e| e == name) {
+                        Ok(Entry::dir(name))
+                    } else {
+                        Err(HandlerError::NotFound(p.to_string_path()))
+                    }
+                }
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Err(HandlerError::NotAFile(p.to_string_path()))
+        }
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            match p.segments() {
+                [] => Ok(vec![Entry::dir("pending")]),
+                [s] if s == "pending" => Ok(self
+                    .entries
+                    .lock()
+                    .iter()
+                    .map(|n| Entry::dir(n))
+                    .collect()),
+                _ => Err(HandlerError::NotADir(p.to_string_path())),
+            }
+        }
+    }
+
+    /// Regression for the Enso/Aave integration test bug: when the
+    /// daemon writes a new pending stage out-of-band (i.e. not via the
+    /// NFS write path), `getattr` on the parent directory must report a
+    /// different `change` so the kernel's NFS dir cache invalidates and
+    /// the next READDIR sees the new entry. Before this fix `change`
+    /// was a function of fileid (path), so it never moved and clients
+    /// who saw the directory empty kept seeing it empty forever.
+    #[tokio::test]
+    async fn dir_change_moves_when_listing_grows() {
+        let h = MutableDirHandler::new();
+        let vfs = Vfs::builder().mount("box", h.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let box_dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let pending = fs.lookup(&ctx, &box_dir, "pending").await.unwrap();
+        let before = fs.getattr(&ctx, &pending).await.unwrap().change;
+        h.push("0001-21699");
+        let after = fs.getattr(&ctx, &pending).await.unwrap().change;
+        assert_ne!(
+            before, after,
+            "directory change must move after a new entry is added; \
+             otherwise the kernel will keep serving the cached empty listing"
+        );
+    }
+
+    /// Two empty directories at different paths must not share a
+    /// `change` value. Otherwise an empty-listing cache for one
+    /// directory would falsely validate against another's attribute.
+    #[tokio::test]
+    async fn dir_change_distinguishes_empty_directories() {
+        let h = MutableDirHandler::new();
+        let vfs = Vfs::builder().mount("box", h.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let root = fs.getattr(&ctx, &BethHandle::Root).await.unwrap().change;
+        let box_dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let pending = fs.lookup(&ctx, &box_dir, "pending").await.unwrap();
+        let pending_change = fs.getattr(&ctx, &pending).await.unwrap().change;
+        assert_ne!(root, pending_change);
+    }
+
+    /// `change` must be stable across calls when the listing hasn't
+    /// changed — otherwise multi-page READDIR (cookieverf check)
+    /// returns NFS4ERR_NOT_SAME mid-walk.
+    #[tokio::test]
+    async fn dir_change_stable_when_listing_unchanged() {
+        let h = MutableDirHandler::new();
+        h.push("0001-21699");
+        let vfs = Vfs::builder().mount("box", h.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let box_dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let pending = fs.lookup(&ctx, &box_dir, "pending").await.unwrap();
+        let a = fs.getattr(&ctx, &pending).await.unwrap().change;
+        let b = fs.getattr(&ctx, &pending).await.unwrap().change;
+        assert_eq!(a, b);
     }
 }
