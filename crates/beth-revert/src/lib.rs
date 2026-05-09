@@ -22,11 +22,19 @@ mod abi;
 mod builtin;
 mod chain;
 mod etherscan;
+mod openchain;
+
+#[cfg(feature = "bytecode-decompile")]
+mod heimdall;
 
 pub use abi::{AbiSource, EtherscanAbiSource};
 pub use builtin::BuiltinDecoder;
 pub use chain::DecoderChain;
 pub use etherscan::EtherscanAbiDecoder;
+pub use openchain::OpenchainDecoder;
+
+#[cfg(feature = "bytecode-decompile")]
+pub use heimdall::{BytecodeSource, ChainRegistryBytecodeSource, HeimdallDecompileDecoder};
 
 /// Source attribution for a decoded revert. Variants for stages 4 and 5
 /// are reserved here so decoders added later can populate them without

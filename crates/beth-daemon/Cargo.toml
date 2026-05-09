@@ -11,6 +11,10 @@ default = []
 # in the embednfs server. Off by default so the default daemon build
 # stays portable (no embednfs git dep, no kernel NFS tooling).
 mount = ["beth-mount/mount"]
+# Forward to beth-revert/bytecode-decompile: appends the heimdall-rs
+# decompile fallback to the revert-decoder chain. Heavy build (heimdall
+# pulls a lot of git deps) so opt-in only.
+bytecode-decompile = ["beth-revert/bytecode-decompile"]
 
 [dependencies]
 beth-proto.workspace = true

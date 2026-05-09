@@ -9,6 +9,12 @@ description = "bloom-eth daemon and CLI"
 name = "beth"
 path = "src/main.rs"
 
+[features]
+default = []
+# Pass-through for the heimdall-rs decompile decoder. Build with
+# `cargo build --features bytecode-decompile` to enable.
+bytecode-decompile = ["beth-daemon/bytecode-decompile"]
+
 [dependencies]
 beth-proto.workspace = true
 beth-daemon.workspace = true

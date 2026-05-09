@@ -22,6 +22,7 @@ use beth_prices::PricesClient;
 use beth_proto::{AddressBook, AuditLog, Config, HomeDir};
 use beth_revert::{
     boxed, AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
+    OpenchainDecoder,
 };
 use beth_tx::outbox::Outbox;
 use beth_tx::tx_engine::TxEngine;
@@ -155,6 +156,18 @@ impl Daemon {
         if let Some(es) = etherscan_arc.clone() {
             let abi_source: Arc<dyn AbiSource> = Arc::new(EtherscanAbiSource::new(es));
             decoder_chain = decoder_chain.with(boxed(EtherscanAbiDecoder::new(abi_source)));
+        }
+        decoder_chain = decoder_chain.with(boxed(OpenchainDecoder::default()));
+        #[cfg(feature = "bytecode-decompile")]
+        {
+            let bytecode_source: Arc<dyn beth_revert::BytecodeSource> = Arc::new(
+                beth_revert::ChainRegistryBytecodeSource::new(chains.clone()),
+            );
+            let cache_dir = home.cache_dir().join("heimdall");
+            decoder_chain = decoder_chain.with(boxed(
+                beth_revert::HeimdallDecompileDecoder::new(bytecode_source)
+                    .with_cache_dir(cache_dir),
+            ));
         }
         let decoder_chain = Arc::new(decoder_chain);
 
