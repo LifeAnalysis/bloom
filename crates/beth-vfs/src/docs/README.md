@@ -32,7 +32,9 @@ cat /eth/wallets/alice/chains/anvil/balance.eth
 cat /eth/wallets/alice/chains/ethereum/history.json
 cat /eth/tools/keccak/hello
 cat /eth/tools/abi/decode/<sig>/<hex>
-cat /eth/ens/forward/vitalik.eth
+cat /eth/ens/vitalik.eth/address
+cat /eth/ens/vitalik.eth/avatar
+cat /eth/ens/vitalik.eth/text/url
 cat /eth/prices/spot/eth-usd
 cat /eth/addressbook/alice
 ```

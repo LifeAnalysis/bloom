@@ -368,7 +368,10 @@ async fn run(cli: Cli) -> Result<()> {
             });
             server.serve(&socket).await.context("ipc serve")?;
             shutdown.abort();
+            // Stop the outbox expiry sweeper (fix #3) and any other
+            // daemon-owned workers (watch executor, etc., fix #6).
             sweeper.shutdown().await;
+            d.shutdown().await;
             println!("shutting down");
             Ok(())
         }
