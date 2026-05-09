@@ -323,7 +323,27 @@ impl Outbox {
                             staged: staged.clone(),
                             dir: ent.path(),
                         };
-                        let _ = self.transition(&entry, OutboxState::Failed);
+                        match self.transition(&entry, OutboxState::Failed) {
+                            Ok(_) => {
+                                tracing::debug!(
+                                    id = %staged.id,
+                                    wallet = %staged.wallet,
+                                    chain = %staged.chain,
+                                    expired_at = staged.expires_ms,
+                                    now_ms,
+                                    "outbox.sweep_expired"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    id = %staged.id,
+                                    wallet = %staged.wallet,
+                                    chain = %staged.chain,
+                                    error = %e,
+                                    "outbox.sweep_transition_failed"
+                                );
+                            }
+                        }
                         count += 1;
                     }
                 }

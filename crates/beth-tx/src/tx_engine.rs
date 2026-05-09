@@ -554,7 +554,18 @@ impl TxEngine {
             Some(n) => n,
             None => chain.nonce(from).await?,
         };
-        let gas_price = chain.gas_price().await.unwrap_or(1_000_000_000);
+        let gas_price = match chain.gas_price().await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    chain = %spec.name,
+                    fallback_wei = 1_000_000_000u128,
+                    "tx.gas_price_fallback"
+                );
+                1_000_000_000
+            }
+        };
         let max_fee = gas_price.saturating_mul(2);
         let prio = (gas_price / 10).max(1);
 
@@ -801,12 +812,26 @@ impl TxEngine {
             staged.status = TxStatus::Failed;
             self.outbox
                 .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            debug!(
+                id = %staged.id,
+                wallet,
+                chain = %chain_name,
+                reason = "hard",
+                "tx.policy_denied"
+            );
             return Err(TxEngineError::PolicyDenied);
         }
         let warn = policy_engine::has_warning(&staged.policy_checks);
         let sentinel = policy.override_sentinel();
         let override_text = confirm_text.trim().eq_ignore_ascii_case(sentinel);
         if warn && !override_text {
+            debug!(
+                id = %staged.id,
+                wallet,
+                chain = %chain_name,
+                reason = "warn_no_override",
+                "tx.policy_denied"
+            );
             return Err(TxEngineError::PolicyDenied);
         }
 
@@ -814,6 +839,15 @@ impl TxEngine {
         let spec = chain.spec();
         let is_mainnet = beth_proto::Config::is_mainnet_id(spec.chain_id);
         if (self.block_mainnet_broadcast && is_mainnet) || !spec.allow_broadcast {
+            debug!(
+                id = %staged.id,
+                wallet,
+                chain = %spec.name,
+                is_mainnet,
+                allow_broadcast = spec.allow_broadcast,
+                block_mainnet = self.block_mainnet_broadcast,
+                "tx.broadcast_disabled"
+            );
             return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
         }
 
@@ -1041,7 +1075,13 @@ impl TxEngine {
             &serde_json::to_vec_pretty(&cancel_tx).unwrap(),
         )?;
         if entry.state != OutboxState::Failed {
-            let _ = self.outbox.transition(&entry, OutboxState::Failed);
+            if let Err(e) = self.outbox.transition(&entry, OutboxState::Failed) {
+                debug!(
+                    id = %original.id,
+                    error = %e,
+                    "tx.cancel_transition_failed"
+                );
+            }
         }
         info!(
             id = %original.id,
@@ -1108,24 +1148,42 @@ fn parse_approve_amount(s: &str) -> Result<U256, String> {
 /// approve call — the caller treats that as "no spender hint" and
 /// policy contexts fall back to the default recipient.
 fn decode_approve_spender(data: &[u8]) -> Option<Address> {
-    IERC20::approveCall::abi_decode(data)
-        .ok()
-        .map(|c| c.spender)
+    match IERC20::approveCall::abi_decode(data) {
+        Ok(c) => Some(c.spender),
+        Err(e) => {
+            debug!(
+                error = %e,
+                data_len = data.len(),
+                "tx.decode_approve_spender_failed"
+            );
+            None
+        }
+    }
 }
 
 /// Pull the recipient out of an NFT transfer calldata blob. Tries the
 /// ERC-721 3-arg form first, then the 1155 5-arg form; falls back to
 /// the legacy `transferFrom` shape last.
 fn decode_nft_recipient(data: &[u8]) -> Option<Address> {
-    if let Ok(c) = INftWrite721::safeTransferFromCall::abi_decode(data) {
-        return Some(c.to);
-    }
-    if let Ok(c) = INftWrite1155::safeTransferFromCall::abi_decode(data) {
-        return Some(c.to);
-    }
-    if let Ok(c) = INftWrite721::transferFromCall::abi_decode(data) {
-        return Some(c.to);
-    }
+    let e_721 = match INftWrite721::safeTransferFromCall::abi_decode(data) {
+        Ok(c) => return Some(c.to),
+        Err(e) => e,
+    };
+    let e_1155 = match INftWrite1155::safeTransferFromCall::abi_decode(data) {
+        Ok(c) => return Some(c.to),
+        Err(e) => e,
+    };
+    let e_legacy = match INftWrite721::transferFromCall::abi_decode(data) {
+        Ok(c) => return Some(c.to),
+        Err(e) => e,
+    };
+    debug!(
+        data_len = data.len(),
+        err_721 = %e_721,
+        err_1155 = %e_1155,
+        err_legacy = %e_legacy,
+        "tx.decode_nft_recipient_no_match"
+    );
     None
 }
 
@@ -1134,7 +1192,17 @@ fn decode_nft_recipient(data: &[u8]) -> Option<Address> {
 /// — both selectors are `0x095ea7b3`, so we use the field name `to`
 /// rather than `spender` to match the NFT shape).
 fn decode_nft_approve_operator(data: &[u8]) -> Option<Address> {
-    INftWrite721::approveCall::abi_decode(data).ok().map(|c| c.to)
+    match INftWrite721::approveCall::abi_decode(data) {
+        Ok(c) => Some(c.to),
+        Err(e) => {
+            debug!(
+                error = %e,
+                data_len = data.len(),
+                "tx.decode_nft_approve_operator_failed"
+            );
+            None
+        }
+    }
 }
 
 /// Stringify an `NftKind` for plan/audit display.
@@ -1152,7 +1220,18 @@ fn nft_kind_label(kind: NftKind) -> String {
 async fn best_effort_nft_symbol(chain: &ChainClient, contract: Address) -> String {
     match chain.erc721_symbol(contract).await {
         Ok(Some(s)) if !s.is_empty() => s,
-        _ => String::new(),
+        Ok(Some(_)) => {
+            debug!(%contract, "tx.nft_symbol_empty");
+            String::new()
+        }
+        Ok(None) => {
+            debug!(%contract, "tx.nft_symbol_absent");
+            String::new()
+        }
+        Err(e) => {
+            debug!(%contract, error = %e, "tx.nft_symbol_failed");
+            String::new()
+        }
     }
 }
 
@@ -1181,13 +1260,17 @@ fn short_addr_label(a: &Address) -> String {
 /// chain id 31337 with vanilla Anvil — the lookup is best-effort and a
 /// caller can always pass a 0x address explicitly.
 fn lookup_known_token(chain_id: u64, symbol_upper: &str) -> Option<&'static str> {
-    match (chain_id, symbol_upper) {
+    let hit: Option<&'static str> = match (chain_id, symbol_upper) {
         (1, "USDC") | (31337, "USDC") => Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         (1, "USDT") | (31337, "USDT") => Some("0xdAC17F958D2ee523a2206206994597C13D831ec7"),
         (1, "DAI") | (31337, "DAI") => Some("0x6B175474E89094C44Da98b954EedeAC495271d0F"),
         (1, "WETH") | (31337, "WETH") => Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
         _ => None,
+    };
+    if hit.is_none() {
+        debug!(chain_id, symbol = symbol_upper, "tx.known_token_miss");
     }
+    hit
 }
 
 const _PARSE_UNITS: fn(&str, u8) -> Result<U256, beth_proto::units::UnitError> = parse_units;
