@@ -129,14 +129,17 @@ impl AuditLog {
         let f = std::fs::File::open(&g.path)?;
         let mut buf: std::collections::VecDeque<AuditRecord> =
             std::collections::VecDeque::with_capacity(n);
-        for line in BufReader::new(f).lines() {
+        for (line_no, line) in BufReader::new(f).lines().enumerate() {
             let line = line?;
             if line.is_empty() {
                 continue;
             }
             let rec: AuditRecord = match serde_json::from_str(&line) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::debug!(line = line_no + 1, error = %e, "audit.tail.skip_unparsable");
+                    continue;
+                }
             };
             if buf.len() == n {
                 buf.pop_front();
