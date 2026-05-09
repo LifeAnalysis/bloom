@@ -10,7 +10,7 @@ pub mod ipc;
 mod ens_resolver;
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use beth_chain::{ChainClient, ChainRegistry};
 use beth_defi::EnsoClient;
@@ -28,6 +28,8 @@ use beth_vfs::handlers::{
 use beth_vfs::Vfs;
 use beth_watch::{WatchExecutor, WatchRegistry};
 use thiserror::Error;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 #[derive(Debug, Error)]
@@ -242,6 +244,52 @@ impl Daemon {
         Self::from_home(home)
     }
 
+    /// Spawn long-lived background tasks: currently the outbox expiry
+    /// sweeper that runs every 60s and moves any pending entry past its
+    /// `expires_ms` into `failed/` (fix #3). Caller keeps the returned
+    /// [`BackgroundTasks`] alive; dropping it triggers graceful shutdown.
+    ///
+    /// Safe to call multiple times — each call spawns a fresh task and
+    /// returns its own handle. Short-lived CLI commands generally don't
+    /// need this; it's primarily for `beth serve` and the in-process
+    /// daemon used by integration tests.
+    pub fn spawn_background_tasks(&self) -> BackgroundTasks {
+        let outbox = self.tx_engine.outbox.clone();
+        let (tx, mut rx) = watch::channel(false);
+        let interval = Duration::from_secs(60);
+        let handle = tokio::spawn(async move {
+            // Tick at `interval`, but exit promptly when the cancel
+            // channel flips. We use `tokio::select!` so a long sleep
+            // doesn't delay shutdown.
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        match outbox.sweep_expired(now_ms) {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(swept=n, "outbox.sweep_expired"),
+                            Err(e) => tracing::warn!(error=%e, "outbox.sweep_expired failed"),
+                        }
+                    }
+                    _ = rx.changed() => {
+                        if *rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        BackgroundTasks {
+            cancel: tx,
+            handle: Some(handle),
+        }
+    }
+
     /// Mount this daemon's [`Vfs`] over NFS at `path`.
     ///
     /// Only available with `--features mount` on this crate (which in
@@ -259,6 +307,36 @@ impl Daemon {
         path: &std::path::Path,
     ) -> Result<beth_mount::NfsMountHandle, beth_mount::MountError> {
         beth_mount::serve_nfs(self.vfs.clone(), path).await
+    }
+}
+
+/// Handle to background tasks owned by a running [`Daemon`]. Drop to
+/// signal shutdown; the spawned tasks read the watch and exit at the
+/// next tick. Holding this past daemon lifetime keeps the sweeper alive.
+pub struct BackgroundTasks {
+    cancel: watch::Sender<bool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl BackgroundTasks {
+    /// Trigger graceful shutdown and wait for the sweeper task to exit.
+    pub async fn shutdown(mut self) {
+        let _ = self.cancel.send(true);
+        if let Some(h) = self.handle.take() {
+            let _ = h.await;
+        }
+    }
+}
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        // Best-effort fire-and-forget cancel. If the runtime is still up
+        // the task will see the flip and exit; if the runtime is being
+        // torn down, abort the join handle to avoid a leak.
+        let _ = self.cancel.send(true);
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
     }
 }
 
@@ -294,5 +372,49 @@ mod tests {
         assert!(d.vfs.handler("watch").is_some());
         assert!(d.vfs.handler("prices").is_some());
         assert!(d.vfs.handler("addressbook").is_some());
+    }
+
+    /// Fix #3: the spawned sweeper drops expired pending entries into
+    /// `failed/` on its own. We don't wait for the natural 60s tick;
+    /// instead the test calls `outbox.sweep_expired` itself to keep
+    /// runtime short, but verifies that `spawn_background_tasks` returns
+    /// a guard that cleans up cleanly when shut down.
+    #[tokio::test]
+    async fn sweep_background_task_handles_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(dir.path());
+        let d = Daemon::from_home(home).unwrap();
+        let tasks = d.spawn_background_tasks();
+        // Seed an already-expired pending entry; the foreground call
+        // exercises the same code the spawned task runs.
+        let staged = beth_proto::StagedTx {
+            id: "0001-test".into(),
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            chain_id: 31337,
+            from: "0x0000000000000000000000000000000000000001".into(),
+            to: "0x0000000000000000000000000000000000000002".into(),
+            value_wei: "0".into(),
+            data_hex: "0x".into(),
+            gas_limit: 21000,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            gas_price: None,
+            nonce: 0,
+            policy_checks: vec![],
+            created_ms: 0,
+            expires_ms: 1,
+            status: beth_proto::TxStatus::Pending,
+            tx_hash: None,
+            token: None,
+        };
+        d.tx_engine.outbox.write_pending(&staged, "p").unwrap();
+        let n = d.tx_engine.outbox.sweep_expired(2).unwrap();
+        assert_eq!(n, 1);
+
+        // Shutdown completes promptly.
+        tokio::time::timeout(std::time::Duration::from_secs(2), tasks.shutdown())
+            .await
+            .expect("background task did not honour shutdown signal");
     }
 }
