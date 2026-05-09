@@ -347,25 +347,48 @@ impl TxEngine {
         //   - native send: contract=None,    token=None,         recipient=to
         //   - erc20 send:  contract=token,   token=token,        recipient=token_for_plan.recipient
         //   - call/raw:    contract=to,      token=None,         recipient=to (best-effort)
+        //
+        // `destination_is_contract` drives the legacy `[contracts]` block
+        // from the spec: a plain native send to an EOA bypasses those
+        // checks. For native sends with a non-empty data field or where
+        // the destination has bytecode we still flag it as a contract
+        // call; the heuristic mirrors the spec's "code length > 0 OR data
+        // is non-empty" rule.
         let mut policy_ctx = policy_engine::AddressContext::default();
         match &intent.body {
             RawIntentBody::Send { .. } => {
                 if let Some(t) = &token_for_plan {
                     policy_ctx.token = Some(to);
                     policy_ctx.contract = Some(to);
+                    policy_ctx.destination_is_contract = true;
+                    policy_ctx.token_symbol = Some(t.symbol.clone());
                     if let Ok(rec) = t.recipient.parse::<Address>() {
                         policy_ctx.recipient = Some(rec);
                     }
                 } else {
                     policy_ctx.recipient = Some(to);
+                    // Native send: if data is non-empty or the destination
+                    // has bytecode, treat as contract call.
+                    let data_nonempty = !data_bytes.is_empty();
+                    let to_has_code = chain.code(to).await.map(|c| !c.is_empty()).unwrap_or(false);
+                    policy_ctx.destination_is_contract = data_nonempty || to_has_code;
+                    if policy_ctx.destination_is_contract {
+                        policy_ctx.contract = Some(to);
+                    }
                 }
             }
             RawIntentBody::Call { .. } | RawIntentBody::Raw { .. } => {
                 policy_ctx.contract = Some(to);
                 policy_ctx.recipient = Some(to);
+                policy_ctx.destination_is_contract = true;
             }
             RawIntentBody::Enso { .. } => {}
         }
+        // TODO(policy): wire a price oracle so usd_value is populated for
+        // non-zero-value txs. Until then USD caps fire a single Warn check
+        // that surfaces the missing oracle in plan.md, instead of silently
+        // passing dollar-denominated rules.
+        policy_ctx.usd_value = None;
 
         let mut staged = StagedTx {
             id: self.outbox.allocate_id(),
@@ -404,7 +427,14 @@ impl TxEngine {
     }
 
     /// Confirm and broadcast a staged tx. Caller decides whether the
-    /// confirm content is "y" (normal) or "override" (bypass soft warns).
+    /// confirm content is "y" (normal) or the policy's override sentinel
+    /// (bypass soft warns).
+    ///
+    /// Refuses any id that is not currently in `pending`: a stale path
+    /// like `outbox/<wallet>/<chain>/pending/<sent-id>/confirm` cannot
+    /// rebroadcast (fix #2). Refuses any pending entry whose `expires_ms`
+    /// has passed (fix #3) — the caller should sweep expired and re-stage.
+    #[allow(clippy::too_many_arguments)]
     pub async fn confirm(
         &self,
         wallet: &str,
@@ -412,10 +442,25 @@ impl TxEngine {
         id: &str,
         chain: &ChainClient,
         signer: &PrivateKeySigner,
+        policy: &Policy,
         confirm_text: &str,
     ) -> Result<StagedTx, TxEngineError> {
-        let entry = self.outbox.read(wallet, chain_name, id)?;
+        let entry = self
+            .outbox
+            .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
         let mut staged = entry.staged.clone();
+
+        // Expiry check: stage TTL is enforced regardless of whether the
+        // sweeper has run yet. We use wall-clock here; sweep_expired is the
+        // background mop-up that removes stale dirs.
+        let now = now_ms();
+        if staged.expires_ms != 0 && now >= staged.expires_ms {
+            return Err(TxEngineError::Outbox(OutboxError::StagedExpired {
+                id: staged.id.clone(),
+                expired_at: staged.expires_ms,
+                now,
+            }));
+        }
 
         // Policy gate.
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
@@ -426,7 +471,8 @@ impl TxEngine {
             return Err(TxEngineError::PolicyDenied);
         }
         let warn = policy_engine::has_warning(&staged.policy_checks);
-        let override_text = confirm_text.trim().eq_ignore_ascii_case("override");
+        let sentinel = policy.override_sentinel();
+        let override_text = confirm_text.trim().eq_ignore_ascii_case(sentinel);
         if warn && !override_text {
             return Err(TxEngineError::PolicyDenied);
         }
@@ -522,8 +568,10 @@ impl TxEngine {
     }
 
     /// Issue a same-nonce replacement tx with bumped fees. The original
-    /// must already be persisted in the outbox. Floors `bump_pct` at 10
-    /// to satisfy the mempool's >= 10% rule.
+    /// must already be persisted in the outbox **and still in pending**;
+    /// already-broadcast txs cannot be replaced through this path
+    /// (fix #2 / #10). Floors `bump_pct` at 10 to satisfy the mempool's
+    /// >= 10% rule.
     pub async fn replace(
         &self,
         wallet: &str,
@@ -534,7 +582,9 @@ impl TxEngine {
         bump_pct: u32,
     ) -> Result<StagedTx, TxEngineError> {
         let bump = bump_pct.max(10);
-        let entry = self.outbox.read(wallet, chain_name, original_id)?;
+        let entry =
+            self.outbox
+                .read_in_state(wallet, chain_name, original_id, OutboxState::Pending)?;
         let original = &entry.staged;
 
         let mut bumped = original.clone();
@@ -564,7 +614,8 @@ impl TxEngine {
         Ok(bumped)
     }
 
-    /// Issue a same-nonce self-send to cancel the original.
+    /// Issue a same-nonce self-send to cancel the original. Refuses if the
+    /// original is no longer pending (fix #2 / #10).
     pub async fn cancel(
         &self,
         wallet: &str,
@@ -575,7 +626,9 @@ impl TxEngine {
         bump_pct: u32,
     ) -> Result<StagedTx, TxEngineError> {
         let bump = bump_pct.max(10);
-        let entry = self.outbox.read(wallet, chain_name, original_id)?;
+        let entry =
+            self.outbox
+                .read_in_state(wallet, chain_name, original_id, OutboxState::Pending)?;
         let original = &entry.staged;
 
         let mut cancel_tx = original.clone();
@@ -749,5 +802,163 @@ mod tests {
     fn resolve_token_unknown_symbol_errors() {
         let err = TxEngine::resolve_token_address("MOCK", 1).unwrap_err();
         assert!(matches!(err, TxEngineError::Token(_)));
+    }
+
+    /// Helpers shared by the confirm-flow regression tests below. They
+    /// build a self-contained TxEngine + Outbox + ChainClient pointing at
+    /// an unreachable URL — every test below must fail (expectedly!)
+    /// before any chain call is attempted, otherwise the assertion
+    /// becomes "could not connect" and you can't tell which gate the
+    /// confirm flow is meant to be honouring.
+    fn fake_engine(stage_ttl_ms: u128) -> (TxEngine, beth_proto::ChainSpec, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = crate::outbox::Outbox::new(dir.path()).unwrap();
+        let engine = TxEngine::new(outbox, stage_ttl_ms, false);
+        let spec = beth_proto::ChainSpec {
+            name: "anvil".into(),
+            chain_id: 31337,
+            // Unreachable URL — confirms that fail before broadcast must
+            // not depend on this being reachable.
+            rpc_urls: vec!["http://127.0.0.1:1".into()],
+            allow_broadcast: true,
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+        };
+        (engine, spec, dir)
+    }
+
+    /// Fix #2: writing `pending/<sent-id>/confirm` must not rebroadcast
+    /// — the engine must refuse to confirm an id that no longer lives in
+    /// `pending`.
+    #[tokio::test]
+    async fn confirm_rejects_id_already_in_sent() {
+        let (engine, spec, _dir) = fake_engine(60_000);
+        let chain = beth_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let policy = beth_proto::Policy::default();
+
+        // Stage manually (write_pending) so we don't need a live RPC.
+        let mut staged = fake_staged_1559("0001-test");
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        // Move it to sent to simulate a stale path that targets the wrong
+        // state.
+        let entry = engine.outbox.read("alice", "anvil", "0001-test").unwrap();
+        engine
+            .outbox
+            .transition(&entry, crate::outbox::OutboxState::Sent)
+            .unwrap();
+
+        let r = engine
+            .confirm("alice", "anvil", "0001-test", &chain, &signer, &policy, "y")
+            .await;
+        match r {
+            Err(TxEngineError::Outbox(OutboxError::StateMismatch { actual, .. })) => {
+                assert_eq!(actual, "sent");
+            }
+            other => panic!("expected StateMismatch, got {other:?}"),
+        }
+    }
+
+    /// Fix #3: confirm must reject a pending entry whose stage TTL has
+    /// expired. The check fires before broadcast, so the (unreachable)
+    /// chain URL is never touched.
+    #[tokio::test]
+    async fn confirm_rejects_expired_stage() {
+        let (engine, spec, _dir) = fake_engine(60_000);
+        let chain = beth_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let policy = beth_proto::Policy::default();
+
+        let mut staged = fake_staged_1559("0001-test");
+        // Already expired the moment this test runs.
+        staged.expires_ms = 1;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+
+        let r = engine
+            .confirm("alice", "anvil", "0001-test", &chain, &signer, &policy, "y")
+            .await;
+        match r {
+            Err(TxEngineError::Outbox(OutboxError::StagedExpired { id, .. })) => {
+                assert_eq!(id, "0001-test");
+            }
+            other => panic!("expected StagedExpired, got {other:?}"),
+        }
+    }
+
+    /// Fix #11: the override sentinel comes from policy.toml, not a hard
+    /// "override" string. A custom token must be honoured.
+    #[tokio::test]
+    async fn confirm_uses_policy_override_token() {
+        use beth_proto::policy::{PolicyAutomation, PolicyCaps, PolicyCheck, PolicyOutcome};
+
+        let (engine, spec, _dir) = fake_engine(60_000);
+        let chain = beth_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+
+        // Soft-warn on tx, with a non-default override token.
+        let policy = beth_proto::Policy {
+            automation: PolicyAutomation {
+                override_token: Some("yolo".into()),
+                ..Default::default()
+            },
+            caps: PolicyCaps::default(),
+            ..Default::default()
+        };
+
+        let mut staged = fake_staged_1559("0001-test");
+        staged.expires_ms = now_ms() + 60_000;
+        // Inject a Warn check directly so the override gate fires.
+        staged.policy_checks = vec![PolicyCheck {
+            rule: "test.warn".into(),
+            outcome: PolicyOutcome::Warn,
+            message: "soft cap".into(),
+        }];
+        engine.outbox.write_pending(&staged, "p").unwrap();
+
+        // "y" must be rejected — needs the policy's override token.
+        let r = engine
+            .confirm("alice", "anvil", "0001-test", &chain, &signer, &policy, "y")
+            .await;
+        assert!(matches!(r, Err(TxEngineError::PolicyDenied)));
+
+        // Default sentinel ("override") must NOT bypass when policy
+        // overrides it.
+        let r = engine
+            .confirm(
+                "alice",
+                "anvil",
+                "0001-test",
+                &chain,
+                &signer,
+                &policy,
+                "override",
+            )
+            .await;
+        assert!(matches!(r, Err(TxEngineError::PolicyDenied)));
+
+        // The configured token gets past the policy gate; the next gate
+        // is broadcast, which fails on the unreachable RPC. We treat any
+        // *non*-PolicyDenied error as the policy gate having let us
+        // through.
+        let r = engine
+            .confirm(
+                "alice",
+                "anvil",
+                "0001-test",
+                &chain,
+                &signer,
+                &policy,
+                "yolo",
+            )
+            .await;
+        match r {
+            Err(TxEngineError::PolicyDenied) => panic!("override token did not bypass warn"),
+            Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
+            Err(_) => {}
+        }
     }
 }
