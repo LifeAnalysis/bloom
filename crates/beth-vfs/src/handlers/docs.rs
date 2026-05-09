@@ -29,6 +29,32 @@ impl DocsHandler {
 #[async_trait]
 impl Handler for DocsHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        let r = self.lookup_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "docs.lookup_err");
+        }
+        r
+    }
+
+    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        let r = self.read_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "docs.read_err");
+        }
+        r
+    }
+
+    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        let r = self.list_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "docs.list_err");
+        }
+        r
+    }
+}
+
+impl DocsHandler {
+    async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         match path.segments() {
             [] => Ok(Entry::dir("")),
             [s] if s == "README.md" => Ok(Entry::file("README.md")),
@@ -37,7 +63,7 @@ impl Handler for DocsHandler {
         }
     }
 
-    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+    async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         match path.segments() {
             [s] if s == "README.md" => Ok(self.readme.as_bytes().to_vec()),
             [s] if s == "examples.md" => Ok(self.examples.as_bytes().to_vec()),
@@ -45,7 +71,7 @@ impl Handler for DocsHandler {
         }
     }
 
-    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+    async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         if path.is_root() {
             Ok(vec![Entry::file("README.md"), Entry::file("examples.md")])
         } else {

@@ -332,6 +332,36 @@ struct DaemonInfo {
 #[async_trait]
 impl Handler for StatusHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        let r = self.lookup_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "status.lookup_err");
+        }
+        r
+    }
+
+    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        let r = self.read_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "status.read_err");
+        }
+        r
+    }
+
+    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        let r = self.list_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "status.list_err");
+        }
+        r
+    }
+
+    fn cache_ttl(&self, path: &VfsPath) -> Option<Duration> {
+        self.cache_ttl_inner(path)
+    }
+}
+
+impl StatusHandler {
+    async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         match path.segments() {
             [] => Ok(Entry::dir("")),
             [s] if s == "daemon.json"
@@ -396,7 +426,7 @@ impl Handler for StatusHandler {
         }
     }
 
-    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+    async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         match path.segments() {
             [s] if s == "version" => Ok(format!("{}\n", self.version).into_bytes()),
             [s] if s == "uptime" => Ok(format!("{}\n", self.uptime_string()).into_bytes()),
@@ -490,7 +520,7 @@ impl Handler for StatusHandler {
         }
     }
 
-    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+    async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         match path.segments() {
             [] => Ok(vec![
                 Entry::file("daemon.json"),
@@ -552,7 +582,7 @@ impl Handler for StatusHandler {
     /// Per-path TTL hints for the router cache. Status fields are
     /// cheap but RPC-heavy (chain probes), so 5s smooths burst polling
     /// without making the data feel stale.
-    fn cache_ttl(&self, path: &VfsPath) -> Option<Duration> {
+    fn cache_ttl_inner(&self, path: &VfsPath) -> Option<Duration> {
         let segs = path.segments();
         match segs.first().map(|s| s.as_str()) {
             // `audit/last` walks the file but is otherwise pure I/O;

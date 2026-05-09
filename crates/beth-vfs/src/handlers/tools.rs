@@ -125,6 +125,45 @@ fn family_out_name(family: &str) -> &'static str {
 #[async_trait]
 impl Handler for ToolsHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        let r = self.lookup_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "tools.lookup_err");
+        }
+        r
+    }
+
+    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        let r = self.read_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "tools.read_err");
+        }
+        r
+    }
+
+    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        let r = self.write_inner(path, data).await;
+        if let Err(e) = &r {
+            tracing::debug!(
+                path = %path.to_string_path(),
+                bytes = data.len(),
+                error = %e,
+                "tools.write_err"
+            );
+        }
+        r
+    }
+
+    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        let r = self.list_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "tools.list_err");
+        }
+        r
+    }
+}
+
+impl ToolsHandler {
+    async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         if path.is_root() {
             return Ok(Entry::dir(""));
         }
@@ -208,7 +247,7 @@ impl Handler for ToolsHandler {
         }
     }
 
-    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+    async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
         if segs.is_empty() {
             return Err(HandlerError::NotAFile(path.to_string_path()));
@@ -320,7 +359,7 @@ impl Handler for ToolsHandler {
         }
     }
 
-    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+    async fn write_inner(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let segs = path.segments();
         if let Some((family, rest)) = match_session_family(segs) {
             if rest.len() == 2 && rest[1].as_str() == "in.json" {
@@ -337,7 +376,7 @@ impl Handler for ToolsHandler {
         Err(HandlerError::PermissionDenied)
     }
 
-    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+    async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         if path.is_root() {
             return Ok(TOOLS_TOP.iter().map(|s| Entry::dir(s)).collect());
         }

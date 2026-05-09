@@ -56,6 +56,45 @@ impl AddressBookHandler {
 #[async_trait]
 impl Handler for AddressBookHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        let r = self.lookup_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "addressbook.lookup_err");
+        }
+        r
+    }
+
+    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        let r = self.read_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "addressbook.read_err");
+        }
+        r
+    }
+
+    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        let r = self.write_inner(path, data).await;
+        if let Err(e) = &r {
+            tracing::debug!(
+                path = %path.to_string_path(),
+                bytes = data.len(),
+                error = %e,
+                "addressbook.write_err"
+            );
+        }
+        r
+    }
+
+    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        let r = self.list_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "addressbook.list_err");
+        }
+        r
+    }
+}
+
+impl AddressBookHandler {
+    async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         if path.is_root() {
             return Ok(Entry::dir(""));
         }
@@ -77,7 +116,7 @@ impl Handler for AddressBookHandler {
         }
     }
 
-    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+    async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
         if segs.len() != 1 {
             return Err(HandlerError::NotAFile(path.to_string_path()));
@@ -94,7 +133,7 @@ impl Handler for AddressBookHandler {
         Ok(format!("{v}\n").into_bytes())
     }
 
-    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+    async fn write_inner(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let segs = path.segments();
         let body = std::str::from_utf8(data)
             .map_err(|e| HandlerError::invalid(format!("utf8: {e}")))?
@@ -140,7 +179,7 @@ impl Handler for AddressBookHandler {
         Ok(())
     }
 
-    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+    async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         if !path.is_root() {
             return Err(HandlerError::NotADir(path.to_string_path()));
         }

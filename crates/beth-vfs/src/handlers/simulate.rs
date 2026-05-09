@@ -687,6 +687,45 @@ impl SimulateHandler {
 #[async_trait]
 impl Handler for SimulateHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        let r = self.lookup_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "simulate.lookup_err");
+        }
+        r
+    }
+
+    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        let r = self.read_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "simulate.read_err");
+        }
+        r
+    }
+
+    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        let r = self.write_inner(path, data).await;
+        if let Err(e) = &r {
+            tracing::debug!(
+                path = %path.to_string_path(),
+                bytes = data.len(),
+                error = %e,
+                "simulate.write_err"
+            );
+        }
+        r
+    }
+
+    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        let r = self.list_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "simulate.list_err");
+        }
+        r
+    }
+}
+
+impl SimulateHandler {
+    async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         let segs = path.segments();
         match segs.len() {
             0 => Ok(Entry::dir("")),
@@ -721,7 +760,7 @@ impl Handler for SimulateHandler {
         }
     }
 
-    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+    async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
         match segs.len() {
             1 if segs[0] == "last" => {
@@ -739,7 +778,7 @@ impl Handler for SimulateHandler {
         }
     }
 
-    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+    async fn write_inner(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let segs = path.segments();
         match segs.len() {
             1 if segs[0] == "new" => {
@@ -755,7 +794,7 @@ impl Handler for SimulateHandler {
         }
     }
 
-    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+    async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         let segs = path.segments();
         match segs.len() {
             0 => {

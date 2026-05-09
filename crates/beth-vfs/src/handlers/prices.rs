@@ -58,6 +58,38 @@ fn err_be(e: PricesError) -> HandlerError {
 #[async_trait]
 impl Handler for PricesHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        let r = self.lookup_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "prices.lookup_err");
+        }
+        r
+    }
+
+    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        let r = self.read_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "prices.read_err");
+        }
+        r
+    }
+
+    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        let r = self.list_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "prices.list_err");
+        }
+        r
+    }
+
+    /// DefiLlama is rate-limited keyless; 30s on quotes is plenty for
+    /// agent-driven workflows and saves us from being throttled.
+    fn cache_ttl(&self, _path: &VfsPath) -> Option<Duration> {
+        Some(Duration::from_secs(30))
+    }
+}
+
+impl PricesHandler {
+    async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         let segs = path.segments();
         if segs.is_empty() {
             return Ok(Entry::dir(""));
@@ -77,7 +109,7 @@ impl Handler for PricesHandler {
         }
     }
 
-    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+    async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
         if segs.len() != 2 {
             return Err(HandlerError::NotAFile(path.to_string_path()));
@@ -108,7 +140,7 @@ impl Handler for PricesHandler {
         }
     }
 
-    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+    async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         if path.is_root() {
             return Ok(vec![Entry::dir("spot"), Entry::dir("change_24h")]);
         }
@@ -117,12 +149,6 @@ impl Handler for PricesHandler {
             "change_24h" if path.segments().len() == 1 => Ok(vec![]),
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
-    }
-
-    /// DefiLlama is rate-limited keyless; 30s on quotes is plenty for
-    /// agent-driven workflows and saves us from being throttled.
-    fn cache_ttl(&self, _path: &VfsPath) -> Option<Duration> {
-        Some(Duration::from_secs(30))
     }
 }
 

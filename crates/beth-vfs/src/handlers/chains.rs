@@ -429,6 +429,61 @@ const TOKEN_FILES: &[&str] = &[
 #[async_trait]
 impl Handler for ChainsHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        let r = self.lookup_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(
+                path = %path.to_string_path(),
+                error = %e,
+                "chains.lookup_err"
+            );
+        }
+        r
+    }
+
+    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        let r = self.read_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(
+                path = %path.to_string_path(),
+                error = %e,
+                "chains.read_err"
+            );
+        }
+        r
+    }
+
+    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        let r = self.list_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(
+                path = %path.to_string_path(),
+                error = %e,
+                "chains.list_err"
+            );
+        }
+        r
+    }
+
+    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        let r = self.write_inner(path, data).await;
+        if let Err(e) = &r {
+            tracing::debug!(
+                path = %path.to_string_path(),
+                bytes = data.len(),
+                error = %e,
+                "chains.write_err"
+            );
+        }
+        r
+    }
+
+    fn cache_ttl(&self, path: &VfsPath) -> Option<Duration> {
+        self.cache_ttl_inner(path)
+    }
+}
+
+impl ChainsHandler {
+    async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         let segs = path.segments();
         if segs.is_empty() {
             return Ok(Entry::dir(""));
@@ -539,7 +594,7 @@ impl Handler for ChainsHandler {
         }
     }
 
-    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+    async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
         if segs.is_empty() {
             return Err(HandlerError::NotAFile(path.to_string_path()));
@@ -854,7 +909,7 @@ impl Handler for ChainsHandler {
         }
     }
 
-    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+    async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         let segs = path.segments();
         if segs.is_empty() {
             return Ok(self
@@ -931,7 +986,7 @@ impl Handler for ChainsHandler {
         }
     }
 
-    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+    async fn write_inner(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let segs = path.segments();
         if segs.len() >= 4 && segs[1] == "contracts" {
             // Validate the chain so the caller doesn't get a permission
@@ -947,7 +1002,7 @@ impl Handler for ChainsHandler {
     /// short for live data (head, balance, nonce) and longer for
     /// immutable data (chain id, mined tx receipt, etherscan-backed
     /// txs) that doesn't change in practice.
-    fn cache_ttl(&self, path: &VfsPath) -> Option<Duration> {
+    fn cache_ttl_inner(&self, path: &VfsPath) -> Option<Duration> {
         let segs = path.segments();
         if segs.is_empty() {
             return None;
@@ -1128,23 +1183,13 @@ impl ChainsHandler {
                 6 => match segs[4].as_str() {
                     "owner_of" => {
                         let tid = chains_nfts::parse_token_id(&segs[5])?;
-                        chains_nfts::read_collection_owner_of(
-                            &self.nft_cache,
-                            client,
-                            addr,
-                            tid,
-                        )
-                        .await
+                        chains_nfts::read_collection_owner_of(&self.nft_cache, client, addr, tid)
+                            .await
                     }
                     "token_uri" => {
                         let tid = chains_nfts::parse_token_id(&segs[5])?;
-                        chains_nfts::read_collection_token_uri(
-                            &self.nft_cache,
-                            client,
-                            addr,
-                            tid,
-                        )
-                        .await
+                        chains_nfts::read_collection_token_uri(&self.nft_cache, client, addr, tid)
+                            .await
                     }
                     _ => Err(HandlerError::NotAFile(path.to_string_path())),
                 },
@@ -1251,8 +1296,10 @@ impl ChainsHandler {
                 "storage" => Ok(Vec::new()),
                 "proxy" => Ok(PROXY_LEAVES.iter().map(|n| Entry::file(n)).collect()),
                 "nft" => {
-                    let mut out: Vec<Entry> =
-                        NFT_COLLECTION_LEAVES.iter().map(|n| Entry::file(n)).collect();
+                    let mut out: Vec<Entry> = NFT_COLLECTION_LEAVES
+                        .iter()
+                        .map(|n| Entry::file(n))
+                        .collect();
                     for d in NFT_COLLECTION_DIRS {
                         out.push(Entry::dir(d));
                     }
@@ -2045,8 +2092,7 @@ mod tests {
     #[tokio::test]
     async fn nft_lookup_owner_of_with_token_id_is_file() {
         let h = nft_handler_with_seed(std::collections::HashMap::new(), None).await;
-        let p =
-            VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/owner_of/7")).unwrap();
+        let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/owner_of/7")).unwrap();
         let entry = h.lookup(&p).await.unwrap();
         assert_eq!(entry.name, "7");
         assert_eq!(entry.kind, crate::handler::EntryKind::File);
@@ -2068,8 +2114,7 @@ mod tests {
     #[tokio::test]
     async fn nft_lookup_unknown_collection_leaf_is_not_found() {
         let h = nft_handler_with_seed(std::collections::HashMap::new(), None).await;
-        let p =
-            VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/bogus")).unwrap();
+        let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/bogus")).unwrap();
         match h.lookup(&p).await {
             Err(HandlerError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
@@ -2085,7 +2130,14 @@ mod tests {
         .unwrap();
         let entries = h.list(&dir).await.unwrap();
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        for leaf in ["owner", "uri", "metadata.json", "balance", "is_owner", "approved"] {
+        for leaf in [
+            "owner",
+            "uri",
+            "metadata.json",
+            "balance",
+            "is_owner",
+            "approved",
+        ] {
             assert!(names.contains(&leaf), "missing {leaf} in {names:?}");
         }
     }
@@ -2095,8 +2147,7 @@ mod tests {
         // /addresses/<a>/nfts only advertises history leaves when
         // address_history is etherscan-backed and configured.
         let h = nft_handler_with_seed(std::collections::HashMap::new(), None).await;
-        let dir =
-            VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}/nfts")).unwrap();
+        let dir = VfsPath::parse(&format!("/test/addresses/{HOLDER_ADDR}/nfts")).unwrap();
         let entries = h.list(&dir).await.unwrap();
         assert!(
             entries.is_empty(),
@@ -2107,8 +2158,7 @@ mod tests {
     #[tokio::test]
     async fn nft_list_collection_dir_lists_leaves_and_dirs() {
         let h = nft_handler_with_seed(std::collections::HashMap::new(), None).await;
-        let dir =
-            VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft")).unwrap();
+        let dir = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft")).unwrap();
         let entries = h.list(&dir).await.unwrap();
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         for leaf in ["kind", "name", "symbol", "total_supply"] {
@@ -2126,8 +2176,7 @@ mod tests {
             Some(beth_chain::NftKind::Erc721),
         )
         .await;
-        let p =
-            VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/kind")).unwrap();
+        let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/kind")).unwrap();
         let bytes = h.read(&p).await.unwrap();
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), "erc721\n");
     }
@@ -2139,8 +2188,7 @@ mod tests {
             Some(beth_chain::NftKind::Erc1155),
         )
         .await;
-        let p =
-            VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/kind")).unwrap();
+        let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/kind")).unwrap();
         let bytes = h.read(&p).await.unwrap();
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), "erc1155\n");
     }
@@ -2150,8 +2198,7 @@ mod tests {
         let mut routes = std::collections::HashMap::new();
         routes.insert("eth_call".into(), enc_string_value("Crypto Sample"));
         let h = nft_handler_with_seed(routes, None).await;
-        let p =
-            VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/name")).unwrap();
+        let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/name")).unwrap();
         let bytes = h.read(&p).await.unwrap();
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), "Crypto Sample\n");
     }
@@ -2163,10 +2210,7 @@ mod tests {
         let mut routes = std::collections::HashMap::new();
         routes.insert("eth_call".into(), enc_address_value(owner_addr));
         let h = nft_handler_with_seed(routes, Some(beth_chain::NftKind::Erc721)).await;
-        let p = VfsPath::parse(&format!(
-            "/test/contracts/{NFT_CONTRACT}/nft/owner_of/42"
-        ))
-        .unwrap();
+        let p = VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/owner_of/42")).unwrap();
         let bytes = h.read(&p).await.unwrap();
         let s = std::str::from_utf8(&bytes).unwrap().trim();
         // The handler emits an EIP-55 checksum for the owner — derive the
@@ -2179,9 +2223,11 @@ mod tests {
     async fn nft_owner_erc1155_returns_not_applicable() {
         // ERC-1155 has no per-token ownerOf; the handler returns a
         // sentinel rather than erroring so directory walks stay clean.
-        let h =
-            nft_handler_with_seed(std::collections::HashMap::new(), Some(beth_chain::NftKind::Erc1155))
-                .await;
+        let h = nft_handler_with_seed(
+            std::collections::HashMap::new(),
+            Some(beth_chain::NftKind::Erc1155),
+        )
+        .await;
         let p = VfsPath::parse(&format!(
             "/test/addresses/{HOLDER_ADDR}/nfts/{NFT_CONTRACT}/42/owner"
         ))
@@ -2192,9 +2238,11 @@ mod tests {
 
     #[tokio::test]
     async fn nft_approved_erc1155_returns_not_applicable() {
-        let h =
-            nft_handler_with_seed(std::collections::HashMap::new(), Some(beth_chain::NftKind::Erc1155))
-                .await;
+        let h = nft_handler_with_seed(
+            std::collections::HashMap::new(),
+            Some(beth_chain::NftKind::Erc1155),
+        )
+        .await;
         let p = VfsPath::parse(&format!(
             "/test/addresses/{HOLDER_ADDR}/nfts/{NFT_CONTRACT}/42/approved"
         ))
@@ -2218,8 +2266,7 @@ mod tests {
         .unwrap();
         let bytes = h.read(&p).await.unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
-        let want_id =
-            "0000000000000000000000000000000000000000000000000000000000000001";
+        let want_id = "0000000000000000000000000000000000000000000000000000000000000001";
         assert_eq!(s, format!("ipfs://QmFoo/{want_id}.json\n"));
     }
 
@@ -2294,9 +2341,11 @@ mod tests {
         // plain ERC-20). The handler must return a clean "not an NFT
         // contract" error rather than crashing or surfacing a low-level
         // decode error.
-        let h =
-            nft_handler_with_seed(std::collections::HashMap::new(), Some(beth_chain::NftKind::Unknown))
-                .await;
+        let h = nft_handler_with_seed(
+            std::collections::HashMap::new(),
+            Some(beth_chain::NftKind::Unknown),
+        )
+        .await;
         let p = VfsPath::parse(&format!(
             "/test/addresses/{HOLDER_ADDR}/nfts/{NFT_CONTRACT}/42/owner"
         ))
@@ -2319,10 +2368,8 @@ mod tests {
             Some(beth_chain::NftKind::Erc721),
         )
         .await;
-        let p = VfsPath::parse(&format!(
-            "/test/contracts/{NFT_CONTRACT}/nft/total_supply"
-        ))
-        .unwrap();
+        let p =
+            VfsPath::parse(&format!("/test/contracts/{NFT_CONTRACT}/nft/total_supply")).unwrap();
         let bytes = h.read(&p).await.unwrap();
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), "unknown\n");
     }
@@ -2333,10 +2380,8 @@ mod tests {
         let chain = h.registry.list_names()[0].clone();
 
         // Holder history files: 30s.
-        let p = VfsPath::parse(&format!(
-            "/{chain}/addresses/{HOLDER_ADDR}/nfts/erc721_txs"
-        ))
-        .unwrap();
+        let p =
+            VfsPath::parse(&format!("/{chain}/addresses/{HOLDER_ADDR}/nfts/erc721_txs")).unwrap();
         assert_eq!(h.cache_ttl(&p), Some(Duration::from_secs(30)));
 
         // Per-token uri / metadata: 1h.
@@ -2359,10 +2404,7 @@ mod tests {
         assert_eq!(h.cache_ttl(&p), Some(Duration::from_secs(5)));
 
         // Collection static metadata: 1d.
-        let p = VfsPath::parse(&format!(
-            "/{chain}/contracts/{NFT_CONTRACT}/nft/kind"
-        ))
-        .unwrap();
+        let p = VfsPath::parse(&format!("/{chain}/contracts/{NFT_CONTRACT}/nft/kind")).unwrap();
         assert_eq!(h.cache_ttl(&p), Some(Duration::from_secs(86_400)));
 
         // total_supply: 30s.
@@ -2373,10 +2415,8 @@ mod tests {
         assert_eq!(h.cache_ttl(&p), Some(Duration::from_secs(30)));
 
         // owner_of/<id>: 5s; token_uri/<id>: 1h.
-        let p = VfsPath::parse(&format!(
-            "/{chain}/contracts/{NFT_CONTRACT}/nft/owner_of/1"
-        ))
-        .unwrap();
+        let p =
+            VfsPath::parse(&format!("/{chain}/contracts/{NFT_CONTRACT}/nft/owner_of/1")).unwrap();
         assert_eq!(h.cache_ttl(&p), Some(Duration::from_secs(5)));
         let p = VfsPath::parse(&format!(
             "/{chain}/contracts/{NFT_CONTRACT}/nft/token_uri/1"

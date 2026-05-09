@@ -380,11 +380,19 @@ impl DefiHandler {
             .input(route.tx.data.clone().into());
         let to = Some(route.tx.to);
         match chain.eth_call_capture_revert(req, None).await {
-            Ok(Ok(bytes)) => Ok(serde_json::json!({
-                "success": true,
-                "return_data": format!("0x{}", hex::encode(bytes.as_ref())),
-                "gas_estimate": route.gas,
-            })),
+            Ok(Ok(bytes)) => {
+                tracing::debug!(
+                    session = %sess.id,
+                    chain = %sess.chain,
+                    return_len = bytes.len(),
+                    "defi.simulate_ok"
+                );
+                Ok(serde_json::json!({
+                    "success": true,
+                    "return_data": format!("0x{}", hex::encode(bytes.as_ref())),
+                    "gas_estimate": route.gas,
+                }))
+            }
             Ok(Err(returndata)) => {
                 let chain_id = chain
                     .chain_id()
@@ -396,17 +404,34 @@ impl DefiHandler {
                     chain_id,
                 };
                 let decoded = self.revert_decoder.decode(&ctx).await;
+                tracing::debug!(
+                    session = %sess.id,
+                    chain = %sess.chain,
+                    chain_id,
+                    returndata_len = returndata.len(),
+                    decoded_signature = ?decoded.signature,
+                    decoded_message = ?decoded.message,
+                    "defi.simulate_revert"
+                );
                 Ok(serde_json::json!({
                     "success": false,
                     "decoded_error": decoded,
                     "gas_estimate": route.gas,
                 }))
             }
-            Err(e) => Ok(serde_json::json!({
-                "success": false,
-                "error": e.to_string(),
-                "gas_estimate": route.gas,
-            })),
+            Err(e) => {
+                tracing::debug!(
+                    session = %sess.id,
+                    chain = %sess.chain,
+                    error = %e,
+                    "defi.simulate_call_err"
+                );
+                Ok(serde_json::json!({
+                    "success": false,
+                    "error": e.to_string(),
+                    "gas_estimate": route.gas,
+                }))
+            }
         }
     }
 
@@ -446,6 +471,45 @@ impl DefiHandler {
 #[async_trait]
 impl Handler for DefiHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        let r = self.lookup_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "defi.lookup_err");
+        }
+        r
+    }
+
+    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        let r = self.read_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "defi.read_err");
+        }
+        r
+    }
+
+    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        let r = self.write_inner(path, data).await;
+        if let Err(e) = &r {
+            tracing::debug!(
+                path = %path.to_string_path(),
+                bytes = data.len(),
+                error = %e,
+                "defi.write_err"
+            );
+        }
+        r
+    }
+
+    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        let r = self.list_inner(path).await;
+        if let Err(e) = &r {
+            tracing::debug!(path = %path.to_string_path(), error = %e, "defi.list_err");
+        }
+        r
+    }
+}
+
+impl DefiHandler {
+    async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         let segs = path.segments();
         if segs.is_empty() {
             return Ok(Entry::dir(""));
@@ -478,7 +542,7 @@ impl Handler for DefiHandler {
         }
     }
 
-    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+    async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
         if segs.len() != 4 || segs[0] != "intents" {
             return Err(HandlerError::NotAFile(path.to_string_path()));
@@ -512,7 +576,7 @@ impl Handler for DefiHandler {
         }
     }
 
-    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+    async fn write_inner(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let segs = path.segments();
         if segs.is_empty() || segs[0] != "intents" {
             return Err(HandlerError::PermissionDenied);
@@ -548,7 +612,7 @@ impl Handler for DefiHandler {
         }
     }
 
-    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+    async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         let segs = path.segments();
         match segs.len() {
             0 => Ok(vec![Entry::dir("intents")]),

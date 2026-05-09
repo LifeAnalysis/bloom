@@ -335,22 +335,33 @@ fn decode_outputs(func: &Function, raw: &[u8]) -> Result<serde_json::Value, Hand
 /// indexed + body params via the supplied event when possible.
 fn render_log(event: &Event, log: &alloy::rpc::types::eth::Log) -> serde_json::Value {
     let mut data_obj = serde_json::Map::new();
-    if let Ok(decoded) = event.decode_log(&log.inner.data) {
-        // Indexed params come back in the order they appear; same for
-        // body. Solidity guarantees both lists preserve declaration
-        // order, so we walk the param list once and pop the matching
-        // bucket as we go.
-        let mut idx_iter = decoded.indexed.into_iter();
-        let mut body_iter = decoded.body.into_iter();
-        for p in &event.inputs {
-            let value = if p.indexed {
-                idx_iter.next().map(|v| sol_to_json(&v))
-            } else {
-                body_iter.next().map(|v| sol_to_json(&v))
-            };
-            if let Some(v) = value {
-                data_obj.insert(p.name.clone(), v);
+    match event.decode_log(&log.inner.data) {
+        Ok(decoded) => {
+            // Indexed params come back in the order they appear; same for
+            // body. Solidity guarantees both lists preserve declaration
+            // order, so we walk the param list once and pop the matching
+            // bucket as we go.
+            let mut idx_iter = decoded.indexed.into_iter();
+            let mut body_iter = decoded.body.into_iter();
+            for p in &event.inputs {
+                let value = if p.indexed {
+                    idx_iter.next().map(|v| sol_to_json(&v))
+                } else {
+                    body_iter.next().map(|v| sol_to_json(&v))
+                };
+                if let Some(v) = value {
+                    data_obj.insert(p.name.clone(), v);
+                }
             }
+        }
+        Err(e) => {
+            tracing::debug!(
+                event = %event.name,
+                tx_hash = ?log.transaction_hash,
+                log_index = ?log.log_index,
+                error = %e,
+                "chains.render_log_decode_failed"
+            );
         }
     }
     let topics: Vec<String> = log
