@@ -22,8 +22,8 @@ use beth_proto::{AddressBook, AuditLog, Config, HomeDir};
 use beth_tx::outbox::Outbox;
 use beth_tx::tx_engine::TxEngine;
 use beth_vfs::handlers::{
-    AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, PricesHandler, SimulateHandler,
-    StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
+    AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, PricesHandler,
+    SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
 use beth_vfs::Vfs;
 use beth_watch::{WatchExecutor, WatchRegistry};
@@ -99,9 +99,9 @@ impl Daemon {
         // Wire ENS resolver into TxEngine when a mainnet-style chain is
         // configured. We pick the first chain with id 1 / 11155111 / 5 /
         // 17000 (the ENS canonical-registry chains) for resolution.
-        if let Some(ens_client) = pick_ens_client(&chains) {
-            tx_engine =
-                tx_engine.with_resolver(Arc::new(ens_resolver::EnsAdapter::new(ens_client)) as _);
+        let ens_client = pick_ens_client(&chains);
+        if let Some(c) = ens_client.clone() {
+            tx_engine = tx_engine.with_resolver(Arc::new(ens_resolver::EnsAdapter::new(c)) as _);
         }
 
         let address_book_path = home.root().join("addressbook.toml");
@@ -182,6 +182,7 @@ impl Daemon {
                     home.clone(),
                 )) as _,
             )
+            .mount("ens", Arc::new(EnsHandler::new(ens_client.clone())) as _)
             .mount("prices", Arc::new(PricesHandler::new(prices)) as _)
             .mount(
                 "addressbook",
@@ -329,6 +330,7 @@ mod tests {
         assert!(d.vfs.handler("watch").is_some());
         assert!(d.vfs.handler("prices").is_some());
         assert!(d.vfs.handler("addressbook").is_some());
+        assert!(d.vfs.handler("ens").is_some());
     }
 
     /// A pre-existing watch spec on disk should be loaded into the
