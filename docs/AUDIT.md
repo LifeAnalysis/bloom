@@ -120,8 +120,10 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | ERC-20 sends | shipped | `tx_engine.rs` (`RawIntent.token` branch); `acceptance.sh` scenario 2; live verified via Enso roundtrip. |
 | Direct contract `call` intents | shipped | `RawIntent::call` (method + args); used by `live_test.sh` for ERC-20 approvals and Aave V3 withdraw. |
 | EIP-1559 + legacy fallback per chain spec | shipped | `crates/beth-proto/src/chain.rs::ChainSpec.legacy_tx`; `tx_engine.rs` branches accordingly. |
-| Replacement / cancel | shipped | `tx_engine.rs::stage_replacement` (same nonce + bumped fees). |
-| Per-wallet `policy.toml` enforcement | shipped | `crates/beth-tx/src/policy_engine.rs` — caps (per-tx + daily totals), recipient allow / deny, contract-call gating; results land at `pending/<id>/policy_check.json`. |
+| Replacement / cancel | shipped | `tx_engine.rs::replace_with_intent` substitutes (to/value/data) from the posted body and bumps fees ≥10%; cancel is a same-nonce self-send. |
+| Per-wallet `policy.toml` enforcement | shipped | `crates/beth-tx/src/policy_engine.rs` — per-tx + rolling 24h USD caps backed by `Outbox::sum_usd_since`, allow/deny lists, contract-call gating; results land at `pending/<id>/policy_check.json`. |
+| USD-priced policy caps via DefiLlama | shipped | `beth-tx/src/oracle.rs` (`PriceOracle` trait) wired to `beth-daemon/src/price_oracle.rs::PricesOracle` over `beth-prices`. |
+| Reverse ENS at `chains/<chain>/addresses/<addr>/ens` | shipped | `beth-vfs/src/handlers/chains.rs` (`with_ens` builder); cross-checked by `EnsClient::reverse`. |
 
 ## §10 — Security
 
