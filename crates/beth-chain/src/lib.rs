@@ -215,18 +215,28 @@ impl ChainClient {
     pub async fn trace_revert(&self, hash: B256) -> Result<Option<Bytes>, ChainError> {
         let receipt = match self.primary.get_transaction_receipt(hash).await? {
             Some(r) => r,
-            None => return Ok(None),
+            None => {
+                debug!(%hash, "trace_revert.no_receipt");
+                return Ok(None);
+            }
         };
         if receipt.status() {
+            debug!(%hash, "trace_revert.tx_succeeded");
             return Ok(None);
         }
         let block_number = match receipt.block_number {
             Some(n) => n,
-            None => return Ok(None),
+            None => {
+                debug!(%hash, "trace_revert.no_block_number");
+                return Ok(None);
+            }
         };
         let tx = match self.primary.get_transaction_by_hash(hash).await? {
             Some(t) => t,
-            None => return Ok(None),
+            None => {
+                debug!(%hash, "trace_revert.no_tx");
+                return Ok(None);
+            }
         };
         let from = receipt.from;
         let req: TransactionRequest = tx.into_request().with_from(from);
@@ -238,9 +248,20 @@ impl ChainClient {
             // The replay succeeded? That means the original failure was
             // not a deterministic revert (e.g. out-of-gas / nonce race).
             // Surface as `None` so callers can fall back to the receipt.
-            Ok(_) => Ok(None),
+            Ok(_) => {
+                debug!(%hash, block_number, "trace_revert.replay_succeeded");
+                Ok(None)
+            }
             Err(e) => match &e {
-                TransportError::ErrorResp(payload) => Ok(payload.as_revert_data()),
+                TransportError::ErrorResp(payload) => {
+                    let data = payload.as_revert_data();
+                    if data.is_none() {
+                        // Some providers strip revert payloads from replay
+                        // responses; surface so callers know we asked.
+                        debug!(%hash, block_number, "trace_revert.no_revert_data");
+                    }
+                    Ok(data)
+                }
                 _ => Err(ChainError::Transport(e.to_string())),
             },
         }
@@ -269,7 +290,14 @@ impl ChainClient {
             Ok(bytes) => Ok(Ok(bytes)),
             Err(e) => match &e {
                 TransportError::ErrorResp(payload) => {
-                    Ok(Err(payload.as_revert_data().unwrap_or_default()))
+                    let data = payload.as_revert_data().unwrap_or_else(|| {
+                        // The RPC error came back tagged as a revert but
+                        // carried no payload — log so callers chasing an
+                        // empty `Bytes` know it wasn't a decoder bug.
+                        debug!("eth_call_capture_revert.empty_payload");
+                        Default::default()
+                    });
+                    Ok(Err(data))
                 }
                 _ => Err(ChainError::Transport(e.to_string())),
             },
@@ -363,7 +391,10 @@ impl ChainClient {
         let contract = IERC20::new(token, self.primary.clone());
         match contract.symbol().call().await {
             Ok(s) => Ok(Some(s.trim_matches('\0').to_string())),
-            Err(_) => Ok(None),
+            Err(e) => {
+                debug!(error = %e, "erc20_symbol.call_failed");
+                Ok(None)
+            }
         }
     }
 
@@ -472,7 +503,10 @@ impl ChainClient {
         let contract = IERC721Metadata::new(addr, self.primary.clone());
         match contract.name().call().await {
             Ok(s) => Ok(Some(s.trim_matches('\0').to_string())),
-            Err(_) => Ok(None),
+            Err(e) => {
+                debug!(error = %e, "erc721_name.call_failed");
+                Ok(None)
+            }
         }
     }
 
@@ -481,7 +515,10 @@ impl ChainClient {
         let contract = IERC721Metadata::new(addr, self.primary.clone());
         match contract.symbol().call().await {
             Ok(s) => Ok(Some(s.trim_matches('\0').to_string())),
-            Err(_) => Ok(None),
+            Err(e) => {
+                debug!(error = %e, "erc721_symbol.call_failed");
+                Ok(None)
+            }
         }
     }
 
