@@ -268,6 +268,28 @@ fn build_tx_request(
                 .map_err(|e| HandlerError::invalid(format!("encode_call: {e}")))?;
             (contract_addr, v, data)
         }
+        RawIntentBody::Approve {
+            token,
+            spender,
+            amount,
+        } => {
+            use alloy::sol_types::SolCall;
+            use beth_chain::IERC20;
+            let token_addr = resolve_addr(token, addr_book)?;
+            let spender_addr = resolve_addr(spender, addr_book)?;
+            let amount_u = if amount.trim().is_empty() || amount.eq_ignore_ascii_case("max") {
+                U256::MAX
+            } else {
+                U256::from_str_radix(amount.trim(), 10)
+                    .map_err(|e| HandlerError::invalid(format!("approve amount: {e}")))?
+            };
+            let call = IERC20::approveCall {
+                spender: spender_addr,
+                amount: amount_u,
+            };
+            let data = format!("0x{}", hex::encode(call.abi_encode()));
+            (token_addr, U256::ZERO, data)
+        }
         RawIntentBody::Enso { .. } => {
             return Err(HandlerError::Unsupported(
                 "Enso intents are not simulated through /simulate (use defi/intents/)".into(),
@@ -363,6 +385,16 @@ fn render_sim_plan(session: &SimSession) -> String {
                 if !value.is_empty() {
                     s.push_str(&format!("Value:   {}\n", value));
                 }
+            }
+            RawIntentBody::Approve {
+                token,
+                spender,
+                amount,
+            } => {
+                s.push_str("Kind:    approve\n");
+                s.push_str(&format!("Token:   {}\n", token));
+                s.push_str(&format!("Spender: {}\n", spender));
+                s.push_str(&format!("Amount:  {}\n", amount));
             }
             RawIntentBody::Enso { intent } => {
                 s.push_str("Kind:   enso\n");

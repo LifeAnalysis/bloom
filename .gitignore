@@ -6,3 +6,4 @@ Cargo.lock
 .env
 test.env
 *.local.toml
+.worktrees/

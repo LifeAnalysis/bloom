@@ -41,6 +41,10 @@ struct LooseIntent {
     #[serde(default)]
     args: Option<Vec<serde_json::Value>>,
     #[serde(default)]
+    spender: Option<String>,
+    #[serde(default)]
+    amount: Option<String>,
+    #[serde(default)]
     intent: Option<String>,
     #[serde(default)]
     chain: Option<String>,
@@ -58,7 +62,9 @@ impl LooseIntent {
             .kind
             .clone()
             .or_else(|| {
-                if self.contract.is_some() && self.method.is_some() {
+                if self.token.is_some() && self.spender.is_some() {
+                    Some("approve".into())
+                } else if self.contract.is_some() && self.method.is_some() {
                     Some("call".into())
                 } else if self.intent.is_some() {
                     Some("enso".into())
@@ -98,6 +104,11 @@ impl LooseIntent {
             },
             "enso" => RawIntentBody::Enso {
                 intent: self.intent.ok_or(ParseError::Ambiguous)?,
+            },
+            "approve" => RawIntentBody::Approve {
+                token: self.token.ok_or(ParseError::Ambiguous)?,
+                spender: self.spender.ok_or(ParseError::Ambiguous)?,
+                amount: self.amount.unwrap_or_else(|| "max".into()),
             },
             _ => return Err(ParseError::Ambiguous),
         };
@@ -228,5 +239,33 @@ chain = "ethereum"
     #[test]
     fn empty_input_errors() {
         assert!(matches!(parse(""), Err(ParseError::Empty)));
+    }
+
+    #[test]
+    fn json_approve_explicit_kind() {
+        let r = parse(r#"{"kind":"approve","token":"0xUSDC","spender":"0xRouter","amount":"123"}"#)
+            .unwrap();
+        match r.body {
+            RawIntentBody::Approve {
+                token,
+                spender,
+                amount,
+            } => {
+                assert_eq!(token, "0xUSDC");
+                assert_eq!(spender, "0xRouter");
+                assert_eq!(amount, "123");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn json_approve_inferred_from_fields() {
+        // No kind; presence of token+spender disambiguates.
+        let r = parse(r#"{"token":"0xUSDC","spender":"0xRouter"}"#).unwrap();
+        match r.body {
+            RawIntentBody::Approve { amount, .. } => assert_eq!(amount, "max"),
+            _ => panic!("wrong variant"),
+        }
     }
 }

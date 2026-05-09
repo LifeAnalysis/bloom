@@ -16,12 +16,26 @@ use alloy::rpc::types::eth::state::StateOverride;
 use alloy::rpc::types::eth::{
     Block, Filter, Log, Transaction, TransactionReceipt, TransactionRequest,
 };
+use alloy::sol;
 use alloy::transports::TransportError;
 use parking_lot::RwLock;
 use thiserror::Error;
 use tracing::{debug, warn};
 
 use beth_proto::{ChainId, ChainSpec};
+
+sol! {
+    #[sol(rpc)]
+    #[allow(missing_docs)]
+    interface IERC20 {
+        function decimals() external view returns (uint8);
+        function balanceOf(address account) external view returns (uint256);
+        function allowance(address owner, address spender) external view returns (uint256);
+        function symbol() external view returns (string);
+        function approve(address spender, uint256 amount) external returns (bool);
+        function transfer(address to, uint256 amount) external returns (bool);
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ChainError {
@@ -168,90 +182,64 @@ impl ChainClient {
         Ok(*pending.tx_hash())
     }
 
-    /// Read an ERC-20 token's `decimals()` via `eth_call`. Returns
-    /// `None` if the call reverts or returns malformed bytes — callers
-    /// should fall back to a sensible default (or refuse to stage).
+    /// Read an ERC-20 token's `decimals()`. Returns `None` if the call
+    /// reverts — callers should fall back to a sensible default (or
+    /// refuse to stage).
     pub async fn erc20_decimals(&self, token: Address) -> Result<Option<u8>, ChainError> {
-        // selector("decimals()") = 0x313ce567
-        use alloy::network::TransactionBuilder;
-        let data = alloy::primitives::Bytes::from(hex::decode("313ce567").unwrap());
-        let req = TransactionRequest::default()
-            .with_to(token)
-            .with_input(data);
-        let res = match self.primary.call(req).await {
-            Ok(b) => b,
+        let contract = IERC20::new(token, self.primary.clone());
+        match contract.decimals().call().await {
+            Ok(d) => Ok(Some(d)),
             Err(e) => {
-                debug!(error = %e, "erc20_decimals.eth_call_failed");
-                return Ok(None);
+                debug!(error = %e, "erc20_decimals.call_failed");
+                Ok(None)
             }
-        };
-        if res.is_empty() {
-            return Ok(None);
         }
-        // ABI-encoded uint8 — last byte of the 32-byte word.
-        let bytes = res.as_ref();
-        if bytes.len() < 32 {
-            return Ok(None);
-        }
-        Ok(Some(bytes[31]))
     }
 
-    /// Read an ERC-20 token's `balanceOf(holder)` via `eth_call`. Returns
-    /// `None` if the call reverts or returns malformed bytes.
+    /// Read an ERC-20 token's `balanceOf(holder)`. Returns `None` if the
+    /// call reverts.
     pub async fn erc20_balance(
         &self,
         token: Address,
         holder: Address,
     ) -> Result<Option<U256>, ChainError> {
-        use alloy::network::TransactionBuilder;
-        // selector("balanceOf(address)") = 0x70a08231
-        let mut data = vec![0x70u8, 0xa0, 0x82, 0x31];
-        data.extend_from_slice(&[0u8; 12]);
-        data.extend_from_slice(holder.as_slice());
-        let req = TransactionRequest::default()
-            .with_to(token)
-            .with_input(Bytes::from(data));
-        let res = match self.primary.call(req).await {
-            Ok(b) => b,
+        let contract = IERC20::new(token, self.primary.clone());
+        match contract.balanceOf(holder).call().await {
+            Ok(b) => Ok(Some(b)),
             Err(e) => {
-                debug!(error = %e, "erc20_balance.eth_call_failed");
-                return Ok(None);
+                debug!(error = %e, "erc20_balance.call_failed");
+                Ok(None)
             }
-        };
-        let bytes = res.as_ref();
-        if bytes.len() < 32 {
-            return Ok(None);
         }
-        Ok(Some(U256::from_be_slice(&bytes[..32])))
     }
 
-    /// Read an ERC-20 token's `symbol()` via `eth_call`. Returns
-    /// `None` if the call reverts or the response can't be decoded as a
-    /// dynamic string (some early tokens use `bytes32` instead — we
-    /// don't decode that variant).
+    /// Read an ERC-20 token's `allowance(owner, spender)`. Returns
+    /// `None` if the call reverts.
+    pub async fn erc20_allowance(
+        &self,
+        token: Address,
+        owner: Address,
+        spender: Address,
+    ) -> Result<Option<U256>, ChainError> {
+        let contract = IERC20::new(token, self.primary.clone());
+        match contract.allowance(owner, spender).call().await {
+            Ok(a) => Ok(Some(a)),
+            Err(e) => {
+                debug!(error = %e, "erc20_allowance.call_failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Read an ERC-20 token's `symbol()`. Returns `None` if the call
+    /// reverts. (Some early tokens encode `symbol` as `bytes32` instead
+    /// of `string`; those will surface here as a decode error.)
     pub async fn erc20_symbol(&self, token: Address) -> Result<Option<String>, ChainError> {
-        use alloy::network::TransactionBuilder;
-        // selector("symbol()") = 0x95d89b41
-        let data = Bytes::from(vec![0x95u8, 0xd8, 0x9b, 0x41]);
-        let req = TransactionRequest::default()
-            .with_to(token)
-            .with_input(data);
-        let res = match self.primary.call(req).await {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-        let bytes = res.as_ref();
-        // Dynamic string ABI: [offset:32][len:32][data...].
-        if bytes.len() < 64 {
-            return Ok(None);
+        let contract = IERC20::new(token, self.primary.clone());
+        match contract.symbol().call().await {
+            Ok(s) => Ok(Some(s.trim_matches('\0').to_string())),
+            Err(_) => Ok(None),
         }
-        let len = U256::from_be_slice(&bytes[32..64]).to::<usize>();
-        if 64 + len > bytes.len() {
-            return Ok(None);
-        }
-        Ok(std::str::from_utf8(&bytes[64..64 + len])
-            .ok()
-            .map(|s| s.trim_matches('\0').to_string()))
     }
 
     /// Read a single 32-byte storage slot at `addr`, optionally pinning

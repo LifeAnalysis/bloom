@@ -64,6 +64,15 @@ pub enum RawIntentBody {
         value: String,
         data: String,
     },
+    /// ERC-20 approval. `amount` accepts a decimal integer or `"max"`
+    /// (shorthand for 2^256 - 1 — the conventional infinite-allowance
+    /// value). The tx engine encodes `approve(address,uint256)`; the
+    /// approval is to `spender` against the token contract `token`.
+    Approve {
+        token: String,
+        spender: String,
+        amount: String,
+    },
     /// Enso DeFi intent.
     Enso { intent: String },
 }

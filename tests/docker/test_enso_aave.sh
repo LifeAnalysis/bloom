@@ -396,5 +396,157 @@ log "aBaseUSDC raw balance after supply: $AUSDC_RAW"
 [[ -n "$AUSDC_RAW" && "$AUSDC_RAW" != "0" ]] \
     || fail "aBaseUSDC balance is 0 after a successful Enso route"
 
+# ---------- live-mode unwind: keep dest1 balance-neutral ----------
+# Without this, every --enso-live run permanently leaves the supplied
+# aBaseUSDC at dest1, so balances drift up forever. Fork mode skips —
+# anvil throws state away on container shutdown.
+if [[ "$MODE" == "live" ]]; then
+    log "===== unwind: redeem aBaseUSDC -> ETH via Enso ====="
+
+    OUTBOX="$MNT/wallets/$WALLET/chains/$CHAIN/outbox"
+
+    # Wait up to $2 seconds for the daemon to publish $1's receipt.
+    unwind_wait_receipt() {
+        local hash=$1 budget=${2:-90}
+        for _ in $(seq 1 "$budget"); do
+            local s
+            s=$(cat "$MNT/chains/$CHAIN/tx/$hash/status" 2>/dev/null | tr -d '\n' || true)
+            case "$s" in
+                success)  return 0 ;;
+                reverted) warn "tx $hash reverted"; return 1 ;;
+            esac
+            sleep 1
+        done
+        warn "tx $hash did not confirm within ${budget}s"
+        return 1
+    }
+
+    # Confirm a single staged tx and await its receipt. Helper since
+    # the auto-approve flow produces N stages from one DeFi session.
+    unwind_confirm_stage() {
+        local stage=$1 label=$2
+        log "  $label: $stage"
+        echo y > "$OUTBOX/pending/$stage/confirm"
+        local hash
+        hash=$(cat "$OUTBOX/sent/$stage/tx_hash" 2>/dev/null | tr -d '\n' || true)
+        [[ -n "$hash" ]] || { warn "$label: tx_hash missing after broadcast"; return 1; }
+        log "  $label tx: $hash"
+        unwind_wait_receipt "$hash" 90 || return 1
+        log "  $label ✓"
+    }
+
+    # Single DeFi intent: aBaseUSDC -> ETH. Enso bundles the Aave
+    # redemption (aBaseUSDC -> USDC) and the USDC -> ETH swap into one
+    # routed transaction; the DeFi handler auto-prepends an `approve`
+    # stage when the wallet's allowance to the router is below the
+    # input amount, so a single user-facing intent produces 1-2 staged
+    # txs (`approve` + `swap`, or just `swap` when allowance is already
+    # set).
+    AUSDC_BEFORE=$(cat "$MNT/chains/$CHAIN/addresses/$DEST1/tokens/$AUSDC/balance.raw" \
+        2>/dev/null | tr -d '\n' || echo 0)
+    log "  aBaseUSDC raw to redeem: $AUSDC_BEFORE"
+    if [[ -z "$AUSDC_BEFORE" || "$AUSDC_BEFORE" == "0" ]]; then
+        warn "aBaseUSDC balance is 0 — nothing to unwind"
+    else
+        unwind_pending_before=$(ls "$OUTBOX/pending" 2>/dev/null \
+            | sort -u | tr '\n' '|' || true)
+
+        intent_body=$(printf '{"intent":"swap %s %s to ETH","chain":"%s"}' \
+            "$AUSDC_BEFORE" "$AUSDC" "$CHAIN")
+        log "  POST defi intent: $intent_body"
+        printf '%s' "$intent_body" > "$MNT/defi/intents/$WALLET/new"
+
+        unwind_sess=$(ls "$MNT/defi/intents/$WALLET" | grep -v '^new$' \
+            | sort | tail -n1 || true)
+        [[ -n "$unwind_sess" ]] || fail "unwind: no defi session created"
+        log "  unwind session: $unwind_sess"
+
+        echo '::group::unwind plan.md' >&2
+        cat "$MNT/defi/intents/$WALLET/$unwind_sess/plan.md" >&2 || true
+        echo '::endgroup::' >&2
+
+        # Confirm the session. Auto-approve may produce up to 2 stages
+        # (approve, swap). Budget bumps to 300s — Enso route quoting +
+        # gas estimation across both stages can be slow.
+        echo y > "$MNT/defi/intents/$WALLET/$unwind_sess/confirm"
+
+        log "  waiting for staged txs (300s budget)"
+        unwind_stages=
+        for _ in $(seq 1 300); do
+            ua=$(ls "$OUTBOX/pending" 2>/dev/null | sort -u | tr '\n' '|' || true)
+            unwind_stages=$(comm -13 \
+                <(printf '%s' "$unwind_pending_before" | tr '|' '\n' | sort -u) \
+                <(printf '%s' "$ua"                    | tr '|' '\n' | sort -u) \
+                | grep -v '^$' | sort)
+            # Wait for both stages to materialise when auto-approve is
+            # in play. If only the swap is staged (allowance already
+            # max) one is fine.
+            if [[ -n "$unwind_stages" ]]; then
+                # Give the second stage one extra second to appear so
+                # we don't broadcast approve before swap is queued.
+                sleep 1
+                ua=$(ls "$OUTBOX/pending" 2>/dev/null | sort -u | tr '\n' '|' || true)
+                unwind_stages=$(comm -13 \
+                    <(printf '%s' "$unwind_pending_before" | tr '|' '\n' | sort -u) \
+                    <(printf '%s' "$ua"                    | tr '|' '\n' | sort -u) \
+                    | grep -v '^$' | sort)
+                break
+            fi
+            sleep 1
+        done
+        [[ -n "$unwind_stages" ]] || fail "unwind: no stage produced within 300s"
+
+        # Broadcast in id order — outbox ids are monotonic so `sort`
+        # gives the staged sequence.
+        n_stages=$(printf '%s\n' "$unwind_stages" | wc -l | tr -d ' ')
+        log "  unwind staged $n_stages tx(s)"
+        i=0
+        while IFS= read -r stage; do
+            [[ -z "$stage" ]] && continue
+            i=$((i + 1))
+            label="unwind step $i/$n_stages"
+            unwind_confirm_stage "$stage" "$label" \
+                || fail "unwind: $label failed; aborting cleanup"
+        done <<< "$unwind_stages"
+    fi
+
+    # Final assertions: balance-neutral except for gas + interest dust.
+    # Public RPC providers (incl. base-rpc.publicnode.com) load-balance
+    # across replicas that can be a block out of sync — the receipt is
+    # served from a leading node while the next eth_call hits a lagging
+    # one and returns pre-swap state. Poll until both balances converge
+    # to the expected window or the budget elapses.
+    log "  polling final balances (60s budget)"
+    AUSDC_FINAL= USDC_FINAL=
+    for _ in $(seq 1 60); do
+        AUSDC_FINAL=$(cat "$MNT/chains/$CHAIN/addresses/$DEST1/tokens/$AUSDC/balance.raw" \
+            2>/dev/null | tr -d '\n' || echo "")
+        USDC_FINAL=$(cat "$MNT/chains/$CHAIN/addresses/$DEST1/tokens/$USDC/balance.raw" \
+            2>/dev/null | tr -d '\n' || echo "")
+        # aBaseUSDC accrues interest continuously, so a few raw of post-
+        # withdraw dust is normal. Tolerance mirrors live_test.sh.
+        if [[ -n "$AUSDC_FINAL" && -n "$USDC_FINAL" ]] \
+            && (( AUSDC_FINAL <= 5 )) \
+            && [[ "$USDC_FINAL" == "0" ]]; then
+            break
+        fi
+        sleep 1
+    done
+    log "  final aBaseUSDC raw: $AUSDC_FINAL"
+    log "  final USDC raw:     $USDC_FINAL"
+
+    unwind_fail=0
+    if [[ -z "$AUSDC_FINAL" ]] || (( AUSDC_FINAL > 5 )); then
+        warn "aBaseUSDC residue '$AUSDC_FINAL' > 5 raw — cleanup incomplete"
+        unwind_fail=1
+    fi
+    if [[ -z "$USDC_FINAL" || "$USDC_FINAL" != "0" ]]; then
+        warn "USDC residue '$USDC_FINAL' != 0 — cleanup incomplete"
+        unwind_fail=1
+    fi
+    [[ "$unwind_fail" -eq 0 ]] || fail "unwind did not return dest1 to balance-neutral"
+    log "===== unwind PASSED — dest1 balance-neutral ====="
+fi
+
 log "===== Enso -> Aave integration test PASSED ====="
 exit 0

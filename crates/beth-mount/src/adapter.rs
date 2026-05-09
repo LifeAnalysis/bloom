@@ -140,6 +140,16 @@ fn epoch_ts() -> Timestamp {
 }
 
 /// Build attrs for an Entry returned by `list` / `lookup`.
+///
+/// File `change` is bumped on every call. Beth's file content is
+/// computed lazily from chain state — the same path can return new
+/// bytes between calls (balance.raw, gas/suggest, head). Linux's NFS
+/// client validates page-cache pages against `change`: if it doesn't
+/// move, the cached pages stay live regardless of `mtime` or the
+/// `noac` mount option. Returning a fresh change here forces the
+/// kernel to re-issue READ on every access, and the router-level
+/// `PathCache` (TTL per path) absorbs the cost so dynamic reads stay
+/// snappy without serving stale bytes.
 fn entry_to_attrs(path: &VfsPath, e: &Entry) -> Attrs {
     let ot = match e.kind {
         EntryKind::Dir => ObjectType::Directory,
@@ -159,7 +169,34 @@ fn entry_to_attrs(path: &VfsPath, e: &Entry) -> Attrs {
     a.mtime = ts;
     a.atime = ts;
     a.ctime = ts;
+    if e.kind == EntryKind::File {
+        a.change = file_change_now();
+    }
     a
+}
+
+/// Monotonically-increasing change id for files. Uses nanosecond
+/// wall-clock with an atomic floor so two calls within the same nano
+/// still produce distinct values.
+fn file_change_now() -> u64 {
+    static FLOOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut prev = FLOOR.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = now.max(prev.wrapping_add(1));
+        match FLOOR.compare_exchange_weak(
+            prev,
+            next,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => prev = observed,
+        }
+    }
 }
 
 /// Per-path buffered write state. Holds the assembled file contents
@@ -1212,12 +1249,9 @@ mod tests {
         async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
             match p.segments() {
                 [] => Ok(vec![Entry::dir("pending")]),
-                [s] if s == "pending" => Ok(self
-                    .entries
-                    .lock()
-                    .iter()
-                    .map(|n| Entry::dir(n))
-                    .collect()),
+                [s] if s == "pending" => {
+                    Ok(self.entries.lock().iter().map(|n| Entry::dir(n)).collect())
+                }
                 _ => Err(HandlerError::NotADir(p.to_string_path())),
             }
         }
@@ -1262,6 +1296,27 @@ mod tests {
         let pending = fs.lookup(&ctx, &box_dir, "pending").await.unwrap();
         let pending_change = fs.getattr(&ctx, &pending).await.unwrap().change;
         assert_ne!(root, pending_change);
+    }
+
+    /// File `change` must move between calls so the kernel's NFS
+    /// page cache invalidates whenever the daemon recomputes content
+    /// (balance.raw, gas/suggest, head). Before this fix `change` was
+    /// fileid-derived and stable, so a polling loop reading the same
+    /// path saw the first cached value forever even with `noac`.
+    #[tokio::test]
+    async fn file_change_moves_between_calls() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let readme = fs.lookup(&ctx, &dir, "readme").await.unwrap();
+        let a = fs.getattr(&ctx, &readme).await.unwrap().change;
+        let b = fs.getattr(&ctx, &readme).await.unwrap().change;
+        assert_ne!(
+            a, b,
+            "file change must move between calls so NFS clients re-read on every access; got {a} == {b}"
+        );
     }
 
     /// `change` must be stable across calls when the listing hasn't

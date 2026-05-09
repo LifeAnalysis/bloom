@@ -31,12 +31,10 @@ CHAIN=${CHAIN:-base}
 WALLET_MAIN=${WALLET_MAIN:-dest1}
 SWAP_AMOUNT_ETH=${SWAP_AMOUNT_ETH:-0.0005}
 DUST_ETH=${DUST_ETH:-0.0002}   # don't sweep below this; gas exceeds value
-# Enso router on Base (singleton). All ERC-20 swaps go through this.
+# Enso router on Base (singleton). All ERC-20 swaps go through this,
+# and the DeFi handler's auto-approve targets it as the spender when
+# the wallet's allowance for the input token is below the swap amount.
 ENSO_ROUTER_BASE=${ENSO_ROUTER_BASE:-0xF75584eF6673aD213a685a1B58Cc0330B8eA22Cf}
-# Aave V3 Pool on Base. Used to withdraw aBaseUSDC directly (Enso has no
-# shortcut for redeeming aTokens for ETH).
-AAVE_V3_POOL_BASE=${AAVE_V3_POOL_BASE:-0xA238Dd80C259a72e81d7e4664a9801593F98d1c5}
-MAX_UINT=115792089237316195423570985008687907853269984665640564039457584007913129639935
 
 GREEN=$'\033[32m' YELLOW=$'\033[33m' RED=$'\033[31m' RESET=$'\033[0m'
 log()  { printf "%s[live]%s %s\n" "$GREEN" "$RESET" "$*" >&2; }
@@ -132,14 +130,16 @@ wait_for_tx() {
 
 # ---------- swap via Enso (defi handler) ----------
 
-# Stage a swap via the in-process defi handler. Returns the outbox
-# stage id (e.g. "0001-12345") on stdout.
+# Stage a swap via the in-process defi handler. Echoes every newly
+# created outbox stage id (one per line, in id order). Multi-stage
+# output is normal when the DeFi handler auto-prepends an `approve`
+# ahead of the swap.
 stage_swap() {
     local intent=$1
     local body
     body=$(jq -nc --arg i "$intent" --arg c "$CHAIN" '{intent:$i,chain:$c}')
 
-    # Snapshot pending stages so we can detect the new one.
+    # Snapshot pending stages so we can detect the new ones.
     local before
     before=$(vfs_ls "/wallets/$WALLET_MAIN/chains/$CHAIN/outbox/pending" \
         | sort -u | tr '\n' '|' || true)
@@ -151,14 +151,15 @@ stage_swap() {
     sess=$(vfs_ls "/defi/intents/$WALLET_MAIN" | grep -v '^new$' | sort | tail -1)
     [[ -n "$sess" ]] || { warn "no defi session created"; return 1; }
 
+    # `confirm` stages all session intents sequentially before the IPC
+    # write returns, so a single readdir afterwards sees the full set.
     ipc_write_text "/defi/intents/$WALLET_MAIN/$sess/confirm" "y"
 
-    # New pending stage is the one not in `before`.
-    local after stage
+    local after stages
     after=$(vfs_ls "/wallets/$WALLET_MAIN/chains/$CHAIN/outbox/pending" | sort -u)
-    stage=$(comm -13 <(echo "$before" | tr '|' '\n' | sort -u) <(echo "$after") | head -1)
-    [[ -n "$stage" ]] || { warn "no new stage produced"; return 1; }
-    echo "$stage"
+    stages=$(comm -13 <(echo "$before" | tr '|' '\n' | sort -u) <(echo "$after"))
+    [[ -n "$stages" ]] || { warn "no new stage produced"; return 1; }
+    printf '%s\n' "$stages"
 }
 
 # Confirm a staged tx and return tx_hash. Uses the wallet CLI which
@@ -175,24 +176,33 @@ confirm_stage() {
         | tr -d '\n'
 }
 
-# Broadcast a swap in one shot. Echoes tx_hash on success.
+# Broadcast a swap in one shot. Echoes the final tx_hash (the swap)
+# on success. When auto-approve produces an extra `approve` stage it
+# is broadcast and confirmed first; only then does the swap go out.
 do_swap() {
     local intent=$1 description=$2
     log "swap: $description -- '$intent'"
-    local stage
-    stage=$(stage_swap "$intent") || return 1
-    log "  staged $stage; broadcasting"
-    local hash
-    hash=$(confirm_stage "$stage") || return 1
-    log "  tx hash $hash; waiting for receipt…"
-    if wait_for_tx "$hash"; then
-        log "  ✓ success"
-        echo "$hash"
-        return 0
-    else
-        warn "  ✗ tx did not succeed within 60s (or reverted)"
-        return 1
-    fi
+    local stages
+    stages=$(stage_swap "$intent") || return 1
+    local n_stages
+    n_stages=$(printf '%s\n' "$stages" | grep -cv '^$' || true)
+    log "  staged $n_stages tx(s)"
+    local i=0 hash=
+    while IFS= read -r stage; do
+        [[ -z "$stage" ]] && continue
+        i=$((i + 1))
+        log "  step $i/$n_stages: $stage"
+        hash=$(confirm_stage "$stage") || return 1
+        log "    tx $hash; waiting for receipt…"
+        if ! wait_for_tx "$hash"; then
+            warn "  ✗ step $i tx did not succeed within 60s (or reverted)"
+            return 1
+        fi
+        log "    ✓ step $i confirmed"
+    done <<< "$stages"
+    log "  ✓ success"
+    echo "$hash"
+    return 0
 }
 
 # ---------- ERC-20 approval ----------
@@ -208,17 +218,24 @@ allowance_raw() {
 }
 
 # One-shot infinite approval of `token` to the Enso router from $WALLET_MAIN.
-# Idempotent in effect — re-approving max is a no-op for routing, just costs gas.
+# Uses the first-class `kind:"approve"` intent — the tx engine encodes
+# `approve(address,uint256)` and the policy engine treats the spender as
+# the recipient. Idempotent in effect: re-approving max is a no-op for
+# routing, just costs gas.
+#
+# Most callers no longer need this — the DeFi handler auto-prepends an
+# approve stage when the route's input allowance is insufficient. Kept
+# for explicit pre-warming and as a regression target for the new
+# intent type.
 approve_token() {
     local token=$1 wallet=${2:-$WALLET_MAIN}
     log "approve: $wallet -> $ENSO_ROUTER_BASE for $token (max)"
     local intent_body
     intent_body=$(jq -nc \
-        --arg c "$token" \
+        --arg t "$token" \
         --arg s "$ENSO_ROUTER_BASE" \
-        --arg max "$MAX_UINT" \
         --arg chain "$CHAIN" \
-        '{kind:"call",contract:$c,method:"approve(address,uint256)",args:[$s,$max],chain:$chain}')
+        '{kind:"approve",token:$t,spender:$s,amount:"max",chain:$chain}')
 
     local before
     before=$(vfs_ls "/wallets/$wallet/chains/$CHAIN/outbox/pending" \
@@ -293,19 +310,6 @@ call_contract() {
     fi
 }
 
-# Withdraw all aBaseUSDC from Aave V3 Pool back into USDC. The Pool burns
-# the aTokens from msg.sender directly, so no ERC-20 approval is needed.
-aave_withdraw_all_usdc() {
-    local args_json
-    args_json=$(jq -nc \
-        --arg asset "$BETH_BASE_USDC" \
-        --arg max "$MAX_UINT" \
-        --arg to "$BETH_LIVE_DEST1" \
-        '[$asset,$max,$to]')
-    call_contract "$WALLET_MAIN" "$AAVE_V3_POOL_BASE" "withdraw(address,uint256,address)" \
-        "$args_json" "Aave V3 withdraw all USDC"
-}
-
 # ---------- native ETH transfer (sweep) ----------
 
 # Send raw native ETH (no token field). Used for sweeping dest2/3 back.
@@ -368,21 +372,19 @@ print_state() {
 
 phase_cleanup() {
     log "===== phase 1: cleanup pre-existing balances ====="
-    local usdc ausdc
+    # Both aBaseUSDC and USDC unwind to ETH via a single Enso route per
+    # token; the DeFi handler auto-prepends an `approve` stage when the
+    # router's allowance is short, so each cleanup is one user-facing
+    # intent producing 1-2 staged txs.
+    local ausdc usdc
     ausdc=$(token_balance_raw "$BETH_LIVE_DEST1" "$BETH_BASE_AUSDC")
     if [[ -n "$ausdc" && "$ausdc" != "0" ]]; then
-        # Redeem aBaseUSDC -> USDC via Aave Pool, then swap USDC -> ETH.
-        aave_withdraw_all_usdc \
-            || warn "Aave withdraw failed; aBaseUSDC will linger"
+        do_swap "swap $ausdc $BETH_BASE_AUSDC to ETH" "aBaseUSDC -> ETH (cleanup)" \
+            || warn "aBaseUSDC -> ETH cleanup failed; aBaseUSDC will linger"
     fi
-    # Re-read USDC after potential withdraw above.
     usdc=$(token_balance_raw "$BETH_LIVE_DEST1" "$BETH_BASE_USDC")
     if [[ -n "$usdc" && "$usdc" != "0" ]]; then
-        approve_token "$BETH_BASE_USDC" \
-            || warn "USDC approve failed; swap may revert"
-        # Re-read USDC again post-approve (Aave withdraw may have rounded).
-        usdc=$(token_balance_raw "$BETH_LIVE_DEST1" "$BETH_BASE_USDC")
-        do_swap "swap $usdc $BETH_BASE_USDC to ETH" "USDC -> ETH (initial cleanup)" \
+        do_swap "swap $usdc $BETH_BASE_USDC to ETH" "USDC -> ETH (cleanup)" \
             || warn "USDC -> ETH cleanup failed; continuing"
     fi
 }
@@ -402,7 +404,7 @@ phase_swap_roundtrip() {
 
 phase_aave_roundtrip() {
     log "===== phase 3: ETH <-> aBaseUSDC (Aave V3) roundtrip ====="
-    # Step A: deposit ETH -> aBaseUSDC via Enso shortcut.
+    # Step A: deposit ETH -> aBaseUSDC via Enso (Aave V3 supply bundled).
     do_swap "swap $SWAP_AMOUNT_ETH ETH to $BETH_BASE_AUSDC" "ETH -> aBaseUSDC" || return 1
     sleep 6
     local ausdc
@@ -410,18 +412,12 @@ phase_aave_roundtrip() {
     [[ -n "$ausdc" && "$ausdc" != "0" ]] \
         || { warn "aBaseUSDC balance still 0 after deposit"; return 1; }
     log "  aBaseUSDC raw: $ausdc"
-    # Step B: redeem aBaseUSDC -> USDC via Aave V3 Pool.withdraw.
-    aave_withdraw_all_usdc || return 1
-    sleep 4
-    local usdc
-    usdc=$(token_balance_raw "$BETH_LIVE_DEST1" "$BETH_BASE_USDC")
-    [[ -n "$usdc" && "$usdc" != "0" ]] \
-        || { warn "USDC balance still 0 after Aave withdraw"; return 1; }
-    log "  USDC raw after withdraw: $usdc"
-    # Step C: swap the resulting USDC back to ETH (round-trip complete).
-    approve_token "$BETH_BASE_USDC" \
-        || warn "USDC approve failed; swap may revert"
-    do_swap "swap $usdc $BETH_BASE_USDC to ETH" "USDC -> ETH (Aave proceeds)" || return 1
+    # Step B: redeem aBaseUSDC straight back to ETH via Enso. The route
+    # bundles the Aave redemption and the USDC -> ETH swap into a single
+    # transaction; the DeFi handler auto-prepends an `approve(aBaseUSDC,
+    # router, max)` stage when needed, so this is one user-facing intent
+    # that produces 1-2 staged txs.
+    do_swap "swap $ausdc $BETH_BASE_AUSDC to ETH" "aBaseUSDC -> ETH" || return 1
 }
 
 phase_sweep() {
@@ -493,7 +489,7 @@ phase_cleanup        || warn "cleanup phase had issues; continuing"
 print_state "after cleanup"
 phase_swap_roundtrip || fail "swap roundtrip phase failed"
 print_state "after swap roundtrip"
-phase_aave_roundtrip || warn "Aave roundtrip phase failed (likely Enso withdraw unsupported)"
+phase_aave_roundtrip || warn "Aave roundtrip phase failed"
 print_state "after Aave roundtrip"
 phase_sweep          || warn "sweep phase had issues"
 print_state "final"

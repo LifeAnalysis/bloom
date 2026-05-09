@@ -11,7 +11,8 @@ use alloy::network::{NetworkTransactionBuilder, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
-use beth_chain::{ChainClient, ChainError};
+use alloy::sol_types::SolCall;
+use beth_chain::{ChainClient, ChainError, IERC20};
 use beth_proto::{
     parse_amount, parse_eth, parse_units, AddressBook, ChainSpec, Policy, RawIntent, RawIntentBody,
     StagedTx, TokenRef, TxStatus,
@@ -251,14 +252,11 @@ impl TxEngine {
                         parse_amount(value).map_err(|e| TxEngineError::Amount(e.to_string()))?;
                     let amount = parse_units(&parsed.number, meta.decimals)
                         .map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                    let calldata = beth_tools::encode_call(
-                        "transfer(address,uint256)",
-                        &serde_json::json!([
-                            beth_proto::checksum_address(&to_addr),
-                            amount.to_string(),
-                        ]),
-                    )
-                    .map_err(|e| TxEngineError::Amount(format!("encode_call: {e}")))?;
+                    let call = IERC20::transferCall {
+                        to: to_addr,
+                        amount,
+                    };
+                    let calldata = format!("0x{}", hex::encode(call.abi_encode()));
                     let token_ref = TokenRef {
                         address: beth_proto::checksum_address(&meta.address),
                         symbol: meta.symbol.clone(),
@@ -293,6 +291,22 @@ impl TxEngine {
                 let data = beth_tools::encode_call(method, &serde_json::json!(args))
                     .map_err(|e| TxEngineError::Amount(format!("encode_call: {e}")))?;
                 Ok((contract_addr, v, data, None))
+            }
+            RawIntentBody::Approve {
+                token,
+                spender,
+                amount,
+            } => {
+                let token_addr = self.resolve_recipient_async(token, address_book).await?;
+                let spender_addr = self.resolve_recipient_async(spender, address_book).await?;
+                let amount_u = parse_approve_amount(amount)
+                    .map_err(|e| TxEngineError::Amount(format!("approve amount: {e}")))?;
+                let call = IERC20::approveCall {
+                    spender: spender_addr,
+                    amount: amount_u,
+                };
+                let calldata = format!("0x{}", hex::encode(call.abi_encode()));
+                Ok((token_addr, U256::ZERO, calldata, None))
             }
             RawIntentBody::Enso { .. } => Err(TxEngineError::Unimplemented(
                 "Enso intents flow through beth-defi (not in v1 stage path)".into(),
@@ -400,6 +414,18 @@ impl TxEngine {
                 policy_ctx.contract = Some(to);
                 policy_ctx.recipient = Some(to);
                 policy_ctx.destination_is_contract = true;
+            }
+            RawIntentBody::Approve { .. } => {
+                // contract = the ERC-20 (== `to`); recipient = the
+                // spender, decoded out of the calldata so policies that
+                // restrict who an allowance can be granted to still
+                // have a meaningful target.
+                policy_ctx.contract = Some(to);
+                policy_ctx.token = Some(to);
+                policy_ctx.destination_is_contract = true;
+                if let Some(spender) = decode_approve_spender(&data_bytes) {
+                    policy_ctx.recipient = Some(spender);
+                }
             }
             RawIntentBody::Enso { .. } => {}
         }
@@ -788,6 +814,28 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// Approve amount: accepts `"max"` (alias for 2^256 - 1) or a decimal
+/// integer string. Empty falls through to max so the common case
+/// (`{"kind":"approve","token":"…","spender":"…"}`) doesn't require a
+/// magic constant.
+fn parse_approve_amount(s: &str) -> Result<U256, String> {
+    let t = s.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("max") {
+        return Ok(U256::MAX);
+    }
+    U256::from_str_radix(t, 10).map_err(|e| format!("invalid uint256 '{s}': {e}"))
+}
+
+/// Pull the `spender` argument out of an `approve(address,uint256)`
+/// calldata blob. Returns `None` if the buffer doesn't decode as an
+/// approve call — the caller treats that as "no spender hint" and
+/// policy contexts fall back to the default recipient.
+fn decode_approve_spender(data: &[u8]) -> Option<Address> {
+    IERC20::approveCall::abi_decode(data)
+        .ok()
+        .map(|c| c.spender)
 }
 
 fn short_addr_label(a: &Address) -> String {

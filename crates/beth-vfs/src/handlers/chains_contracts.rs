@@ -398,13 +398,10 @@ fn coerce_topic(ty: &DynSolType, v: &serde_json::Value) -> Result<B256, HandlerE
                 .map_err(|e| HandlerError::invalid(format!("topic: {e}")));
         }
         if rest.len() == 40 && matches!(ty, DynSolType::Address) {
-            // Zero-pad an address to 32 bytes.
             let addr: Address = trimmed
                 .parse()
                 .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
-            let mut padded = [0u8; 32];
-            padded[12..].copy_from_slice(addr.as_slice());
-            return Ok(B256::from(padded));
+            return Ok(addr.into_word());
         }
     }
     if matches!(ty, DynSolType::Uint(_) | DynSolType::Int(_)) {
@@ -541,9 +538,7 @@ pub async fn read_proxy_slot(
         return Ok(b"not a proxy\n".to_vec());
     }
     // EIP-1967 stores the address right-aligned in the 32-byte slot.
-    let mut a = [0u8; 20];
-    a.copy_from_slice(&value.as_slice()[12..32]);
-    let addr = Address::from(a);
+    let addr = Address::from_word(value);
     Ok(format!("{}\n", checksum_address(&addr)).into_bytes())
 }
 

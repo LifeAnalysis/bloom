@@ -26,9 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::Address;
-#[cfg(test)]
-use alloy::primitives::U256;
+use alloy::primitives::{address, Address, U256};
 use alloy::rpc::types::eth::TransactionRequest;
 use async_trait::async_trait;
 use beth_chain::{ChainClient, ChainRegistry};
@@ -37,16 +35,23 @@ use beth_defi::{
     RoutingStrategy,
 };
 use beth_keystore::Keystore;
-use beth_proto::{checksum_address, AddressBook, RawIntent, RawIntentBody, StagedTx};
+use beth_proto::{checksum_address, AddressBook, GasStrategy, RawIntent, RawIntentBody, StagedTx};
 use beth_tx::tx_engine::TxEngine;
 use parking_lot::RwLock;
 use serde::Deserialize;
+
+/// Enso's native-token sentinel; matches `beth_defi::NATIVE_TOKEN`.
+/// When `token_in == NATIVE_TOKEN_ADDR`, no ERC-20 approval is needed.
+const NATIVE_TOKEN_ADDR: Address = address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
 
 /// Cached session: original intent, the Enso route response, and the
-/// derived RawIntent we'd hand to [`TxEngine::stage`] on confirm.
+/// ordered list of `RawIntent`s we hand to [`TxEngine::stage`] on
+/// confirm. For ERC-20 token-in routes the list is `[approve, swap]`
+/// when allowance is insufficient; native ETH or pre-approved tokens
+/// produce a single `[swap]`.
 #[derive(Debug, Clone)]
 pub struct DefiSession {
     pub id: String,
@@ -55,8 +60,8 @@ pub struct DefiSession {
     pub intent_text: String,
     pub route: Option<RouteResponse>,
     pub plan_md: String,
-    pub tx_intent: Option<RawIntent>,
-    pub staged_id: Option<String>,
+    pub intents: Vec<RawIntent>,
+    pub staged_ids: Vec<String>,
     pub created_ms: u128,
 }
 
@@ -287,19 +292,44 @@ impl DefiHandler {
 
         let route = self.enso.route(req.clone()).await.map_err(map_enso_err)?;
 
-        // Build a `Raw` intent that the wallet outbox can stage directly.
-        let raw_intent = RawIntent {
+        // Build the swap (Raw) intent and, when the source token is an
+        // ERC-20 with insufficient allowance to the router, a preceding
+        // approve intent. Order matters — the approve must broadcast and
+        // confirm before the swap, but the outbox preserves stage order
+        // and the wallet broadcasts in that order.
+        let mut intents: Vec<RawIntent> = Vec::new();
+        let needs_approve = req.token_in != NATIVE_TOKEN_ADDR;
+        if needs_approve {
+            let current = chain
+                .erc20_allowance(req.token_in, info.address, route.tx.to)
+                .await
+                .map_err(|e| HandlerError::backend(e.to_string()))?
+                .unwrap_or(U256::ZERO);
+            if current < req.amount_in {
+                intents.push(RawIntent {
+                    body: RawIntentBody::Approve {
+                        token: checksum_address(&req.token_in),
+                        spender: checksum_address(&route.tx.to),
+                        amount: "max".into(),
+                    },
+                    chain: Some(chain_name.clone()),
+                    gas: GasStrategy::Auto,
+                    nonce: None,
+                });
+            }
+        }
+        intents.push(RawIntent {
             body: RawIntentBody::Raw {
                 to: checksum_address(&route.tx.to),
                 value: route.tx.value.to_string(),
                 data: format!("0x{}", hex::encode(route.tx.data.as_ref())),
             },
             chain: Some(chain_name.clone()),
-            gas: beth_proto::GasStrategy::Auto,
+            gas: GasStrategy::Auto,
             nonce: None,
-        };
+        });
 
-        let plan = render_plan_md(&body.intent, &chain_name, &req, &route);
+        let plan = render_plan_md(&body.intent, &chain_name, &req, &route, &intents);
         let id = self.allocate_id();
         let now_ms = now_ms();
         let sess = DefiSession {
@@ -309,8 +339,8 @@ impl DefiHandler {
             intent_text: body.intent,
             route: Some(route),
             plan_md: plan,
-            tx_intent: Some(raw_intent),
-            staged_id: None,
+            intents,
+            staged_ids: Vec::new(),
             created_ms: now_ms,
         };
         self.put_session(sess.clone());
@@ -346,34 +376,36 @@ impl DefiHandler {
         }
     }
 
-    async fn confirm_session(&self, wallet: &str, id: &str) -> Result<StagedTx, HandlerError> {
+    async fn confirm_session(&self, wallet: &str, id: &str) -> Result<Vec<StagedTx>, HandlerError> {
         let sess = self.get_session(wallet, id)?;
+        if sess.intents.is_empty() {
+            return Err(HandlerError::backend("session has no prepared intents"));
+        }
         let info = self
             .keystore
             .info(wallet)
             .map_err(|e| HandlerError::backend(e.to_string()))?;
         let chain = self.chain_client(&sess.chain)?;
-        let intent = sess
-            .tx_intent
-            .clone()
-            .ok_or_else(|| HandlerError::backend("session has no prepared intent"))?;
-        let staged = self
-            .tx_engine
-            .stage(
-                wallet,
-                info.address,
-                intent,
-                &chain,
-                &info.policy,
-                Some(&self.address_book),
-            )
-            .await
-            .map_err(|e| HandlerError::backend(e.to_string()))?;
-        // Update session with staged id.
+        let mut staged_list = Vec::with_capacity(sess.intents.len());
+        for intent in sess.intents.iter().cloned() {
+            let staged = self
+                .tx_engine
+                .stage(
+                    wallet,
+                    info.address,
+                    intent,
+                    &chain,
+                    &info.policy,
+                    Some(&self.address_book),
+                )
+                .await
+                .map_err(|e| HandlerError::backend(e.to_string()))?;
+            staged_list.push(staged);
+        }
         let mut updated = sess;
-        updated.staged_id = Some(staged.id.clone());
+        updated.staged_ids = staged_list.iter().map(|s| s.id.clone()).collect();
         self.put_session(updated);
-        Ok(staged)
+        Ok(staged_list)
     }
 }
 
@@ -432,11 +464,10 @@ impl Handler for DefiHandler {
             }
             "plan.md" => Ok(sess.plan_md.clone().into_bytes()),
             "tx.json" => {
-                let i = sess
-                    .tx_intent
-                    .as_ref()
-                    .ok_or_else(|| HandlerError::backend("no tx intent"))?;
-                Ok(serde_json::to_vec_pretty(i).unwrap())
+                if sess.intents.is_empty() {
+                    return Err(HandlerError::backend("no tx intents"));
+                }
+                Ok(serde_json::to_vec_pretty(&sess.intents).unwrap())
             }
             "simulation.json" => {
                 let v = self.simulate_session(&sess).await?;
@@ -469,10 +500,12 @@ impl Handler for DefiHandler {
                     return Err(HandlerError::invalid("empty confirm"));
                 }
                 let staged = self.confirm_session(&segs[1], &segs[2]).await?;
+                let ids: Vec<&str> = staged.iter().map(|s| s.id.as_str()).collect();
                 tracing::info!(
                     wallet = %segs[1],
                     session = %segs[2],
-                    staged = %staged.id,
+                    staged = ids.join(","),
+                    count = staged.len(),
                     "defi.session.confirmed"
                 );
                 Ok(())
@@ -549,7 +582,13 @@ fn decimals_for_symbol(chain_id: u64, sym: &str) -> u8 {
     }
 }
 
-fn render_plan_md(intent: &str, chain: &str, req: &RouteRequest, route: &RouteResponse) -> String {
+fn render_plan_md(
+    intent: &str,
+    chain: &str,
+    req: &RouteRequest,
+    route: &RouteResponse,
+    intents: &[RawIntent],
+) -> String {
     let mut s = String::new();
     s.push_str("# DeFi intent\n\n");
     s.push_str(&format!("Intent:    {intent}\n"));
@@ -576,11 +615,30 @@ fn render_plan_md(intent: &str, chain: &str, req: &RouteRequest, route: &RouteRe
     s.push_str(&format!("Tx to:     {}\n", checksum_address(&route.tx.to)));
     s.push_str(&format!("Tx value:  {} wei\n", route.tx.value));
     s.push_str(&format!("Tx data:   {} bytes\n", route.tx.data.len()));
+
+    let auto_approve = intents
+        .iter()
+        .any(|i| matches!(i.body, RawIntentBody::Approve { .. }));
+    if auto_approve {
+        s.push_str(&format!(
+            "\n## Auto-approve\n\
+             Existing allowance for {} → {} is below {} (raw). An \
+             ERC-20 `approve(spender, max)` will be staged ahead of the \
+             swap and must broadcast first; both sit in the same outbox \
+             and will be reviewed before sending.\n",
+            checksum_address(&req.token_in),
+            checksum_address(&route.tx.to),
+            req.amount_in,
+        ));
+    }
     s.push_str("\n## Confirm\n");
-    s.push_str(
-        "Write any non-empty content to `confirm` to stage this through \
-         the wallet's outbox; review there before broadcasting.\n",
-    );
+    s.push_str(&format!(
+        "Write any non-empty content to `confirm` to stage {} tx{} \
+         through the wallet's outbox; review there before \
+         broadcasting.\n",
+        intents.len(),
+        if intents.len() == 1 { "" } else { "s" },
+    ));
     s
 }
 
@@ -666,9 +724,78 @@ mod tests {
             route: serde_json::Value::Null,
             price_impact: Some(0.1),
         };
-        let md = render_plan_md("swap 1 ETH to USDC", "ethereum", &req, &route);
+        let intents = vec![RawIntent {
+            body: RawIntentBody::Raw {
+                to: checksum_address(&route.tx.to),
+                value: route.tx.value.to_string(),
+                data: "0x".into(),
+            },
+            chain: Some("ethereum".into()),
+            gas: GasStrategy::Auto,
+            nonce: None,
+        }];
+        let md = render_plan_md("swap 1 ETH to USDC", "ethereum", &req, &route, &intents);
         assert!(md.contains("swap 1 ETH to USDC"));
         assert!(md.contains("Slippage:  50 bps"));
         assert!(md.contains("Confirm"));
+        assert!(!md.contains("Auto-approve"));
+    }
+
+    #[test]
+    fn render_plan_md_shows_auto_approve_when_present() {
+        let usdc: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            .parse()
+            .unwrap();
+        let router: Address = "0xF75584eF6673aD213a685a1B58Cc0330B8eA22Cf"
+            .parse()
+            .unwrap();
+        let req = RouteRequest {
+            from_address: Address::ZERO,
+            chain_id: 1,
+            token_in: usdc,
+            token_out: Address::ZERO,
+            amount_in: U256::from(1_000_000u64),
+            slippage_bps: 50,
+            routing_strategy: None,
+            receiver: None,
+        };
+        let route = RouteResponse {
+            tx: beth_defi::RouteTx {
+                from: Address::ZERO,
+                to: router,
+                data: Default::default(),
+                value: U256::ZERO,
+            },
+            amount_out: "0".into(),
+            gas: None,
+            route: serde_json::Value::Null,
+            price_impact: None,
+        };
+        let intents = vec![
+            RawIntent {
+                body: RawIntentBody::Approve {
+                    token: checksum_address(&usdc),
+                    spender: checksum_address(&router),
+                    amount: "max".into(),
+                },
+                chain: Some("ethereum".into()),
+                gas: GasStrategy::Auto,
+                nonce: None,
+            },
+            RawIntent {
+                body: RawIntentBody::Raw {
+                    to: checksum_address(&router),
+                    value: "0".into(),
+                    data: "0x".into(),
+                },
+                chain: Some("ethereum".into()),
+                gas: GasStrategy::Auto,
+                nonce: None,
+            },
+        ];
+        let md = render_plan_md("swap 1 USDC to ETH", "ethereum", &req, &route, &intents);
+        assert!(md.contains("Auto-approve"));
+        assert!(md.contains("approve(spender, max)"));
+        assert!(md.contains("stage 2 txs"));
     }
 }
