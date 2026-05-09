@@ -39,4 +39,5 @@ heimdall-decompiler = { git = "https://github.com/Jon-Becker/heimdall-rs", rev =
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true
 wiremock = "0.6"

@@ -90,10 +90,12 @@ impl RevertDecoder for OpenchainDecoder {
             Some(CachedLookup::Miss) => return None,
             None => match self.lookup(sel).await {
                 Ok(Some(sig)) => {
-                    self.cache
-                        .write()
-                        .await
-                        .insert(sel, CachedLookup::Hit { signature: sig.clone() });
+                    self.cache.write().await.insert(
+                        sel,
+                        CachedLookup::Hit {
+                            signature: sig.clone(),
+                        },
+                    );
                     sig
                 }
                 Ok(None) => {
@@ -162,11 +164,7 @@ fn pick_signature(value: &serde_json::Value, sel_hex: &str) -> Option<String> {
 /// into its components, decode the payload after the selector, and produce
 /// a [`DecodedRevert`]. Returns `None` when the signature is malformed or
 /// the payload doesn't decode.
-fn decode_with_signature(
-    signature: &str,
-    selector: [u8; 4],
-    raw: &Bytes,
-) -> Option<DecodedRevert> {
+fn decode_with_signature(signature: &str, selector: [u8; 4], raw: &Bytes) -> Option<DecodedRevert> {
     let (name, params) = split_signature(signature)?;
     let types = parse_types(params)?;
     let payload = if raw.len() >= 4 { &raw[4..] } else { &[] };
@@ -255,8 +253,6 @@ mod tests {
     use alloy::primitives::{address, U256};
     use alloy_dyn_abi::DynSolValue;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc as StdArc;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -368,12 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_hit_avoids_second_request() {
-        // Counts hits to the mock endpoint; the second decode call must
-        // not re-issue the request.
         let server = MockServer::start().await;
-        let counter: StdArc<AtomicUsize> = StdArc::new(AtomicUsize::new(0));
-        let counter_clone = counter.clone();
-
         let body = json!({
             "ok": true,
             "result": {
@@ -385,14 +376,9 @@ mod tests {
                 }
             }
         });
-        let template = ResponseTemplate::new(200).set_body_json(body);
-        // wiremock counts incoming requests internally; we also bump
-        // an external counter via a `respond_with` closure-equivalent
-        // pattern. The simplest is to register a Mock and read its
-        // `received_requests` count after the run.
         Mock::given(method("GET"))
             .and(path("/signature-database/v1/lookup"))
-            .respond_with(template)
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(&server)
             .await;
 
@@ -410,9 +396,6 @@ mod tests {
             "second decode must serve from cache; got {} requests",
             received.len()
         );
-        // counter unused but kept to suppress dead_code if we ever wire it
-        let _ = counter_clone.fetch_add(0, Ordering::SeqCst);
-        let _ = counter;
     }
 
     #[tokio::test]
