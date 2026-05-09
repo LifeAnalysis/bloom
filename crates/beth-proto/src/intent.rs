@@ -309,7 +309,8 @@ token_id = "1"
 
     #[test]
     fn json_nft_approve_all_round_trip() {
-        let s = r#"{"kind":"nft_approve_all","contract":"0xnft","operator":"0xop","approved":true}"#;
+        let s =
+            r#"{"kind":"nft_approve_all","contract":"0xnft","operator":"0xop","approved":true}"#;
         let body: RawIntentBody = serde_json::from_str(s).unwrap();
         match &body {
             RawIntentBody::NftApproveAll {

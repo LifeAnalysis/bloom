@@ -13,7 +13,7 @@ use alloy::rpc::types::eth::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use beth_chain::{ChainClient, ChainError, IERC20, NftKind};
+use beth_chain::{ChainClient, ChainError, NftKind, IERC20};
 
 // Local NFT-write interfaces. `beth-chain` declares the read shapes for
 // ERC-721/1155; we add the write functions here so calldata encoding stays
@@ -258,16 +258,7 @@ impl TxEngine {
         chain_id: u64,
         address_book: Option<&AddressBook>,
         from: Address,
-    ) -> Result<
-        (
-            Address,
-            U256,
-            String,
-            Option<TokenRef>,
-            Option<NftRef>,
-        ),
-        TxEngineError,
-    > {
+    ) -> Result<(Address, U256, String, Option<TokenRef>, Option<NftRef>), TxEngineError> {
         match body {
             RawIntentBody::Send {
                 to,
@@ -352,8 +343,7 @@ impl TxEngine {
                 safe,
                 data,
             } => {
-                let contract_addr =
-                    self.resolve_recipient_async(contract, address_book).await?;
+                let contract_addr = self.resolve_recipient_async(contract, address_book).await?;
                 let to_addr = self.resolve_recipient_async(to, address_book).await?;
                 let token_id_u = parse_u256(token_id)
                     .map_err(|e| TxEngineError::Amount(format!("token_id: {e}")))?;
@@ -425,10 +415,8 @@ impl TxEngine {
                 operator,
                 token_id,
             } => {
-                let contract_addr =
-                    self.resolve_recipient_async(contract, address_book).await?;
-                let operator_addr =
-                    self.resolve_recipient_async(operator, address_book).await?;
+                let contract_addr = self.resolve_recipient_async(contract, address_book).await?;
+                let operator_addr = self.resolve_recipient_async(operator, address_book).await?;
                 let token_id_u = parse_u256(token_id)
                     .map_err(|e| TxEngineError::Amount(format!("token_id: {e}")))?;
                 // Per-token approve only exists on ERC-721. Detect first
@@ -470,10 +458,8 @@ impl TxEngine {
                 operator,
                 approved,
             } => {
-                let contract_addr =
-                    self.resolve_recipient_async(contract, address_book).await?;
-                let operator_addr =
-                    self.resolve_recipient_async(operator, address_book).await?;
+                let contract_addr = self.resolve_recipient_async(contract, address_book).await?;
+                let operator_addr = self.resolve_recipient_async(operator, address_book).await?;
                 let kind = self.resolve_nft_kind(chain, contract_addr, None).await?;
                 if matches!(kind, NftKind::Unknown) {
                     return Err(TxEngineError::Token(format!(
@@ -674,7 +660,9 @@ impl TxEngine {
                     policy_ctx.recipient = Some(op);
                 }
             }
-            RawIntentBody::NftApproveAll { operator, approved, .. } => {
+            RawIntentBody::NftApproveAll {
+                operator, approved, ..
+            } => {
                 // Operator-wide approval — the riskiest NFT write. Add a
                 // warn-style policy line so plan.md highlights it.
                 policy_ctx.contract = Some(to);

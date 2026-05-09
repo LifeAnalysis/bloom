@@ -45,11 +45,9 @@ pub(crate) const PER_TOKEN_LEAVES: &[&str] = &[
 
 /// Files exposed under `contracts/<a>/nft/`. `owner_of`, `token_uri`,
 /// and `is_approved_for_all` are directories, not files.
-pub(crate) const NFT_COLLECTION_LEAVES: &[&str] =
-    &["kind", "name", "symbol", "total_supply"];
+pub(crate) const NFT_COLLECTION_LEAVES: &[&str] = &["kind", "name", "symbol", "total_supply"];
 
-pub(crate) const NFT_COLLECTION_DIRS: &[&str] =
-    &["owner_of", "token_uri", "is_approved_for_all"];
+pub(crate) const NFT_COLLECTION_DIRS: &[&str] = &["owner_of", "token_uri", "is_approved_for_all"];
 
 /// Files at `addresses/<a>/nfts/`.
 pub(crate) const NFT_HOLDER_LEAVES: &[&str] = &["erc721_txs", "erc1155_txs", "owned.json"];
@@ -322,10 +320,7 @@ pub async fn read_owned(
         if t.token_id.is_empty() {
             continue;
         }
-        let key = (
-            t.contract_address.to_ascii_lowercase(),
-            t.token_id.clone(),
-        );
+        let key = (t.contract_address.to_ascii_lowercase(), t.token_id.clone());
         let to_me = t.to.to_ascii_lowercase() == me;
         let from_me = t.from.to_ascii_lowercase() == me;
         if to_me {
@@ -546,7 +541,10 @@ pub async fn read_collection_total_supply(
 ) -> Result<Vec<u8>, HandlerError> {
     // Validate the contract is at least an NFT — we don't want
     // totalSupply() lying about a random contract.
-    if matches!(detect_kind(cache, client, contract).await?, NftKind::Unknown) {
+    if matches!(
+        detect_kind(cache, client, contract).await?,
+        NftKind::Unknown
+    ) {
         return Err(HandlerError::invalid("not an NFT contract"));
     }
     match client.erc721_total_supply(contract).await.map_err(err_be)? {

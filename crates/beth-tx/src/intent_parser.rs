@@ -229,7 +229,9 @@ fn parse_nft_shell(line: &str) -> Result<RawIntent, ParseError> {
             //   nft transfer <contract> <token_id> to <addr>
             //   nft transfer <contract> <token_id> amount <n> to <addr>
             if head.len() < 6 {
-                return Err(ParseError::Shell(format!("nft transfer too short: '{line}'")));
+                return Err(ParseError::Shell(format!(
+                    "nft transfer too short: '{line}'"
+                )));
             }
             let contract = head[2].to_string();
             let token_id = head[3].to_string();
@@ -501,10 +503,8 @@ chain = "ethereum"
 
     #[test]
     fn json_nft_transfer_explicit_kind() {
-        let r = parse(
-            r#"{"kind":"nft_transfer","contract":"0xnft","to":"0xbob","token_id":"42"}"#,
-        )
-        .unwrap();
+        let r = parse(r#"{"kind":"nft_transfer","contract":"0xnft","to":"0xbob","token_id":"42"}"#)
+            .unwrap();
         assert!(matches!(r.body, RawIntentBody::NftTransfer { .. }));
     }
 
