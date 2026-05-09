@@ -4,6 +4,7 @@ members = [
   "crates/beth-daemon",
   "crates/beth-vfs",
   "crates/beth-chain",
+  "crates/beth-rpc",
   "crates/beth-tx",
   "crates/beth-keystore",
   "crates/beth-defi",
@@ -61,12 +62,13 @@ futures = "0.3"
 lru = "0.12"
 
 # Ethereum stack
-alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract"] }
+alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract", "transport-throttle", "json-rpc"] }
 alloy-dyn-abi = { version = "1.5", features = ["eip712"] }
 
 # Internal crates
 beth-proto    = { path = "crates/beth-proto" }
 beth-keystore = { path = "crates/beth-keystore" }
+beth-rpc      = { path = "crates/beth-rpc" }
 beth-chain    = { path = "crates/beth-chain" }
 beth-tx       = { path = "crates/beth-tx" }
 beth-vfs      = { path = "crates/beth-vfs" }

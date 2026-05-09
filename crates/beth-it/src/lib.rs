@@ -43,6 +43,14 @@ impl AnvilGuard {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// Detach the underlying anvil `Child` so a test can `.kill()` /
+    /// `.wait()` it explicitly. Used by the RPC failover test which
+    /// needs to take an endpoint down mid-run and observe the
+    /// fallback layer route around it.
+    pub fn take_child(&mut self) -> Option<Child> {
+        self.child.take()
+    }
 }
 
 impl Drop for AnvilGuard {

@@ -7,6 +7,7 @@ description = "RPC pool and chain engine for bloom-eth"
 
 [dependencies]
 beth-proto.workspace = true
+beth-rpc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

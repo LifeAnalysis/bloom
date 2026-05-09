@@ -113,32 +113,56 @@ impl From<TransportError> for ChainError {
     }
 }
 
-/// One alloy provider plus failover endpoints.
+/// Translate a `beth_rpc::BethRpcError` into the historical `ChainError`
+/// surface so existing matchers in the workspace keep working.
+fn map_rpc_error(e: beth_rpc::BethRpcError) -> ChainError {
+    use beth_rpc::BethRpcError;
+    match e {
+        BethRpcError::NoEndpoints(name) => ChainError::NoEndpoints(name),
+        BethRpcError::InvalidUrl { url, source } => {
+            ChainError::Url(format!("{url}: {source}"))
+        }
+        BethRpcError::Transport(t) => ChainError::Transport(t.to_string()),
+        BethRpcError::AllEndpointsFailed { chain, last_error } => {
+            ChainError::Transport(format!("all endpoints failed for {chain}: {last_error}"))
+        }
+        BethRpcError::SessionNotImplemented => {
+            ChainError::Rpc("session not implemented".into())
+        }
+    }
+}
+
+/// One alloy provider backed by the layered `beth-rpc` engine.
+///
+/// The provider is a `RootProvider<Ethereum>` whose transport is the
+/// fallback fan-out built by `beth_rpc::RpcEngine::build`. Existing
+/// call sites that grab `provider()` keep working unchanged — only the
+/// underlying transport changed.
 #[derive(Clone)]
 pub struct ChainClient {
     spec: Arc<ChainSpec>,
     primary: Arc<RootProvider<Ethereum>>,
+    engine: Arc<beth_rpc::RpcEngine>,
     /// Cached chain id once the provider has reported it.
     cached_chain_id: Arc<RwLock<Option<u64>>>,
 }
 
 impl ChainClient {
-    /// Construct a client from a ChainSpec. Picks the first rpc_url and
-    /// builds an http provider.
+    /// Construct a client from a `ChainSpec`.
+    ///
+    /// Builds the layered `beth_rpc::RpcEngine` (retry → optional
+    /// throttle → HTTP, all behind a `FallbackLayer`) for every entry
+    /// returned by `spec.endpoints()`. Returns
+    /// `ChainError::NoEndpoints` when the spec resolves to zero
+    /// endpoints (both `rpc_urls` and `rpc_endpoints` empty), and
+    /// `ChainError::Url` for unparseable endpoint URLs.
     pub fn new(spec: ChainSpec) -> Result<Self, ChainError> {
-        if spec.rpc_urls.is_empty() {
-            return Err(ChainError::NoEndpoints(spec.name.clone()));
-        }
-        let url = spec
-            .rpc_urls
-            .first()
-            .unwrap()
-            .parse::<url::Url>()
-            .map_err(|e| ChainError::Url(e.to_string()))?;
-        let provider: RootProvider<Ethereum> = RootProvider::<Ethereum>::new_http(url);
+        let engine = beth_rpc::RpcEngine::build(&spec).map_err(map_rpc_error)?;
+        let provider = engine.provider();
         Ok(Self {
             spec: Arc::new(spec),
-            primary: Arc::new(provider),
+            primary: provider,
+            engine: Arc::new(engine),
             cached_chain_id: Arc::new(RwLock::new(None)),
         })
     }
@@ -151,6 +175,15 @@ impl ChainClient {
     }
     pub fn provider(&self) -> Arc<RootProvider<Ethereum>> {
         self.primary.clone()
+    }
+
+    /// True when at least one configured endpoint is `ws://` or
+    /// `wss://` and not flagged `http_only`. WP-4 wires this into the
+    /// watch executor's WS subscription fast path; today the engine
+    /// only attaches HTTP transports, so this method reports
+    /// configuration intent rather than runtime capability.
+    pub fn supports_subscriptions(&self) -> bool {
+        self.engine.supports_subscriptions()
     }
 
     pub async fn chain_id(&self) -> Result<u64, ChainError> {
@@ -756,13 +789,36 @@ mod tests {
 
     #[test]
     fn missing_endpoints_error() {
+        // §F.3 of the spec: the error must fire when both `rpc_urls`
+        // and `rpc_endpoints` are empty. Clearing only one leg now
+        // succeeds because of the back-compat shim in WP-1.
         let mut s = ChainSpec::anvil_default();
         s.rpc_urls.clear();
+        s.rpc_endpoints.clear();
         match ChainClient::new(s) {
             Err(ChainError::NoEndpoints(name)) => assert_eq!(name, "anvil"),
             Err(e) => panic!("expected NoEndpoints, got {e:?}"),
             Ok(_) => panic!("expected NoEndpoints error"),
         }
+    }
+
+    #[test]
+    fn endpoints_only_path_builds_client() {
+        // The richer `rpc_endpoints` form must let us build a client
+        // even with `rpc_urls` empty — this is the new path WP-1
+        // unblocks and WP-2 honours through `RpcEngine::build`.
+        use beth_proto::EndpointSpec;
+        let mut s = ChainSpec::anvil_default();
+        s.rpc_urls.clear();
+        s.rpc_endpoints.push(EndpointSpec {
+            url: "http://127.0.0.1:8545".into(),
+            weight: 100,
+            cu_per_sec: None,
+            max_rps: None,
+            http_only: false,
+        });
+        let client = ChainClient::new(s).expect("build client from rich form");
+        assert!(!client.supports_subscriptions());
     }
 
     #[test]
