@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tests/docker/test_enso_aave.sh — dockerized Enso -> Aave integration
-# test driver. Runs *inside* the beth-test container brought up by
-# tests/docker/docker-compose-enso.yml (fork mode) or by
-# tests/docker/run.sh --enso-live (live mainnet mode).
+# test driver. Runs *inside* the beth-test-enso container brought up by
+# tests/docker/docker-compose.yml under the `enso` profile (fork mode)
+# or by tests/docker/run.sh --enso-live (live mainnet mode).
 #
 # What this proves
 #   The agent-facing surface (NFS mount at /eth/) end-to-ends a real
@@ -27,7 +27,7 @@
 #   bash tests/docker/run.sh --enso         # fork
 #   bash tests/docker/run.sh --enso-live    # mainnet, spends real ETH
 #
-# Required env (fork mode — set by docker-compose-enso.yml)
+# Required env (fork mode — set by docker-compose.yml's enso profile)
 #   BETH_ENSO_KEY              Enso v1 API key
 #   BETH_TEST_WALLET_PASSPHRASE   passphrase for the imported test wallet
 #   BASE_FORK_INTERNAL_URL     RPC URL the daemon hits (anvil-fork:8545)
@@ -49,32 +49,22 @@
 
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+LOG_PREFIX=enso-test
+source "$SCRIPT_DIR/lib.sh"
+
 MODE="${BETH_TEST_MODE:-fork}"
 
-MNT=/eth
+# MNT/PIDFILE/LOGFILE/SENTINEL come from lib.sh defaults.
+# DEST1/ANVIL_KEY/USDC/AUSDC come from lib.sh fixtures (fork mode keeps
+# DEST1 as Anvil account[0]; live mode overrides below).
 HOME_DIR=/tmp/beth-enso-home
-PIDFILE=/tmp/mount_demo.pid
-LOGFILE=/tmp/mount_demo.log
-SENTINEL=/.beth-mounted
-
 WALLET=dest1
 CHAIN=base
-USDC=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
-AUSDC=0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB
-
-GREEN=$'\033[32m' YELLOW=$'\033[33m' RED=$'\033[31m' RESET=$'\033[0m'
-log()  { printf '%s[enso-test]%s %s\n' "$GREEN" "$RESET" "$*" >&2; }
-warn() { printf '%s[enso-test]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
-fail() { printf '%s[enso-test]%s %s\n' "$RED"   "$RESET" "$*" >&2; exit 1; }
 
 # ---------- mode-specific config ----------
 case "$MODE" in
     fork)
-        # Anvil's deterministic account[0]. On a fork the on-chain
-        # balance is whatever real Base has at the fork block, so we
-        # top it up via anvil_setBalance below.
-        ANVIL_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-        DEST1=0xf39Fd6e51aad88F6F4ce6aB8827279cfFFb92266
         SWAP_AMOUNT_ETH=0.05
         WALLET_PASSPHRASE="${BETH_TEST_WALLET_PASSPHRASE:-}"
         IMPORT_KEY="$ANVIL_KEY"
@@ -98,8 +88,6 @@ case "$MODE" in
         [[ -n "$WALLET_PASSPHRASE" ]] || fail "BETH_PASSPHRASE not set"
         [[ -n "${BETH_BASE_RPC_URL:-}" ]] \
             || fail "BETH_BASE_RPC_URL not set"
-        [[ -d /beth-live-home/keystore ]] \
-            || fail "/beth-live-home/keystore missing (mount via run.sh --enso-live)"
         RPC_URL="$BETH_BASE_RPC_URL"
         CHAIN_DISPLAY="Base (mainnet)"
         # block_mainnet_broadcast guards against unexpected broadcasts
@@ -114,55 +102,11 @@ case "$MODE" in
         ;;
 esac
 
-mkdir -p "$MNT" "$HOME_DIR"
-rm -rf "$HOME_DIR"/*
+prepare_home_dir "$HOME_DIR"
+[[ "$MODE" == "live" ]] && prepare_live_home "$HOME_DIR" "$WALLET"
 
-# Live mode: copy the canonical keystore into the throwaway home so
-# the daemon can unlock it without touching the read-only mount. The
-# daemon writes outbox state, prices cache, etc. into HOME_DIR; only
-# the keystore needs to come from the host.
-if [[ "$MODE" == "live" ]]; then
-    log "copying live keystore -> $HOME_DIR/keystore (in-container, throwaway)"
-    cp -r /beth-live-home/keystore "$HOME_DIR/keystore"
-    if [[ ! -d "$HOME_DIR/keystore/$WALLET" ]]; then
-        fail "no '$WALLET' entry under /beth-live-home/keystore"
-    fi
-fi
-
-# ---------- write the daemon config ----------
-log "writing config.toml (rpc: $RPC_URL)"
-cat > "$HOME_DIR/config.toml" <<EOF
-stage_ttl = "30m"
-block_mainnet_broadcast = $BLOCK_MAINNET_BROADCAST
-default_chain = "base"
-
-[chains.base]
-name = "base"
-chain_id = 8453
-rpc_urls = ["$RPC_URL"]
-allow_broadcast = true
-display_name = "$CHAIN_DISPLAY"
-native_symbol = "ETH"
-native_decimals = 18
-legacy_tx = false
-
-[enso]
-api_key = "$BETH_ENSO_KEY"
-EOF
-
-# ---------- build mount_demo ----------
-log "cargo build --release --features mount --example mount_demo"
-cargo build \
-    --release \
-    --package beth-daemon \
-    --features mount \
-    --example mount_demo >&2
-
-EXAMPLE_BIN=target/release/examples/mount_demo
-if [[ ! -x "$EXAMPLE_BIN" ]]; then
-    EXAMPLE_BIN=target/debug/examples/mount_demo
-fi
-[[ -x "$EXAMPLE_BIN" ]] || fail "could not find mount_demo binary"
+write_base_config "$HOME_DIR" "$RPC_URL" "$CHAIN_DISPLAY" "$BLOCK_MAINNET_BROADCAST" "$BETH_ENSO_KEY"
+build_mount_demo
 
 # ---------- top up the test wallet on the fork ----------
 # Anvil's account[0] starts with 10k ETH on a brand-new anvil, but a
@@ -171,79 +115,21 @@ fi
 # Live mode skips this — there is no anvil and the wallet is expected
 # to already hold enough ETH for the swap plus gas.
 if [[ "$MODE" == "fork" ]]; then
-    log "anvil_setBalance $DEST1 := 10 ETH"
-    curl -fsS -X POST -H 'content-type: application/json' \
-        --data '{"jsonrpc":"2.0","id":1,"method":"anvil_setBalance","params":["'"$DEST1"'","0x8AC7230489E80000"]}' \
-        "$BASE_FORK_INTERNAL_URL" \
-        | sed -n 's/.*"result":\([^,}]*\).*/  result=\1/p' >&2 \
-        || fail "anvil_setBalance failed (fork RPC unreachable?)"
+    top_up_anvil_balance "$BASE_FORK_INTERNAL_URL" "$DEST1"
 fi
 
-# ---------- spawn the mount daemon ----------
-log "spawning mount_demo (mount=$MNT home=$HOME_DIR)"
 # BETH_TEST_WALLET_KEY is only set in fork mode where mount_demo
 # imports an Anvil-derived key under the name "dest1". In live mode the
 # keystore was copied in above, so we leave the import key empty —
 # mount_demo will skip the import branch and just unlock the existing
 # entry with BETH_TEST_WALLET_PASSPHRASE.
-BETH_TEST_WALLET_NAME="$WALLET" \
-BETH_TEST_WALLET_KEY="$IMPORT_KEY" \
-BETH_TEST_WALLET_PASSPHRASE="$WALLET_PASSPHRASE" \
-RUST_LOG="${RUST_LOG:-info}" \
-    "$EXAMPLE_BIN" "$MNT" "$HOME_DIR" >"$LOGFILE" 2>&1 &
-echo $! > "$PIDFILE"
-DAEMON_PID=$(cat "$PIDFILE")
-log "  pid=$DAEMON_PID, logging to $LOGFILE"
-
-cleanup() {
-    if [[ -f "$PIDFILE" ]]; then
-        local pid; pid=$(cat "$PIDFILE")
-        if kill -0 "$pid" 2>/dev/null; then
-            log "stopping mount_demo (pid=$pid)"
-            kill -TERM "$pid" 2>/dev/null || true
-            for _ in 1 2 3 4 5 6 7 8 9 10; do
-                kill -0 "$pid" 2>/dev/null || break
-                sleep 1
-            done
-            kill -KILL "$pid" 2>/dev/null || true
-        fi
-    fi
-    umount "$MNT" 2>/dev/null || true
-    if [[ -f "$LOGFILE" ]]; then
-        echo '::group::mount_demo log (tail)' >&2
-        tail -n 200 "$LOGFILE" >&2 || true
-        echo '::endgroup::' >&2
-    fi
-}
-trap cleanup EXIT
-
-# Wait up to 90s for the .beth-mounted sentinel; cargo on a cold cache
-# can need a moment to finish tracing init even after build is done.
-log "waiting for $SENTINEL"
-for i in $(seq 1 90); do
-    if [[ -f "$SENTINEL" ]]; then
-        log "  sentinel found after ${i}s"
-        break
-    fi
-    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
-        echo 'mount_demo exited before mount; tail of log:' >&2
-        tail -n 60 "$LOGFILE" >&2 || true
-        exit 1
-    fi
-    sleep 1
-done
-[[ -f "$SENTINEL" ]] || fail "timed out waiting for mount sentinel"
+start_mount_demo "$MNT" "$HOME_DIR" "$PIDFILE" "$LOGFILE" "$WALLET" "$IMPORT_KEY" "$WALLET_PASSPHRASE"
+trap 'cleanup_mount_demo "$MNT" "$PIDFILE" "$LOGFILE"' EXIT
+wait_for_mount "$SENTINEL" "$DAEMON_PID" "$LOGFILE" 90
 
 # ---------- breadcrumbs ----------
-echo '::group::chain head' >&2
-HEAD=$(cat "$MNT/chains/$CHAIN/head/number" | tr -d '\n')
-log "chain head: block $HEAD"
-echo '::endgroup::' >&2
-
-echo '::group::wallet eth balance' >&2
-BAL_ETH=$(cat "$MNT/chains/$CHAIN/addresses/$DEST1/balance.eth" | tr -d '\n')
-log "$WALLET ($DEST1) ETH balance: $BAL_ETH"
-echo '::endgroup::' >&2
+read_chain_head_breadcrumb "$MNT" "$CHAIN"
+read_wallet_balance_breadcrumb "$MNT" "$CHAIN" "$WALLET" "$DEST1"
 
 # Sanity: the test only makes sense if dest1 has ETH to spend. In fork
 # mode anvil_setBalance guarantees 10 ETH; in live mode the wallet
@@ -255,7 +141,14 @@ if ! awk -v b="$BAL_ETH" -v s="$SWAP_AMOUNT_ETH" 'BEGIN { exit !(b+0 > s+0) }'; 
 fi
 
 # ---------- post the intent through the mount ----------
-INTENT_BODY=$(printf '{"intent":"swap %s ETH to %s on base","chain":"%s"}' \
+# slippage_bps=500 (5%) is generous on purpose. The default of 50bps
+# trips on both the fork (Anvil lazy-fetches storage from public RPC
+# replicas that may serve a different block than the fork's frozen base)
+# and on live mainnet (Enso quotes against latest-mainnet, our broadcast
+# lands a few blocks later). Both surfaced as `ShortcutExecutionFailed`
+# with inner "Insufficient output" / "T12" Uniswap reverts at step 0
+# of the route.
+INTENT_BODY=$(printf '{"intent":"swap %s ETH to %s on base","chain":"%s","slippage_bps":500}' \
     "$SWAP_AMOUNT_ETH" "$AUSDC" "$CHAIN")
 log "POST intent (via /eth write): $INTENT_BODY"
 
@@ -265,14 +158,14 @@ log "POST intent (via /eth write): $INTENT_BODY"
 # empty listing it never refreshed. Now `dir_change` hashes the actual
 # listing, so a daemon-side write moves the change attribute and the
 # kernel re-issues READDIR.
-PENDING_BEFORE=$(ls "$MNT/wallets/$WALLET/chains/$CHAIN/outbox/pending" 2>/dev/null \
-    | sort -u | tr '\n' '|' || true)
+OUTBOX="$MNT/wallets/$WALLET/chains/$CHAIN/outbox"
+PENDING_BEFORE=$(pending_set "$OUTBOX")
 
 printf '%s' "$INTENT_BODY" > "$MNT/defi/intents/$WALLET/new"
 
 # Pull the new session id (the only entry under defi/intents/<w> that
 # isn't `new`).
-SESS=$(ls "$MNT/defi/intents/$WALLET" | grep -v '^new$' | sort | tail -n1 || true)
+SESS=$(latest_session "$WALLET")
 [[ -n "$SESS" ]] || fail "no defi session created under $MNT/defi/intents/$WALLET"
 log "session: $SESS"
 
@@ -293,26 +186,8 @@ STAGE=
 # through Aave/USDC/Uniswap, all of which lazy-fetch state from the
 # fork's upstream RPC. A cold fork against a slow public endpoint can
 # easily push this past 90s.
-log "waiting for new outbox stage (300s budget)"
-for i in $(seq 1 300); do
-    PENDING_AFTER=$(ls "$MNT/wallets/$WALLET/chains/$CHAIN/outbox/pending" 2>/dev/null \
-        | sort -u | tr '\n' '|' || true)
-    # `|| true`: grep exits 1 when there's no new stage yet, which
-    # combined with `set -euo pipefail` would kill the script on the
-    # first poll. We *want* to keep polling.
-    STAGE=$(comm -13 \
-        <(printf '%s' "$PENDING_BEFORE" | tr '|' '\n' | sort -u) \
-        <(printf '%s' "$PENDING_AFTER"  | tr '|' '\n' | sort -u) \
-        | grep -v '^$' | head -n1 || true)
-    if [[ -n "$STAGE" ]]; then
-        log "  stage appeared after ${i}s"
-        break
-    fi
-    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
-        fail "mount_demo died while waiting for stage"
-    fi
-    sleep 1
-done
+STAGE=$(wait_for_new_pending_stages "$OUTBOX" "$PENDING_BEFORE" 300)
+STAGE=${STAGE%%$'\n'*}
 [[ -n "$STAGE" ]] || fail "no new outbox stage produced within 300s"
 log "stage: $STAGE"
 
@@ -334,24 +209,7 @@ HASH=$(cat "$MNT/wallets/$WALLET/chains/$CHAIN/outbox/sent/$STAGE/tx_hash" \
 log "tx hash: $HASH"
 
 # ---------- poll for receipt ----------
-log "polling /chains/$CHAIN/tx/$HASH/status (60s budget)"
-STATUS=
-for i in $(seq 1 60); do
-    STATUS=$(cat "$MNT/chains/$CHAIN/tx/$HASH/status" 2>/dev/null | tr -d '\n' || true)
-    case "$STATUS" in
-        success)
-            log "  status=success after ${i}s"
-            break
-            ;;
-        reverted)
-            fail "tx reverted on-chain (hash=$HASH)"
-            ;;
-        *)
-            sleep 1
-            ;;
-    esac
-done
-[[ "$STATUS" == "success" ]] || fail "tx did not confirm within 60s (last status='$STATUS')"
+wait_tx_success "$MNT" "$CHAIN" "$HASH" 60 tx
 
 # ---------- verify all receipt VFS paths are populated ----------
 # `status` already proved the receipt is fetched. Now exercise every
@@ -359,35 +217,7 @@ done
 # know an agent can pull the full receipt picture from the mount, not
 # just the tx_hash + status.
 TX_DIR="$MNT/chains/$CHAIN/tx/$HASH"
-echo '::group::tx receipt paths' >&2
-
-BLOCK_NUMBER=$(cat "$TX_DIR/block_number" 2>/dev/null | tr -d '\n' || true)
-[[ -n "$BLOCK_NUMBER" && "$BLOCK_NUMBER" =~ ^[0-9]+$ ]] \
-    || fail "block_number empty or non-numeric ('$BLOCK_NUMBER') at $TX_DIR/block_number"
-log "  block_number: $BLOCK_NUMBER"
-
-GAS_USED=$(cat "$TX_DIR/gas_used" 2>/dev/null | tr -d '\n' || true)
-[[ -n "$GAS_USED" && "$GAS_USED" =~ ^[0-9]+$ ]] \
-    || fail "gas_used empty or non-numeric ('$GAS_USED') at $TX_DIR/gas_used"
-log "  gas_used: $GAS_USED"
-
-# receipt.json / logs.json / full.json: confirm each is non-empty and
-# starts with the expected JSON sentinel. The container ships without
-# jq/python so we keep validation to bash builtins — a `{` for the
-# object payloads, `[` for the logs array. That's enough to catch a
-# regression where the path returns empty bytes or an error string.
-for spec in 'receipt.json:{' 'logs.json:[' 'full.json:{'; do
-    f="${spec%:*}"
-    expect="${spec##*:}"
-    P="$TX_DIR/$f"
-    [[ -s "$P" ]] || fail "$f is empty at $P"
-    head1=$(head -c1 "$P")
-    [[ "$head1" == "$expect" ]] \
-        || fail "$f does not start with '$expect' (got '$head1') at $P"
-    sz=$(wc -c <"$P" | tr -d ' ')
-    log "  $f: ok (${sz}B)"
-done
-echo '::endgroup::' >&2
+assert_tx_receipt_paths "$TX_DIR"
 
 # ---------- assert aBaseUSDC balance ----------
 AUSDC_RAW=$(cat "$MNT/chains/$CHAIN/addresses/$DEST1/tokens/$AUSDC/balance.raw" \
@@ -405,33 +235,18 @@ if [[ "$MODE" == "live" ]]; then
 
     OUTBOX="$MNT/wallets/$WALLET/chains/$CHAIN/outbox"
 
-    # Wait up to $2 seconds for the daemon to publish $1's receipt.
-    unwind_wait_receipt() {
-        local hash=$1 budget=${2:-90}
-        for _ in $(seq 1 "$budget"); do
-            local s
-            s=$(cat "$MNT/chains/$CHAIN/tx/$hash/status" 2>/dev/null | tr -d '\n' || true)
-            case "$s" in
-                success)  return 0 ;;
-                reverted) warn "tx $hash reverted"; return 1 ;;
-            esac
-            sleep 1
-        done
-        warn "tx $hash did not confirm within ${budget}s"
-        return 1
-    }
-
-    # Confirm a single staged tx and await its receipt. Helper since
-    # the auto-approve flow produces N stages from one DeFi session.
+    # Confirm a single staged tx and await its receipt. The auto-approve
+    # flow may produce N stages from one DeFi session, so we wrap the
+    # confirm + wait for receipt pair here. Heavy lifting (`confirm_stage_and_get_hash`,
+    # `wait_receipt_status`) lives in lib.sh.
     unwind_confirm_stage() {
         local stage=$1 label=$2
         log "  $label: $stage"
-        echo y > "$OUTBOX/pending/$stage/confirm"
         local hash
-        hash=$(cat "$OUTBOX/sent/$stage/tx_hash" 2>/dev/null | tr -d '\n' || true)
+        hash=$(confirm_stage_and_get_hash "$OUTBOX" "$stage")
         [[ -n "$hash" ]] || { warn "$label: tx_hash missing after broadcast"; return 1; }
         log "  $label tx: $hash"
-        unwind_wait_receipt "$hash" 90 || return 1
+        wait_receipt_status "$CHAIN" "$hash" 90 || return 1
         log "  $label ✓"
     }
 
@@ -451,13 +266,12 @@ if [[ "$MODE" == "live" ]]; then
         unwind_pending_before=$(ls "$OUTBOX/pending" 2>/dev/null \
             | sort -u | tr '\n' '|' || true)
 
-        intent_body=$(printf '{"intent":"swap %s %s to ETH","chain":"%s"}' \
+        intent_body=$(printf '{"intent":"swap %s %s to ETH","chain":"%s","slippage_bps":500}' \
             "$AUSDC_BEFORE" "$AUSDC" "$CHAIN")
         log "  POST defi intent: $intent_body"
         printf '%s' "$intent_body" > "$MNT/defi/intents/$WALLET/new"
 
-        unwind_sess=$(ls "$MNT/defi/intents/$WALLET" | grep -v '^new$' \
-            | sort | tail -n1 || true)
+        unwind_sess=$(latest_session "$WALLET")
         [[ -n "$unwind_sess" ]] || fail "unwind: no defi session created"
         log "  unwind session: $unwind_sess"
 
@@ -524,7 +338,7 @@ if [[ "$MODE" == "live" ]]; then
         USDC_FINAL=$(cat "$MNT/chains/$CHAIN/addresses/$DEST1/tokens/$USDC/balance.raw" \
             2>/dev/null | tr -d '\n' || echo "")
         # aBaseUSDC accrues interest continuously, so a few raw of post-
-        # withdraw dust is normal. Tolerance mirrors live_test.sh.
+        # withdraw dust is normal.
         if [[ -n "$AUSDC_FINAL" && -n "$USDC_FINAL" ]] \
             && (( AUSDC_FINAL <= 5 )) \
             && [[ "$USDC_FINAL" == "0" ]]; then

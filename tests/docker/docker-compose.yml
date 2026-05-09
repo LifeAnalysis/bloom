@@ -1,0 +1,102 @@
+# Compose stack for the dockerized chain-mode integration tests.
+#
+# Two test driver services share one anvil-fork sidecar and one shared
+# cargo cache volume. Profiles select which driver runs:
+#
+#   docker compose -f tests/docker/docker-compose.yml --profile enso up
+#   docker compose -f tests/docker/docker-compose.yml --profile fork up
+#
+# `anvil-fork` has no profile, so it always starts when *any* driver
+# is brought up. The two drivers never run together in practice (they
+# share the wallet name + container ports), and `tests/docker/run.sh`
+# does a `down --remove-orphans` between modes anyway.
+#
+# `anvil-fork` forks Base mainnet so chain reads/quotes hit real state,
+# but every broadcast lands on a throwaway fork. BASE_FORK_RPC_URL
+# overrides the upstream when the public RPC rate-limits.
+
+x-beth-test: &beth-test
+  image: ${BETH_TEST_IMAGE:-bloom-eth-mount-test:latest}
+  depends_on:
+    anvil-fork:
+      condition: service_healthy
+  # Mount-side privileges: SYS_ADMIN for mount(), apparmor=unconfined to
+  # bypass Debian's mount-blocking profile, /dev/fuse for the eventual
+  # FUSE adapter (harmless today). seccomp=unconfined matches what the
+  # privileged single-container `--enso-live` path uses in run.sh.
+  cap_add:
+    - SYS_ADMIN
+  security_opt:
+    - apparmor=unconfined
+    - seccomp=unconfined
+  devices:
+    - /dev/fuse
+  volumes:
+    - ${REPO_ROOT}:/workspace
+    # Persist /tmp/cargo-target across `--rm` runs so the second test
+    # invocation onwards only pays for incremental compiles. Volume name
+    # mirrors the one tests/docker/run.sh uses for the non-compose paths.
+    - bloom-eth-cargo-cache:/tmp/cargo-target
+  working_dir: /workspace
+
+services:
+  anvil-fork:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: beth-anvil
+    entrypoint: ["anvil"]
+    command:
+      - --fork-url
+      - ${BASE_FORK_RPC_URL:-https://base-rpc.publicnode.com}
+      - --chain-id
+      - "8453"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8545"
+      - --block-time
+      - "1"
+      - --silent
+    ports:
+      # Exposed for host-side debugging (cast, curl, etc.). Not
+      # required by the in-network beth-test client.
+      - "127.0.0.1:8546:8545"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cast chain-id --rpc-url http://localhost:8545 >/dev/null 2>&1 ||
+          exit 1
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+
+  beth-test-enso:
+    <<: *beth-test
+    profiles: ["enso"]
+    container_name: beth-enso-driver
+    environment:
+      - BETH_ENSO_KEY
+      - BETH_TEST_WALLET_PASSPHRASE=test
+      - BASE_FORK_INTERNAL_URL=http://anvil-fork:8545
+      - RUST_LOG=info
+    command: ["bash", "tests/docker/test_enso_aave.sh"]
+
+  beth-test-fork:
+    <<: *beth-test
+    profiles: ["fork"]
+    container_name: beth-fork-driver
+    environment:
+      - BETH_TEST_WALLET_PASSPHRASE=test
+      - BASE_FORK_INTERNAL_URL=http://anvil-fork:8545
+      - RUST_LOG=info
+    command: ["bash", "tests/docker/test_fork_mount.sh"]
+
+volumes:
+  bloom-eth-cargo-cache:
+    # Pin the literal name so this volume is the same one the
+    # non-compose paths in tests/docker/run.sh (--mount, --workspace,
+    # --enso-live) mount as `bloom-eth-cargo-cache`. Without this,
+    # compose would mangle it to `<project>_bloom-eth-cargo-cache` and
+    # the cargo cache wouldn't carry over between modes.
+    name: bloom-eth-cargo-cache

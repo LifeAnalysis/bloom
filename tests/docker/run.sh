@@ -12,9 +12,10 @@
 #   --workspace   — runs tests/docker/test_workspace.sh (cargo test
 #                   --workspace --lib). Skips the privileged flags
 #                   because the workspace unit tests don't mount.
-#   --enso        — runs tests/docker/test_enso_aave.sh inside a
-#                   docker-compose stack with an anvil --fork-url=Base
-#                   sidecar. Drives the Enso -> Aave intent flow end
+#   --enso        — runs tests/docker/test_enso_aave.sh inside the
+#                   shared docker-compose stack (anvil-fork sidecar +
+#                   beth-test-enso driver, selected via the `enso`
+#                   profile). Drives the Enso -> Aave intent flow end
 #                   to end through the NFS mount at /eth/. Requires
 #                   BETH_ENSO_KEY in the environment.
 #   --enso-live   — same Enso -> Aave flow but against Base mainnet,
@@ -25,20 +26,99 @@
 #                   read-only and copied into a throwaway home inside
 #                   the container — the canonical keystore is never
 #                   written to from this script.
-#   --fork        — runs tests/docker/test_fork_mount.sh inside a
-#                   docker-compose stack with an anvil --fork-url=Base
-#                   sidecar. Like --enso but skips DeFi: stages and
-#                   broadcasts a plain native-ETH send via the wallet
-#                   outbox, then exercises the chain read paths
-#                   (head/tx/blocks/gas) against the resulting hash.
-#                   No Enso key required.
+#   --fork        — runs tests/docker/test_fork_mount.sh inside the same
+#                   docker-compose stack via the `fork` profile. Like
+#                   --enso but skips DeFi: stages and broadcasts a plain
+#                   native-ETH send via the wallet outbox, then exercises
+#                   the chain read paths (head/tx/blocks/gas) against the
+#                   resulting hash. No Enso key required.
 #
 # `--rebuild` forces `docker build --no-cache`. The default reuses the
-# cached image so iterative loops stay fast.
+# cached image so iterative loops stay fast. The named docker volume
+# `bloom-eth-cargo-cache` (mounted at /tmp/cargo-target inside the
+# container) persists incremental compile artifacts across runs — wipe
+# it with `docker volume rm bloom-eth-cargo-cache` if you ever need a
+# truly cold rebuild.
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 IMAGE_TAG=bloom-eth-mount-test:latest
+COMPOSE_FILE="$REPO_ROOT/tests/docker/docker-compose.yml"
+CARGO_CACHE_VOLUME=bloom-eth-cargo-cache
+
+usage() {
+    cat <<EOF
+Usage: $0 [--rebuild] [--workspace|--mount|--enso|--enso-live|--fork]
+
+Default mode runs the NFS mount integration test.
+--workspace runs \`cargo test --workspace --lib\` inside the same image.
+--enso runs the Enso -> Aave integration test against an anvil fork.
+--enso-live runs the same flow against Base mainnet (spends real ETH).
+--fork runs the wallet outbox + chain reads test against an anvil fork.
+--rebuild forces \`docker build --no-cache\`.
+EOF
+}
+
+require_env() {
+    local name
+    for name in "$@"; do
+        if [[ -z "${!name:-}" ]]; then
+            echo "$name not set; required for --$MODE." >&2
+            echo "  hint: source test.env or pass it inline." >&2
+            exit 2
+        fi
+    done
+}
+
+docker_build_image() {
+    echo "::group::docker build"
+    local build_args=(-t "$IMAGE_TAG" -f "$REPO_ROOT/tests/docker/Dockerfile" "$REPO_ROOT")
+    if [ "$REBUILD" -eq 1 ]; then
+        docker build --no-cache "${build_args[@]}"
+    else
+        docker build "${build_args[@]}"
+    fi
+    echo "::endgroup::"
+}
+
+compose_cmd() {
+    if command -v docker-compose >/dev/null 2>&1; then
+        COMPOSE=(docker-compose)
+    else
+        COMPOSE=(docker compose)
+    fi
+}
+
+# Run a profile under the consolidated compose stack. The driver service
+# the profile exposes is always named beth-test-<profile> so we can pin
+# `--exit-code-from` to the right thing without another arg.
+run_compose_profile() {
+    local profile=$1
+    local service="beth-test-$profile"
+
+    compose_cmd
+    echo "::group::docker compose up ($profile)"
+    export REPO_ROOT
+    export BETH_TEST_IMAGE="$IMAGE_TAG"
+    export BASE_FORK_RPC_URL="${BASE_FORK_RPC_URL:-https://base-rpc.publicnode.com}"
+
+    "${COMPOSE[@]}" -f "$COMPOSE_FILE" --profile "$profile" \
+        down --remove-orphans >/dev/null 2>&1 || true
+    rc=0
+    "${COMPOSE[@]}" -f "$COMPOSE_FILE" --profile "$profile" up \
+        --abort-on-container-exit --exit-code-from "$service" \
+        || rc=$?
+    "${COMPOSE[@]}" -f "$COMPOSE_FILE" --profile "$profile" \
+        down --remove-orphans >/dev/null 2>&1 || true
+    echo "::endgroup::"
+    exit "$rc"
+}
+
+mount_privileges=(
+    --cap-add SYS_ADMIN
+    --device /dev/fuse
+    --security-opt apparmor=unconfined
+)
 
 REBUILD=0
 MODE=mount
@@ -51,39 +131,22 @@ for arg in "$@"; do
         --enso-live) MODE=enso-live ;;
         --fork) MODE=fork ;;
         -h|--help)
-            cat <<EOF
-Usage: $0 [--rebuild] [--workspace|--mount|--enso|--enso-live|--fork]
-
-Default mode runs the NFS mount integration test.
---workspace runs \`cargo test --workspace --lib\` inside the same image.
---enso runs the Enso -> Aave integration test against an anvil fork.
---enso-live runs the same flow against Base mainnet (spends real ETH).
---fork runs the wallet outbox + chain reads test against an anvil fork.
---rebuild forces \`docker build --no-cache\`.
-EOF
+            usage
             exit 0
             ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
 
-echo "::group::docker build"
-if [ "$REBUILD" -eq 1 ]; then
-    docker build --no-cache \
-        -t "$IMAGE_TAG" \
-        -f "$REPO_ROOT/tests/docker/Dockerfile" \
-        "$REPO_ROOT"
-else
-    docker build \
-        -t "$IMAGE_TAG" \
-        -f "$REPO_ROOT/tests/docker/Dockerfile" \
-        "$REPO_ROOT"
-fi
-echo "::endgroup::"
+docker_build_image
 
 run_args=(
     --rm
     -v "$REPO_ROOT":/workspace
+    # Persist cargo's incremental cache across runs. The image's
+    # CARGO_TARGET_DIR points here, so anything compiled in one run is
+    # reused by the next.
+    -v "$CARGO_CACHE_VOLUME":/tmp/cargo-target
     -w /workspace
 )
 
@@ -96,11 +159,7 @@ case "$MODE" in
         #                              — Debian/Ubuntu hosts ship an apparmor
         #                                 profile that blocks mount() even with
         #                                 SYS_ADMIN; unconfined gets us past it
-        run_args+=(
-            --cap-add SYS_ADMIN
-            --device /dev/fuse
-            --security-opt apparmor=unconfined
-        )
+        run_args+=("${mount_privileges[@]}")
         cmd=(bash tests/docker/test.sh)
         ;;
     workspace)
@@ -108,75 +167,18 @@ case "$MODE" in
         cmd=(bash tests/docker/test_workspace.sh)
         ;;
     enso)
-        # Compose-driven: anvil-fork sidecar + beth-test driver. The
-        # compose file pins the same image we just built and threads
-        # SYS_ADMIN / apparmor flags via cap_add+security_opt.
-        if [[ -z "${BETH_ENSO_KEY:-}" ]]; then
-            echo "BETH_ENSO_KEY not set; required for --enso." >&2
-            echo "  hint: source test.env or pass it inline." >&2
-            exit 2
-        fi
-        if command -v docker-compose >/dev/null 2>&1; then
-            COMPOSE=(docker-compose)
-        else
-            COMPOSE=(docker compose)
-        fi
-        echo "::group::docker compose up ($MODE)"
-        export REPO_ROOT
+        require_env BETH_ENSO_KEY
         export BETH_ENSO_KEY
-        export BETH_TEST_IMAGE="$IMAGE_TAG"
-        # Optional override: when public Base RPC rate-limits, point
-        # at a private endpoint via BASE_FORK_RPC_URL.
-        export BASE_FORK_RPC_URL="${BASE_FORK_RPC_URL:-https://base-rpc.publicnode.com}"
-        compose_file="$REPO_ROOT/tests/docker/docker-compose-enso.yml"
-        # Tear down any previous run before bringing the stack up so a
-        # stale anvil fork can't leak state into a new test.
-        "${COMPOSE[@]}" -f "$compose_file" down --remove-orphans >/dev/null 2>&1 || true
-        # `up --abort-on-container-exit` returns the driver's exit code.
-        rc=0
-        "${COMPOSE[@]}" -f "$compose_file" up \
-            --abort-on-container-exit --exit-code-from beth-test \
-            || rc=$?
-        "${COMPOSE[@]}" -f "$compose_file" down --remove-orphans >/dev/null 2>&1 || true
-        echo "::endgroup::"
-        exit "$rc"
+        run_compose_profile enso
         ;;
     fork)
-        # Compose-driven: anvil-fork sidecar + beth-test driver, same
-        # privilege flags as --enso. No Enso key needed; the test
-        # exercises the wallet/outbox + chain read paths only.
-        if command -v docker-compose >/dev/null 2>&1; then
-            COMPOSE=(docker-compose)
-        else
-            COMPOSE=(docker compose)
-        fi
-        echo "::group::docker compose up ($MODE)"
-        export REPO_ROOT
-        export BETH_TEST_IMAGE="$IMAGE_TAG"
-        export BASE_FORK_RPC_URL="${BASE_FORK_RPC_URL:-https://base-rpc.publicnode.com}"
-        compose_file="$REPO_ROOT/tests/docker/docker-compose-fork.yml"
-        # Tear down any previous run so a stale anvil fork can't leak
-        # state into a new test run.
-        "${COMPOSE[@]}" -f "$compose_file" down --remove-orphans >/dev/null 2>&1 || true
-        rc=0
-        "${COMPOSE[@]}" -f "$compose_file" up \
-            --abort-on-container-exit --exit-code-from beth-test \
-            || rc=$?
-        "${COMPOSE[@]}" -f "$compose_file" down --remove-orphans >/dev/null 2>&1 || true
-        echo "::endgroup::"
-        exit "$rc"
+        run_compose_profile fork
         ;;
     enso-live)
         # No anvil sidecar: the daemon points at a real Base RPC and
         # the broadcast lands on Base mainnet. Single privileged
         # `docker run` so the in-container kernel can mount NFS.
-        for v in BETH_ENSO_KEY BETH_LIVE_HOME BETH_LIVE_DEST1 BETH_PASSPHRASE; do
-            if [[ -z "${!v:-}" ]]; then
-                echo "$v not set; required for --enso-live." >&2
-                echo "  hint: \`set -a && source test.env && set +a\` first." >&2
-                exit 2
-            fi
-        done
+        require_env BETH_ENSO_KEY BETH_LIVE_HOME BETH_LIVE_DEST1 BETH_PASSPHRASE
         if [[ ! -d "$BETH_LIVE_HOME/keystore" ]]; then
             echo "BETH_LIVE_HOME=$BETH_LIVE_HOME has no keystore/ subdir." >&2
             echo "  the live wallet must already exist before this test runs." >&2
@@ -193,11 +195,10 @@ case "$MODE" in
         # copies it into a throwaway home inside the container so an
         # in-container daemon write can't corrupt the canonical copy.
         docker run --rm \
-            --cap-add SYS_ADMIN \
-            --device /dev/fuse \
-            --security-opt apparmor=unconfined \
+            "${mount_privileges[@]}" \
             --security-opt seccomp=unconfined \
             -v "$REPO_ROOT":/workspace \
+            -v "$CARGO_CACHE_VOLUME":/tmp/cargo-target \
             -v "$BETH_LIVE_HOME":/beth-live-home:ro \
             -e BETH_TEST_MODE=live \
             -e BETH_ENSO_KEY \
