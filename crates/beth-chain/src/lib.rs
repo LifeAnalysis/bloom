@@ -35,6 +35,60 @@ sol! {
         function approve(address spender, uint256 amount) external returns (bool);
         function transfer(address to, uint256 amount) external returns (bool);
     }
+
+    #[sol(rpc)]
+    #[allow(missing_docs)]
+    interface IERC165 {
+        function supportsInterface(bytes4 interfaceId) external view returns (bool);
+    }
+
+    #[sol(rpc)]
+    #[allow(missing_docs)]
+    interface IERC721 {
+        function ownerOf(uint256 tokenId) external view returns (address);
+        function balanceOf(address owner) external view returns (uint256);
+        function getApproved(uint256 tokenId) external view returns (address);
+        function isApprovedForAll(address owner, address operator) external view returns (bool);
+    }
+
+    #[sol(rpc)]
+    #[allow(missing_docs)]
+    interface IERC721Metadata {
+        function name() external view returns (string);
+        function symbol() external view returns (string);
+        function tokenURI(uint256 tokenId) external view returns (string);
+    }
+
+    #[sol(rpc)]
+    #[allow(missing_docs)]
+    interface IERC721Enumerable {
+        function totalSupply() external view returns (uint256);
+    }
+
+    #[sol(rpc)]
+    #[allow(missing_docs)]
+    interface IERC1155 {
+        function balanceOf(address account, uint256 id) external view returns (uint256);
+        function isApprovedForAll(address account, address operator) external view returns (bool);
+    }
+
+    #[sol(rpc)]
+    #[allow(missing_docs)]
+    interface IERC1155MetadataURI {
+        function uri(uint256 id) external view returns (string);
+    }
+}
+
+/// ERC-165 interface IDs for the standards we care about.
+pub const ERC165_INTERFACE_ID_ERC721: [u8; 4] = [0x80, 0xac, 0x58, 0xcd];
+pub const ERC165_INTERFACE_ID_ERC1155: [u8; 4] = [0xd9, 0xb6, 0x7a, 0x26];
+
+/// What kind of NFT contract `addr` is. Detected via `supportsInterface`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NftKind {
+    Erc721,
+    Erc1155,
+    Unknown,
 }
 
 #[derive(Debug, Error)]
@@ -239,6 +293,191 @@ impl ChainClient {
         match contract.symbol().call().await {
             Ok(s) => Ok(Some(s.trim_matches('\0').to_string())),
             Err(_) => Ok(None),
+        }
+    }
+
+    // ---- NFT (ERC-721 / ERC-1155) reads --------------------------------
+
+    /// `IERC165.supportsInterface(selector)`. Returns `Ok(false)` on revert.
+    pub async fn supports_interface(
+        &self,
+        addr: Address,
+        selector: [u8; 4],
+    ) -> Result<bool, ChainError> {
+        let contract = IERC165::new(addr, self.primary.clone());
+        match contract.supportsInterface(selector.into()).call().await {
+            Ok(b) => Ok(b),
+            Err(e) => {
+                debug!(error = %e, "supports_interface.call_failed");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Detect whether `addr` is ERC-721, ERC-1155, or neither.
+    pub async fn nft_detect(&self, addr: Address) -> Result<NftKind, ChainError> {
+        if self
+            .supports_interface(addr, ERC165_INTERFACE_ID_ERC721)
+            .await?
+        {
+            return Ok(NftKind::Erc721);
+        }
+        if self
+            .supports_interface(addr, ERC165_INTERFACE_ID_ERC1155)
+            .await?
+        {
+            return Ok(NftKind::Erc1155);
+        }
+        Ok(NftKind::Unknown)
+    }
+
+    /// `IERC721.ownerOf(tokenId)`. `None` on revert (typical for
+    /// nonexistent / burnt tokens).
+    pub async fn erc721_owner_of(
+        &self,
+        addr: Address,
+        token_id: U256,
+    ) -> Result<Option<Address>, ChainError> {
+        let contract = IERC721::new(addr, self.primary.clone());
+        match contract.ownerOf(token_id).call().await {
+            Ok(a) => Ok(Some(a)),
+            Err(e) => {
+                debug!(error = %e, "erc721_owner_of.call_failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `IERC721.balanceOf(owner)` — number of tokens held by `owner`.
+    pub async fn erc721_balance_of(
+        &self,
+        addr: Address,
+        owner: Address,
+    ) -> Result<Option<U256>, ChainError> {
+        let contract = IERC721::new(addr, self.primary.clone());
+        match contract.balanceOf(owner).call().await {
+            Ok(b) => Ok(Some(b)),
+            Err(e) => {
+                debug!(error = %e, "erc721_balance_of.call_failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `IERC721.getApproved(tokenId)`.
+    pub async fn erc721_get_approved(
+        &self,
+        addr: Address,
+        token_id: U256,
+    ) -> Result<Option<Address>, ChainError> {
+        let contract = IERC721::new(addr, self.primary.clone());
+        match contract.getApproved(token_id).call().await {
+            Ok(a) => Ok(Some(a)),
+            Err(e) => {
+                debug!(error = %e, "erc721_get_approved.call_failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `IERC721Metadata.tokenURI(tokenId)`.
+    pub async fn erc721_token_uri(
+        &self,
+        addr: Address,
+        token_id: U256,
+    ) -> Result<Option<String>, ChainError> {
+        let contract = IERC721Metadata::new(addr, self.primary.clone());
+        match contract.tokenURI(token_id).call().await {
+            Ok(s) => Ok(Some(s)),
+            Err(e) => {
+                debug!(error = %e, "erc721_token_uri.call_failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `IERC721Metadata.name()`.
+    pub async fn erc721_name(&self, addr: Address) -> Result<Option<String>, ChainError> {
+        let contract = IERC721Metadata::new(addr, self.primary.clone());
+        match contract.name().call().await {
+            Ok(s) => Ok(Some(s.trim_matches('\0').to_string())),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// `IERC721Metadata.symbol()`.
+    pub async fn erc721_symbol(&self, addr: Address) -> Result<Option<String>, ChainError> {
+        let contract = IERC721Metadata::new(addr, self.primary.clone());
+        match contract.symbol().call().await {
+            Ok(s) => Ok(Some(s.trim_matches('\0').to_string())),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// `IERC721Enumerable.totalSupply()`. `None` if not enumerable.
+    pub async fn erc721_total_supply(
+        &self,
+        addr: Address,
+    ) -> Result<Option<U256>, ChainError> {
+        let contract = IERC721Enumerable::new(addr, self.primary.clone());
+        match contract.totalSupply().call().await {
+            Ok(n) => Ok(Some(n)),
+            Err(e) => {
+                debug!(error = %e, "erc721_total_supply.call_failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `IERC1155.balanceOf(holder, tokenId)`.
+    pub async fn erc1155_balance_of(
+        &self,
+        addr: Address,
+        holder: Address,
+        token_id: U256,
+    ) -> Result<Option<U256>, ChainError> {
+        let contract = IERC1155::new(addr, self.primary.clone());
+        match contract.balanceOf(holder, token_id).call().await {
+            Ok(b) => Ok(Some(b)),
+            Err(e) => {
+                debug!(error = %e, "erc1155_balance_of.call_failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `IERC1155MetadataURI.uri(tokenId)`. Caller must perform `{id}`
+    /// substitution per the ERC-1155 metadata spec.
+    pub async fn erc1155_uri(
+        &self,
+        addr: Address,
+        token_id: U256,
+    ) -> Result<Option<String>, ChainError> {
+        let contract = IERC1155MetadataURI::new(addr, self.primary.clone());
+        match contract.uri(token_id).call().await {
+            Ok(s) => Ok(Some(s)),
+            Err(e) => {
+                debug!(error = %e, "erc1155_uri.call_failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `isApprovedForAll(owner, operator)`. Selector is shared by
+    /// ERC-721 and ERC-1155.
+    pub async fn is_approved_for_all(
+        &self,
+        addr: Address,
+        owner: Address,
+        operator: Address,
+    ) -> Result<Option<bool>, ChainError> {
+        let contract = IERC721::new(addr, self.primary.clone());
+        match contract.isApprovedForAll(owner, operator).call().await {
+            Ok(b) => Ok(Some(b)),
+            Err(e) => {
+                debug!(error = %e, "is_approved_for_all.call_failed");
+                Ok(None)
+            }
         }
     }
 
@@ -1248,5 +1487,218 @@ mod mock_rpc_tests {
         let c = ChainClient::new(spec).unwrap();
         let err = c.block_number().await.unwrap_err();
         assert!(matches!(err, ChainError::Transport(_)), "got {err:?}");
+    }
+
+    // -- NFT (ERC-721 / ERC-1155) helpers --------------------------------
+
+    /// ABI-encode a bool as a 32-byte word.
+    fn enc_bool(v: bool) -> String {
+        let mut w = [0u8; 32];
+        w[31] = u8::from(v);
+        format!("\"0x{}\"", hex::encode(w))
+    }
+
+    /// ABI-encode a 20-byte address right-padded into a 32-byte word.
+    fn enc_address(addr: Address) -> String {
+        let mut w = [0u8; 32];
+        w[12..].copy_from_slice(addr.as_slice());
+        format!("\"0x{}\"", hex::encode(w))
+    }
+
+    #[tokio::test]
+    async fn supports_interface_true() {
+        let mut r = responses();
+        r.insert("eth_call".into(), vec![MockResponse::Ok(enc_bool(true))]);
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0x1111111111111111111111111111111111111111");
+        assert!(c
+            .supports_interface(nft, ERC165_INTERFACE_ID_ERC721)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn supports_interface_revert_returns_false() {
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![MockResponse::Err(3, "execution reverted".into(), None)],
+        );
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0x2222222222222222222222222222222222222222");
+        assert!(!c
+            .supports_interface(nft, ERC165_INTERFACE_ID_ERC1155)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn nft_detect_erc721() {
+        // First call (ERC-721 selector) returns true; ERC-1155 not asked.
+        let mut r = responses();
+        r.insert("eth_call".into(), vec![MockResponse::Ok(enc_bool(true))]);
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0x3333333333333333333333333333333333333333");
+        assert_eq!(c.nft_detect(nft).await.unwrap(), NftKind::Erc721);
+    }
+
+    #[tokio::test]
+    async fn nft_detect_erc1155() {
+        // ERC-721 → false, ERC-1155 → true.
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![
+                MockResponse::Ok(enc_bool(false)),
+                MockResponse::Ok(enc_bool(true)),
+            ],
+        );
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0x4444444444444444444444444444444444444444");
+        assert_eq!(c.nft_detect(nft).await.unwrap(), NftKind::Erc1155);
+    }
+
+    #[tokio::test]
+    async fn nft_detect_unknown() {
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![
+                MockResponse::Ok(enc_bool(false)),
+                MockResponse::Ok(enc_bool(false)),
+            ],
+        );
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0x5555555555555555555555555555555555555555");
+        assert_eq!(c.nft_detect(nft).await.unwrap(), NftKind::Unknown);
+    }
+
+    #[tokio::test]
+    async fn erc721_owner_of_happy_path() {
+        let owner = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let mut r = responses();
+        r.insert("eth_call".into(), vec![MockResponse::Ok(enc_address(owner))]);
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0x6666666666666666666666666666666666666666");
+        assert_eq!(
+            c.erc721_owner_of(nft, U256::from(42)).await.unwrap(),
+            Some(owner)
+        );
+    }
+
+    #[tokio::test]
+    async fn erc721_owner_of_revert_returns_none() {
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![MockResponse::Err(3, "ERC721: invalid token ID".into(), None)],
+        );
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0x6666666666666666666666666666666666666666");
+        assert_eq!(c.erc721_owner_of(nft, U256::from(99)).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn erc721_token_uri_happy_path() {
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![MockResponse::Ok(enc_string("ipfs://Qm.../1.json"))],
+        );
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0x7777777777777777777777777777777777777777");
+        assert_eq!(
+            c.erc721_token_uri(nft, U256::from(1)).await.unwrap(),
+            Some("ipfs://Qm.../1.json".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn erc721_get_approved_zero_means_no_approval() {
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![MockResponse::Ok(enc_address(Address::ZERO))],
+        );
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0x8888888888888888888888888888888888888888");
+        assert_eq!(
+            c.erc721_get_approved(nft, U256::from(7)).await.unwrap(),
+            Some(Address::ZERO)
+        );
+    }
+
+    #[tokio::test]
+    async fn erc721_total_supply_revert_returns_none() {
+        // Plenty of NFTs aren't enumerable; assert the call surfaces
+        // None rather than an error.
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![MockResponse::Err(3, "execution reverted".into(), None)],
+        );
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0x9999999999999999999999999999999999999999");
+        assert_eq!(c.erc721_total_supply(nft).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn erc1155_balance_of_happy_path() {
+        let want = U256::from(42u64);
+        let mut r = responses();
+        r.insert("eth_call".into(), vec![MockResponse::Ok(enc_uint256(want))]);
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let holder = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(
+            c.erc1155_balance_of(nft, holder, U256::from(123))
+                .await
+                .unwrap(),
+            Some(want)
+        );
+    }
+
+    #[tokio::test]
+    async fn erc1155_uri_happy_path_with_id_placeholder() {
+        // The ChainClient returns the raw URI; substitution is a handler
+        // concern. Assert we get the placeholder back verbatim.
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![MockResponse::Ok(enc_string("https://example/{id}.json"))],
+        );
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0xcccccccccccccccccccccccccccccccccccccccc");
+        assert_eq!(
+            c.erc1155_uri(nft, U256::from(7)).await.unwrap(),
+            Some("https://example/{id}.json".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn is_approved_for_all_true() {
+        let mut r = responses();
+        r.insert("eth_call".into(), vec![MockResponse::Ok(enc_bool(true))]);
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let nft = address!("0xdddddddddddddddddddddddddddddddddddddddd");
+        let owner = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let operator = address!("0xffffffffffffffffffffffffffffffffffffffff");
+        assert_eq!(
+            c.is_approved_for_all(nft, owner, operator).await.unwrap(),
+            Some(true)
+        );
     }
 }
