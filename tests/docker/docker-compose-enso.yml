@@ -1,0 +1,68 @@
+# Compose stack for the dockerized Enso -> Aave integration test
+# (driven by tests/docker/test_enso_aave.sh, host-side launcher
+# tests/docker/run.sh --enso).
+#
+# Two services on a shared bridge network so the beth daemon inside
+# beth-test reaches anvil-fork at http://anvil-fork:8545.
+#
+# anvil-fork forks Base mainnet so Enso quotes for chain_id=8453 still
+# match the on-chain state, but every broadcast lands on a throwaway
+# fork. BASE_FORK_RPC_URL overrides the upstream when the public RPC
+# rate-limits.
+services:
+  anvil-fork:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: beth-enso-anvil
+    entrypoint: ["anvil"]
+    command:
+      - --fork-url
+      - ${BASE_FORK_RPC_URL:-https://base-rpc.publicnode.com}
+      - --chain-id
+      - "8453"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8545"
+      - --block-time
+      - "1"
+      - --silent
+    ports:
+      # Exposed for host-side debugging (cast, curl, etc.). Not
+      # required by the in-network beth-test client.
+      - "127.0.0.1:8546:8545"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cast chain-id --rpc-url http://localhost:8545 >/dev/null 2>&1 ||
+          exit 1
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+
+  beth-test:
+    image: ${BETH_TEST_IMAGE:-bloom-eth-mount-test:latest}
+    container_name: beth-enso-driver
+    depends_on:
+      anvil-fork:
+        condition: service_healthy
+    # Mount-side privileges: SYS_ADMIN for mount(), apparmor=unconfined
+    # to bypass Debian's mount-blocking profile, /dev/fuse for the
+    # eventual FUSE adapter (harmless today). Mirrors run.sh --mount.
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
+      - seccomp=unconfined
+    devices:
+      - /dev/fuse
+    environment:
+      - BETH_ENSO_KEY
+      - BETH_TEST_WALLET_PASSPHRASE=test
+      - BASE_FORK_INTERNAL_URL=http://anvil-fork:8545
+      - RUST_LOG=info
+    volumes:
+      - ${REPO_ROOT}:/workspace
+    working_dir: /workspace
+    command: ["bash", "tests/docker/test_enso_aave.sh"]

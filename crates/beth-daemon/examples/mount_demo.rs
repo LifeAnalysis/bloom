@@ -50,6 +50,37 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let daemon = Daemon::from_home(home)?;
+
+    // Test-fixture hook: optionally import + unlock a wallet at startup.
+    // The mount adapter and the IPC layer don't expose an `unlock` RPC,
+    // so any test driver that wants to confirm staged txs through the
+    // mount needs the wallet unlocked in this very process. Triggered
+    // by env vars so the production binary stays untouched.
+    //
+    //   BETH_TEST_WALLET_NAME       — wallet name to register (e.g. "dest1")
+    //   BETH_TEST_WALLET_KEY        — 0x-prefixed hex private key (optional)
+    //                                  if set, the wallet is imported under
+    //                                  the name; ignored if it already exists.
+    //   BETH_TEST_WALLET_PASSPHRASE — passphrase used both for import and
+    //                                  the in-memory unlock.
+    if let Ok(name) = std::env::var("BETH_TEST_WALLET_NAME") {
+        let pass = std::env::var("BETH_TEST_WALLET_PASSPHRASE").unwrap_or_default();
+        if let Ok(key) = std::env::var("BETH_TEST_WALLET_KEY") {
+            if !key.is_empty() && daemon.keystore.info(&name).is_err() {
+                daemon
+                    .keystore
+                    .import_hex(&name, &key, &pass)
+                    .map_err(|e| anyhow::anyhow!("import {}: {}", name, e))?;
+                tracing::info!(wallet = %name, "test fixture: wallet imported");
+            }
+        }
+        daemon
+            .keystore
+            .unlock(&name, &pass)
+            .map_err(|e| anyhow::anyhow!("unlock {}: {}", name, e))?;
+        tracing::info!(wallet = %name, "test fixture: wallet unlocked in-process");
+    }
+
     tracing::info!(mount = %mount_path.display(), "mounting bloom-eth vfs");
     let handle = daemon.mount(&mount_path).await?;
     tracing::info!(mount = %mount_path.display(), nfs = %beth_mount::MountHandle::nfs_addr(&handle), "mounted");
