@@ -143,6 +143,22 @@ pub trait AddressHistorySource: Send + Sync {
         page_size: u32,
         sort: Sort,
     ) -> Result<Vec<TokenTransfer>, DataSourceError>;
+
+    /// ERC-1155 transfer feed (`token1155tx`). Returns the same
+    /// `TokenTransfer` shape as `get_nft_tx` with `token_id` and
+    /// `token_value` populated for each row.
+    #[allow(clippy::too_many_arguments)]
+    async fn get_nft1155_tx(
+        &self,
+        chain_id: u64,
+        addr: Address,
+        contract_addr_filter: Option<Address>,
+        start_block: u64,
+        end_block: u64,
+        page: u32,
+        page_size: u32,
+        sort: Sort,
+    ) -> Result<Vec<TokenTransfer>, DataSourceError>;
 }
 
 #[async_trait]
@@ -256,6 +272,32 @@ impl AddressHistorySource for EtherscanClient {
         sort: Sort,
     ) -> Result<Vec<TokenTransfer>, DataSourceError> {
         EtherscanClient::get_nft_tx(
+            self,
+            chain_id,
+            addr,
+            contract_addr_filter,
+            start_block,
+            end_block,
+            page,
+            page_size,
+            sort,
+        )
+        .await
+        .map_err(DataSourceError::from)
+    }
+
+    async fn get_nft1155_tx(
+        &self,
+        chain_id: u64,
+        addr: Address,
+        contract_addr_filter: Option<Address>,
+        start_block: u64,
+        end_block: u64,
+        page: u32,
+        page_size: u32,
+        sort: Sort,
+    ) -> Result<Vec<TokenTransfer>, DataSourceError> {
+        EtherscanClient::get_nft1155_tx(
             self,
             chain_id,
             addr,

@@ -54,6 +54,17 @@ struct LooseIntent {
     nonce: Option<u64>,
     #[serde(default)]
     priority: Option<String>,
+    // NFT-specific fields.
+    #[serde(default)]
+    operator: Option<String>,
+    #[serde(default)]
+    token_id: Option<String>,
+    #[serde(default)]
+    standard: Option<String>,
+    #[serde(default)]
+    safe: Option<bool>,
+    #[serde(default)]
+    approved: Option<bool>,
 }
 
 impl LooseIntent {
@@ -109,6 +120,25 @@ impl LooseIntent {
                 token: self.token.ok_or(ParseError::Ambiguous)?,
                 spender: self.spender.ok_or(ParseError::Ambiguous)?,
                 amount: self.amount.unwrap_or_else(|| "max".into()),
+            },
+            "nft_transfer" => RawIntentBody::NftTransfer {
+                contract: self.contract.ok_or(ParseError::Ambiguous)?,
+                to: self.to.ok_or(ParseError::Ambiguous)?,
+                token_id: self.token_id.ok_or(ParseError::Ambiguous)?,
+                standard: self.standard,
+                amount: self.amount,
+                safe: self.safe.unwrap_or(true),
+                data: self.data,
+            },
+            "nft_approve" => RawIntentBody::NftApprove {
+                contract: self.contract.ok_or(ParseError::Ambiguous)?,
+                operator: self.operator.ok_or(ParseError::Ambiguous)?,
+                token_id: self.token_id.ok_or(ParseError::Ambiguous)?,
+            },
+            "nft_approve_all" => RawIntentBody::NftApproveAll {
+                contract: self.contract.ok_or(ParseError::Ambiguous)?,
+                operator: self.operator.ok_or(ParseError::Ambiguous)?,
+                approved: self.approved.ok_or(ParseError::Ambiguous)?,
             },
             _ => return Err(ParseError::Ambiguous),
         };
@@ -170,9 +200,123 @@ pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
             nonce: None,
         });
     }
+    if s.starts_with("nft ") {
+        return parse_nft_shell(s);
+    }
     // Try TOML.
     let loose: LooseIntent = toml::from_str(s)?;
     loose.into_raw()
+}
+
+/// Parse the shell-style NFT intents:
+///   `nft transfer <contract> <token_id> [amount <n>] to <addr> [on <chain>]`
+///   `nft approve <contract> <token_id> to <operator> [on <chain>]`
+///   `nft set_approval_for_all <contract> <operator> {true|false} [on <chain>]`
+fn parse_nft_shell(line: &str) -> Result<RawIntent, ParseError> {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    if toks.len() < 3 || toks[0] != "nft" {
+        return Err(ParseError::Shell(format!("not an nft intent: '{line}'")));
+    }
+    // Pull out a trailing `on <chain>` if present.
+    let (head, chain) = match toks.iter().position(|t| *t == "on") {
+        Some(i) if i + 1 < toks.len() => (&toks[..i], Some(toks[i + 1].to_string())),
+        Some(_) => return Err(ParseError::Shell("dangling 'on' with no chain".into())),
+        None => (&toks[..], None),
+    };
+    let body = match head[1] {
+        "transfer" => {
+            // forms:
+            //   nft transfer <contract> <token_id> to <addr>
+            //   nft transfer <contract> <token_id> amount <n> to <addr>
+            if head.len() < 6 {
+                return Err(ParseError::Shell(format!("nft transfer too short: '{line}'")));
+            }
+            let contract = head[2].to_string();
+            let token_id = head[3].to_string();
+            let (amount, to_idx) = if head[4] == "amount" {
+                if head.len() < 8 {
+                    return Err(ParseError::Shell(
+                        "nft transfer amount form needs 'amount <n> to <addr>'".into(),
+                    ));
+                }
+                (Some(head[5].to_string()), 6)
+            } else {
+                (None, 4)
+            };
+            if head[to_idx] != "to" {
+                return Err(ParseError::Shell(format!(
+                    "expected 'to' at position {}, got '{}'",
+                    to_idx, head[to_idx]
+                )));
+            }
+            let to = head
+                .get(to_idx + 1)
+                .ok_or_else(|| ParseError::Shell("missing recipient after 'to'".into()))?
+                .to_string();
+            // ERC-1155 is implied when amount is set; standard left None
+            // otherwise lets the engine auto-detect.
+            let standard = if amount.is_some() {
+                Some("erc1155".to_string())
+            } else {
+                None
+            };
+            RawIntentBody::NftTransfer {
+                contract,
+                to,
+                token_id,
+                standard,
+                amount,
+                safe: true,
+                data: None,
+            }
+        }
+        "approve" => {
+            // nft approve <contract> <token_id> to <operator>
+            if head.len() < 6 || head[4] != "to" {
+                return Err(ParseError::Shell(
+                    "expected: nft approve <contract> <token_id> to <operator>".into(),
+                ));
+            }
+            RawIntentBody::NftApprove {
+                contract: head[2].to_string(),
+                token_id: head[3].to_string(),
+                operator: head[5].to_string(),
+            }
+        }
+        "set_approval_for_all" => {
+            // nft set_approval_for_all <contract> <operator> {true|false}
+            if head.len() < 5 {
+                return Err(ParseError::Shell(
+                    "expected: nft set_approval_for_all <contract> <operator> {true|false}".into(),
+                ));
+            }
+            let approved = match head[4] {
+                "true" => true,
+                "false" => false,
+                other => {
+                    return Err(ParseError::Shell(format!(
+                        "expected 'true' or 'false', got '{other}'"
+                    )))
+                }
+            };
+            RawIntentBody::NftApproveAll {
+                contract: head[2].to_string(),
+                operator: head[3].to_string(),
+                approved,
+            }
+        }
+        other => {
+            return Err(ParseError::Shell(format!(
+                "unknown nft verb '{other}'; expected transfer | approve | set_approval_for_all"
+            )))
+        }
+    };
+    Ok(RawIntent {
+        body,
+        chain,
+        gas: beth_proto::GasStrategy::Auto,
+        nonce: None,
+    })
 }
 
 #[cfg(test)]
@@ -265,6 +409,113 @@ chain = "ethereum"
         let r = parse(r#"{"token":"0xUSDC","spender":"0xRouter"}"#).unwrap();
         match r.body {
             RawIntentBody::Approve { amount, .. } => assert_eq!(amount, "max"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn shell_nft_transfer_erc721() {
+        let r = parse("nft transfer 0xnft 42 to 0xbob on anvil").unwrap();
+        assert_eq!(r.chain.as_deref(), Some("anvil"));
+        match r.body {
+            RawIntentBody::NftTransfer {
+                contract,
+                token_id,
+                to,
+                amount,
+                standard,
+                safe,
+                ..
+            } => {
+                assert_eq!(contract, "0xnft");
+                assert_eq!(token_id, "42");
+                assert_eq!(to, "0xbob");
+                assert!(amount.is_none());
+                assert!(standard.is_none()); // auto-detect
+                assert!(safe);
+            }
+            _ => panic!("wrong variant: {:?}", r.body),
+        }
+    }
+
+    #[test]
+    fn shell_nft_transfer_erc1155_amount() {
+        let r = parse("nft transfer 0xnft 7 amount 3 to 0xbob").unwrap();
+        match r.body {
+            RawIntentBody::NftTransfer {
+                amount, standard, ..
+            } => {
+                assert_eq!(amount.as_deref(), Some("3"));
+                assert_eq!(standard.as_deref(), Some("erc1155"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn shell_nft_approve() {
+        let r = parse("nft approve 0xnft 1 to 0xspender").unwrap();
+        match r.body {
+            RawIntentBody::NftApprove {
+                contract,
+                token_id,
+                operator,
+            } => {
+                assert_eq!(contract, "0xnft");
+                assert_eq!(token_id, "1");
+                assert_eq!(operator, "0xspender");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn shell_nft_set_approval_for_all() {
+        let r = parse("nft set_approval_for_all 0xnft 0xop true on ethereum").unwrap();
+        assert_eq!(r.chain.as_deref(), Some("ethereum"));
+        match r.body {
+            RawIntentBody::NftApproveAll {
+                contract,
+                operator,
+                approved,
+            } => {
+                assert_eq!(contract, "0xnft");
+                assert_eq!(operator, "0xop");
+                assert!(approved);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let r2 = parse("nft set_approval_for_all 0xnft 0xop false").unwrap();
+        match r2.body {
+            RawIntentBody::NftApproveAll { approved, .. } => assert!(!approved),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn shell_nft_invalid_verb_errors() {
+        let r = parse("nft yeet 0xnft 1 to 0xb");
+        assert!(matches!(r, Err(ParseError::Shell(_))));
+    }
+
+    #[test]
+    fn json_nft_transfer_explicit_kind() {
+        let r = parse(
+            r#"{"kind":"nft_transfer","contract":"0xnft","to":"0xbob","token_id":"42"}"#,
+        )
+        .unwrap();
+        assert!(matches!(r.body, RawIntentBody::NftTransfer { .. }));
+    }
+
+    #[test]
+    fn json_nft_approve_all_explicit_kind() {
+        let r = parse(
+            r#"{"kind":"nft_approve_all","contract":"0xnft","operator":"0xop","approved":false}"#,
+        )
+        .unwrap();
+        match r.body {
+            RawIntentBody::NftApproveAll { approved, .. } => assert!(!approved),
             _ => panic!("wrong variant"),
         }
     }

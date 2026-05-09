@@ -41,6 +41,32 @@ cat /eth/prices/spot/eth.usd
 cat /eth/addressbook/alice
 ```
 
+NFT reads (auto-detects ERC-721 vs ERC-1155 via ERC-165):
+
+```sh
+# Per-holder views (transfer history requires etherscan-backed history).
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/erc721_txs
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/erc1155_txs
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/owned.json   # best-effort
+
+# Per-token reads (RPC-only):
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/owner
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/uri
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/metadata.json
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/balance
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/is_owner
+cat /eth/chains/ethereum/addresses/0xd8da.../nfts/<contract>/<id>/approved
+
+# Collection-level views:
+cat /eth/chains/ethereum/contracts/<contract>/nft/kind          # erc721 | erc1155 | unknown
+cat /eth/chains/ethereum/contracts/<contract>/nft/name
+cat /eth/chains/ethereum/contracts/<contract>/nft/symbol
+cat /eth/chains/ethereum/contracts/<contract>/nft/total_supply
+cat /eth/chains/ethereum/contracts/<contract>/nft/owner_of/<id>
+cat /eth/chains/ethereum/contracts/<contract>/nft/token_uri/<id>
+cat /eth/chains/ethereum/contracts/<contract>/nft/is_approved_for_all/<owner>/<operator>
+```
+
 ## Writing (stage-confirm)
 
 Native send (canonical):
@@ -59,6 +85,28 @@ ERC-20 send (token symbol resolved via address book / token registry):
 echo 'send 100 USDC to alice on ethereum' \
   > /eth/wallets/alice/chains/ethereum/outbox/new.tx
 ```
+
+NFT writes — three intent kinds, ERC-721 + ERC-1155, ERC-165
+auto-detected:
+
+```sh
+# Transfer ERC-721 #1234 to Bob (encodes `safeTransferFrom`):
+echo 'nft transfer 0xb47e3...3bbb #1234 to 0x70997...79C8' \
+  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+
+# Per-token approve (ERC-721 only — ERC-1155 is rejected):
+echo 'nft approve 0xb47e3...3bbb #1234 operator 0x111...111' \
+  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+
+# Operator-wide approval — always policy-warned:
+echo 'nft set_approval_for_all 0xb47e3...3bbb operator 0x111...111 approved true' \
+  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+```
+
+JSON form supports `"standard": "erc721"|"erc1155"` to skip the
+auto-detect probe, and `"safe": false` on `nft_transfer` to use the
+legacy `transferFrom` selector. ERC-1155 transfers accept an
+`"amount"` (defaults to `"1"`) and an optional `"data"` payload.
 
 Replace / cancel pending tx:
 

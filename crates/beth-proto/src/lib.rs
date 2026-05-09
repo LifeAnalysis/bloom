@@ -24,7 +24,7 @@ pub use home::{HomeDir, HomeError};
 pub use intent::{
     EnsoIntent, GasStrategy, RawIntent, RawIntentBody, ShellIntent, TxIntent, ValueOrToken,
 };
-pub use plan::{PlanRender, StagedTx, TokenRef, TxStatus};
+pub use plan::{NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxStatus};
 pub use policy::{Policy, PolicyCheck, PolicyOutcome};
 pub use units::{format_units, parse_amount, parse_eth, parse_units, ParsedAmount};
 

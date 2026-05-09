@@ -73,7 +73,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Etherscan history (txs, internal, ERC-20, ERC-721, source, abi) | `chains/<chain>/addresses/<a>/{txs,internal_txs,erc20_txs,erc721_txs}` and `chains/<chain>/contracts/<a>/{source,abi}` | shipped | `chains_history.rs` + `crates/beth-etherscan/src/lib.rs` (TTL cache in `cache.rs`) |
 | Wallets: VFS-driven creation (local / import / watch) | `wallets/new` (writable) | shipped | `wallets.rs::write_new_wallet` + `parse_new_wallet_spec` |
 | Wallets: metadata, balance, nonce, policy round-trip | `wallets/<w>/{address,public_key,kind,policy.toml,chains/<c>/{balance,balance.eth,balance.raw,nonce}}` | shipped | `wallets.rs`; covered by outbox tests + `acceptance.sh` |
-| Wallets: outbox stage / confirm | `wallets/<w>/chains/<c>/outbox/{new.tx,pending/<id>/{plan.md,policy_check.json,confirm},sent/<id>/*,failed/<id>/*}` | shipped | `wallets.rs::write_outbox` → `crates/beth-tx/src/tx_engine.rs` |
+| Wallets: outbox stage / confirm | `wallets/<w>/chains/<c>/outbox/{new.tx,pending/<id>/{plan.md,policy_check.json,confirm},sent/<id>/*,failed/<id>/*}` | shipped | `wallets.rs::write_outbox` → `crates/beth-tx/src/tx_engine.rs`. Intents: `send` (native + ERC-20), `approve`, `call`, `raw`, plus NFT writes — `nft_transfer` (auto-detects ERC-721 vs ERC-1155, optional `safe`/`amount`/`data`), `nft_approve` (per-token, ERC-721 only), `nft_approve_all` (`setApprovalForAll`, policy-warned). |
 | Wallets: sign — EIP-191 + raw hash + EIP-712 | `wallets/<w>/sign/{message,hash,typed_data}` (+ `.sig`) | shipped | `wallets.rs::write_sign` |
 | DeFi (Enso intents, route quoting, stage-confirm) | `defi/intents/<wallet>/{new,<sess>/{intent.txt,route.json,plan.md,tx.json,simulation.json,confirm}}` | shipped | `crates/beth-vfs/src/handlers/defi.rs` + `crates/beth-defi/src/lib.rs` |
 | Watch (subscriptions, executor task, events tail) | `watch/{new,<id>/{spec.toml,live,history.jsonl[.n],delete}}` | shipped | `crates/beth-vfs/src/handlers/watch.rs` + `crates/beth-watch/src/{lib.rs,executor.rs}`; executor started by `Daemon::from_home` |
@@ -84,7 +84,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Address book (petname round-trip) | `addressbook/{<alias>,new}` | shipped | `crates/beth-vfs/src/handlers/addressbook.rs` + `crates/beth-proto/src/address.rs` |
 | Prices (DefiLlama, keyless) | `prices/{spot/<coin>(.usd),change_24h/<coin>}` | shipped | `crates/beth-vfs/src/handlers/prices.rs` + `crates/beth-prices/src/lib.rs` |
 | ENS forward resolution surface | `ens/<name>.eth` | shipped | ENS handler (forward resolve via `crates/beth-ens` against the canonical mainnet registry) |
-| NFTs (`addresses/<a>/nfts/...`) | — | deferred | Spec §3.2 surface; not implemented. |
+| NFTs (`addresses/<a>/nfts/...`, `contracts/<a>/nft/...`) | — | shipped | `crates/beth-vfs/src/handlers/chains_nfts.rs` + chains.rs routing. Per-holder views (`erc721_txs`, `erc1155_txs`, `owned.json`, per-token `owner/uri/metadata.json/balance/is_owner/approved`) and collection views (`kind`, `name`, `symbol`, `total_supply`, `owner_of/<id>`, `token_uri/<id>`, `is_approved_for_all/<o>/<op>`). ERC-721 vs ERC-1155 auto-detected via ERC-165 (cached). ERC-1155 `{id}` placeholder substitution applied; metadata.json supports `data:`, `ipfs://`, `http(s)://`. ChainClient NFT helpers in `crates/beth-chain/src/lib.rs`; ERC-1155 transfer history via `crates/beth-etherscan/src/lib.rs::get_nft1155_tx`. Writes (transfers / per-token approve / set-approval-for-all) flow through the wallet outbox — see the wallets row. |
 | Mempool (`chains/<c>/mempool/...`) | — | deferred | Spec §3.2 surface; depends on provider-specific APIs. |
 | Contract methods / events / storage / proxy subtrees | `chains/<c>/contracts/<a>/{methods,events,storage,proxy}/...` | shipped | `crates/beth-vfs/src/handlers/chains_contracts.rs` — ABI-driven `methods/<m>.{read,tx,sig}` (writable JSON body, eth_call + decode, no broadcast), `events/<e>/{recent,query,live}` (eth_getLogs + alloy log decoding, per-(chain,addr,event) live cursor), `storage/<slot>` and `proxy/{implementation,admin,beacon}` (EIP-1967 + EIP-1822). Methods/events gated behind `contract_metadata = etherscan` (ABI source); storage/proxy stay RPC-only. ABI cache TTL 60s. |
 
@@ -170,8 +170,13 @@ data or rely on their own internal caches, e.g. the etherscan client).
 
 ## Known limitations / deferred items
 
-1. **NFTs subtree** (`chains/<c>/addresses/<a>/nfts/...`) — not
-   implemented.
+1. **NFT writes** — `nft_transfer` / `nft_approve` / `nft_approve_all`
+   ship through the wallet outbox (ERC-721 + ERC-1155, ERC-165
+   auto-detection, policy-warned operator approvals). `owned.json`
+   remains best-effort (reduced from etherscan tx history, not
+   authoritative — see the `caveat` field in the response). Mint
+   intents are not modelled separately; mints are issued via the
+   generic `call` intent against the contract's mint method.
 2. **Mempool subtree** (`chains/<c>/mempool/...`) — not implemented;
    depends on provider-specific APIs.
 3. **Embedded block indexer** — activity / history rely on Etherscan
