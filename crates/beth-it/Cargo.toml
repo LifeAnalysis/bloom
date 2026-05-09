@@ -6,6 +6,12 @@ license.workspace = true
 description = "End-to-end integration tests for bloom-eth"
 publish = false
 
+[features]
+default = []
+# Forwards to beth-revert/bytecode-decompile so the heimdall-fallback
+# integration test (`tests/revert_decoding_fallbacks.rs`) compiles.
+bytecode-decompile = ["beth-revert/bytecode-decompile"]
+
 [dependencies]
 beth-proto.workspace = true
 beth-keystore.workspace = true
