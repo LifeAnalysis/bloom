@@ -19,7 +19,7 @@ pub mod units;
 pub use address::{checksum_address, parse_address, AddressBook, AddressBookError};
 pub use audit::{AuditLog, AuditRecord};
 pub use chain::{ChainId, ChainRef, ChainSpec};
-pub use config::{Config, ConfigError, EnsoConfig, EtherscanConfig};
+pub use config::{Backend, BackendsConfig, Config, ConfigError, EnsoConfig, EtherscanConfig};
 pub use home::{HomeDir, HomeError};
 pub use intent::{
     EnsoIntent, GasStrategy, RawIntent, RawIntentBody, ShellIntent, TxIntent, ValueOrToken,

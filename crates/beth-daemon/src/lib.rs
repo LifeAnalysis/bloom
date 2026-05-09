@@ -148,7 +148,8 @@ impl Daemon {
                 Arc::new(
                     ChainsHandler::new(chains.clone())
                         .with_etherscan(etherscan_arc.clone())
-                        .with_ens(ens_client.clone()),
+                        .with_ens(ens_client.clone())
+                        .with_backends(config.backends),
                 ) as _,
             )
             .mount(
@@ -163,7 +164,7 @@ impl Daemon {
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
             .mount(
                 "status",
-                Arc::new(StatusHandler::new(
+                Arc::new(StatusHandler::with_backends(
                     chains.clone(),
                     keystore.clone(),
                     tx_engine.clone(),
@@ -175,6 +176,7 @@ impl Daemon {
                         .as_ref()
                         .map(|c| !c.api_key.is_empty())
                         .unwrap_or(false),
+                    config.backends,
                     home.root().to_path_buf(),
                     SystemTime::now(),
                     env!("CARGO_PKG_VERSION"),

@@ -45,6 +45,98 @@ pub struct Config {
     /// of per-chain `allow_broadcast`.
     #[serde(default = "default_mainnet_block")]
     pub block_mainnet_broadcast: bool,
+    /// Per-feature backend selection. Makes the data-source boundary
+    /// between Etherscan, raw RPC, and a future embedded indexer
+    /// explicit. Defaults match the historical behaviour: Etherscan for
+    /// metadata + history, RPC for everything else.
+    #[serde(default)]
+    pub backends: BackendsConfig,
+}
+
+/// Where a given feature sources its data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Backend {
+    /// Etherscan v2 multichain API. Requires an `[etherscan]` block.
+    Etherscan,
+    /// Raw JSON-RPC against the configured chain endpoints.
+    Rpc,
+    /// Embedded local block/log indexer. Not yet implemented; selecting
+    /// this surfaces a clear "not yet available" error at read time.
+    Indexer,
+}
+
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Etherscan => "etherscan",
+            Backend::Rpc => "rpc",
+            Backend::Indexer => "indexer",
+        }
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Declares which backend serves each feature surface. The defaults
+/// preserve historical behaviour: contract metadata and address history
+/// come from Etherscan; everything else is RPC-native.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BackendsConfig {
+    /// `chains/<c>/contracts/<a>/{source,abi}` and the ABI feed used by
+    /// the contract methods/events surfaces.
+    #[serde(default = "default_contract_metadata_backend")]
+    pub contract_metadata: Backend,
+    /// `chains/<c>/addresses/<a>/{txs,internal_txs,erc20_txs,erc721_txs}`.
+    #[serde(default = "default_address_history_backend")]
+    pub address_history: Backend,
+    /// `chains/<c>/contracts/<a>/events/<name>/{recent,query,live}`.
+    #[serde(default = "default_event_logs_backend")]
+    pub event_logs: Backend,
+    /// `chains/<c>/contracts/<a>/storage/<slot>` (eth_getStorageAt).
+    #[serde(default = "default_storage_reads_backend")]
+    pub storage_reads: Backend,
+    /// `chains/<c>/contracts/<a>/proxy/{implementation,admin,beacon}`
+    /// (well-known EIP-1967 / EIP-1822 / beacon slot reads).
+    #[serde(default = "default_proxy_detection_backend")]
+    pub proxy_detection: Backend,
+}
+
+impl Default for BackendsConfig {
+    fn default() -> Self {
+        Self {
+            contract_metadata: default_contract_metadata_backend(),
+            address_history: default_address_history_backend(),
+            event_logs: default_event_logs_backend(),
+            storage_reads: default_storage_reads_backend(),
+            proxy_detection: default_proxy_detection_backend(),
+        }
+    }
+}
+
+impl BackendsConfig {
+    /// Iterate over (feature_name, backend) pairs. Order is stable; used
+    /// to render `status/backends/*` and `summary.json`.
+    pub fn entries(&self) -> [(&'static str, Backend); 5] {
+        [
+            ("contract_metadata", self.contract_metadata),
+            ("address_history", self.address_history),
+            ("event_logs", self.event_logs),
+            ("storage_reads", self.storage_reads),
+            ("proxy_detection", self.proxy_detection),
+        ]
+    }
+
+    pub fn get(&self, feature: &str) -> Option<Backend> {
+        self.entries()
+            .into_iter()
+            .find(|(name, _)| *name == feature)
+            .map(|(_, b)| b)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +175,21 @@ fn default_enso_url() -> String {
 fn default_mainnet_block() -> bool {
     true
 }
+fn default_contract_metadata_backend() -> Backend {
+    Backend::Etherscan
+}
+fn default_address_history_backend() -> Backend {
+    Backend::Etherscan
+}
+fn default_event_logs_backend() -> Backend {
+    Backend::Rpc
+}
+fn default_storage_reads_backend() -> Backend {
+    Backend::Rpc
+}
+fn default_proxy_detection_backend() -> Backend {
+    Backend::Rpc
+}
 
 impl Config {
     /// A safe local-dev default: Anvil only, no broadcast on mainnet ids.
@@ -98,6 +205,7 @@ impl Config {
             etherscan: None,
             enso: None,
             block_mainnet_broadcast: true,
+            backends: BackendsConfig::default(),
         }
     }
 

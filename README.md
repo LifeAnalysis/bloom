@@ -80,7 +80,9 @@ top-level trees:
 - `addressbook/<alias>` — local petname directory.
 - `ens/<name>.eth` — ENS forward resolution as a read surface.
 - `status/` — daemon health, chain probes, audit head/count, cache
-  counts, policy flags, wallet/outbox counts.
+  counts, policy flags, wallet/outbox counts, and the live
+  `status/backends/<feature>` declaration of which data source
+  (etherscan / rpc / indexer) each surface is wired to.
 - `docs/` — in-tree help, vendored from `crates/beth-vfs/src/docs/`.
 
 See [QUICKSTART.md](./QUICKSTART.md) for an Anvil-backed walkthrough
@@ -119,8 +121,24 @@ map and live-network verification log.
   confirm 403s".
 - **Embedded indexer deferred.** Address activity, ERC-20 / ERC-721
   history, and contract source / ABI are served via Etherscan v2; no
-  local block-by-block index. Without an `[etherscan]` block in
-  config, the etherscan-backed paths return `NotFound`.
+  local block-by-block index. The boundary between Etherscan-backed
+  and RPC-backed surfaces is declared explicitly in `config.toml`
+  under `[backends]` (one of `etherscan`, `rpc`, `indexer`):
+  - `contract_metadata` — `chains/<c>/contracts/<a>/{source,abi,...}`
+    (default `etherscan`).
+  - `address_history` — `chains/<c>/addresses/<a>/{txs,internal_txs,
+    erc20_txs,erc721_txs}` (default `etherscan`).
+  - `event_logs` — `chains/<c>/contracts/<a>/events/...`
+    (default `rpc`).
+  - `storage_reads` — `chains/<c>/contracts/<a>/storage/<slot>`
+    (default `rpc`).
+  - `proxy_detection` — `chains/<c>/contracts/<a>/proxy/...`
+    (default `rpc`).
+
+  `indexer` is reserved for the future embedded indexer; selecting it
+  today returns a clear "not yet implemented" error. The live config
+  is readable at `status/backends/<feature>` and
+  `status/backends/summary.json`.
 - **Mempool surface not implemented.** The spec's `chains/<c>/mempool/`
   tree is not wired up — it depends on provider-specific APIs
   (Alchemy / Blocknative).

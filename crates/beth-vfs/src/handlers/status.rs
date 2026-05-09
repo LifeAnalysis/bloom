@@ -20,6 +20,10 @@
 //! - `status/policies/block_mainnet_broadcast`   — `true`/`false`
 //! - `status/wallets/count`                      — number of wallets
 //! - `status/outbox/pending_count`               — total pending tx ids
+//! - `status/backends/<feature>`                 — declared backend per feature
+//!   (`contract_metadata`, `address_history`, `event_logs`, `storage_reads`,
+//!   `proxy_detection`); each returns one of `etherscan`, `rpc`, `indexer`.
+//! - `status/backends/summary.json`              — JSON map of all of the above
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,7 +37,7 @@ use tokio::time::timeout;
 use beth_chain::ChainRegistry;
 use beth_keystore::Keystore;
 use beth_prices::PricesClient;
-use beth_proto::AuditLog;
+use beth_proto::{AuditLog, BackendsConfig};
 use beth_tx::tx_engine::TxEngine;
 
 use crate::handler::{Entry, Handler, HandlerError};
@@ -54,6 +58,7 @@ pub struct StatusHandler {
     pub prices: Option<PricesClient>,
     pub etherscan_cache_dir: Option<PathBuf>,
     pub etherscan_configured: bool,
+    pub backends: BackendsConfig,
     pub home: PathBuf,
     pub started_at: SystemTime,
     pub version: String,
@@ -86,6 +91,38 @@ impl StatusHandler {
         started_at: SystemTime,
         version: impl Into<String>,
     ) -> Self {
+        Self::with_backends(
+            chains,
+            keystore,
+            tx_engine,
+            audit,
+            prices,
+            etherscan_cache_dir,
+            etherscan_configured,
+            BackendsConfig::default(),
+            home,
+            started_at,
+            version,
+        )
+    }
+
+    /// Variant of [`Self::new`] that takes the per-feature backend
+    /// declaration. Used by the daemon so `status/backends/...` reflects
+    /// the live config; tests can call [`Self::new`] for the default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_backends(
+        chains: ChainRegistry,
+        keystore: Keystore,
+        tx_engine: TxEngine,
+        audit: Arc<AuditLog>,
+        prices: Option<PricesClient>,
+        etherscan_cache_dir: Option<PathBuf>,
+        etherscan_configured: bool,
+        backends: BackendsConfig,
+        home: PathBuf,
+        started_at: SystemTime,
+        version: impl Into<String>,
+    ) -> Self {
         Self {
             chains,
             keystore,
@@ -94,6 +131,7 @@ impl StatusHandler {
             prices,
             etherscan_cache_dir,
             etherscan_configured,
+            backends,
             home,
             started_at,
             version: version.into(),
@@ -309,7 +347,8 @@ impl Handler for StatusHandler {
                 || s == "cache"
                 || s == "policies"
                 || s == "wallets"
-                || s == "outbox" =>
+                || s == "outbox"
+                || s == "backends" =>
             {
                 Ok(Entry::dir(s))
             }
@@ -346,6 +385,13 @@ impl Handler for StatusHandler {
             }
             [a, leaf] if a == "wallets" && leaf == "count" => Ok(Entry::file(leaf)),
             [a, leaf] if a == "outbox" && leaf == "pending_count" => Ok(Entry::file(leaf)),
+            [a, leaf] if a == "backends" => {
+                if leaf == "summary.json" || self.backends.get(leaf).is_some() {
+                    Ok(Entry::file(leaf))
+                } else {
+                    Err(HandlerError::not_found(path.to_string_path()))
+                }
+            }
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -427,6 +473,19 @@ impl Handler for StatusHandler {
             [a, leaf] if a == "outbox" && leaf == "pending_count" => {
                 Ok(format!("{}\n", self.outbox_pending_count()).into_bytes())
             }
+            [a, leaf] if a == "backends" && leaf == "summary.json" => {
+                let map: serde_json::Map<String, serde_json::Value> = self
+                    .backends
+                    .entries()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.as_str().into())))
+                    .collect();
+                Ok(serde_json::to_vec_pretty(&serde_json::Value::Object(map)).unwrap())
+            }
+            [a, leaf] if a == "backends" => match self.backends.get(leaf) {
+                Some(b) => Ok(format!("{}\n", b.as_str()).into_bytes()),
+                None => Err(HandlerError::NotAFile(path.to_string_path())),
+            },
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
@@ -445,6 +504,7 @@ impl Handler for StatusHandler {
                 Entry::dir("policies"),
                 Entry::dir("wallets"),
                 Entry::dir("outbox"),
+                Entry::dir("backends"),
             ]),
             [a] if a == "chains" => Ok(self
                 .chains
@@ -475,6 +535,16 @@ impl Handler for StatusHandler {
             [a] if a == "policies" => Ok(vec![Entry::file("block_mainnet_broadcast")]),
             [a] if a == "wallets" => Ok(vec![Entry::file("count")]),
             [a] if a == "outbox" => Ok(vec![Entry::file("pending_count")]),
+            [a] if a == "backends" => {
+                let mut entries: Vec<Entry> = self
+                    .backends
+                    .entries()
+                    .iter()
+                    .map(|(k, _)| Entry::file(k))
+                    .collect();
+                entries.push(Entry::file("summary.json"));
+                Ok(entries)
+            }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }
@@ -499,6 +569,8 @@ impl Handler for StatusHandler {
             Some("version" | "started_at" | "home") => Some(Duration::from_secs(86_400)),
             Some("uptime" | "daemon.json") => Some(Duration::from_secs(2)),
             Some("policies") => Some(Duration::from_secs(60)),
+            // Backend declarations are static for the daemon's lifetime.
+            Some("backends") => Some(Duration::from_secs(86_400)),
             _ => None,
         }
     }
@@ -657,8 +729,61 @@ mod tests {
             "policies",
             "wallets",
             "outbox",
+            "backends",
         ] {
             assert!(names.contains(&required), "missing top-level: {required}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backends_surface_lists_each_feature_and_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+
+        // Each feature is a readable file with one of the three backend names.
+        for feature in [
+            "contract_metadata",
+            "address_history",
+            "event_logs",
+            "storage_reads",
+            "proxy_detection",
+        ] {
+            let p = VfsPath::parse(&format!("backends/{feature}")).unwrap();
+            let body = h.read(&p).await.unwrap();
+            let s = String::from_utf8(body).unwrap();
+            let trimmed = s.trim_end();
+            assert!(
+                matches!(trimmed, "etherscan" | "rpc" | "indexer"),
+                "unexpected backend label for {feature}: {trimmed:?}"
+            );
+        }
+
+        // summary.json carries the same data as a JSON object.
+        let p = VfsPath::parse("backends/summary.json").unwrap();
+        let body = h.read(&p).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for feature in [
+            "contract_metadata",
+            "address_history",
+            "event_logs",
+            "storage_reads",
+            "proxy_detection",
+        ] {
+            assert!(v[feature].is_string(), "summary missing {feature}");
+        }
+
+        // Listing the directory advertises each entry plus summary.json.
+        let entries = h.list(&VfsPath::parse("backends").unwrap()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        for required in [
+            "contract_metadata",
+            "address_history",
+            "event_logs",
+            "storage_reads",
+            "proxy_detection",
+            "summary.json",
+        ] {
+            assert!(names.contains(&required), "missing entry: {required}");
         }
     }
 

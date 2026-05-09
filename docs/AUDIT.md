@@ -106,7 +106,8 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Requirement | Status | Artifact |
 |---|---|---|
 | Etherscan v2 multichain client + on-disk cache | shipped | `crates/beth-etherscan/src/{lib.rs,cache.rs}` |
-| Embedded indexer | deferred | Activity / history served via Etherscan; no local block index. |
+| Embedded indexer | deferred | Activity / history served via Etherscan; no local block index. The Etherscan↔RPC boundary is now explicit per-feature via `[backends]` in `Config` (`crates/beth-proto/src/config.rs::BackendsConfig`); selecting `indexer` returns a clear "not yet implemented" error. Live config readable at `status/backends/<feature>` and `status/backends/summary.json`. |
+| Per-feature backend declaration (etherscan / rpc / indexer) | shipped | `crates/beth-proto/src/config.rs::BackendsConfig`; gating in `crates/beth-vfs/src/handlers/chains.rs::ChainsHandler::require_etherscan_backend`; surface in `crates/beth-vfs/src/handlers/status.rs` (`status/backends/...`). |
 | ENS forward + reverse resolution | shipped | `crates/beth-ens/src/lib.rs::EnsClient::{resolve,reverse,text,content_hash}` |
 | ENS plumbed into tx engine recipient resolution | shipped | `crates/beth-tx/src/tx_engine.rs::RecipientResolver` + `crates/beth-daemon/src/ens_resolver.rs::EnsAdapter` |
 | ENS as a VFS surface | shipped | `ens/<name>.eth` read returns the resolved address. |
