@@ -290,6 +290,17 @@ fn build_tx_request(
             let data = format!("0x{}", hex::encode(call.abi_encode()));
             (token_addr, U256::ZERO, data)
         }
+        RawIntentBody::NftTransfer { .. }
+        | RawIntentBody::NftApprove { .. }
+        | RawIntentBody::NftApproveAll { .. } => {
+            // /simulate intentionally has no chain client at this layer
+            // (no ERC-165 detection). NFT writes flow through the wallet
+            // outbox where detection + encoding live; surface a clear
+            // unsupported here rather than mis-encoding.
+            return Err(HandlerError::Unsupported(
+                "NFT intents are simulated via the wallet outbox stage path (see wallets/<w>/chains/<c>/outbox/new.tx)".into(),
+            ));
+        }
         RawIntentBody::Enso { .. } => {
             return Err(HandlerError::Unsupported(
                 "Enso intents are not simulated through /simulate (use defi/intents/)".into(),
@@ -395,6 +406,41 @@ fn render_sim_plan(session: &SimSession) -> String {
                 s.push_str(&format!("Token:   {}\n", token));
                 s.push_str(&format!("Spender: {}\n", spender));
                 s.push_str(&format!("Amount:  {}\n", amount));
+            }
+            RawIntentBody::NftTransfer {
+                contract,
+                to,
+                token_id,
+                amount,
+                ..
+            } => {
+                s.push_str("Kind:    nft_transfer\n");
+                s.push_str(&format!("Contract:{}\n", contract));
+                s.push_str(&format!("TokenId: {}\n", token_id));
+                s.push_str(&format!("To:      {}\n", to));
+                if let Some(a) = amount.as_deref() {
+                    s.push_str(&format!("Amount:  {}\n", a));
+                }
+            }
+            RawIntentBody::NftApprove {
+                contract,
+                operator,
+                token_id,
+            } => {
+                s.push_str("Kind:    nft_approve\n");
+                s.push_str(&format!("Contract:{}\n", contract));
+                s.push_str(&format!("Operator:{}\n", operator));
+                s.push_str(&format!("TokenId: {}\n", token_id));
+            }
+            RawIntentBody::NftApproveAll {
+                contract,
+                operator,
+                approved,
+            } => {
+                s.push_str("Kind:    nft_approve_all\n");
+                s.push_str(&format!("Contract:{}\n", contract));
+                s.push_str(&format!("Operator:{}\n", operator));
+                s.push_str(&format!("Approved:{}\n", approved));
             }
             RawIntentBody::Enso { intent } => {
                 s.push_str("Kind:   enso\n");
