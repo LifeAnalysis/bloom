@@ -1356,6 +1356,7 @@ mod tests {
             // Unreachable URL — confirms that fail before broadcast must
             // not depend on this being reachable.
             rpc_urls: vec!["http://127.0.0.1:1".into()],
+            rpc_endpoints: Vec::new(),
             allow_broadcast: true,
             etherscan_api_url: None,
             display_name: None,

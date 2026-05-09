@@ -1671,6 +1671,7 @@ mod tests {
             name: "test".into(),
             chain_id,
             rpc_urls: vec![format!("http://{rpc}")],
+            rpc_endpoints: Vec::new(),
             allow_broadcast: false,
             etherscan_api_url: None,
             display_name: None,

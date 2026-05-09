@@ -16,6 +16,7 @@ fn mainnet_spec(url: String) -> ChainSpec {
         name: "ethereum".to_string(),
         chain_id: 1,
         rpc_urls: vec![url],
+        rpc_endpoints: Vec::new(),
         allow_broadcast: false,
         etherscan_api_url: None,
         display_name: Some("Ethereum Mainnet".to_string()),

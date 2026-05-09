@@ -42,6 +42,40 @@ impl std::fmt::Display for ChainRef {
     }
 }
 
+/// Rich per-endpoint config.
+///
+/// Used by `beth-rpc` to build the layered transport stack. The legacy
+/// flat `rpc_urls` list still works — `ChainSpec::endpoints()` maps it
+/// onto this shape with sensible defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointSpec {
+    /// Endpoint URL. One of `http://`, `https://`, `ws://`, `wss://`.
+    pub url: String,
+    /// Higher number = preferred. The legacy `rpc_urls` form maps the
+    /// list-index to a descending weight starting at 100 so the first
+    /// entry stays the default winner.
+    #[serde(default = "default_endpoint_weight")]
+    pub weight: u32,
+    /// Compute-units-per-second budget (Alchemy/Infura convention).
+    /// Used by the retry layer for per-endpoint pacing.
+    #[serde(default)]
+    pub cu_per_sec: Option<u64>,
+    /// Optional throttle ceiling. None = disabled (no throttle layer).
+    #[serde(default)]
+    pub max_rps: Option<u32>,
+    /// If true, this endpoint is excluded from `subscribe_*` and only
+    /// used for HTTP RPC. Useful when a vendor charges WS separately.
+    #[serde(default)]
+    pub http_only: bool,
+}
+
+/// Default weight for a freshly-declared endpoint when `weight` is
+/// omitted. Picked to sit above the descending sequence the back-compat
+/// shim derives from `rpc_urls` (which starts at 100 and goes down).
+pub fn default_endpoint_weight() -> u32 {
+    100
+}
+
 /// Per-chain configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainSpec {
@@ -49,9 +83,12 @@ pub struct ChainSpec {
     pub name: String,
     /// EVM chainId.
     pub chain_id: u64,
-    /// RPC endpoints in priority order. The first is preferred; later
-    /// entries are failovers.
+    /// Legacy: flat URL list. If `rpc_endpoints` is empty, every entry
+    /// here is mapped to a default `EndpointSpec` ordered by index.
     pub rpc_urls: Vec<String>,
+    /// New: rich endpoint schema. Wins over `rpc_urls` when non-empty.
+    #[serde(default)]
+    pub rpc_endpoints: Vec<EndpointSpec>,
     /// Whether broadcasts are allowed on this chain. **False by default
     /// on mainnet/L2** to enforce the "never broadcast to mainnet
     /// without explicit operator config" rule.
@@ -90,6 +127,7 @@ impl ChainSpec {
             name: "anvil".to_string(),
             chain_id: 31337,
             rpc_urls: vec!["http://127.0.0.1:8545".to_string()],
+            rpc_endpoints: Vec::new(),
             allow_broadcast: true,
             etherscan_api_url: None,
             display_name: Some("Anvil (local)".to_string()),
@@ -104,6 +142,29 @@ impl ChainSpec {
     }
     pub fn r#ref(&self) -> ChainRef {
         ChainRef::new(&self.name)
+    }
+
+    /// Single source of truth for the RPC layer.
+    ///
+    /// Returns `rpc_endpoints` verbatim when non-empty. Otherwise maps
+    /// every `rpc_urls` entry into an `EndpointSpec` whose weight
+    /// descends from 100 (so the first URL keeps winning ties under the
+    /// fallback layer's score-then-tie-break ordering).
+    pub fn endpoints(&self) -> Vec<EndpointSpec> {
+        if !self.rpc_endpoints.is_empty() {
+            return self.rpc_endpoints.clone();
+        }
+        self.rpc_urls
+            .iter()
+            .enumerate()
+            .map(|(i, u)| EndpointSpec {
+                url: u.clone(),
+                weight: 100u32.saturating_sub(i as u32),
+                cu_per_sec: None,
+                max_rps: None,
+                http_only: false,
+            })
+            .collect()
     }
 }
 
@@ -172,6 +233,7 @@ mod tests {
             name: "ethereum".to_string(),
             chain_id: 1,
             rpc_urls: vec!["https://rpc.example".to_string()],
+            rpc_endpoints: Vec::new(),
             allow_broadcast: false,
             etherscan_api_url: Some("https://api.etherscan.io/v2/api".to_string()),
             display_name: Some("Ethereum Mainnet".to_string()),
@@ -182,6 +244,109 @@ mod tests {
         let s = serde_json::to_string(&original).unwrap();
         let back: ChainSpec = serde_json::from_str(&s).unwrap();
         assert_eq!(back, original);
+    }
+
+    #[test]
+    fn chain_spec_endpoints_back_compat() {
+        // Legacy form: only `rpc_urls`. The shim must produce one
+        // EndpointSpec per URL with descending weights and Nones in the
+        // optional knobs.
+        let spec = ChainSpec {
+            name: "back-compat".to_string(),
+            chain_id: 1,
+            rpc_urls: vec!["a".into(), "b".into(), "c".into()],
+            rpc_endpoints: Vec::new(),
+            allow_broadcast: false,
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+        };
+        let eps = spec.endpoints();
+        assert_eq!(eps.len(), 3);
+        assert_eq!(eps[0].url, "a");
+        assert_eq!(eps[1].url, "b");
+        assert_eq!(eps[2].url, "c");
+        assert_eq!(eps[0].weight, 100);
+        assert_eq!(eps[1].weight, 99);
+        assert_eq!(eps[2].weight, 98);
+        for e in &eps {
+            assert!(e.cu_per_sec.is_none());
+            assert!(e.max_rps.is_none());
+            assert!(!e.http_only);
+        }
+    }
+
+    #[test]
+    fn chain_spec_endpoints_prefers_rich_form() {
+        // Rich form non-empty wins verbatim — `rpc_urls` content is
+        // ignored when both are present.
+        let rich = vec![
+            EndpointSpec {
+                url: "wss://rich.example".to_string(),
+                weight: 200,
+                cu_per_sec: Some(660),
+                max_rps: Some(50),
+                http_only: false,
+            },
+            EndpointSpec {
+                url: "https://other.example".to_string(),
+                weight: 50,
+                cu_per_sec: None,
+                max_rps: None,
+                http_only: true,
+            },
+        ];
+        let spec = ChainSpec {
+            name: "rich".to_string(),
+            chain_id: 1,
+            rpc_urls: vec!["https://legacy.example".into()],
+            rpc_endpoints: rich.clone(),
+            allow_broadcast: false,
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+        };
+        assert_eq!(spec.endpoints(), rich);
+    }
+
+    #[test]
+    fn endpoints_round_trip_toml() {
+        // A chain declared with only `rpc_endpoints` must round-trip
+        // losslessly through TOML.
+        let toml_text = r#"
+            name = "rt"
+            chain_id = 1
+            rpc_urls = []
+
+            [[rpc_endpoints]]
+            url = "wss://primary.example"
+            weight = 200
+            cu_per_sec = 660
+            max_rps = 25
+
+            [[rpc_endpoints]]
+            url = "https://secondary.example"
+        "#;
+        let parsed: ChainSpec = toml::from_str(toml_text).unwrap();
+        assert_eq!(parsed.rpc_endpoints.len(), 2);
+        assert_eq!(parsed.rpc_endpoints[0].url, "wss://primary.example");
+        assert_eq!(parsed.rpc_endpoints[0].weight, 200);
+        assert_eq!(parsed.rpc_endpoints[0].cu_per_sec, Some(660));
+        assert_eq!(parsed.rpc_endpoints[0].max_rps, Some(25));
+        assert!(!parsed.rpc_endpoints[0].http_only);
+        // Unspecified knobs use the schema defaults.
+        assert_eq!(parsed.rpc_endpoints[1].weight, default_endpoint_weight());
+        assert!(parsed.rpc_endpoints[1].cu_per_sec.is_none());
+        assert!(parsed.rpc_endpoints[1].max_rps.is_none());
+        assert!(!parsed.rpc_endpoints[1].http_only);
+
+        let s = toml::to_string(&parsed).unwrap();
+        let back: ChainSpec = toml::from_str(&s).unwrap();
+        assert_eq!(back, parsed);
     }
 
     #[test]

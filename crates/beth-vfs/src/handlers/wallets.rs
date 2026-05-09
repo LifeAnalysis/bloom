@@ -786,6 +786,7 @@ mod tests {
                 name: "anvil".into(),
                 chain_id: 31337,
                 rpc_urls: vec!["http://127.0.0.1:1".into()],
+                rpc_endpoints: Vec::new(),
                 allow_broadcast: true,
                 etherscan_api_url: None,
                 display_name: None,

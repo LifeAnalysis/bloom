@@ -254,9 +254,9 @@ impl Config {
                     k, c.name
                 )));
             }
-            if c.rpc_urls.is_empty() {
+            if c.rpc_urls.is_empty() && c.rpc_endpoints.is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "chain '{}' has no rpc_urls",
+                    "chain '{}' has no rpc_urls or rpc_endpoints",
                     k
                 )));
             }
@@ -417,14 +417,38 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_chain_with_no_rpc_urls() {
+    fn config_rejects_when_both_empty() {
         let mut cfg = Config::local_default();
-        cfg.chains.get_mut("anvil").unwrap().rpc_urls.clear();
+        let entry = cfg.chains.get_mut("anvil").unwrap();
+        entry.rpc_urls.clear();
+        entry.rpc_endpoints.clear();
         let err = cfg.validate().unwrap_err();
         match err {
-            ConfigError::Invalid(m) => assert!(m.contains("no rpc_urls"), "msg: {m}"),
+            ConfigError::Invalid(m) => {
+                assert!(m.contains("no rpc_urls or rpc_endpoints"), "msg: {m}")
+            }
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn config_validates_with_only_endpoints() {
+        // Empty `rpc_urls` is fine as long as `rpc_endpoints` carries
+        // at least one entry — the new richer schema is allowed to
+        // stand on its own.
+        use crate::chain::EndpointSpec;
+        let mut cfg = Config::local_default();
+        let entry = cfg.chains.get_mut("anvil").unwrap();
+        entry.rpc_urls.clear();
+        entry.rpc_endpoints.push(EndpointSpec {
+            url: "http://127.0.0.1:8545".into(),
+            weight: 100,
+            cu_per_sec: None,
+            max_rps: None,
+            http_only: false,
+        });
+        cfg.validate()
+            .expect("validation passes when only endpoints present");
     }
 
     #[test]
@@ -453,6 +477,7 @@ mod tests {
             name: "ethereum".to_string(),
             chain_id: 1,
             rpc_urls: vec!["https://x".into()],
+            rpc_endpoints: Vec::new(),
             allow_broadcast: true,
             etherscan_api_url: None,
             display_name: None,
@@ -471,6 +496,7 @@ mod tests {
             name: "ethereum".to_string(),
             chain_id: 1,
             rpc_urls: vec!["https://x".into()],
+            rpc_endpoints: Vec::new(),
             allow_broadcast: true,
             etherscan_api_url: None,
             display_name: None,
