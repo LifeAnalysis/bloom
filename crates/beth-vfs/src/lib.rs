@@ -17,11 +17,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cache;
 pub mod handler;
 pub mod handlers;
 pub mod path;
 pub mod router;
 
+pub use cache::PathCache;
 pub use handler::{Entry, EntryKind, Handler, HandlerError};
 pub use path::VfsPath;
 pub use router::Vfs;

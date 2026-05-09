@@ -18,6 +18,7 @@
 //! | `prices/change_24h/<coin>`           | 24h pct change (txt)       |
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use beth_prices::{CoinId, PricesClient, PricesError};
@@ -116,6 +117,12 @@ impl Handler for PricesHandler {
             "change_24h" if path.segments().len() == 1 => Ok(vec![]),
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
+    }
+
+    /// DefiLlama is rate-limited keyless; 30s on quotes is plenty for
+    /// agent-driven workflows and saves us from being throttled.
+    fn cache_ttl(&self, _path: &VfsPath) -> Option<Duration> {
+        Some(Duration::from_secs(30))
     }
 }
 

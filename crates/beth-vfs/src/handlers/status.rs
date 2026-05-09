@@ -478,6 +478,30 @@ impl Handler for StatusHandler {
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }
+
+    /// Per-path TTL hints for the router cache. Status fields are
+    /// cheap but RPC-heavy (chain probes), so 5s smooths burst polling
+    /// without making the data feel stale.
+    fn cache_ttl(&self, path: &VfsPath) -> Option<Duration> {
+        let segs = path.segments();
+        match segs.first().map(|s| s.as_str()) {
+            // `audit/last` walks the file but is otherwise pure I/O;
+            // we don't want to cache it because users tail it for live
+            // events. Same for `audit/head`/`count` — keep them live.
+            Some("audit") => None,
+            // Chain probes hit RPC; the handler also has its own
+            // 2s probe cache, but caching at the router avoids even
+            // the JSON re-serialisation cost.
+            Some("chains") => Some(Duration::from_secs(5)),
+            // Filesystem counts. Cheap, but cap polling.
+            Some("cache" | "wallets" | "outbox") => Some(Duration::from_secs(5)),
+            // Daemon-static fields.
+            Some("version" | "started_at" | "home") => Some(Duration::from_secs(86_400)),
+            Some("uptime" | "daemon.json") => Some(Duration::from_secs(2)),
+            Some("policies") => Some(Duration::from_secs(60)),
+            _ => None,
+        }
+    }
 }
 
 fn count_files_recursive(dir: &std::path::Path) -> u64 {

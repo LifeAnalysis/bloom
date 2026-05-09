@@ -30,6 +30,7 @@ alloy-dyn-abi.workspace = true
 parking_lot.workspace = true
 once_cell.workspace = true
 url.workspace = true
+lru.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

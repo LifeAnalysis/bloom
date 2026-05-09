@@ -9,6 +9,54 @@
 
 This document is the prompt-to-artifact checklist required by the goal's quality gates.
 
+## §9 — Audit log wiring (router)
+
+Every successful VFS write and every successful side-effecting read
+appends a hash-chained record (`crates/beth-proto/src/audit.rs`,
+`AuditLog::append`). Wiring lives in `crates/beth-vfs/src/router.rs`
+and is constructed by `crates/beth-daemon/src/lib.rs::Daemon::from_home`.
+
+Record schema (`AuditRecord.kind` + `AuditRecord.data`):
+
+| `kind`       | When                              | `data` shape                                                                |
+|--------------|-----------------------------------|-----------------------------------------------------------------------------|
+| `vfs.write`  | After any successful write/delete | `{ "path": "/<full path>", "actor": "local", "details": { "sha256": "<hex>", "size": <bytes> } }` |
+| `vfs.read`   | After a successful read whose handler returned `is_read_side_effecting=true` | `{ "path": "/<full path>", "actor": "local", "details": {} }` |
+
+Failed operations are NOT recorded — we err on the side of fewer
+entries to keep the chain useful for verification. The `actor` field
+is currently a placeholder (`"local"`) until the IPC / NFS transports
+plumb authenticated identity through.
+
+## §10 — Router-level cache
+
+Reads are cached at the router layer when the dispatched handler
+returns `Some(ttl)` from `Handler::cache_ttl`. The cache is an LRU
+bounded at 4096 entries (`crates/beth-vfs/src/cache.rs::PathCache`).
+Writes invalidate the exact path *and* every cached entry under the
+same top-level prefix (handler-mount segment).
+
+Default TTLs (handler overrides):
+
+| Handler | Path | TTL |
+|---|---|---|
+| chains | `chains/<c>/chain_id` | 1 day |
+| chains | `chains/<c>/head/*` | 1s |
+| chains | `chains/<c>/gas/*` | 2s |
+| chains | `chains/<c>/tx/<hash>/*` | 60s |
+| chains | `chains/<c>/addresses/<a>/{balance,balance.eth,balance.raw,nonce}` | 5s |
+| chains | `chains/<c>/addresses/<a>/{code,is_contract}` | 1 day |
+| chains | `chains/<c>/addresses/<a>/{txs,internal_txs,erc20_txs,erc721_txs}` | 30s |
+| chains | `chains/<c>/contracts/<a>/{source,abi}` | 7 days |
+| chains | `chains/<c>/blocks/<n>/*` | 5 min |
+| status | `status/chains/...` | 5s |
+| status | `status/{cache,wallets,outbox}/*` | 5s |
+| status | `status/{version,started_at,home}` | 1 day |
+| prices | `prices/...` | 30s |
+
+Other handlers default to no router cache (they either compute pure
+data or rely on their own internal caches, e.g. the etherscan client).
+
 ## §3 — VFS surfaces
 
 | Surface | VFS path(s) | Implementation | Tests |
