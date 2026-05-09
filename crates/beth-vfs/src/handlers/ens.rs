@@ -17,11 +17,11 @@
 //!
 //! All entries are read-only.
 //!
-//! Reverse resolution (`ens/0xAddr/name`) is **not** wired in v1; the
-//! [`beth_ens::EnsClient::reverse`] primitive is available but the spec
-//! prefers `chains/<chain>/addresses/<addr>/ens` for reverse lookups
-//! (see `docs/specs/2026-05-08-bloom-eth-design.md` §3.2). Tracked as a
-//! TODO; this handler returns `NotFound` for any non-`*.eth` segment.
+//! Reverse resolution lives at `chains/<chain>/addresses/<addr>/ens`
+//! per spec §3.2 — that path is wired through [`super::ChainsHandler`]
+//! and consults [`beth_ens::EnsClient::reverse`] (which already
+//! cross-checks the forward lookup). This handler stays
+//! forward-only and 404s any non-`*.eth` segment.
 //!
 //! Behaviour:
 //!

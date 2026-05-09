@@ -29,6 +29,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use beth_chain::{ChainClient, ChainRegistry};
+use beth_ens::{EnsClient, EnsError};
 use beth_etherscan::EtherscanClient;
 use beth_proto::{checksum_address, format_units};
 
@@ -41,6 +42,7 @@ use super::chains_history;
 pub struct ChainsHandler {
     pub registry: ChainRegistry,
     pub etherscan: Option<Arc<EtherscanClient>>,
+    pub ens: Option<EnsClient>,
 }
 
 impl ChainsHandler {
@@ -48,6 +50,7 @@ impl ChainsHandler {
         Self {
             registry,
             etherscan: None,
+            ens: None,
         }
     }
 
@@ -55,6 +58,14 @@ impl ChainsHandler {
     /// paths return `NotFound` and existing chain reads are unaffected.
     pub fn with_etherscan(mut self, client: Option<Arc<EtherscanClient>>) -> Self {
         self.etherscan = client;
+        self
+    }
+
+    /// Builder: attach an ENS client so `addresses/<addr>/ens` returns
+    /// the reverse-resolved name (cross-checked against forward
+    /// resolution by `EnsClient::reverse`).
+    pub fn with_ens(mut self, client: Option<EnsClient>) -> Self {
+        self.ens = client;
         self
     }
 
@@ -68,6 +79,12 @@ impl ChainsHandler {
         self.etherscan
             .as_ref()
             .ok_or_else(|| HandlerError::not_found("etherscan not configured"))
+    }
+
+    fn ens_or_404(&self) -> Result<&EnsClient, HandlerError> {
+        self.ens
+            .as_ref()
+            .ok_or_else(|| HandlerError::not_found("ens not configured"))
     }
 }
 
@@ -91,6 +108,8 @@ const ADDRESS_FILES_CORE: &[&str] = &[
     "is_contract",
 ];
 const ADDRESS_FILES_ETHERSCAN: &[&str] = &["txs", "internal_txs", "erc20_txs", "erc721_txs"];
+/// Files that need an ENS-capable chain to be wired into the handler.
+const ADDRESS_FILES_ENS: &[&str] = &["ens"];
 
 const CONTRACT_FILES_ETHERSCAN: &[&str] = &["source", "abi"];
 
@@ -148,6 +167,9 @@ impl Handler for ChainsHandler {
                     } else if ADDRESS_FILES_ETHERSCAN.contains(&f) {
                         // Only expose when etherscan is configured.
                         self.etherscan_or_404()?;
+                        Ok(Entry::file(f))
+                    } else if ADDRESS_FILES_ENS.contains(&f) {
+                        self.ens_or_404()?;
                         Ok(Entry::file(f))
                     } else if f == "tokens" {
                         Ok(Entry::dir(f))
@@ -285,6 +307,15 @@ impl Handler for ChainsHandler {
                     "erc721_txs" => {
                         let es = self.etherscan_or_404()?;
                         chains_history::read_erc721_txs(es, spec.chain_id, addr).await
+                    }
+                    "ens" => {
+                        let ens = self.ens_or_404()?;
+                        match ens.reverse(addr).await {
+                            Ok(name) => Ok(format!("{}\n", name).into_bytes()),
+                            Err(EnsError::NotFound(_)) => Ok(b"unresolved\n".to_vec()),
+                            Err(EnsError::InvalidName(s)) => Err(HandlerError::invalid(s)),
+                            Err(e) => Err(HandlerError::backend(e.to_string())),
+                        }
                     }
                     _ => Err(HandlerError::NotAFile(path.to_string_path())),
                 }
@@ -451,6 +482,11 @@ impl Handler for ChainsHandler {
                         entries.push(Entry::file(n));
                     }
                 }
+                if self.ens.is_some() {
+                    for n in ADDRESS_FILES_ENS {
+                        entries.push(Entry::file(n));
+                    }
+                }
                 Ok(entries)
             }
             5 if segs[1] == "addresses" && segs[3] == "tokens" => {
@@ -503,6 +539,9 @@ impl Handler for ChainsHandler {
                 Some("txs" | "internal_txs" | "erc20_txs" | "erc721_txs") => {
                     Some(Duration::from_secs(30))
                 }
+                // Reverse ENS rarely changes; the EnsClient itself
+                // also caches, but a layered TTL cuts repeat reads.
+                Some("ens") => Some(Duration::from_secs(300)),
                 _ => None,
             },
             // Verified source / ABI: effectively immutable.
@@ -666,5 +705,32 @@ mod tests {
         let p = VfsPath::parse(&format!("/{chain_name}/chain_id")).unwrap();
         let entry = h.lookup(&p).await.unwrap();
         assert_eq!(entry.name, "chain_id");
+    }
+
+    /// `addresses/<addr>/ens` is hidden from listings and 404s on
+    /// lookup when no ENS-capable chain has been wired in.
+    #[tokio::test]
+    async fn ens_path_404s_when_unwired() {
+        let h = ChainsHandler::new(anvil_registry());
+        let chain_name = h.registry.list_names()[0].clone();
+
+        let dir = VfsPath::parse(&format!(
+            "/{chain_name}/addresses/0x0000000000000000000000000000000000000001"
+        ))
+        .unwrap();
+        let entries = h.list(&dir).await.unwrap();
+        assert!(
+            !entries.iter().any(|e| e.name == "ens"),
+            "should not advertise ens without a client: {entries:?}"
+        );
+
+        let p = VfsPath::parse(&format!(
+            "/{chain_name}/addresses/0x0000000000000000000000000000000000000001/ens"
+        ))
+        .unwrap();
+        match h.lookup(&p).await {
+            Err(HandlerError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 }

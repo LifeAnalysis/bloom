@@ -145,8 +145,11 @@ impl Daemon {
         let mut vfs_builder = Vfs::builder()
             .mount(
                 "chains",
-                Arc::new(ChainsHandler::new(chains.clone()).with_etherscan(etherscan_arc.clone()))
-                    as _,
+                Arc::new(
+                    ChainsHandler::new(chains.clone())
+                        .with_etherscan(etherscan_arc.clone())
+                        .with_ens(ens_client.clone()),
+                ) as _,
             )
             .mount(
                 "wallets",
