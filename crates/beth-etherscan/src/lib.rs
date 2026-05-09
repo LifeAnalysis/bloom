@@ -34,12 +34,27 @@ use tokio::sync::Semaphore;
 use tracing::{debug, trace};
 use url::Url;
 
+use alloy::json_abi::JsonAbi;
 use beth_proto::prelude::{Address, B256, U256};
 
 pub mod cache;
 pub mod traits;
 pub use cache::EtherscanCache;
 pub use traits::{AddressHistorySource, ContractMetadataSource, DataSourceError};
+
+/// EIP-1967 implementation slot (`keccak256("eip1967.proxy.implementation") - 1`).
+pub const EIP1967_IMPL_SLOT: B256 = B256::new([
+    0x36, 0x08, 0x94, 0xa1, 0x3b, 0xa1, 0xa3, 0x21, 0x06, 0x67, 0xc8, 0x28, 0x49, 0x2d, 0xb9, 0x8d,
+    0xca, 0x3e, 0x20, 0x76, 0xcc, 0x37, 0x35, 0xa9, 0x20, 0xa3, 0xca, 0x50, 0x5d, 0x38, 0x2b, 0xbc,
+]);
+
+/// Storage-read abstraction. Lets [`EtherscanClient::json_abi_for`] follow
+/// EIP-1967 proxies without depending on `beth-chain` directly.
+#[async_trait::async_trait]
+pub trait StorageReader: Send + Sync {
+    /// Read 32 bytes from `addr` at `slot` (latest block).
+    async fn read_slot(&self, addr: Address, slot: B256) -> Result<B256, EtherscanError>;
+}
 
 /// Default base URL for Etherscan v2 multichain API.
 pub const DEFAULT_BASE_URL: &str = "https://api.etherscan.io/v2/api";
@@ -331,12 +346,29 @@ impl EtherscanConfig {
 /// Etherscan v2 multichain client.
 ///
 /// Cheap to clone; the inner state is shared via `Arc`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EtherscanClient {
     cfg: Arc<EtherscanConfig>,
     http: reqwest::Client,
     /// 1-permit-per-request semaphore that's permit-replenished on a tick.
     limiter: Arc<RateLimiter>,
+    /// Optional cache, used by `json_abi_for` (and any future cached
+    /// helpers). Always-on read-through; misses fall back to the network.
+    cache: Option<Arc<EtherscanCache>>,
+    /// Storage reader for proxy resolution (EIP-1967). When absent we
+    /// fall back to Etherscan's own `Implementation` field.
+    storage: Option<Arc<dyn StorageReader>>,
+}
+
+impl std::fmt::Debug for EtherscanClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EtherscanClient")
+            .field("cfg", &self.cfg)
+            .field("limiter", &self.limiter)
+            .field("cache", &self.cache.is_some())
+            .field("storage", &self.storage.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -404,7 +436,24 @@ impl EtherscanClient {
             cfg: Arc::new(cfg),
             http,
             limiter,
+            cache: None,
+            storage: None,
         }
+    }
+
+    /// Builder: attach a [`EtherscanCache`]. Currently used by
+    /// [`Self::json_abi_for`]; other endpoints stay uncached for now.
+    pub fn with_cache(mut self, cache: Arc<EtherscanCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Builder: attach a [`StorageReader`] used for EIP-1967 proxy
+    /// detection in [`Self::json_abi_for`]. Without one, proxy resolution
+    /// relies solely on Etherscan's own `Implementation` field.
+    pub fn with_storage_reader(mut self, reader: Arc<dyn StorageReader>) -> Self {
+        self.storage = Some(reader);
+        self
     }
 
     /// Active configuration.
@@ -543,6 +592,97 @@ impl EtherscanClient {
         arr.pop().ok_or_else(|| {
             EtherscanError::InvalidResponse("getsourcecode returned empty array".into())
         })
+    }
+
+    /// Resolve a [`JsonAbi`] for `addr` on `chain_id`, transparently
+    /// following EIP-1967 proxy delegation up to two hops deep.
+    ///
+    /// Resolution order for the implementation address:
+    /// 1. If a [`StorageReader`] is wired, read the EIP-1967 implementation
+    ///    slot. A non-zero value (lower 20 bytes) overrides `addr`.
+    /// 2. Otherwise, if Etherscan's `getsourcecode` reports `Proxy=1`
+    ///    with a non-empty `Implementation`, use that.
+    ///
+    /// Returns `Ok(None)` when the resolved address has no verified ABI.
+    /// Cached under kind `abi`, key `0x<addr>` per chain.
+    pub async fn json_abi_for(
+        &self,
+        chain_id: u64,
+        addr: Address,
+    ) -> Result<Option<JsonAbi>, EtherscanError> {
+        if let Some(cache) = &self.cache {
+            let key = format!("{addr:#x}");
+            if let Some(cached) = cache.get::<JsonAbi>(chain_id, "abi", &key, None) {
+                return Ok(Some(cached));
+            }
+        }
+        let mut current = addr;
+        let mut hops = 0;
+        let abi = loop {
+            // Storage read is the EIP-1967 standard path; fall back to
+            // Etherscan's own proxy field if no reader is wired.
+            let mut next = None;
+            if let Some(reader) = &self.storage {
+                match reader.read_slot(current, EIP1967_IMPL_SLOT).await {
+                    Ok(slot) if !slot.is_zero() => {
+                        next = Some(addr_from_slot(slot));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        debug!(error = %e, %current, "json_abi_for.slot_read_failed");
+                    }
+                }
+            }
+            // Always fetch source for the current address — we need the
+            // ABI either way.
+            let src = match self.get_source_code(chain_id, current).await {
+                Ok(s) => s,
+                Err(EtherscanError::Api { .. }) | Err(EtherscanError::InvalidResponse(_)) => {
+                    return Ok(None)
+                }
+                Err(e) => return Err(e),
+            };
+            // If the chain reader didn't already give us a target, look
+            // at Etherscan's reported proxy fields.
+            if next.is_none() && src.is_proxy() && !src.implementation.is_empty() {
+                if let Ok(impl_addr) = src.implementation.parse::<Address>() {
+                    if impl_addr != Address::ZERO {
+                        next = Some(impl_addr);
+                    }
+                }
+            }
+            if let Some(n) = next {
+                if hops >= 2 || n == current {
+                    // Cap recursion; fall back to the current ABI rather
+                    // than chasing further.
+                    break src.parsed_abi().ok();
+                }
+                hops += 1;
+                current = n;
+                continue;
+            }
+            break src.parsed_abi().ok();
+        };
+
+        let abi = match abi {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let abi: JsonAbi = match serde_json::from_value(abi) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(error = %e, "json_abi_for.parse_failed");
+                return Ok(None);
+            }
+        };
+
+        if let Some(cache) = &self.cache {
+            let key = format!("{addr:#x}");
+            if let Err(e) = cache.put(chain_id, "abi", &key, &abi) {
+                tracing::warn!(error = %e, "json_abi_for.cache_put_failed");
+            }
+        }
+        Ok(Some(abi))
     }
 
     // --- Account -----------------------------------------------------------
@@ -778,6 +918,14 @@ impl EtherscanClient {
         let result = self.raw_call(chain_id, "logs", "getLogs", &extra).await?;
         Self::decode(result)
     }
+}
+
+/// EIP-1967 storage slot encodes the implementation address right-aligned
+/// in a 32-byte word (lower 20 bytes).
+fn addr_from_slot(slot: B256) -> Address {
+    let mut bytes = [0u8; 20];
+    bytes.copy_from_slice(&slot.as_slice()[12..]);
+    Address::from(bytes)
 }
 
 /// Standard Etherscan envelope: `{status, message, result}`.

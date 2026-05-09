@@ -20,6 +20,9 @@ use beth_etherscan::EtherscanClient;
 use beth_keystore::Keystore;
 use beth_prices::PricesClient;
 use beth_proto::{AddressBook, AuditLog, Config, HomeDir};
+use beth_revert::{
+    boxed, AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
+};
 use beth_tx::outbox::Outbox;
 use beth_tx::tx_engine::TxEngine;
 use beth_vfs::handlers::{
@@ -142,6 +145,19 @@ impl Daemon {
         tx_engine =
             tx_engine.with_price_oracle(Arc::new(price_oracle::PricesOracle::new(prices.clone())));
 
+        // Build the tiered revert decoder once and share it across every
+        // handler that needs to attribute revert returndata. Builtin
+        // decoders (Solidity Error/Panic) are always installed; the
+        // Etherscan-driven ABI decoder is layered on top when an
+        // Etherscan client is configured. Stages 4 and 5 (Openchain,
+        // Heimdall) plug in by appending more decoders here.
+        let mut decoder_chain = DecoderChain::new().with(boxed(BuiltinDecoder));
+        if let Some(es) = etherscan_arc.clone() {
+            let abi_source: Arc<dyn AbiSource> = Arc::new(EtherscanAbiSource::new(es));
+            decoder_chain = decoder_chain.with(boxed(EtherscanAbiDecoder::new(abi_source)));
+        }
+        let decoder_chain = Arc::new(decoder_chain);
+
         let mut vfs_builder = Vfs::builder()
             .mount(
                 "chains",
@@ -149,7 +165,8 @@ impl Daemon {
                     ChainsHandler::new(chains.clone())
                         .with_etherscan(etherscan_arc.clone())
                         .with_ens(ens_client.clone())
-                        .with_backends(config.backends),
+                        .with_backends(config.backends)
+                        .with_revert_decoder(decoder_chain.clone()),
                 ) as _,
             )
             .mount(
@@ -230,7 +247,8 @@ impl Daemon {
                         tx_engine.clone(),
                         address_book_arc.clone(),
                     )
-                    .with_default_chain(config.default_chain.clone()),
+                    .with_default_chain(config.default_chain.clone())
+                    .with_revert_decoder(decoder_chain.clone()),
                 ) as _,
             );
         }

@@ -10,117 +10,20 @@
 //! Requires the `anvil` and `cast` binaries from Foundry to be available
 //! at `~/.foundry/bin/{anvil,cast}` (or on `$PATH`).
 
-use std::net::TcpListener;
-use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use beth_daemon::Daemon;
+use beth_it::{cast_send, spawn_anvil};
 use beth_proto::{ChainSpec, Config, HomeDir};
 use beth_vfs::handler::Handler;
 use beth_vfs::VfsPath;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::time::{sleep, timeout};
-
-const ANVIL_BIN: &str = "/Users/joshua/.foundry/bin/anvil";
-const CAST_BIN: &str = "/Users/joshua/.foundry/bin/cast";
-const FUNDER_PRIV_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-
-/// RAII guard that kills the spawned anvil process on drop.
-struct AnvilGuard {
-    child: Option<Child>,
-    port: u16,
-}
-
-impl AnvilGuard {
-    fn rpc_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-}
-
-impl Drop for AnvilGuard {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            // Best-effort kill. start_kill is sync; the OS will reap.
-            let _ = c.start_kill();
-        }
-    }
-}
-
-/// Pick an OS-assigned free TCP port by binding to :0 and releasing it.
-fn pick_free_port() -> Result<u16> {
-    let l = TcpListener::bind("127.0.0.1:0")?;
-    Ok(l.local_addr()?.port())
-}
-
-/// Spawn anvil on the given port and wait until its stdout shows it is
-/// listening. Returns a guard that kills the child on drop.
-async fn spawn_anvil() -> Result<AnvilGuard> {
-    let port = pick_free_port()?;
-    let mut cmd = Command::new(ANVIL_BIN);
-    cmd.arg("--port")
-        .arg(port.to_string())
-        .arg("--host")
-        .arg("127.0.0.1")
-        // Determinism: chain id 31337, default mnemonic.
-        .arg("--chain-id")
-        .arg("31337")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = cmd.spawn().context("spawn anvil")?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("anvil stdout missing"))?;
-
-    // Read lines until we see "Listening on" or hit a timeout.
-    let mut reader = BufReader::new(stdout).lines();
-    let wait = async {
-        loop {
-            match reader.next_line().await? {
-                Some(line) => {
-                    if line.contains("Listening on") {
-                        return Ok::<(), anyhow::Error>(());
-                    }
-                }
-                None => return Err(anyhow!("anvil exited before becoming ready")),
-            }
-        }
-    };
-    timeout(Duration::from_secs(15), wait)
-        .await
-        .map_err(|_| anyhow!("timed out waiting for anvil to start"))??;
-
-    Ok(AnvilGuard {
-        child: Some(child),
-        port,
-    })
-}
+use tokio::time::sleep;
 
 /// Fund `to_addr` with `value_eth` ETH from anvil's prefunded account #0.
 async fn fund_via_cast(rpc_url: &str, to_addr: &str, value_eth: u64) -> Result<()> {
-    let out = Command::new(CAST_BIN)
-        .arg("send")
-        .arg("--private-key")
-        .arg(FUNDER_PRIV_KEY)
-        .arg("--rpc-url")
-        .arg(rpc_url)
-        .arg(to_addr)
-        .arg("--value")
-        .arg(format!("{}ether", value_eth))
-        .output()
-        .await
-        .context("invoke cast send")?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "cast send failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
+    let value = format!("{}ether", value_eth);
+    let _ = cast_send(rpc_url, &[to_addr, "--value", &value]).await?;
     Ok(())
 }
 

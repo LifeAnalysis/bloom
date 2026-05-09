@@ -25,6 +25,7 @@ beth-mount.workspace = true
 beth-ens.workspace = true
 beth-etherscan.workspace = true
 beth-prices.workspace = true
+beth-revert.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

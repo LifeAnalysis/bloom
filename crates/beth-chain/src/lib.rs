@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use alloy::eips::BlockNumberOrTag;
-use alloy::network::Ethereum;
+use alloy::network::{Ethereum, TransactionBuilder};
 use alloy::primitives::{Address, BlockHash, Bytes, B256, U256};
 use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::eth::state::StateOverride;
@@ -203,6 +203,77 @@ impl ChainClient {
 
     pub async fn receipt(&self, hash: B256) -> Result<Option<TransactionReceipt>, ChainError> {
         Ok(self.primary.get_transaction_receipt(hash).await?)
+    }
+
+    /// Re-execute a *reverted* transaction via `eth_call` at the block it
+    /// was mined in, to capture revert returndata. Returns:
+    ///
+    /// * `Ok(None)` — tx succeeded, isn't on-chain, or the RPC didn't
+    ///   surface revert data on the replay (some providers strip it).
+    /// * `Ok(Some(bytes))` — the replayed call reverted and we extracted
+    ///   the encoded returndata from the JSON-RPC error.
+    pub async fn trace_revert(&self, hash: B256) -> Result<Option<Bytes>, ChainError> {
+        let receipt = match self.primary.get_transaction_receipt(hash).await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if receipt.status() {
+            return Ok(None);
+        }
+        let block_number = match receipt.block_number {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        let tx = match self.primary.get_transaction_by_hash(hash).await? {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let from = receipt.from;
+        let req: TransactionRequest = tx.into_request().with_from(from);
+        let call = self
+            .primary
+            .call(req)
+            .block(BlockNumberOrTag::Number(block_number).into());
+        match call.await {
+            // The replay succeeded? That means the original failure was
+            // not a deterministic revert (e.g. out-of-gas / nonce race).
+            // Surface as `None` so callers can fall back to the receipt.
+            Ok(_) => Ok(None),
+            Err(e) => match &e {
+                TransportError::ErrorResp(payload) => Ok(payload.as_revert_data()),
+                _ => Err(ChainError::Transport(e.to_string())),
+            },
+        }
+    }
+
+    /// Run an `eth_call` and, on revert, return the encoded returndata so
+    /// callers can pass it to a [`beth_revert::DecoderChain`]. The
+    /// `Result` semantics mirror [`Self::trace_revert`]:
+    ///
+    /// * `Ok(Ok(bytes))` — the call succeeded; `bytes` is the return data.
+    /// * `Ok(Err(returndata))` — the call reverted; `returndata` is the
+    ///   raw revert payload (possibly empty when the contract reverted
+    ///   with no reason).
+    /// * `Err(e)` — transport/RPC failure unrelated to a revert.
+    pub async fn eth_call_capture_revert(
+        &self,
+        req: TransactionRequest,
+        overrides: Option<StateOverride>,
+    ) -> Result<Result<Bytes, Bytes>, ChainError> {
+        let call = self.primary.call(req);
+        let result = match overrides {
+            Some(o) => call.overrides(o).await,
+            None => call.await,
+        };
+        match result {
+            Ok(bytes) => Ok(Ok(bytes)),
+            Err(e) => match &e {
+                TransportError::ErrorResp(payload) => {
+                    Ok(Err(payload.as_revert_data().unwrap_or_default()))
+                }
+                _ => Err(ChainError::Transport(e.to_string())),
+            },
+        }
     }
 
     pub async fn gas_price(&self) -> Result<u128, ChainError> {
@@ -1473,6 +1544,60 @@ mod mock_rpc_tests {
         let v = c.debug_trace_call(req, None).await.unwrap();
         assert_eq!(v["type"], "CALL");
         assert_eq!(v["gasUsed"], "0x1");
+    }
+
+    // -- eth_call_capture_revert ------------------------------------------
+
+    #[tokio::test]
+    async fn eth_call_capture_revert_success_returns_bytes() {
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![MockResponse::Ok(format!("\"0x{}\"", "12abcd"))],
+        );
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let req = TransactionRequest::default();
+        let out = c.eth_call_capture_revert(req, None).await.unwrap();
+        match out {
+            Ok(bytes) => assert_eq!(bytes.as_ref(), &[0x12, 0xab, 0xcd]),
+            Err(_) => panic!("expected Ok(success bytes)"),
+        }
+    }
+
+    /// Builtin `Error("boom")` returndata: 0x08c379a0 + abi-encode("boom").
+    fn error_string_returndata(msg: &str) -> Vec<u8> {
+        use alloy::sol;
+        use alloy::sol_types::{SolError, SolValue as _};
+        sol! { error Error(string); }
+        let _ = <(String,)>::abi_encode(&(msg.to_string(),)); // ensure trait in scope
+        Error(msg.to_string()).abi_encode()
+    }
+
+    #[tokio::test]
+    async fn eth_call_capture_revert_error_returns_revert_data() {
+        let payload = error_string_returndata("boom");
+        // alloy provider expects `data` either as a 0x-prefixed hex string
+        // *or* as an object with a `data` field. JSON-RPC servers (like
+        // anvil) respond with `data` as a 0x-prefixed hex string.
+        let data_field = format!("\"0x{}\"", hex::encode(&payload));
+        let mut r = responses();
+        r.insert(
+            "eth_call".into(),
+            vec![MockResponse::Err(
+                3,
+                "execution reverted: boom".into(),
+                Some(data_field),
+            )],
+        );
+        let url = spawn_mock(r).await;
+        let c = client_at(&url);
+        let req = TransactionRequest::default();
+        let out = c.eth_call_capture_revert(req, None).await.unwrap();
+        match out {
+            Ok(_) => panic!("expected revert"),
+            Err(returndata) => assert_eq!(returndata.as_ref(), payload.as_slice()),
+        }
     }
 
     // -- transport-layer error mapping ------------------------------------

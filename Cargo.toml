@@ -14,6 +14,7 @@ members = [
   "crates/beth-etherscan",
   "crates/beth-ens",
   "crates/beth-prices",
+  "crates/beth-revert",
   "crates/beth-it",
 ]
 resolver = "2"
@@ -76,6 +77,7 @@ beth-mount    = { path = "crates/beth-mount" }
 beth-etherscan = { path = "crates/beth-etherscan" }
 beth-ens      = { path = "crates/beth-ens" }
 beth-prices   = { path = "crates/beth-prices" }
+beth-revert   = { path = "crates/beth-revert" }
 beth-daemon   = { path = "crates/beth-daemon" }
 
 [profile.release]

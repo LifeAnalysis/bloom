@@ -43,6 +43,8 @@ use beth_chain::{ChainClient, ChainRegistry};
 use beth_ens::{EnsClient, EnsError};
 use beth_etherscan::{AddressHistorySource, ContractMetadataSource, EtherscanClient};
 use beth_proto::{checksum_address, format_units, Backend, BackendsConfig};
+use beth_revert::{DecodeContext, DecodedRevert, DecoderChain};
+use parking_lot::Mutex as PlMutex;
 
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
@@ -82,6 +84,14 @@ pub struct ChainsHandler {
     pending: Arc<PendingBodies>,
     /// Process-wide cache of ERC-165 NFT kind detection.
     nft_cache: Arc<NftKindCache>,
+    /// Tiered revert decoder chain, shared across requests. `None` is a
+    /// degenerate config: `error.json` will return an empty marker.
+    revert_decoder: Arc<DecoderChain>,
+    /// Cache of decoded reverts keyed by `(chain, tx_hash)`. Reverts are
+    /// immutable so a small unbounded map is fine in practice; the
+    /// daemon process is the natural lifetime bound.
+    revert_cache:
+        Arc<PlMutex<std::collections::HashMap<(String, alloy::primitives::B256), DecodedRevert>>>,
 }
 
 impl ChainsHandler {
@@ -96,7 +106,16 @@ impl ChainsHandler {
             live_state: Arc::new(LiveTailState::new()),
             pending: Arc::new(PendingBodies::new()),
             nft_cache: Arc::new(NftKindCache::new()),
+            revert_decoder: Arc::new(DecoderChain::new()),
+            revert_cache: Arc::new(PlMutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Builder: install a tiered revert decoder chain. Used by `error.json`
+    /// reads on reverted transactions.
+    pub fn with_revert_decoder(mut self, chain: Arc<DecoderChain>) -> Self {
+        self.revert_decoder = chain;
+        self
     }
 
     /// Builder: attach an Etherscan client. Convenience for the common
@@ -396,6 +415,7 @@ const TX_FILES: &[&str] = &[
     "gas_used",
     "logs.json",
     "full.json",
+    "error.json",
 ];
 
 const TOKEN_FILES: &[&str] = &[
@@ -783,6 +803,43 @@ impl Handler for ChainsHandler {
                                 HandlerError::not_found(format!("receipt {hash:#x}"))
                             })?;
                         Ok(serde_json::to_vec_pretty(&r.inner.logs()).map_err(err_be)?)
+                    }
+                    "error.json" => {
+                        let r =
+                            client.receipt(hash).await.map_err(err_be)?.ok_or_else(|| {
+                                HandlerError::not_found(format!("receipt {hash:#x}"))
+                            })?;
+                        if r.status() {
+                            // Successful tx → no error to report.
+                            return Err(HandlerError::not_found(format!(
+                                "tx {hash:#x} did not revert"
+                            )));
+                        }
+                        if let Some(cached) = self
+                            .revert_cache
+                            .lock()
+                            .get(&(chain.clone(), hash))
+                            .cloned()
+                        {
+                            return serde_json::to_vec_pretty(&cached).map_err(err_be);
+                        }
+                        let returndata = client
+                            .trace_revert(hash)
+                            .await
+                            .map_err(err_be)?
+                            .unwrap_or_default();
+                        let chain_id = client.chain_id().await.map_err(err_be)?;
+                        let to = r.to;
+                        let ctx = DecodeContext {
+                            returndata,
+                            to,
+                            chain_id,
+                        };
+                        let decoded = self.revert_decoder.decode(&ctx).await;
+                        self.revert_cache
+                            .lock()
+                            .insert((chain.clone(), hash), decoded.clone());
+                        Ok(serde_json::to_vec_pretty(&decoded).map_err(err_be)?)
                     }
                     _ => Err(HandlerError::NotAFile(path.to_string_path())),
                 }

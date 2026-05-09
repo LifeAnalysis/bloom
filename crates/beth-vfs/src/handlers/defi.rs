@@ -36,6 +36,7 @@ use beth_defi::{
 };
 use beth_keystore::Keystore;
 use beth_proto::{checksum_address, AddressBook, GasStrategy, RawIntent, RawIntentBody, StagedTx};
+use beth_revert::{DecodeContext, DecoderChain};
 use beth_tx::tx_engine::TxEngine;
 use parking_lot::RwLock;
 use serde::Deserialize;
@@ -90,6 +91,10 @@ pub struct DefiHandler {
     /// Default chain when an intent omits one.
     default_chain: String,
     next_id: Arc<RwLock<u64>>,
+    /// Tiered revert decoder used to attach a structured `decoded_error`
+    /// to simulation/confirm failures. Defaults to an empty chain so the
+    /// handler still works in tests; the daemon wires a real chain in.
+    revert_decoder: Arc<DecoderChain>,
 }
 
 impl DefiHandler {
@@ -109,11 +114,20 @@ impl DefiHandler {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_chain: "ethereum".into(),
             next_id: Arc::new(RwLock::new(1)),
+            revert_decoder: Arc::new(DecoderChain::new()),
         }
     }
 
     pub fn with_default_chain(mut self, chain: impl Into<String>) -> Self {
         self.default_chain = chain.into();
+        self
+    }
+
+    /// Wire a shared revert decoder chain into this handler. Construct
+    /// once at daemon startup and clone the `Arc` for every handler that
+    /// needs to attribute reverts.
+    pub fn with_revert_decoder(mut self, chain: Arc<DecoderChain>) -> Self {
+        self.revert_decoder = chain;
         self
     }
 
@@ -347,7 +361,9 @@ impl DefiHandler {
         Ok(sess)
     }
 
-    /// Run an `eth_call` simulation of the staged Enso tx.
+    /// Run an `eth_call` simulation of the staged Enso tx. On revert,
+    /// attach a structured `decoded_error` produced by the wired
+    /// [`DecoderChain`].
     async fn simulate_session(
         &self,
         sess: &DefiSession,
@@ -362,12 +378,30 @@ impl DefiHandler {
             .to(route.tx.to)
             .value(route.tx.value)
             .input(route.tx.data.clone().into());
-        match chain.eth_call_with_overrides(req, None).await {
-            Ok(bytes) => Ok(serde_json::json!({
+        let to = Some(route.tx.to);
+        match chain.eth_call_capture_revert(req, None).await {
+            Ok(Ok(bytes)) => Ok(serde_json::json!({
                 "success": true,
                 "return_data": format!("0x{}", hex::encode(bytes.as_ref())),
                 "gas_estimate": route.gas,
             })),
+            Ok(Err(returndata)) => {
+                let chain_id = chain
+                    .chain_id()
+                    .await
+                    .map_err(|e| HandlerError::backend(e.to_string()))?;
+                let ctx = DecodeContext {
+                    returndata: returndata.clone(),
+                    to,
+                    chain_id,
+                };
+                let decoded = self.revert_decoder.decode(&ctx).await;
+                Ok(serde_json::json!({
+                    "success": false,
+                    "decoded_error": decoded,
+                    "gas_estimate": route.gas,
+                }))
+            }
             Err(e) => Ok(serde_json::json!({
                 "success": false,
                 "error": e.to_string(),
