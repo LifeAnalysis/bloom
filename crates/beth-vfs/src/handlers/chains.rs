@@ -865,10 +865,13 @@ impl ChainsHandler {
                                 HandlerError::not_found(format!("receipt {hash:#x}"))
                             })?;
                         if r.status() {
-                            // Successful tx → no error to report.
-                            return Err(HandlerError::not_found(format!(
-                                "tx {hash:#x} did not revert"
-                            )));
+                            // Successful tx → emit an explicit "no error"
+                            // marker rather than a NotFound. Lets callers
+                            // `cat` the file unconditionally without
+                            // branching on tx success, and avoids the
+                            // mount adapter logging a render-failure WARN
+                            // for every getattr on a successful tx.
+                            return Ok(b"null\n".to_vec());
                         }
                         if let Some(cached) = self
                             .revert_cache

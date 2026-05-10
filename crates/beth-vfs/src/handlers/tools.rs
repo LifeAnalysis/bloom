@@ -122,6 +122,50 @@ fn family_out_name(family: &str) -> &'static str {
         .unwrap_or("out.bin")
 }
 
+/// Map a leaf segment of `unit/format/<wei>/<x>` to a decimals count.
+/// Accepts either a u8 ("18") or a known native unit name. Used by
+/// `unit/format` so callers don't have to remember that "eth" is 18.
+fn decimals_from_unit_or_number(s: &str) -> Option<u8> {
+    if let Ok(n) = s.parse::<u8>() {
+        return Some(n);
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "wei" => Some(0),
+        "gwei" => Some(9),
+        "eth" | "ether" => Some(18),
+        _ => None,
+    }
+}
+
+/// Validate the value segment of `unit/{parse,format}/<value>/...` at
+/// lookup time so malformed inputs don't get cached as files. For
+/// `parse`, the value must be a bare decimal number (no embedded unit
+/// suffix — that's what the next segment is for). For `format`, it
+/// must parse as a U256.
+fn is_valid_unit_value(op: &str, value: &str) -> bool {
+    match op {
+        "parse" => {
+            if value.is_empty() {
+                return false;
+            }
+            // Bare decimal: digits with at most one dot. Reject any
+            // embedded alphabetic suffix like "1.5eth" — the
+            // user-facing form for that is "1.5/eth".
+            let mut seen_dot = false;
+            for c in value.chars() {
+                match c {
+                    '0'..='9' => {}
+                    '.' if !seen_dot => seen_dot = true,
+                    _ => return false,
+                }
+            }
+            true
+        }
+        "format" => value.parse::<alloy::primitives::U256>().is_ok(),
+        _ => false,
+    }
+}
+
 #[async_trait]
 impl Handler for ToolsHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
@@ -221,8 +265,22 @@ impl ToolsHandler {
                 } else if segs[1] == "parse" || segs[1] == "format" {
                     match segs.len() {
                         2 => Ok(Entry::dir(&segs[1])),
-                        3 => Ok(Entry::dir(&segs[2])),
-                        4 => Ok(Entry::file(segs.last().unwrap())),
+                        3 => {
+                            // Validate the value at lookup so malformed
+                            // inputs (e.g. "1.5eth" for parse, or non-u256
+                            // for format) don't get cached as directories
+                            // by NFS clients only to fail at read time.
+                            if !is_valid_unit_value(&segs[1], &segs[2]) {
+                                return Err(HandlerError::not_found(path.to_string_path()));
+                            }
+                            Ok(Entry::dir(&segs[2]))
+                        }
+                        4 => {
+                            if !is_valid_unit_value(&segs[1], &segs[2]) {
+                                return Err(HandlerError::not_found(path.to_string_path()));
+                            }
+                            Ok(Entry::file(segs.last().unwrap()))
+                        }
                         _ => Err(HandlerError::not_found(path.to_string_path())),
                     }
                 } else {
@@ -332,13 +390,19 @@ impl ToolsHandler {
                 Ok(format!("{}\n", raw).into_bytes())
             }
             "unit" if segs.len() >= 4 && segs[1] == "format" => {
-                // /unit/format/<wei>/<decimals>
+                // /unit/format/<wei>/<decimals-or-unit>
+                // Accept either a numeric decimals (u8) or a known native
+                // unit name (eth, gwei, wei, ether). The unit-name form is
+                // the symmetric counterpart of `unit/parse/<v>/<unit>`.
                 let wei: alloy::primitives::U256 = segs[2]
                     .parse()
                     .map_err(|_| HandlerError::invalid("not a u256"))?;
-                let decimals: u8 = segs[3]
-                    .parse()
-                    .map_err(|_| HandlerError::invalid("not a u8"))?;
+                let decimals = decimals_from_unit_or_number(&segs[3]).ok_or_else(|| {
+                    HandlerError::invalid(format!(
+                        "'{}' is neither a u8 nor a known unit (wei/gwei/eth/ether)",
+                        segs[3]
+                    ))
+                })?;
                 Ok(format!("{}\n", beth_proto::format_units(wei, decimals)).into_bytes())
             }
             "hex" if segs.len() >= 3 && segs[1] == "encode" => {
@@ -722,6 +786,55 @@ mod tests {
     async fn unit_unknown_subcommand_is_not_found() {
         let h = ToolsHandler::new();
         let r = h.lookup(&VfsPath::parse("/unit/bogus").unwrap()).await;
+        match r {
+            Err(HandlerError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn unit_format_accepts_unit_name_in_place_of_decimals() {
+        let h = ToolsHandler::new();
+        // The kernel will GETATTR before READ. Both must succeed for the
+        // user-facing `cat /tools/unit/format/<wei>/eth` flow to work.
+        let p = VfsPath::parse("/unit/format/1500000000000000000/eth").unwrap();
+        h.lookup(&p).await.unwrap();
+        let v = h.read(&p).await.unwrap();
+        assert_eq!(String::from_utf8(v).unwrap().trim(), "1.5");
+
+        let p = VfsPath::parse("/unit/format/1000000000/gwei").unwrap();
+        let v = h.read(&p).await.unwrap();
+        assert_eq!(String::from_utf8(v).unwrap().trim(), "1");
+
+        let p = VfsPath::parse("/unit/format/42/wei").unwrap();
+        let v = h.read(&p).await.unwrap();
+        assert_eq!(String::from_utf8(v).unwrap().trim(), "42");
+
+        // "ether" is an accepted alias for "eth".
+        let p = VfsPath::parse("/unit/format/2000000000000000000/ether").unwrap();
+        let v = h.read(&p).await.unwrap();
+        assert_eq!(String::from_utf8(v).unwrap().trim(), "2");
+    }
+
+    #[tokio::test]
+    async fn unit_parse_lookup_rejects_embedded_unit_in_value() {
+        // `1.5eth` in the value slot is malformed — the unit belongs in
+        // the next path segment. Reject it at lookup so NFS clients don't
+        // cache the bad path as a directory and then fail noisily on read.
+        let h = ToolsHandler::new();
+        let p = VfsPath::parse("/unit/parse/1.5eth").unwrap();
+        let r = h.lookup(&p).await;
+        match r {
+            Err(HandlerError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn unit_format_lookup_rejects_non_u256_value() {
+        let h = ToolsHandler::new();
+        let p = VfsPath::parse("/unit/format/notanumber").unwrap();
+        let r = h.lookup(&p).await;
         match r {
             Err(HandlerError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {:?}", other),

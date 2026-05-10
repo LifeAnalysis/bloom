@@ -152,6 +152,9 @@ impl WatchHandler {
 
     async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
+        if segs.len() == 1 && segs[0] == "new" {
+            return Ok(b"# write a TOML watch spec to subscribe\n# examples (one of the kinds):\n#   printf 'kind = \"head\"\\nchain = \"anvil\"\\n' > /eth/watch/new\n#   printf 'kind = \"addr\"\\nchain = \"anvil\"\\naddress = \"0x...\"\\n' > /eth/watch/new\n#   printf 'kind = \"log\"\\nchain = \"anvil\"\\naddress = \"0x...\"\\ntopics = []\\n' > /eth/watch/new\n# optional: id = \"...\", wallet = \"...\", note = \"...\"\n".to_vec());
+        }
         match segs.len() {
             2 => {
                 let spec = self.resolve_id(&segs[0])?;
@@ -371,6 +374,18 @@ mod tests {
         let entries = h.list(&VfsPath::root()).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "new");
+    }
+
+    #[tokio::test]
+    async fn read_new_returns_help_text() {
+        // Same motivation as simulate/new: a write-only path that errors
+        // on read causes WARN spam at every getattr. Returning help
+        // text gives the kernel a stable size to cache.
+        let (h, _t) = build_handler();
+        let bytes = h.read(&VfsPath::parse("new").unwrap()).await.unwrap();
+        let s = String::from_utf8(bytes).unwrap();
+        assert!(s.contains("watch"), "help text should mention watch: {s}");
+        assert!(s.contains("kind"), "help text should mention kind: {s}");
     }
 
     #[tokio::test]

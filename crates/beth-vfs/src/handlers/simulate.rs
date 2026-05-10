@@ -763,6 +763,9 @@ impl SimulateHandler {
     async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
         match segs.len() {
+            1 if segs[0] == "new" => {
+                Ok(b"# write a JSON simulate envelope to allocate a session\n# example:\n#   echo '{\"intent\":{\"chain\":\"anvil\",\"to\":\"0x...\",\"data\":\"0x...\"}}' > /eth/simulate/new\n# read the resulting session id from /eth/simulate/last\n".to_vec())
+            }
             1 if segs[0] == "last" => {
                 let g = self.sessions.read();
                 let mut ids: Vec<&String> = g.keys().collect();
@@ -967,6 +970,21 @@ mod tests {
             HandlerError::Invalid(_) => {}
             other => panic!("expected Invalid, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn read_new_returns_help_text() {
+        // The mount adapter calls read at GETATTR time to size the file.
+        // Returning an error caused noisy `render_failed_falling_back_to_size_0`
+        // warnings on every getattr. Help text gives kernel a stable size
+        // and gives users something useful when they `cat` the path.
+        let r = ChainRegistry::new();
+        let h = SimulateHandler::new(r, Arc::new(AddressBook::default()));
+        let p = VfsPath::parse("/new").unwrap();
+        let bytes = h.read(&p).await.unwrap();
+        let s = String::from_utf8(bytes).unwrap();
+        assert!(s.contains("simulate"), "help text should mention simulate: {s}");
+        assert!(s.contains("intent"), "help text should mention intent: {s}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
