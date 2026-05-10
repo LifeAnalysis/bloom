@@ -42,6 +42,7 @@ use beth_chain::ChainRegistry;
 use beth_keystore::Keystore;
 use beth_prices::PricesClient;
 use beth_proto::{AuditLog, BackendsConfig};
+use beth_rpc::EndpointHealthSnapshot;
 use beth_tx::tx_engine::TxEngine;
 
 use crate::handler::{Entry, Handler, HandlerError};
@@ -192,6 +193,35 @@ impl StatusHandler {
             block_number: None,
         };
         if let Some(client) = self.chains.get(name) {
+            // Health-registry fast path: the per-endpoint active probe
+            // loop in `beth-rpc` is the source of truth for endpoint
+            // reachability. If at least one endpoint has had a recent
+            // successful probe (`last_block` populated) and is not
+            // currently parked in cooldown, the chain is connected and
+            // we report the highest observed `last_block` rather than
+            // issuing a fresh live call.
+            //
+            // This makes "≥1 healthy endpoint → connected=true" robust
+            // against the live-call path's pathologies: a refused
+            // sibling endpoint racing inside the alloy `FallbackLayer`
+            // can push the aggregate `block_number()` past
+            // `PING_TIMEOUT` even when one endpoint would respond
+            // cleanly on its own.
+            let snaps = client.endpoints();
+            if let Some(b) = aggregate_healthy_block(&snaps) {
+                probe.connected = true;
+                probe.block_number = Some(b);
+                self.chain_cache
+                    .write()
+                    .insert(name.to_string(), probe.clone());
+                return probe;
+            }
+            // Bootstrap path: the active probe loop hasn't populated
+            // the registry yet (cold start; the loop sleeps
+            // `PROBE_INTERVAL` before its first round). Fall back to a
+            // live block-number call through the layered transport so
+            // status reads in the first ~15 s after daemon launch
+            // aren't artificially `connected=false`.
             match timeout(PING_TIMEOUT, client.block_number()).await {
                 Ok(Ok(n)) => {
                     probe.connected = true;
@@ -321,6 +351,29 @@ impl StatusHandler {
         }
         total
     }
+}
+
+/// Pure helper: given a snapshot of every endpoint's health, return
+/// the highest `last_block` observed by an endpoint that is currently
+/// out of cooldown. Returns `None` when no endpoint qualifies — either
+/// the probe loop hasn't populated the registry yet (cold start) or
+/// every endpoint is parked / never succeeded.
+///
+/// Extracted from `StatusHandler::probe_chain` so the unit tests can
+/// exercise the aggregation rule without spinning up real RPC
+/// transports. The rule is the load-bearing one for the `connected`
+/// leaf: "≥1 healthy endpoint → connected=true, last_block populated".
+fn aggregate_healthy_block(snaps: &[EndpointHealthSnapshot]) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    for s in snaps {
+        if s.cooldown_until.is_some() {
+            continue;
+        }
+        if let Some(b) = s.last_block {
+            best = Some(best.map_or(b, |prev| prev.max(b)));
+        }
+    }
+    best
 }
 
 #[derive(Serialize)]
@@ -927,6 +980,91 @@ mod tests {
         ] {
             assert!(names.contains(&required), "missing entry: {required}");
         }
+    }
+
+    fn snap(url: &str, last_block: Option<u64>, in_cooldown: bool) -> EndpointHealthSnapshot {
+        // Only the fields `aggregate_healthy_block` reads matter for
+        // these tests; latency/score/success_rate are filled with
+        // plausible-but-arbitrary values so the snapshot would
+        // round-trip through serde unchanged.
+        let cooldown_until = if in_cooldown {
+            // Twelve seconds in the future — well past any reasonable
+            // probe round but still inside `Duration::from_secs(60)`
+            // worth of room.
+            Some(SystemTime::now() + StdDuration::from_secs(12))
+        } else {
+            None
+        };
+        EndpointHealthSnapshot {
+            url: url.into(),
+            score: if last_block.is_some() { 0.9 } else { 0.0 },
+            cooldown_until,
+            latency_ms: if last_block.is_some() { 120 } else { 0 },
+            success_rate: if last_block.is_some() { 1.0 } else { 0.0 },
+            last_block,
+        }
+    }
+
+    #[test]
+    fn aggregate_healthy_block_picks_good_endpoint_when_other_refused() {
+        // Mirrors the user-reported scenario: one endpoint refuses
+        // connection (recorded as a string of failures → cooldown,
+        // last_block empty), another responded cleanly.
+        let snaps = vec![
+            snap("https://0xrpc.io/eth", Some(22_000_001), false),
+            snap("https://eth.llamarpc.com", None, true),
+        ];
+        let block = aggregate_healthy_block(&snaps);
+        assert_eq!(
+            block,
+            Some(22_000_001),
+            "must report the healthy endpoint's last_block even when the sibling is in cooldown"
+        );
+    }
+
+    #[test]
+    fn aggregate_healthy_block_none_when_all_endpoints_down() {
+        // Every endpoint either has no successful probe yet or is
+        // parked in cooldown (or both). The aggregate must yield None
+        // so `connected` reads as false.
+        let snaps = vec![
+            snap("https://eth.llamarpc.com", None, true),
+            snap("https://busted.example", None, true),
+            snap("https://never-probed.example", None, false),
+        ];
+        assert_eq!(aggregate_healthy_block(&snaps), None);
+    }
+
+    #[test]
+    fn aggregate_healthy_block_recovers_when_endpoint_clears_cooldown() {
+        // (1) Initial state: both endpoints cooled down → aggregate is None.
+        let cooled = vec![
+            snap("https://0xrpc.io/eth", None, true),
+            snap("https://eth.llamarpc.com", None, true),
+        ];
+        assert_eq!(aggregate_healthy_block(&cooled), None);
+
+        // (2) Probe loop records two consecutive successes for the
+        //     first endpoint; the registry clears its cooldown and
+        //     records `last_block`. The aggregate must flip back to
+        //     Some(block) — i.e. `connected` recovers automatically.
+        let recovered = vec![
+            snap("https://0xrpc.io/eth", Some(22_000_002), false),
+            snap("https://eth.llamarpc.com", None, true),
+        ];
+        assert_eq!(aggregate_healthy_block(&recovered), Some(22_000_002));
+    }
+
+    #[test]
+    fn aggregate_healthy_block_takes_max_when_multiple_endpoints_healthy() {
+        // Defensive: when more than one endpoint is healthy we report
+        // the freshest block we've seen so a slightly-laggy endpoint
+        // doesn't make the chain look behind tip.
+        let snaps = vec![
+            snap("https://primary.example", Some(22_000_010), false),
+            snap("https://secondary.example", Some(22_000_007), false),
+        ];
+        assert_eq!(aggregate_healthy_block(&snaps), Some(22_000_010));
     }
 
     #[test]

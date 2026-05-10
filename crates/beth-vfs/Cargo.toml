@@ -9,6 +9,7 @@ description = "Path router and handlers for bloom-eth virtual filesystem"
 beth-proto.workspace = true
 beth-keystore.workspace = true
 beth-chain.workspace = true
+beth-rpc.workspace = true
 beth-tx.workspace = true
 beth-tools.workspace = true
 beth-defi.workspace = true
