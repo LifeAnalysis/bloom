@@ -143,6 +143,10 @@ impl LiveTailState {
 
 /// Fetch the parsed ABI for `(chain_id, addr)`, going through the
 /// short-TTL cache. Errors map onto sensible `HandlerError` variants.
+///
+/// **Not proxy-aware.** Most callers should reach for
+/// [`fetch_abi_proxy_aware`] so EIP-1967 proxies (USDC etc.) surface the
+/// implementation ABI rather than the proxy/admin one.
 pub async fn fetch_abi(
     cache: &AbiCache,
     src: &Arc<dyn ContractMetadataSource>,
@@ -152,6 +156,19 @@ pub async fn fetch_abi(
     if let Some(a) = cache.get(&(chain_id, addr)) {
         return Ok(a);
     }
+    let abi = fetch_abi_uncached(src, chain_id, addr).await?;
+    let arc = Arc::new(abi);
+    cache.put((chain_id, addr), arc.clone());
+    Ok(arc)
+}
+
+/// One ABI fetch + parse, no caching. Shared between the direct fetch
+/// and the proxy-aware variant so error handling stays in one place.
+async fn fetch_abi_uncached(
+    src: &Arc<dyn ContractMetadataSource>,
+    chain_id: u64,
+    addr: Address,
+) -> Result<JsonAbi, HandlerError> {
     let raw = src.get_abi(chain_id, addr).await.map_err(map_es_err)?;
     let s = match raw {
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => raw.to_string(),
@@ -162,8 +179,118 @@ pub async fn fetch_abi(
             )))
         }
     };
-    let abi: JsonAbi =
-        serde_json::from_str(&s).map_err(|e| HandlerError::backend(format!("abi parse: {e}")))?;
+    serde_json::from_str(&s).map_err(|e| HandlerError::backend(format!("abi parse: {e}")))
+}
+
+/// Render the user-facing `<addr>/abi` payload, transparently following
+/// an EIP-1967 proxy when `impl_addr` is supplied. The output is the raw
+/// ABI value as the metadata source returned it (string or array) so we
+/// don't lose fidelity for ABIs that don't round-trip through alloy's
+/// strict `JsonAbi` parser.
+///
+/// When the implementation has no verified ABI we fall back to the
+/// proxy's own ABI — better to show *something* than `NotFound`.
+pub async fn read_contract_abi_for(
+    src: &Arc<dyn ContractMetadataSource>,
+    chain_id: u64,
+    proxy: Address,
+    impl_addr: Option<Address>,
+) -> Result<Vec<u8>, HandlerError> {
+    let raw = match impl_addr {
+        Some(target) => match src.get_abi(chain_id, target).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(
+                    %proxy,
+                    %target,
+                    error = ?e,
+                    "chains.proxy.impl_abi_unavailable_falling_back_to_proxy_raw"
+                );
+                src.get_abi(chain_id, proxy).await.map_err(map_es_err)?
+            }
+        },
+        None => src.get_abi(chain_id, proxy).await.map_err(map_es_err)?,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&raw)
+        .map_err(|e| HandlerError::backend(format!("abi serialise: {e}")))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Resolve the implementation address behind an EIP-1967 proxy by
+/// reading the implementation slot. Returns `Ok(None)` when the slot is
+/// zero (i.e. the contract is not an EIP-1967 proxy) **or** when the
+/// storage read fails for any reason. The proxy detection is best-effort:
+/// a transient RPC failure shouldn't break the whole `methods/` surface,
+/// so we log and fall back to the proxy's own ABI.
+///
+/// Today we only check the standard EIP-1967 implementation slot. UUPS
+/// (EIP-1822) and beacon proxies are intentionally not resolved here
+/// because the patterns differ subtly enough to deserve their own pass —
+/// see the module-level follow-ups list.
+pub async fn resolve_eip1967_implementation(
+    client: &ChainClient,
+    addr: Address,
+) -> Option<Address> {
+    match client
+        .eth_get_storage_at(addr, U256::from_be_bytes(EIP1967_IMPLEMENTATION_SLOT.0), None)
+        .await
+    {
+        Ok(slot) if slot != B256::ZERO => {
+            let impl_addr = Address::from_word(slot);
+            if impl_addr == Address::ZERO || impl_addr == addr {
+                None
+            } else {
+                Some(impl_addr)
+            }
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::debug!(%addr, error = %e, "chains.eip1967_slot_read_failed");
+            None
+        }
+    }
+}
+
+/// Proxy-aware ABI fetch. Reads the EIP-1967 implementation slot from
+/// the chain; if non-zero, fetches *that* contract's ABI rather than
+/// the proxy's own. Falls back to the proxy ABI when:
+/// - the slot is zero (not a proxy),
+/// - the storage read fails, or
+/// - the implementation has no verified ABI on the metadata source.
+///
+/// Caches under the **proxy** address so all callers for a given user-
+/// facing address share the result.
+pub async fn fetch_abi_proxy_aware(
+    cache: &AbiCache,
+    src: &Arc<dyn ContractMetadataSource>,
+    client: &ChainClient,
+    chain_id: u64,
+    addr: Address,
+) -> Result<Arc<JsonAbi>, HandlerError> {
+    if let Some(a) = cache.get(&(chain_id, addr)) {
+        return Ok(a);
+    }
+    let impl_addr = resolve_eip1967_implementation(client, addr).await;
+    let abi = if let Some(target) = impl_addr {
+        match fetch_abi_uncached(src, chain_id, target).await {
+            Ok(a) => {
+                tracing::debug!(%addr, %target, "chains.proxy.abi_resolved_via_eip1967");
+                a
+            }
+            Err(e) => {
+                tracing::debug!(
+                    %addr,
+                    %target,
+                    error = %e,
+                    "chains.proxy.impl_abi_unavailable_falling_back_to_proxy"
+                );
+                fetch_abi_uncached(src, chain_id, addr).await?
+            }
+        }
+    } else {
+        fetch_abi_uncached(src, chain_id, addr).await?
+    };
     let arc = Arc::new(abi);
     cache.put((chain_id, addr), arc.clone());
     Ok(arc)
@@ -219,6 +346,39 @@ fn parse_block_param(s: Option<&str>) -> Result<Option<u64>, HandlerError> {
     beth_chain::parse_block_arg(s)
         .map(Some)
         .map_err(|e| HandlerError::invalid(e.to_string()))
+}
+
+/// Enumerate every leaf the `methods/` directory should expose for the
+/// given ABI. Returns one `<fname>.sig`, `<fname>.read`, and `<fname>.tx`
+/// triple per function on the ABI.
+///
+/// Overloads collapse onto one set of leaves keyed by the bare function
+/// name; reads of an overloaded leaf require a `selector` hint in the
+/// staged body — see `pick_function`.
+///
+/// `.sig` is read-only; `.read` and `.tx` are writable so callers can
+/// stage a body before reading.
+pub fn enumerate_method_leaves(abi: &JsonAbi) -> Vec<Entry> {
+    use std::collections::BTreeSet;
+    // BTreeSet so the listing is deterministic — readdir is unordered
+    // by spec but a stable order saves the user's eyes when grepping.
+    let names: BTreeSet<&str> = abi.functions().map(|f| f.name.as_str()).collect();
+    let mut out: Vec<Entry> = Vec::with_capacity(names.len() * 3);
+    for name in names {
+        out.push(Entry::file(&format!("{name}.sig")));
+        out.push(Entry::writable_file(&format!("{name}.read")));
+        out.push(Entry::writable_file(&format!("{name}.tx")));
+    }
+    out
+}
+
+/// Enumerate every event directory `events/<name>` should expose, one
+/// per event on the ABI. Each entry is a directory whose children are
+/// the well-known event leaves (`recent`, `query`, `live`).
+pub fn enumerate_event_dirs(abi: &JsonAbi) -> Vec<Entry> {
+    use std::collections::BTreeSet;
+    let names: BTreeSet<&str> = abi.events().map(|e| e.name.as_str()).collect();
+    names.into_iter().map(Entry::dir).collect()
 }
 
 /// Find a function on the ABI by name, optionally narrowed by selector.
@@ -825,5 +985,66 @@ mod tests {
         let n = U256::from_be_bytes(h.0).wrapping_sub(U256::from(1u64));
         let expected = B256::from(n.to_be_bytes::<32>());
         assert_eq!(expected, EIP1967_IMPLEMENTATION_SLOT);
+    }
+
+    /// `enumerate_method_leaves` emits one .sig/.read/.tx triple per
+    /// distinct function name, sorted alphabetically by name. Overloads
+    /// (same name, different signature) collapse onto one set of
+    /// leaves — disambiguation lives in `pick_function`.
+    #[test]
+    fn enumerate_method_leaves_emits_triple_per_function() {
+        let abi: JsonAbi = serde_json::from_str(
+            r#"[
+                {"type":"function","name":"transfer","stateMutability":"nonpayable",
+                 "inputs":[{"name":"to","type":"address"},{"name":"amt","type":"uint256"}],
+                 "outputs":[{"name":"","type":"bool"}]},
+                {"type":"function","name":"balanceOf","stateMutability":"view",
+                 "inputs":[{"name":"o","type":"address"}],
+                 "outputs":[{"name":"","type":"uint256"}]},
+                {"type":"function","name":"transfer","stateMutability":"nonpayable",
+                 "inputs":[{"name":"to","type":"address"}],
+                 "outputs":[{"name":"","type":"bool"}]}
+            ]"#,
+        )
+        .unwrap();
+        let leaves = enumerate_method_leaves(&abi);
+        let names: Vec<&str> = leaves.iter().map(|e| e.name.as_str()).collect();
+        // Two distinct names -> 6 entries. Overloaded `transfer` collapses.
+        assert_eq!(
+            names,
+            vec![
+                "balanceOf.sig",
+                "balanceOf.read",
+                "balanceOf.tx",
+                "transfer.sig",
+                "transfer.read",
+                "transfer.tx",
+            ]
+        );
+    }
+
+    /// `enumerate_event_dirs` emits one directory per distinct event
+    /// name, sorted alphabetically.
+    #[test]
+    fn enumerate_event_dirs_emits_one_per_event() {
+        let abi: JsonAbi = serde_json::from_str(
+            r#"[
+                {"type":"event","name":"Transfer","anonymous":false,
+                 "inputs":[{"name":"from","type":"address","indexed":true},
+                           {"name":"to","type":"address","indexed":true},
+                           {"name":"value","type":"uint256","indexed":false}]},
+                {"type":"event","name":"Approval","anonymous":false,
+                 "inputs":[{"name":"owner","type":"address","indexed":true},
+                           {"name":"spender","type":"address","indexed":true},
+                           {"name":"value","type":"uint256","indexed":false}]}
+            ]"#,
+        )
+        .unwrap();
+        let dirs = enumerate_event_dirs(&abi);
+        let names: Vec<&str> = dirs.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Approval", "Transfer"]);
+        for d in &dirs {
+            assert_eq!(d.kind, crate::handler::EntryKind::Dir);
+        }
     }
 }

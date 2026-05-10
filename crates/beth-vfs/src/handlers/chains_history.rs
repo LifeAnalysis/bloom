@@ -127,6 +127,14 @@ pub async fn read_contract_source(
     json_bytes(&s)
 }
 
+/// Read the raw ABI without proxy resolution.
+///
+/// Currently unused at the router level — the contracts surface uses
+/// [`super::chains_contracts::fetch_abi_proxy_aware`] so EIP-1967
+/// proxies surface the implementation ABI rather than the proxy/admin
+/// one. Kept around (and tested) because future callers wanting the
+/// raw proxy-side ABI for inspection can reach for it directly.
+#[allow(dead_code)]
 pub async fn read_contract_abi(
     src: &Arc<dyn ContractMetadataSource>,
     chain_id: u64,

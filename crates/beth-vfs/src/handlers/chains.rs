@@ -981,7 +981,10 @@ impl ChainsHandler {
                 // /chains/<chain>/tx/<hash>
                 Ok(TX_FILES.iter().map(|n| Entry::file(n)).collect())
             }
-            n if n >= 3 && segs[1] == "contracts" => self.list_contracts(segs).await,
+            n if n >= 3 && segs[1] == "contracts" => {
+                let client = self.client(chain)?;
+                self.list_contracts(segs, &client).await
+            }
             _ => Ok(Vec::new()),
         }
     }
@@ -1095,14 +1098,28 @@ impl ChainsHandler {
             }
             "abi" if segs.len() == 4 => {
                 let es = self.require_contract_metadata_backend()?;
-                chains_history::read_contract_abi(es, chain_id, addr).await
+                // Proxy-aware: when the contract is an EIP-1967 proxy
+                // we surface the implementation's ABI so the rendered
+                // file matches what `methods/` enumerates. Falls back
+                // to the proxy's own ABI whenever the slot is zero or
+                // the implementation has no verified ABI upstream.
+                let target =
+                    chains_contracts::resolve_eip1967_implementation(client, addr).await;
+                chains_contracts::read_contract_abi_for(es, chain_id, addr, target).await
             }
             "methods" if segs.len() == 5 => {
                 let es = self.require_contract_metadata_backend()?;
                 let leaf = segs[4].as_str();
                 let (name, suffix) = Self::split_method_leaf(leaf)
                     .ok_or_else(|| HandlerError::not_found(path.to_string_path()))?;
-                let abi = chains_contracts::fetch_abi(&self.abi_cache, es, chain_id, addr).await?;
+                let abi = chains_contracts::fetch_abi_proxy_aware(
+                    &self.abi_cache,
+                    es,
+                    client,
+                    chain_id,
+                    addr,
+                )
+                .await?;
                 // Sniff `selector` from the staged body so overloads
                 // disambiguate before we encode args.
                 let body_str = std::str::from_utf8(&self.pending.peek(&path.to_string_path()))
@@ -1134,7 +1151,14 @@ impl ChainsHandler {
             }
             "events" if segs.len() == 6 => {
                 let es = self.require_contract_metadata_backend()?;
-                let abi = chains_contracts::fetch_abi(&self.abi_cache, es, chain_id, addr).await?;
+                let abi = chains_contracts::fetch_abi_proxy_aware(
+                    &self.abi_cache,
+                    es,
+                    client,
+                    chain_id,
+                    addr,
+                )
+                .await?;
                 let event_name = segs[4].as_str();
                 let event = chains_contracts::pick_event(&abi, event_name)?;
                 match segs[5].as_str() {
@@ -1261,7 +1285,17 @@ impl ChainsHandler {
     }
 
     /// Listing helper for `contracts/<addr>/...` directories.
-    async fn list_contracts(&self, segs: &[String]) -> Result<Vec<Entry>, HandlerError> {
+    ///
+    /// `methods/` and `events/` enumerate against the resolved ABI —
+    /// EIP-1967 proxies surface the implementation contract's surface
+    /// here, not the proxy's own. A failed ABI fetch maps onto the
+    /// usual `HandlerError`, so the user sees why their listing is
+    /// empty rather than an unexplained zero-row directory.
+    async fn list_contracts(
+        &self,
+        segs: &[String],
+        client: &ChainClient,
+    ) -> Result<Vec<Entry>, HandlerError> {
         match segs.len() {
             3 => {
                 // contracts/<addr> always lists storage/proxy/nft (RPC-only);
@@ -1282,16 +1316,34 @@ impl ChainsHandler {
             }
             4 => match segs[3].as_str() {
                 "methods" => {
-                    let _es = self.require_contract_metadata_backend()?;
-                    // We don't pre-enumerate the ABI for `ls methods/`;
-                    // it would require a fresh etherscan hit per
-                    // listing. The shell still allows direct
-                    // `cat methods/<name>.sig`.
-                    Ok(Vec::new())
+                    let es = self.require_contract_metadata_backend()?;
+                    let addr = parse_addr(&segs[2])?;
+                    let chain_id = client.spec().chain_id;
+                    // Resolve the (possibly proxy-resolved) ABI and
+                    // enumerate one .sig/.read/.tx triple per function.
+                    let abi = chains_contracts::fetch_abi_proxy_aware(
+                        &self.abi_cache,
+                        es,
+                        client,
+                        chain_id,
+                        addr,
+                    )
+                    .await?;
+                    Ok(chains_contracts::enumerate_method_leaves(&abi))
                 }
                 "events" => {
-                    let _es = self.require_contract_metadata_backend()?;
-                    Ok(Vec::new())
+                    let es = self.require_contract_metadata_backend()?;
+                    let addr = parse_addr(&segs[2])?;
+                    let chain_id = client.spec().chain_id;
+                    let abi = chains_contracts::fetch_abi_proxy_aware(
+                        &self.abi_cache,
+                        es,
+                        client,
+                        chain_id,
+                        addr,
+                    )
+                    .await?;
+                    Ok(chains_contracts::enumerate_event_dirs(&abi))
                 }
                 "storage" => Ok(Vec::new()),
                 "proxy" => Ok(PROXY_LEAVES.iter().map(|n| Entry::file(n)).collect()),
@@ -2424,5 +2476,257 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(h.cache_ttl(&p), Some(Duration::from_secs(3600)));
+    }
+
+    // ---- methods/ enumeration + EIP-1967 proxy resolution ----------------
+    //
+    // These tests exercise the bug repro from operator testing:
+    //   * `methods/` was empty even when `abi` resolved successfully (5a),
+    //   * proxies returned the proxy admin ABI rather than the
+    //     implementation ABI (5b — USDC mainnet).
+    //
+    // We mock `ContractMetadataSource` directly so the test can return
+    // *different* ABIs for the proxy vs the implementation address —
+    // something the single-shot HTTP server doesn't support.
+
+    /// Mock metadata source that maps `addr -> abi JSON value`. Anything
+    /// outside the map yields a `NotFound` data-source error so we can
+    /// assert that the right address is being asked for.
+    #[derive(Default)]
+    struct StaticAbiSource {
+        map: std::collections::HashMap<alloy::primitives::Address, serde_json::Value>,
+    }
+
+    #[async_trait]
+    impl beth_etherscan::ContractMetadataSource for StaticAbiSource {
+        async fn get_source_code(
+            &self,
+            _chain_id: u64,
+            _addr: alloy::primitives::Address,
+        ) -> Result<beth_etherscan::ContractSource, beth_etherscan::DataSourceError> {
+            Err(beth_etherscan::DataSourceError::Unsupported(
+                "test mock has no source".into(),
+            ))
+        }
+
+        async fn get_abi(
+            &self,
+            _chain_id: u64,
+            addr: alloy::primitives::Address,
+        ) -> Result<serde_json::Value, beth_etherscan::DataSourceError> {
+            self.map.get(&addr).cloned().ok_or_else(|| {
+                beth_etherscan::DataSourceError::NotFound(format!("no abi for {addr}"))
+            })
+        }
+    }
+
+    /// Minimal "proxy admin" ABI: a single `admin()` function plus an
+    /// `Upgraded(address)` event. Distinct from the ERC-20 surface so
+    /// the test can tell which side is being enumerated.
+    const PROXY_ADMIN_ABI: &str = r#"[
+        {"type":"function","name":"admin","stateMutability":"view",
+         "inputs":[],
+         "outputs":[{"name":"","type":"address"}]},
+        {"type":"event","name":"Upgraded","anonymous":false,
+         "inputs":[{"name":"implementation","type":"address","indexed":true}]}
+    ]"#;
+
+    /// Right-pad an address into a 32-byte storage slot value (EIP-1967
+    /// stores the impl right-aligned).
+    fn slot_value_for_addr(addr: alloy::primitives::Address) -> serde_json::Value {
+        let mut padded = [0u8; 32];
+        padded[12..].copy_from_slice(addr.as_slice());
+        serde_json::Value::String(format!("0x{}", hex::encode(padded)))
+    }
+
+    /// 5a regression: `list` of `methods/` enumerates one .sig/.read/.tx
+    /// triple per ABI function, sorted deterministically. Previously
+    /// returned an empty Vec, which is what caused USDC's `methods/` to
+    /// look empty in the live mount.
+    #[tokio::test]
+    async fn methods_dir_lists_one_triple_per_function() {
+        // RPC: zero slot -> not a proxy -> ABI fetched directly from proxy.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_getStorageAt".to_string(),
+            serde_json::Value::String(format!("0x{}", "00".repeat(32))),
+        );
+        let rpc = spawn_rpc(31338, routes);
+        let proxy: alloy::primitives::Address = SAMPLE_ADDR.parse().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(proxy, serde_json::from_str(ERC20_ABI).unwrap());
+        let src: Arc<dyn beth_etherscan::ContractMetadataSource> =
+            Arc::new(StaticAbiSource { map });
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338))
+            .with_contract_metadata(Some(src));
+
+        let p =
+            VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/methods")).unwrap();
+        let entries = h.list(&p).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // ERC20_ABI has two functions (balanceOf, transfer). Names are
+        // sorted alphabetically; for each name we emit .sig then
+        // .read/.tx in the constant push order.
+        assert_eq!(
+            names,
+            vec![
+                "balanceOf.sig",
+                "balanceOf.read",
+                "balanceOf.tx",
+                "transfer.sig",
+                "transfer.read",
+                "transfer.tx",
+            ]
+        );
+        // sig is read-only; read/tx are writable.
+        for e in &entries {
+            if e.name.ends_with(".sig") {
+                assert_eq!(e.mode, 0o444, "{} should be read-only", e.name);
+            } else {
+                assert_eq!(e.mode, 0o644, "{} should be writable", e.name);
+            }
+        }
+    }
+
+    /// 5b regression: when the contract is an EIP-1967 proxy, `methods/`
+    /// must enumerate the **implementation's** functions, not the proxy
+    /// admin's.
+    #[tokio::test]
+    async fn methods_dir_resolves_eip1967_implementation() {
+        // The implementation lives at this distinct address.
+        let impl_addr: alloy::primitives::Address =
+            "0x000000000000000000000000000000000000beef".parse().unwrap();
+        let proxy: alloy::primitives::Address = SAMPLE_ADDR.parse().unwrap();
+
+        // RPC: storage slot returns the implementation address (right-
+        // aligned, like the chain actually returns it for EIP-1967).
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_getStorageAt".to_string(),
+            slot_value_for_addr(impl_addr),
+        );
+        let rpc = spawn_rpc(31338, routes);
+
+        // Metadata source returns proxy-admin ABI for the proxy, ERC-20
+        // ABI for the implementation. If the handler enumerates against
+        // the proxy address it'll see admin() not balanceOf().
+        let mut map = std::collections::HashMap::new();
+        map.insert(proxy, serde_json::from_str(PROXY_ADMIN_ABI).unwrap());
+        map.insert(impl_addr, serde_json::from_str(ERC20_ABI).unwrap());
+        let src: Arc<dyn beth_etherscan::ContractMetadataSource> =
+            Arc::new(StaticAbiSource { map });
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338))
+            .with_contract_metadata(Some(src));
+
+        let p =
+            VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/methods")).unwrap();
+        let entries = h.list(&p).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // ERC-20 surface: balanceOf, transfer. NOT the proxy's admin().
+        assert!(
+            names.contains(&"balanceOf.sig"),
+            "expected impl ABI, got proxy ABI: {names:?}"
+        );
+        assert!(
+            names.contains(&"transfer.read"),
+            "expected impl ABI, got proxy ABI: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("admin.")),
+            "proxy admin function leaked through: {names:?}"
+        );
+    }
+
+    /// 5b regression continued: `events/` likewise resolves the proxy
+    /// before enumeration. ERC-20's `Transfer` should show up; the
+    /// proxy's `Upgraded` should not.
+    #[tokio::test]
+    async fn events_dir_resolves_eip1967_implementation() {
+        let impl_addr: alloy::primitives::Address =
+            "0x000000000000000000000000000000000000beef".parse().unwrap();
+        let proxy: alloy::primitives::Address = SAMPLE_ADDR.parse().unwrap();
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_getStorageAt".to_string(),
+            slot_value_for_addr(impl_addr),
+        );
+        let rpc = spawn_rpc(31338, routes);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(proxy, serde_json::from_str(PROXY_ADMIN_ABI).unwrap());
+        map.insert(impl_addr, serde_json::from_str(ERC20_ABI).unwrap());
+        let src: Arc<dyn beth_etherscan::ContractMetadataSource> =
+            Arc::new(StaticAbiSource { map });
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338))
+            .with_contract_metadata(Some(src));
+
+        let p =
+            VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/events")).unwrap();
+        let entries = h.list(&p).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Transfer"]);
+    }
+
+    /// 5b: the user-facing `<addr>/abi` payload should also follow the
+    /// proxy. We assert on substring rather than exact JSON shape so
+    /// the test stays robust against pretty-printer changes.
+    #[tokio::test]
+    async fn abi_path_follows_eip1967_proxy_to_impl() {
+        let impl_addr: alloy::primitives::Address =
+            "0x000000000000000000000000000000000000beef".parse().unwrap();
+        let proxy: alloy::primitives::Address = SAMPLE_ADDR.parse().unwrap();
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "eth_getStorageAt".to_string(),
+            slot_value_for_addr(impl_addr),
+        );
+        let rpc = spawn_rpc(31338, routes);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(proxy, serde_json::from_str(PROXY_ADMIN_ABI).unwrap());
+        map.insert(impl_addr, serde_json::from_str(ERC20_ABI).unwrap());
+        let src: Arc<dyn beth_etherscan::ContractMetadataSource> =
+            Arc::new(StaticAbiSource { map });
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338))
+            .with_contract_metadata(Some(src));
+
+        let p =
+            VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/abi")).unwrap();
+        let bytes = h.read(&p).await.unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.contains("balanceOf"), "abi missing balanceOf: {s}");
+        assert!(s.contains("transfer"), "abi missing transfer: {s}");
+        // The proxy admin's `admin()` function name must not bleed in.
+        assert!(
+            !s.contains("\"admin\""),
+            "proxy admin abi leaked into output: {s}"
+        );
+    }
+
+    /// 5a/5b: when the storage slot is zero we should NOT chase a phantom
+    /// implementation; the proxy's own ABI is enumerated.
+    #[tokio::test]
+    async fn methods_dir_uses_proxy_abi_when_slot_is_zero() {
+        let proxy: alloy::primitives::Address = SAMPLE_ADDR.parse().unwrap();
+        let mut routes = std::collections::HashMap::new();
+        // Zero slot → not a proxy.
+        routes.insert(
+            "eth_getStorageAt".to_string(),
+            serde_json::Value::String(format!("0x{}", "00".repeat(32))),
+        );
+        let rpc = spawn_rpc(31338, routes);
+        let mut map = std::collections::HashMap::new();
+        map.insert(proxy, serde_json::from_str(PROXY_ADMIN_ABI).unwrap());
+        let src: Arc<dyn beth_etherscan::ContractMetadataSource> =
+            Arc::new(StaticAbiSource { map });
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338))
+            .with_contract_metadata(Some(src));
+
+        let p =
+            VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/methods")).unwrap();
+        let entries = h.list(&p).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // Only `admin` from PROXY_ADMIN_ABI.
+        assert_eq!(names, vec!["admin.sig", "admin.read", "admin.tx"]);
     }
 }
