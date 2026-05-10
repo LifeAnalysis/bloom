@@ -332,6 +332,7 @@ impl EnsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::EntryKind;
 
     #[tokio::test]
     async fn unconfigured_returns_clear_error() {
@@ -411,5 +412,179 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(e.name, "some.custom.key");
+    }
+
+    // --- Shape B (directory) contract pins ----------------------------
+    //
+    // EXAMPLES.md §11 documents `/eth/ens/<name>/` as a *directory*
+    // containing `address`, `avatar`, `content_hash`, `text/`. These
+    // tests pin that shape so a future refactor can't silently flip
+    // `<name>` into a file (which would break `cat <name>/address`).
+
+    #[tokio::test]
+    async fn name_is_a_directory_not_a_file() {
+        // The user-reported "bug" was that `/eth/ens/vitalik.eth`
+        // reads as a directory. That is the documented contract —
+        // every example uses `<name>/<field>`. Pin it.
+        let h = EnsHandler::new(None);
+        let e = h
+            .lookup(&VfsPath::parse("vitalik.eth").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(e.kind, EntryKind::Dir, "ens name must be a directory");
+        assert_eq!(e.name, "vitalik.eth");
+    }
+
+    #[tokio::test]
+    async fn name_subpaths_are_files_or_text_dir() {
+        let h = EnsHandler::new(None);
+        for leaf in ["address", "avatar", "content_hash"] {
+            let p = format!("vitalik.eth/{leaf}");
+            let e = h.lookup(&VfsPath::parse(&p).unwrap()).await.unwrap();
+            assert_eq!(e.kind, EntryKind::File, "{leaf} must be a file");
+        }
+        let text = h
+            .lookup(&VfsPath::parse("vitalik.eth/text").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(text.kind, EntryKind::Dir);
+
+        let key = h
+            .lookup(&VfsPath::parse("vitalik.eth/text/com.twitter").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(key.kind, EntryKind::File);
+    }
+
+    // --- Read-path tests via primed cache (no live RPC) --------------
+    //
+    // We can't construct a real EnsClient without an RPC endpoint, but
+    // every read path consults the in-handler cache *before* touching
+    // the client. Priming the cache lets us exercise the formatting
+    // and routing logic without a network — equivalent in coverage to
+    // a mocked resolver for these surface-level concerns.
+
+    #[tokio::test]
+    async fn address_read_returns_resolved_value_from_cache() {
+        let h = EnsHandler::new(None);
+        let addr = "0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045";
+        h.cache_put(
+            "vitalik.eth",
+            "addr",
+            "",
+            Cached::Address(Some(addr.to_string())),
+        );
+        let bytes = h
+            .read(&VfsPath::parse("vitalik.eth/address").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, format!("{addr}\n").into_bytes());
+    }
+
+    #[tokio::test]
+    async fn address_read_unresolved_returns_literal() {
+        let h = EnsHandler::new(None);
+        h.cache_put("nobody.eth", "addr", "", Cached::Address(None));
+        let bytes = h
+            .read(&VfsPath::parse("nobody.eth/address").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"unresolved\n");
+    }
+
+    #[tokio::test]
+    async fn avatar_and_text_routes_share_cache() {
+        // The `avatar` shortcut reads the same key as `text/avatar`.
+        // Prime the text cache once and confirm both paths see it.
+        let h = EnsHandler::new(None);
+        let url = "https://example.test/v.png";
+        h.cache_put(
+            "vitalik.eth",
+            "text",
+            "avatar",
+            Cached::Text(Some(url.to_string())),
+        );
+        let via_shortcut = h
+            .read(&VfsPath::parse("vitalik.eth/avatar").unwrap())
+            .await
+            .unwrap();
+        let via_text = h
+            .read(&VfsPath::parse("vitalik.eth/text/avatar").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(via_shortcut, format!("{url}\n").into_bytes());
+        assert_eq!(via_text, via_shortcut);
+    }
+
+    #[tokio::test]
+    async fn unset_text_record_returns_not_set() {
+        let h = EnsHandler::new(None);
+        h.cache_put("vitalik.eth", "text", "email", Cached::Text(None));
+        let bytes = h
+            .read(&VfsPath::parse("vitalik.eth/text/email").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"not set\n");
+    }
+
+    #[tokio::test]
+    async fn content_hash_read_formats_hex() {
+        let h = EnsHandler::new(None);
+        h.cache_put(
+            "ens.eth",
+            "content",
+            "",
+            Cached::Content(Some("0xdeadbeef".to_string())),
+        );
+        let bytes = h
+            .read(&VfsPath::parse("ens.eth/content_hash").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"0xdeadbeef\n");
+    }
+
+    #[tokio::test]
+    async fn content_hash_unset_returns_not_set() {
+        let h = EnsHandler::new(None);
+        h.cache_put("ens.eth", "content", "", Cached::Content(None));
+        let bytes = h
+            .read(&VfsPath::parse("ens.eth/content_hash").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"not set\n");
+    }
+
+    #[tokio::test]
+    async fn list_name_dir_matches_examples_md() {
+        // EXAMPLES.md §11: `ls /eth/ens/vitalik.eth/` →
+        //   address  avatar  content_hash  text
+        let h = EnsHandler::new(None);
+        let entries = h
+            .list(&VfsPath::parse("vitalik.eth").unwrap())
+            .await
+            .unwrap();
+        let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["address", "avatar", "content_hash", "text"]);
+    }
+
+    #[tokio::test]
+    async fn non_eth_subpath_at_root_is_404() {
+        // Reverse lookups don't live here; per the module docs and
+        // EXAMPLES.md they're under chains/<chain>/addresses/<addr>/ens.
+        let h = EnsHandler::new(None);
+        for bad in ["0xabc", "notaname", ""] {
+            let p = VfsPath::parse(bad).unwrap();
+            // empty parses to root which is a dir; only non-empty
+            // non-ENS names should 404 at lookup.
+            if p.segments().is_empty() {
+                continue;
+            }
+            let res = h.lookup(&p).await;
+            assert!(
+                matches!(res, Err(HandlerError::NotFound(_))),
+                "{bad} should 404, got {res:?}"
+            );
+        }
     }
 }
