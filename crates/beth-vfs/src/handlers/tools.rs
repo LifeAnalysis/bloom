@@ -210,13 +210,20 @@ impl ToolsHandler {
                 }
             }
             "unit" => {
+                // /unit                           -> dir
+                // /unit/parse | /unit/format      -> dir
+                // /unit/{parse,format}/<value>    -> dir (the value is a
+                //                                   directory whose children
+                //                                   are the unit / decimals)
+                // /unit/{parse,format}/<value>/<u>-> file (computes result)
                 if segs.len() == 1 {
                     Ok(Entry::dir("unit"))
                 } else if segs[1] == "parse" || segs[1] == "format" {
-                    if segs.len() == 2 {
-                        Ok(Entry::dir(&segs[1]))
-                    } else {
-                        Ok(Entry::file(segs.last().unwrap()))
+                    match segs.len() {
+                        2 => Ok(Entry::dir(&segs[1])),
+                        3 => Ok(Entry::dir(&segs[2])),
+                        4 => Ok(Entry::file(segs.last().unwrap())),
+                        _ => Err(HandlerError::not_found(path.to_string_path())),
                     }
                 } else {
                     Err(HandlerError::not_found(path.to_string_path()))
@@ -546,6 +553,140 @@ mod tests {
         let v = h.read(&p).await.unwrap();
         let s = String::from_utf8(v).unwrap();
         assert_eq!(s.trim(), "1500000000000000000");
+    }
+
+    /// Regression: each component of `/unit/{parse,format}/<value>/<unit>`
+    /// must lookup as a directory until the leaf, otherwise NFS clients
+    /// see "Not a directory" when they walk the path one segment at a
+    /// time. Bug where the `<value>` segment was incorrectly typed as a
+    /// file.
+    #[tokio::test]
+    async fn unit_parse_intermediate_lookups_are_dirs() {
+        let h = ToolsHandler::new();
+        // Walk: unit -> parse -> 1.5 -> eth(file)
+        let dir1 = h.lookup(&VfsPath::parse("/unit").unwrap()).await.unwrap();
+        assert_eq!(dir1.kind, EntryKind::Dir);
+        let dir2 = h
+            .lookup(&VfsPath::parse("/unit/parse").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(dir2.kind, EntryKind::Dir);
+        let dir3 = h
+            .lookup(&VfsPath::parse("/unit/parse/1.5").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(dir3.kind, EntryKind::Dir, "<value> must be a directory");
+        let leaf = h
+            .lookup(&VfsPath::parse("/unit/parse/1.5/eth").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(leaf.kind, EntryKind::File);
+    }
+
+    #[tokio::test]
+    async fn unit_format_intermediate_lookups_are_dirs() {
+        let h = ToolsHandler::new();
+        let dir = h
+            .lookup(&VfsPath::parse("/unit/format/1500000000000000000").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(dir.kind, EntryKind::Dir, "<wei> must be a directory");
+        let leaf = h
+            .lookup(&VfsPath::parse("/unit/format/1500000000000000000/18").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(leaf.kind, EntryKind::File);
+    }
+
+    #[tokio::test]
+    async fn unit_parse_integer_input() {
+        let h = ToolsHandler::new();
+        let p = VfsPath::parse("/unit/parse/25/gwei").unwrap();
+        let v = h.read(&p).await.unwrap();
+        let s = String::from_utf8(v).unwrap();
+        assert_eq!(s.trim(), "25000000000");
+    }
+
+    #[tokio::test]
+    async fn unit_parse_small_fraction() {
+        let h = ToolsHandler::new();
+        // Smallest representable eth value (1 wei).
+        let p = VfsPath::parse("/unit/parse/0.000000000000000001/eth").unwrap();
+        let v = h.read(&p).await.unwrap();
+        let s = String::from_utf8(v).unwrap();
+        assert_eq!(s.trim(), "1");
+    }
+
+    #[tokio::test]
+    async fn unit_parse_ether_alias() {
+        let h = ToolsHandler::new();
+        // "ether" is an accepted alias for "eth".
+        let p = VfsPath::parse("/unit/parse/2/ether").unwrap();
+        let v = h.read(&p).await.unwrap();
+        let s = String::from_utf8(v).unwrap();
+        assert_eq!(s.trim(), "2000000000000000000");
+    }
+
+    #[tokio::test]
+    async fn unit_format_various_decimals() {
+        let h = ToolsHandler::new();
+        // 6 decimals -> USDC-style (1_000_000 = 1.0).
+        let p = VfsPath::parse("/unit/format/1000000/6").unwrap();
+        let v = h.read(&p).await.unwrap();
+        assert_eq!(String::from_utf8(v).unwrap().trim(), "1");
+
+        // 9 decimals -> gwei (1_000_000_000 = 1.0).
+        let p = VfsPath::parse("/unit/format/1000000000/9").unwrap();
+        let v = h.read(&p).await.unwrap();
+        assert_eq!(String::from_utf8(v).unwrap().trim(), "1");
+
+        // 0 decimals -> identity.
+        let p = VfsPath::parse("/unit/format/42/0").unwrap();
+        let v = h.read(&p).await.unwrap();
+        assert_eq!(String::from_utf8(v).unwrap().trim(), "42");
+    }
+
+    #[tokio::test]
+    async fn unit_parse_invalid_value_is_invalid_not_not_found() {
+        let h = ToolsHandler::new();
+        let p = VfsPath::parse("/unit/parse/notanumber/eth").unwrap();
+        let err = h.read(&p).await.unwrap_err();
+        match err {
+            HandlerError::Invalid(_) => {}
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn unit_parse_invalid_unit_is_invalid_not_not_found() {
+        let h = ToolsHandler::new();
+        let p = VfsPath::parse("/unit/parse/1.5/notaunit").unwrap();
+        let err = h.read(&p).await.unwrap_err();
+        match err {
+            HandlerError::Invalid(_) => {}
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn unit_format_invalid_decimals_is_invalid() {
+        let h = ToolsHandler::new();
+        let p = VfsPath::parse("/unit/format/1000000000000000000/notadigit").unwrap();
+        let err = h.read(&p).await.unwrap_err();
+        match err {
+            HandlerError::Invalid(_) => {}
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn unit_unknown_subcommand_is_not_found() {
+        let h = ToolsHandler::new();
+        let r = h.lookup(&VfsPath::parse("/unit/bogus").unwrap()).await;
+        match r {
+            Err(HandlerError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {:?}", other),
+        }
     }
 
     #[tokio::test]
