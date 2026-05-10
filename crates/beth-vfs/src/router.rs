@@ -76,6 +76,26 @@ impl Vfs {
         self.cache.is_some()
     }
 
+    /// Whether reading `path` would have externally-visible side
+    /// effects (signing, broadcasting, mutating state). Returns
+    /// `false` for paths that fall outside any registered handler —
+    /// the safe default.
+    ///
+    /// The mount adapter consults this from `getattr` to decide
+    /// whether it's safe to render content at stat time. A `true`
+    /// here means "do NOT render speculatively; let the user's
+    /// explicit read trigger the side effect."
+    pub fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
+        let Some(head) = path.first() else {
+            return false;
+        };
+        let Some(h) = self.handlers.get(head) else {
+            return false;
+        };
+        let rest = path.shift();
+        h.is_read_side_effecting(&rest)
+    }
+
     /// Best-effort audit append. Errors are logged at WARN and dropped —
     /// audit failures must not break user-visible operations.
     fn audit_record(&self, kind: &str, path: &VfsPath, data: serde_json::Value) {

@@ -143,6 +143,33 @@ impl Handler for WalletsHandler {
         }
         r
     }
+
+    /// Defense-in-depth gate against the mount layer rendering at
+    /// GETATTR. Sign / outbox-control paths are write-only sinks (mode
+    /// 0o644) so the mount-side mode-bit check already skips them, but
+    /// we declare them side-effecting here too so any future caller
+    /// that bypasses the mode check still cannot trigger a sign or
+    /// broadcast just by stat'ing.
+    fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
+        let segs = path.segments();
+        // wallets/<w>/sign/<kind>
+        if segs.len() == 3
+            && segs[1] == "sign"
+            && matches!(segs[2].as_str(), "message" | "hash" | "typed_data")
+        {
+            return true;
+        }
+        // wallets/<w>/chains/<c>/outbox/pending/<id>/{confirm,replace,cancel}
+        if segs.len() == 7
+            && segs[1] == "chains"
+            && segs[3] == "outbox"
+            && segs[4] == "pending"
+            && matches!(segs[6].as_str(), "confirm" | "replace" | "cancel")
+        {
+            return true;
+        }
+        false
+    }
 }
 
 impl WalletsHandler {

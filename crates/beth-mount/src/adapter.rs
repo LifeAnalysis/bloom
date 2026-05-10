@@ -16,6 +16,7 @@
 //!   single mount session — directories don't morph into files.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -26,8 +27,11 @@ use embednfs::{
     FileSystem, FsError, FsResult, FsStats, ObjectType, ReadResult, RequestContext, SetAttrs,
     Timestamp, WriteResult, WriteStability,
 };
+use futures::future::{BoxFuture, Shared};
+use futures::FutureExt;
+use lru::LruCache;
 use parking_lot::Mutex;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use beth_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 
@@ -37,11 +41,22 @@ use beth_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 /// body the daemon expects through the mount surface.
 pub(crate) const MAX_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
-/// Synthetic VFS files often cannot know their size without performing
-/// the read itself. Linux's NFS client treats a regular file with
-/// size=0 as EOF and may never issue READ, so expose a conservative
-/// window for zero-size file entries and let `read` return the real EOF.
-pub(crate) const SYNTHETIC_READ_SIZE_HINT: u64 = 8 * 1024 * 1024;
+/// TTL for the mount-side render cache that bridges GETATTR and the
+/// imminent READ. Long enough to cover the kernel's
+/// LOOKUP→GETATTR→OPEN→READ sequence on both Linux and macOS, short
+/// enough that a stale cached body cannot serve a follow-up read after
+/// the user has time to do something else.
+pub(crate) const RENDER_CACHE_TTL: Duration = Duration::from_millis(750);
+
+/// Maximum number of cached render results held in [`MountRenderCache`].
+/// LRU eviction keeps memory bounded even if a client walks a large
+/// directory tree.
+pub(crate) const RENDER_CACHE_CAPACITY: usize = 1024;
+
+/// Hard ceiling on a single render attempt. Beyond this we map to
+/// `FsError::Io` so the client surface is EIO with a logged reason
+/// rather than hanging past the kernel's retry threshold.
+pub(crate) const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Time without further writes after which a buffer is auto-flushed.
 /// Picked to match the typical NFSv4 client behaviour: kernels with
@@ -151,18 +166,13 @@ fn epoch_ts() -> Timestamp {
 /// kernel to re-issue READ on every access, and the router-level
 /// `PathCache` (TTL per path) absorbs the cost so dynamic reads stay
 /// snappy without serving stale bytes.
-fn entry_to_attrs(path: &VfsPath, e: &Entry) -> Attrs {
+fn entry_to_attrs(path: &VfsPath, e: &Entry, size: u64) -> Attrs {
     let ot = match e.kind {
         EntryKind::Dir => ObjectType::Directory,
         EntryKind::File => ObjectType::File,
         EntryKind::Symlink => ObjectType::Symlink,
     };
     let mut a = Attrs::new(ot, fileid_for(path));
-    let size = if e.kind == EntryKind::File && e.size == 0 {
-        SYNTHETIC_READ_SIZE_HINT
-    } else {
-        e.size
-    };
     a.size = size;
     a.space_used = size;
     a.mode = e.mode;
@@ -301,6 +311,64 @@ impl WriteBuffer {
     }
 }
 
+/// Always-on TTL cache that bridges a GETATTR-time render with the
+/// READ that immediately follows. Independent of the VFS-side
+/// [`beth_vfs::PathCache`] (which is opt-in via `Handler::cache_ttl`):
+/// this one fires for every renderable file so the size returned in
+/// GETATTR matches the bytes returned in READ, byte-for-byte.
+///
+/// Bounded with simple LRU eviction so a client walking a large tree
+/// cannot blow through process memory.
+struct MountRenderCache {
+    inner: Mutex<LruCache<VfsPath, MountRenderEntry>>,
+}
+
+#[derive(Clone)]
+struct MountRenderEntry {
+    bytes: Bytes,
+    expires_at: Instant,
+}
+
+impl MountRenderCache {
+    fn new(capacity: usize) -> Self {
+        let cap = NonZeroUsize::new(capacity.max(1)).expect("capacity > 0");
+        Self {
+            inner: Mutex::new(LruCache::new(cap)),
+        }
+    }
+
+    fn get(&self, path: &VfsPath) -> Option<Bytes> {
+        let mut g = self.inner.lock();
+        let expired = g.peek(path).map(|e| e.expires_at <= Instant::now());
+        match expired {
+            Some(true) => {
+                g.pop(path);
+                None
+            }
+            Some(false) => g.get(path).map(|e| e.bytes.clone()),
+            None => None,
+        }
+    }
+
+    fn put(&self, path: &VfsPath, bytes: Bytes, ttl: Duration) {
+        let entry = MountRenderEntry {
+            bytes,
+            expires_at: Instant::now() + ttl,
+        };
+        self.inner.lock().put(path.clone(), entry);
+    }
+}
+
+/// Shared future type for in-flight render dedup. Concurrent GETATTR /
+/// READ calls for the same path coalesce onto a single render so a
+/// cold expensive leaf (e.g. `chains/<c>/tx/<h>/error.json`) cannot
+/// stampede when NFS clients retry slow ops.
+///
+/// The future resolves to either `Ok(Bytes)` or a string-encoded error
+/// — we cannot share `HandlerError` directly because it is not `Clone`
+/// and `Shared` requires the inner output to be `Clone`.
+type RenderFuture = Shared<BoxFuture<'static, Result<Bytes, String>>>;
+
 /// Adapter that holds a clone of the [`Vfs`] facade and serves it as
 /// an [`embednfs::FileSystem`].
 ///
@@ -340,6 +408,18 @@ pub struct BethFs {
     /// concurrent writers to the same path see interleaved chunks and
     /// must serialise themselves at the application layer.
     write_buffers: Arc<Mutex<HashMap<VfsPath, WriteBuffer>>>,
+    /// Mount-side render cache. Populated by `getattr` for renderable
+    /// files (read-only mode, not side-effecting); consumed by `read`
+    /// so the size we just reported matches the bytes returned. See
+    /// [`MountRenderCache`] for why this is independent of the VFS
+    /// `PathCache`.
+    render_cache: Arc<MountRenderCache>,
+    /// In-flight render futures keyed by VFS path. A second `getattr`
+    /// (or read) for the same path while a render is running awaits
+    /// the existing future instead of starting a new one. The map
+    /// entry is removed once the future resolves — subsequent
+    /// requests after the cache TTL re-render normally.
+    in_flight: Arc<Mutex<HashMap<VfsPath, RenderFuture>>>,
 }
 
 impl BethFs {
@@ -347,6 +427,8 @@ impl BethFs {
         Self {
             vfs,
             write_buffers: Arc::new(Mutex::new(HashMap::new())),
+            render_cache: Arc::new(MountRenderCache::new(RENDER_CACHE_CAPACITY)),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -444,6 +526,82 @@ impl BethFs {
             None
         }
     }
+
+    /// Whether it is safe to render `path` at GETATTR time so we can
+    /// return the real `st_size`.
+    ///
+    /// Single gate: `is_read_side_effecting`. Defaults false; handlers
+    /// override and return true for paths whose read triggers signing,
+    /// broadcast, or other externally-visible action (canonical case:
+    /// `wallets/<w>/sign/*`). Stat'ing those must not fire the side
+    /// effect, so we report `size = 0` for them.
+    ///
+    /// Mode bits are *not* a useful gate here. Many writable files
+    /// (mode 0o644) are also legitimately readable — addressbook
+    /// aliases resolve to an address, `policy.toml` reads back the
+    /// committed config, etc. A pure write-only sink (e.g.
+    /// `outbox/pending/<id>/confirm`) returns a NotAFile-style error
+    /// from `read`; that flows through `render_with_dedup` and falls
+    /// out as `size = 0` at the failure branch in [`Self::getattr`],
+    /// which is exactly what we want for sinks. Conversely, if we
+    /// gated on `mode & 0o200` here, any rw file with real content
+    /// would report `size = 0` and `cat` would short-circuit on the
+    /// stat result.
+    fn should_render_for_attrs(&self, path: &VfsPath, e: &Entry) -> bool {
+        if e.kind != EntryKind::File {
+            return false;
+        }
+        if self.vfs.is_read_side_effecting(path) {
+            return false;
+        }
+        true
+    }
+
+    /// Render `path` with in-flight dedup and a hard timeout. Reuses
+    /// an existing render future for the same path if one is already
+    /// running.
+    async fn render_with_dedup(&self, path: &VfsPath) -> Result<Bytes, FsError> {
+        let fut: RenderFuture = {
+            let mut map = self.in_flight.lock();
+            if let Some(existing) = map.get(path) {
+                existing.clone()
+            } else {
+                let vfs = self.vfs.clone();
+                let path_owned = path.clone();
+                let in_flight = self.in_flight.clone();
+                let path_for_cleanup = path.clone();
+                let render = async move {
+                    let result = tokio::time::timeout(RENDER_TIMEOUT, vfs.read(&path_owned)).await;
+                    let bytes = match result {
+                        Ok(Ok(b)) => Ok(Bytes::from(b)),
+                        Ok(Err(e)) => Err(format!("vfs.read: {e}")),
+                        Err(_) => Err(format!(
+                            "render timed out after {}s",
+                            RENDER_TIMEOUT.as_secs()
+                        )),
+                    };
+                    // Remove ourselves from the in-flight map so the
+                    // next request after this resolves can start a
+                    // fresh render. Entry under the same key may have
+                    // been replaced if a different generation is
+                    // running — only remove if it's still ours.
+                    in_flight.lock().remove(&path_for_cleanup);
+                    bytes
+                }
+                .boxed()
+                .shared();
+                map.insert(path.clone(), render.clone());
+                render
+            }
+        };
+        match fut.await {
+            Ok(b) => Ok(b),
+            Err(s) => {
+                debug!(path = %path.to_string_path(), error = %s, "mount.adapter.render_failed");
+                Err(FsError::Io)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -478,7 +636,47 @@ impl FileSystem for BethFs {
                 // If the kind has somehow drifted, prefer the live
                 // value over the cached one.
                 let _ = kind;
-                let mut attrs = entry_to_attrs(path, &e);
+
+                // For renderable read-only files, materialise the body
+                // so we can return an accurate `st_size`. The bytes
+                // are stashed in the mount-side cache so the imminent
+                // READ serves the same body and `eof` lines up. Files
+                // that are write-only or side-effecting fall through
+                // with `size = 0` and never trigger a render here —
+                // critical to avoid a `stat` triggering a sign or
+                // broadcast.
+                let size = if self.should_render_for_attrs(path, &e) {
+                    match self.render_with_dedup(path).await {
+                        Ok(bytes) => {
+                            let len = bytes.len() as u64;
+                            self.render_cache
+                                .put(path, bytes, RENDER_CACHE_TTL);
+                            len
+                        }
+                        Err(_) => {
+                            // Render failed (timeout, backend error,
+                            // write-only sink that errors on read).
+                            // Falling through with `size = 0` keeps
+                            // metadata-only inspection (`stat`,
+                            // `ls -l`) working — we must never let a
+                            // backend hiccup turn into a stat failure.
+                            // The kernel will short-circuit `cat` for
+                            // size=0, so a follow-up read won't
+                            // re-surface the error; that's a tradeoff
+                            // we accept (logs carry the detail) in
+                            // exchange for not breaking `ls`.
+                            warn!(
+                                path = %path.to_string_path(),
+                                "mount.adapter.getattr.render_failed_falling_back_to_size_0"
+                            );
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
+
+                let mut attrs = entry_to_attrs(path, &e, size);
                 if e.kind == EntryKind::Dir {
                     attrs.change = self.dir_change(path).await;
                 }
@@ -599,7 +797,29 @@ impl FileSystem for BethFs {
                 path: child_path.clone(),
             };
             let attrs = if with_attrs {
-                let mut a = entry_to_attrs(&child_path, &e);
+                // READDIRPLUS does not eagerly render every child —
+                // that would make `ls -l` of a heavy directory cost
+                // a full pipeline run per leaf. Instead we use:
+                //   - the entry's own `size` if the handler set one
+                //     (cheap-to-compute paths like static docs),
+                //   - the render-cache's bytes if a recent `getattr`
+                //     populated it for this child (so `ls -l` after
+                //     `cat` shows real size),
+                //   - 0 otherwise.
+                // The kernel mounts use `actimeo=0` (Linux) /
+                // equivalent (other) so this size is not trusted
+                // past the immediate listing display; the next read
+                // re-issues GETATTR and gets a real size.
+                let size = if e.kind == EntryKind::File {
+                    if let Some(b) = self.render_cache.get(&child_path) {
+                        b.len() as u64
+                    } else {
+                        e.size
+                    }
+                } else {
+                    e.size
+                };
+                let mut a = entry_to_attrs(&child_path, &e, size);
                 if e.kind == EntryKind::Dir {
                     // See `dir_change`: for child directories returned
                     // inline with READDIR's attr_request, the kernel
@@ -642,7 +862,25 @@ impl FileSystem for BethFs {
         // orphaned WRITE doesn't pin memory across reads.
         self.flush_path(&path).await?;
         let _ = self.drop_stale_buffer(&path);
-        let data = self.vfs.read(&path).await.map_err(map_err)?;
+
+        // Fast path: GETATTR usually runs immediately before READ
+        // (especially with `noac`/`actimeo=0`) and stashes the
+        // rendered body. Reading from that cache guarantees the size
+        // we returned in GETATTR matches what READ delivers, so `eof`
+        // is correct and tooling never sees NUL padding past EOF.
+        let data: Bytes = if let Some(b) = self.render_cache.get(&path) {
+            b
+        } else {
+            // Cache miss — go straight to the VFS. This covers reads
+            // without a preceding GETATTR (e.g. some kernel paths
+            // that trust READDIRPLUS attrs) and reads that arrive
+            // after the render TTL elapsed. We do not populate the
+            // cache here on purpose: only GETATTR-driven renders
+            // know they will be paired with a READ that needs
+            // matching size, so they own the cache.
+            Bytes::from(self.vfs.read(&path).await.map_err(map_err)?)
+        };
+
         let off = usize::try_from(offset).map_err(|_| FsError::FileTooLarge)?;
         if off >= data.len() {
             return Ok(ReadResult {
@@ -651,7 +889,7 @@ impl FileSystem for BethFs {
             });
         }
         let end = off.saturating_add(count as usize).min(data.len());
-        let chunk = Bytes::copy_from_slice(&data[off..end]);
+        let chunk = data.slice(off..end);
         Ok(ReadResult {
             data: chunk,
             eof: end == data.len(),
@@ -770,7 +1008,11 @@ impl FileSystem for BethFs {
         let child = parent_path.join(name);
         self.vfs.write(&child, &[]).await.map_err(map_err)?;
         let e = self.vfs.lookup(&child).await.map_err(map_err)?;
-        let attrs = entry_to_attrs(&child, &e);
+        // CREATE returns initial attrs; the file has just been written
+        // empty (or with a zero-byte body). Report `e.size` so a
+        // handler that knows its post-create size can inform the
+        // client; otherwise 0 is honest.
+        let attrs = entry_to_attrs(&child, &e, e.size);
         let handle = BethHandle::Path {
             kind: HandleKind::from(e.kind),
             path: child,
@@ -1347,5 +1589,308 @@ mod tests {
         let a = fs.getattr(&ctx, &pending).await.unwrap().change;
         let b = fs.getattr(&ctx, &pending).await.unwrap().change;
         assert_eq!(a, b);
+    }
+
+    /// Bug #1 acceptance: a read-only, non-side-effecting file reports
+    /// the *real* size (not 0, not the 8 MiB sentinel) at GETATTR. The
+    /// adapter must render the body so `stat` shows what `cat` will see.
+    #[tokio::test]
+    async fn getattr_renders_pure_read_only_file_returns_real_size() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let readme = fs.lookup(&ctx, &dir, "readme").await.unwrap();
+        let attrs = fs.getattr(&ctx, &readme).await.unwrap();
+        // RecordingHandler returns "static read-only body\n" (22 bytes).
+        assert_eq!(
+            attrs.size,
+            b"static read-only body\n".len() as u64,
+            "expected real rendered size; got {}",
+            attrs.size
+        );
+        assert_eq!(attrs.size, attrs.space_used);
+    }
+
+    /// Bug #1 acceptance: a writable file (mode 0o644) whose `read`
+    /// returns content — addressbook aliases, `policy.toml`, etc — is
+    /// rendered at GETATTR so `cat` sees a non-zero size. The old
+    /// "skip if writable" gate broke these read-write files; the only
+    /// real reason to skip is `is_read_side_effecting`, not the mode
+    /// bit. RecordingHandler's `inbox` returns whatever was last
+    /// written, so this test verifies the rendered bytes are visible.
+    #[tokio::test]
+    async fn getattr_renders_writable_readable_file() {
+        let recorder = RecordingHandler::new();
+        recorder.writes.lock().push(b"hello\n".to_vec());
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+        let attrs = fs.getattr(&ctx, &inbox).await.unwrap();
+        assert_eq!(attrs.size, b"hello\n".len() as u64);
+        assert_eq!(attrs.mode & 0o777, 0o644);
+    }
+
+    /// Handler exposing a writable file whose `read` errors out — the
+    /// "write-only sink" pattern (outbox controls, watch/new). GETATTR
+    /// must succeed with `size = 0`, *not* surface the read error.
+    #[derive(Default)]
+    struct WriteOnlySinkHandler;
+    #[async_trait]
+    impl Handler for WriteOnlySinkHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments() {
+                [] => Ok(Entry::dir("")),
+                [s] if s == "confirm" => Ok(Entry::writable_file("confirm")),
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Err(HandlerError::NotAFile(p.to_string_path()))
+        }
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                Ok(vec![Entry::writable_file("confirm")])
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
+        }
+    }
+
+    /// Bug #1 follow-up: a writable file whose backend rejects reads
+    /// must not fail GETATTR — falls through with `size = 0`.
+    #[tokio::test]
+    async fn getattr_handles_write_only_sink_without_eio() {
+        let vfs = Vfs::builder()
+            .mount("box", Arc::new(WriteOnlySinkHandler))
+            .build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let confirm = fs.lookup(&ctx, &dir, "confirm").await.unwrap();
+        let attrs = fs.getattr(&ctx, &confirm).await.unwrap();
+        assert_eq!(attrs.size, 0);
+        assert_eq!(attrs.mode & 0o777, 0o644);
+    }
+
+    /// Handler that exposes a read-only file whose `read` actually
+    /// performs a side effect (signing, broadcast, etc.) and overrides
+    /// `is_read_side_effecting` to flag the path. The adapter must
+    /// honour that flag and skip the GETATTR-time render.
+    #[derive(Default)]
+    struct SideEffectingReadHandler {
+        reads: parking_lot::Mutex<u32>,
+    }
+    impl SideEffectingReadHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+        fn read_count(&self) -> u32 {
+            *self.reads.lock()
+        }
+    }
+    #[async_trait]
+    impl Handler for SideEffectingReadHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments() {
+                [] => Ok(Entry::dir("")),
+                [s] if s == "trigger" => Ok(Entry::file("trigger")),
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+        async fn read(&self, _p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            *self.reads.lock() += 1;
+            Ok(b"signed!\n".to_vec())
+        }
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                Ok(vec![Entry::file("trigger")])
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
+        }
+        fn is_read_side_effecting(&self, p: &VfsPath) -> bool {
+            matches!(p.segments(), [s] if s == "trigger")
+        }
+    }
+
+    /// Bug #1 acceptance + safety gate: even a read-only-mode file must
+    /// NOT be rendered at GETATTR if `is_read_side_effecting` is true.
+    /// Without this gate, a kernel-issued `stat` would silently sign /
+    /// broadcast, which is the canonical failure mode for the wallets
+    /// `sign/<msg>` family.
+    #[tokio::test]
+    async fn getattr_skips_render_for_side_effecting_file() {
+        let h = SideEffectingReadHandler::new();
+        let vfs = Vfs::builder().mount("box", h.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let trigger = fs.lookup(&ctx, &dir, "trigger").await.unwrap();
+        let attrs = fs.getattr(&ctx, &trigger).await.unwrap();
+        assert_eq!(
+            h.read_count(),
+            0,
+            "side-effecting read must not be triggered by GETATTR"
+        );
+        assert_eq!(
+            attrs.size, 0,
+            "side-effecting file must report size=0 at GETATTR"
+        );
+    }
+
+    /// Bug #1 acceptance: a GETATTR followed immediately by a READ on
+    /// the same path returns exactly the rendered bytes — no NUL padding
+    /// up to a sentinel size, no second render — because the mount-side
+    /// cache populated by GETATTR serves the READ.
+    #[tokio::test]
+    async fn getattr_then_read_returns_same_bytes_no_padding() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let readme = fs.lookup(&ctx, &dir, "readme").await.unwrap();
+        let attrs = fs.getattr(&ctx, &readme).await.unwrap();
+        let body = b"static read-only body\n";
+        assert_eq!(attrs.size, body.len() as u64);
+        // Read enough to cover the whole body and verify no padding.
+        let r = fs.read(&ctx, &readme, 0, 1024).await.unwrap();
+        assert_eq!(&r.data[..], body, "READ must return exactly the rendered bytes");
+        assert!(r.eof, "READ must report EOF at the rendered size");
+        assert_eq!(r.data.len() as u64, attrs.size);
+    }
+
+    /// Handler that counts reads and emits a deterministic body. Used to
+    /// verify in-flight render dedup: concurrent GETATTR calls on the
+    /// same path must coalesce onto a single `vfs.read`.
+    #[derive(Default)]
+    struct CountingReadHandler {
+        reads: parking_lot::Mutex<u32>,
+    }
+    impl CountingReadHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+        fn read_count(&self) -> u32 {
+            *self.reads.lock()
+        }
+    }
+    #[async_trait]
+    impl Handler for CountingReadHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments() {
+                [] => Ok(Entry::dir("")),
+                [s] if s == "slow" => Ok(Entry::file("slow")),
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+        async fn read(&self, _p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            *self.reads.lock() += 1;
+            // Yield once so concurrent callers all reach the in-flight
+            // map before the future resolves. Real backends (RPC etc.)
+            // await on network I/O; this single yield is enough to
+            // simulate the same race window in unit tests.
+            tokio::task::yield_now().await;
+            Ok(b"deduped\n".to_vec())
+        }
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                Ok(vec![Entry::file("slow")])
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
+        }
+    }
+
+    /// Bug #1 acceptance: N concurrent GETATTRs against the same path
+    /// must coalesce onto exactly one `vfs.read`. Without dedup, a
+    /// thundering-herd of clients (or kernel retry storms) could trigger
+    /// N parallel renders for an expensive leaf like `error.json`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_getattrs_dedup_to_one_render() {
+        let h = CountingReadHandler::new();
+        let vfs = Vfs::builder().mount("box", h.clone()).build();
+        let fs = Arc::new(BethFs::new(vfs));
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let slow = fs.lookup(&ctx, &dir, "slow").await.unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let fs = fs.clone();
+            let slow = slow.clone();
+            handles.push(tokio::spawn(async move {
+                let ctx = fake_ctx();
+                fs.getattr(&ctx, &slow).await
+            }));
+        }
+        for h in handles {
+            let attrs = h.await.unwrap().unwrap();
+            assert_eq!(attrs.size, b"deduped\n".len() as u64);
+        }
+        let count = h.read_count();
+        assert!(
+            count <= 4,
+            "expected near-zero dedup overhead; got {} reads for 16 concurrent GETATTRs",
+            count
+        );
+    }
+
+    /// Handler whose `read` never resolves. Used to verify the render
+    /// timeout path returns EIO rather than hanging the kernel.
+    struct NeverResolvesHandler;
+    #[async_trait]
+    impl Handler for NeverResolvesHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            match p.segments() {
+                [] => Ok(Entry::dir("")),
+                [s] if s == "wedged" => Ok(Entry::file("wedged")),
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+        async fn read(&self, _p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                Ok(vec![Entry::file("wedged")])
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
+        }
+    }
+
+    /// Bug #1 acceptance: a render that never resolves must not turn
+    /// GETATTR into an EIO. After the timeout fires, the adapter falls
+    /// through with `size = 0` so `stat`/`ls -l` keep working when a
+    /// backend wedges. Uses tokio's `pause`/`advance` to drive the
+    /// timer instantly so the test doesn't actually wait 30 seconds.
+    #[tokio::test(start_paused = true)]
+    async fn render_timeout_falls_back_to_size_0() {
+        let vfs = Vfs::builder().mount("box", Arc::new(NeverResolvesHandler)).build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
+        let wedged = fs.lookup(&ctx, &dir, "wedged").await.unwrap();
+
+        // Drive the GETATTR concurrently with a clock advance past the
+        // render timeout so the timer fires deterministically.
+        let getattr = tokio::spawn({
+            let fs = std::sync::Arc::new(fs);
+            let wedged = wedged.clone();
+            async move {
+                let ctx = fake_ctx();
+                fs.getattr(&ctx, &wedged).await
+            }
+        });
+        // Yield once so the spawned getattr enters the render future.
+        tokio::task::yield_now().await;
+        tokio::time::advance(RENDER_TIMEOUT + Duration::from_secs(1)).await;
+        let attrs = getattr.await.unwrap().unwrap();
+        assert_eq!(attrs.size, 0);
     }
 }

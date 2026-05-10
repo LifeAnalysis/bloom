@@ -157,19 +157,28 @@ pub fn detect_mount_command() -> &'static str {
 /// the platform mount command, targeting the embedded NFSv4.1 server at
 /// `server`.
 ///
-/// Mirrors bloom's option set: `noac,lookupcache=none` to disable kernel
-/// caching that interferes with reactive VFS updates, `vers=4.1`,
-/// `proto=tcp`, `nolocks` (no NLM — the embedded server doesn't speak
-/// it), explicit `mountport`/`port` so we can target the auto-assigned
-/// ephemeral port, generous `rsize`/`wsize` so most JSON/TOML payloads
-/// fit in a single op (the adapter buffers multi-block writes anyway
-/// but a single op stays simpler for the common case), and `timeo=10`
-/// for snappy failure on a wedged server.
+/// The shared options are `vers=4.1,proto=tcp,nolocks` (the embedded
+/// server doesn't speak NLM), explicit `mountport`/`port` so we can
+/// target the auto-assigned ephemeral port, generous `rsize`/`wsize`
+/// so most JSON/TOML payloads fit in a single op (the adapter buffers
+/// multi-block writes anyway but a single op stays simpler for the
+/// common case), and `timeo=10` for snappy failure on a wedged server.
+///
+/// Caching options diverge per-platform because the kernels expose
+/// different knobs:
+///
+/// * **Linux** (`mount.nfs4`): `noac,lookupcache=none` disables kernel
+///   attribute and lookup caching that would otherwise mask reactive
+///   VFS updates. `noac` implies `actimeo=0` plus sync writes.
+/// * **macOS** (`mount_nfs`): `actimeo=0` zeros the attribute-cache
+///   timeouts. The Linux-only `lookupcache=none`, `nocallback`, and
+///   `nonegnamecache` knobs are *not* recognised by macOS and would
+///   cause the mount to be rejected.
+/// * **Other Unix**: mirrored from macOS as a portable default; mount
+///   tooling that doesn't grok `actimeo=0` will surface its own error.
 pub fn build_mount_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
     let port = server.port();
-    let mut opts = format!(
-        "noac,lookupcache=none,vers=4.1,proto=tcp,nolocks,mountport={port},port={port},rsize=65536,wsize=65536,timeo=10"
-    );
+    let mut opts = build_mount_opts(port);
     if cfg.readonly {
         opts.push_str(",ro");
     }
@@ -179,6 +188,27 @@ pub fn build_mount_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
         format!("{}:/", server.ip()),
         cfg.mount_path.display().to_string(),
     ]
+}
+
+#[cfg(target_os = "linux")]
+fn build_mount_opts(port: u16) -> String {
+    format!(
+        "noac,lookupcache=none,vers=4.1,proto=tcp,nolocks,mountport={port},port={port},rsize=65536,wsize=65536,timeo=10"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn build_mount_opts(port: u16) -> String {
+    format!(
+        "actimeo=0,vers=4.1,proto=tcp,nolocks,mountport={port},port={port},rsize=65536,wsize=65536,timeo=10"
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn build_mount_opts(port: u16) -> String {
+    format!(
+        "actimeo=0,vers=4.1,proto=tcp,nolocks,mountport={port},port={port},rsize=65536,wsize=65536,timeo=10"
+    )
 }
 
 #[cfg(test)]
@@ -217,6 +247,75 @@ mod tests {
             "missing mountport=54321 in {joined}"
         );
         assert!(args.last().unwrap().ends_with("/tmp/beth"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_mount_args_linux_uses_noac_and_lookupcache_none() {
+        let cfg = MountConfig {
+            mount_path: PathBuf::from("/tmp/beth"),
+            nfs_listen: "127.0.0.1:0".parse().unwrap(),
+            readonly: false,
+        };
+        let server: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let args = build_mount_args(&cfg, server);
+        let joined = args.join(" ");
+        assert!(joined.contains("noac"), "linux opts must include noac: {joined}");
+        assert!(
+            joined.contains("lookupcache=none"),
+            "linux opts must include lookupcache=none: {joined}"
+        );
+        assert!(
+            !joined.contains("actimeo="),
+            "linux opts should rely on noac, not actimeo: {joined}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_mount_args_macos_uses_actimeo_only() {
+        let cfg = MountConfig {
+            mount_path: PathBuf::from("/tmp/beth"),
+            nfs_listen: "127.0.0.1:0".parse().unwrap(),
+            readonly: false,
+        };
+        let server: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let args = build_mount_args(&cfg, server);
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("actimeo=0"),
+            "macos opts must include actimeo=0: {joined}"
+        );
+        // Linux-only knobs that mount_nfs doesn't recognise.
+        assert!(
+            !joined.contains("noac"),
+            "macos opts must not include noac: {joined}"
+        );
+        assert!(
+            !joined.contains("lookupcache="),
+            "macos opts must not include lookupcache=: {joined}"
+        );
+        assert!(
+            !joined.contains("nocallback"),
+            "macos opts must not include nocallback: {joined}"
+        );
+        assert!(
+            !joined.contains("nonegnamecache"),
+            "macos opts must not include nonegnamecache: {joined}"
+        );
+    }
+
+    #[test]
+    fn build_mount_args_readonly_appends_ro() {
+        let cfg = MountConfig {
+            mount_path: PathBuf::from("/tmp/beth"),
+            nfs_listen: "127.0.0.1:0".parse().unwrap(),
+            readonly: true,
+        };
+        let server: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let args = build_mount_args(&cfg, server);
+        let joined = args.join(" ");
+        assert!(joined.contains(",ro"), "readonly mount must append ,ro: {joined}");
     }
 
     #[tokio::test]
