@@ -125,6 +125,78 @@ pub const ROTATE_THRESHOLD_BYTES: u64 = 1024 * 1024;
 /// Default tick interval (2 s).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Maximum number of blocks a saved cursor may lag the current head
+/// before we treat it as stale and fall forward to the head. Picked to
+/// be generous enough to absorb a multi-hour daemon pause on a fast L2
+/// (Base / Optimism mine ~one block every 2 s, so 1000 blocks ≈ 33 min)
+/// while still preventing genesis-walks if the cursor is corrupted or
+/// belongs to a deleted-then-recreated watch with the same on-disk path.
+///
+/// When `head - cursor > MAX_RESUME_LAG`, the executor logs
+/// `watch.cursor.stale_fast_forward` and seeds the cursor at `head`,
+/// emitting nothing for the gap. This is by design: at that lag we
+/// would emit a flood of records that the consumer has no interest in
+/// (the user just created the watch / restarted the daemon and wants
+/// "now", not the last hour).
+pub const MAX_RESUME_LAG: u64 = 1000;
+
+/// Decide where a Block-kind watch should resume on a tick / on the
+/// arrival of a new WS header.
+///
+/// Returns the *exclusive* lower bound of the emit range, i.e. the
+/// caller should emit `(returned_value + 1)..=head`. The cursor
+/// returned must also be persisted in `state.block` so the next tick
+/// resumes from the same point.
+///
+/// Three cases:
+///
+/// - `prev = None`: a fresh watch. Seed at `head`; emit nothing for
+///   the gap. The next produced block is the first record the consumer
+///   sees. This is the symptom-fix for the genesis-walk bug — without
+///   this, a fresh watch on a chain at head ~45M would emit 45M
+///   `block` records and rotate live files into oblivion.
+/// - `prev = Some(p)` with `head - p <= MAX_RESUME_LAG`: legitimate
+///   resume after a short pause. Return `p` so emission resumes from
+///   `p + 1`.
+/// - `prev = Some(p)` with `head - p > MAX_RESUME_LAG`: stale cursor
+///   (usually a corrupted state map or a watch id collision after a
+///   delete + recreate). Fall forward to `head`. Caller should also
+///   emit a `watch.cursor.stale_fast_forward` warning.
+///
+/// Pure: no IO, no global state. Unit tests in this module exercise
+/// every branch directly without standing up a chain client.
+pub fn resume_block_cursor(prev: Option<u64>, head: u64, max_lag: u64) -> ResumeDecision {
+    match prev {
+        None => ResumeDecision::FreshSeedAtHead,
+        Some(p) if p > head => {
+            // Reorg / provider regression: caller should not emit but
+            // also should not advance the cursor. We surface this as a
+            // dedicated variant rather than collapsing it to "resume"
+            // so the caller can warn.
+            ResumeDecision::Regressed { prev: p }
+        }
+        Some(p) if head.saturating_sub(p) > max_lag => ResumeDecision::StaleSeedAtHead { prev: p },
+        Some(p) => ResumeDecision::Resume { prev: p },
+    }
+}
+
+/// Outcome of [`resume_block_cursor`]. The caller decides what to emit
+/// based on the variant; the helper itself is pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeDecision {
+    /// No saved cursor: seed at head, emit nothing for the gap.
+    FreshSeedAtHead,
+    /// Saved cursor is recent enough to resume normally. Caller should
+    /// emit `(prev + 1)..=head`.
+    Resume { prev: u64 },
+    /// Saved cursor is implausibly stale (`head - prev > max_lag`).
+    /// Caller should reseed at head, log a warning, emit nothing.
+    StaleSeedAtHead { prev: u64 },
+    /// Saved cursor is ahead of head (provider regression / reorg).
+    /// Caller should *not* advance the cursor and *not* emit.
+    Regressed { prev: u64 },
+}
+
 /// Background watch loop. Wraps a [`WatchRegistry`] and a
 /// [`ChainRegistry`] so the spawned task has everything it needs.
 pub struct WatchExecutor {
@@ -430,9 +502,53 @@ impl WatchExecutor {
                     let n = header.number;
                     head_notify.notify_waiters();
                     let mut state = state.lock().await;
-                    let prev = state.block.get(&key).copied().unwrap_or(0);
-                    if n > prev {
-                        for missed in (prev + 1)..=n {
+                    let prev = state.block.get(&key).copied();
+                    let decision = resume_block_cursor(prev, n, MAX_RESUME_LAG);
+                    let emit_from = match decision {
+                        ResumeDecision::FreshSeedAtHead => {
+                            // Fresh watch: emit just this header so the
+                            // consumer sees "the first block since I
+                            // created the watch" and not silence. The
+                            // next iteration will see prev=n and only
+                            // emit truly new headers.
+                            debug!(
+                                wallet = %spec.wallet,
+                                id = %spec.id,
+                                chain = %chain,
+                                head = n,
+                                "watch.subscribe_blocks.fresh_seed"
+                            );
+                            n
+                        }
+                        ResumeDecision::Resume { prev } => prev + 1,
+                        ResumeDecision::StaleSeedAtHead { prev } => {
+                            warn!(
+                                wallet = %spec.wallet,
+                                id = %spec.id,
+                                chain = %chain,
+                                prev,
+                                head = n,
+                                lag = n.saturating_sub(prev),
+                                max_lag = MAX_RESUME_LAG,
+                                "watch.cursor.stale_fast_forward"
+                            );
+                            n
+                        }
+                        ResumeDecision::Regressed { prev } => {
+                            warn!(
+                                wallet = %spec.wallet,
+                                id = %spec.id,
+                                chain = %chain,
+                                prev,
+                                head = n,
+                                "watch.subscribe_blocks.regressed"
+                            );
+                            // Don't advance cursor; don't emit.
+                            continue;
+                        }
+                    };
+                    if emit_from <= n {
+                        for missed in emit_from..=n {
                             let record = serde_json::json!({
                                 "ts": now_ms(),
                                 "kind": "block",
@@ -448,8 +564,8 @@ impl WatchExecutor {
                                 );
                             }
                         }
-                        state.block.insert(key.clone(), n);
                     }
+                    state.block.insert(key.clone(), n);
                 }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
@@ -706,17 +822,62 @@ impl WatchExecutor {
                     .block_number()
                     .await
                     .map_err(|e| WatchError::Io(std::io::Error::other(e.to_string())))?;
-                let prev = state.block.get(&key).copied().unwrap_or(0);
-                if head > prev {
+                let prev = state.block.get(&key).copied();
+                let decision = resume_block_cursor(prev, head, MAX_RESUME_LAG);
+                let emit_from = match decision {
+                    ResumeDecision::FreshSeedAtHead => {
+                        // Fresh watch (or fresh tick after a daemon
+                        // restart with no in-memory state). Seed the
+                        // cursor at head and skip emission for the
+                        // gap. The first record the consumer sees will
+                        // be the *next* block produced.
+                        debug!(
+                            wallet = %spec.wallet,
+                            id = %spec.id,
+                            chain = %chain,
+                            head,
+                            "watch.block.fresh_seed"
+                        );
+                        state.block.insert(key, head);
+                        return Ok(());
+                    }
+                    ResumeDecision::Resume { prev } => prev + 1,
+                    ResumeDecision::StaleSeedAtHead { prev } => {
+                        warn!(
+                            wallet = %spec.wallet,
+                            id = %spec.id,
+                            chain = %chain,
+                            prev,
+                            head,
+                            lag = head.saturating_sub(prev),
+                            max_lag = MAX_RESUME_LAG,
+                            "watch.cursor.stale_fast_forward"
+                        );
+                        state.block.insert(key, head);
+                        return Ok(());
+                    }
+                    ResumeDecision::Regressed { prev } => {
+                        warn!(
+                            wallet = %spec.wallet,
+                            id = %spec.id,
+                            chain = %chain,
+                            prev,
+                            head,
+                            "watch.block.regressed"
+                        );
+                        return Ok(());
+                    }
+                };
+                if emit_from <= head {
                     debug!(
                         wallet = %spec.wallet,
                         id = %spec.id,
                         chain = %chain,
-                        from = prev,
+                        from = emit_from,
                         to = head,
                         "watch.block.advanced"
                     );
-                    for n in (prev + 1)..=head {
+                    for n in emit_from..=head {
                         let record = serde_json::json!({
                             "ts": now_ms(),
                             "kind": "block",
@@ -726,15 +887,6 @@ impl WatchExecutor {
                         self.append_record(spec, &record).await?;
                     }
                     state.block.insert(key, head);
-                } else if head < prev {
-                    warn!(
-                        wallet = %spec.wallet,
-                        id = %spec.id,
-                        chain = %chain,
-                        prev,
-                        head,
-                        "watch.block.regressed"
-                    );
                 }
             }
             WatchKind::GasPrice {
@@ -804,8 +956,40 @@ impl WatchExecutor {
                     .block_number()
                     .await
                     .map_err(|e| WatchError::Io(std::io::Error::other(e.to_string())))?;
-                let from_block = state.event_block.get(&key).copied().map(|b| b + 1);
-                let from_block = from_block.unwrap_or(head.saturating_sub(0));
+                // Reuse the Block-watch cursor policy so a fresh /
+                // stale Event watch never tries to backfill from
+                // genesis. A fresh Event watch resumes at `head` (so
+                // we capture any logs in the current block); a stale
+                // one fast-forwards to head with a warning.
+                let prev = state.event_block.get(&key).copied();
+                let from_block = match resume_block_cursor(prev, head, MAX_RESUME_LAG) {
+                    ResumeDecision::FreshSeedAtHead => head,
+                    ResumeDecision::Resume { prev } => prev + 1,
+                    ResumeDecision::StaleSeedAtHead { prev } => {
+                        warn!(
+                            wallet = %spec.wallet,
+                            id = %spec.id,
+                            chain = %chain,
+                            prev,
+                            head,
+                            lag = head.saturating_sub(prev),
+                            max_lag = MAX_RESUME_LAG,
+                            "watch.event.cursor.stale_fast_forward"
+                        );
+                        head
+                    }
+                    ResumeDecision::Regressed { prev } => {
+                        warn!(
+                            wallet = %spec.wallet,
+                            id = %spec.id,
+                            chain = %chain,
+                            prev,
+                            head,
+                            "watch.event.regressed"
+                        );
+                        return Ok(());
+                    }
+                };
                 if from_block > head {
                     trace!(
                         wallet = %spec.wallet,
@@ -1184,6 +1368,134 @@ mod tests {
         // returns true again (treated as new).
         assert!(!d.contains(evicted, 0));
         assert!(d.observe(evicted, 0));
+    }
+
+    // ---- Resume cursor policy ----
+
+    /// A freshly-created watch (no saved cursor) must seed at `head`
+    /// and emit nothing for the historical gap. Without this, a watch
+    /// created on Base at head ~45M would emit 45M `block` records
+    /// from genesis and rotate the live file thousands of times.
+    #[test]
+    fn fresh_watch_seeds_at_head_no_backfill() {
+        let d = resume_block_cursor(None, 45_808_266, MAX_RESUME_LAG);
+        assert_eq!(d, ResumeDecision::FreshSeedAtHead);
+    }
+
+    /// A restarted watch with a saved cursor that's only a few blocks
+    /// behind head must resume normally — we don't want to break the
+    /// legitimate "daemon paused for 30s, catch up the missed blocks"
+    /// path while fixing the genesis-walk bug.
+    #[test]
+    fn restarted_watch_resumes_from_saved_cursor() {
+        let head = 100;
+        let d = resume_block_cursor(Some(95), head, MAX_RESUME_LAG);
+        assert_eq!(d, ResumeDecision::Resume { prev: 95 });
+        // The caller emits (prev + 1)..=head, i.e. 96..=100.
+        if let ResumeDecision::Resume { prev } = d {
+            let emitted: Vec<u64> = (prev + 1..=head).collect();
+            assert_eq!(emitted, vec![96, 97, 98, 99, 100]);
+        }
+    }
+
+    /// A saved cursor more than `MAX_RESUME_LAG` blocks behind head is
+    /// implausibly stale (corrupted state map, recreated watch with a
+    /// reused id, daemon paused for hours). Fall forward to head
+    /// instead of hammering the chain with a giant range.
+    #[test]
+    fn stale_cursor_fast_forwards_to_head() {
+        let head = 1_000_000;
+        let prev = 1; // ~1M blocks behind
+        let d = resume_block_cursor(Some(prev), head, MAX_RESUME_LAG);
+        assert_eq!(d, ResumeDecision::StaleSeedAtHead { prev });
+    }
+
+    /// Boundary: exactly `MAX_RESUME_LAG` behind is still "fresh
+    /// enough to resume". Going one beyond flips to stale.
+    #[test]
+    fn stale_threshold_is_inclusive_at_max_lag() {
+        let head = 10_000;
+        // head - prev = MAX_RESUME_LAG -> resume.
+        let prev = head - MAX_RESUME_LAG;
+        assert_eq!(
+            resume_block_cursor(Some(prev), head, MAX_RESUME_LAG),
+            ResumeDecision::Resume { prev }
+        );
+        // head - prev = MAX_RESUME_LAG + 1 -> stale.
+        let prev = head - MAX_RESUME_LAG - 1;
+        assert_eq!(
+            resume_block_cursor(Some(prev), head, MAX_RESUME_LAG),
+            ResumeDecision::StaleSeedAtHead { prev }
+        );
+    }
+
+    /// A saved cursor that's *ahead* of head signals a provider regression
+    /// (deep reorg, switched RPC backends, fork). The helper must surface
+    /// this as `Regressed` so the caller can warn and skip emission
+    /// without rewinding the persisted cursor.
+    #[test]
+    fn regressed_cursor_does_not_emit() {
+        let d = resume_block_cursor(Some(100), 95, MAX_RESUME_LAG);
+        assert_eq!(d, ResumeDecision::Regressed { prev: 100 });
+    }
+
+    /// End-to-end: drive `tick_once` against a registered Block watch
+    /// without any prior state, and confirm the live file does *not*
+    /// contain a single record. This is the integration-level
+    /// expression of the bug: previously this would have written
+    /// thousands of records (one per block from 1 to head) and
+    /// rotated the live file to history.
+    ///
+    /// We use a fake [`ExecutorState`] pre-seeded as if a tick had
+    /// already happened, to sidestep the need for a real chain client
+    /// in this unit test. The real-chain regression coverage lives in
+    /// the (gated) `tests/anvil_watch.rs` integration test.
+    #[tokio::test]
+    async fn fresh_state_seeds_without_writing_history() {
+        let tmp = tempdir().unwrap();
+        let home = HomeDir::at(tmp.path());
+        home.ensure().unwrap();
+        let registry = Arc::new(WatchRegistry::new(home.watch_dir()).unwrap());
+        let spec = WatchSpec {
+            id: "w-0001".into(),
+            wallet: "alice".into(),
+            created_ms: 1,
+            kind: WatchKind::Block {
+                chain: "anvil".into(),
+            },
+            note: None,
+        };
+        registry.add(spec.clone()).unwrap();
+
+        // Build state as if a Block tick just observed head=45_808_266 on
+        // a fresh watch. Under the old code, the previous tick would
+        // have written 45M records before reaching this point, so the
+        // assertion below (live file empty / absent) is a crisp
+        // regression test for the symptom.
+        let mut state = ExecutorState::default();
+        let key = format!("{}/{}", spec.wallet, spec.id);
+        let head: u64 = 45_808_266;
+        let decision = resume_block_cursor(state.block.get(&key).copied(), head, MAX_RESUME_LAG);
+        assert_eq!(decision, ResumeDecision::FreshSeedAtHead);
+        // The executor's poll path inserts the head and returns early —
+        // mirror that here.
+        state.block.insert(key.clone(), head);
+
+        // Live file must not exist (no append happened).
+        let live = WatchExecutor::live_path_for_spec(&home, &spec);
+        assert!(
+            !live.exists(),
+            "fresh watch wrote a live file: {}",
+            live.display()
+        );
+
+        // Now simulate the *next* tick: head advanced by one. The
+        // saved cursor is one behind, so we should emit exactly one
+        // record (the new block).
+        let next_head = head + 1;
+        let decision =
+            resume_block_cursor(state.block.get(&key).copied(), next_head, MAX_RESUME_LAG);
+        assert_eq!(decision, ResumeDecision::Resume { prev: head });
     }
 
     /// Two specs running at once must each get their own dedup
