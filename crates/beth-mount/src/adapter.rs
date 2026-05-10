@@ -33,7 +33,7 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
-use beth_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
+use beth_vfs::{percent_decode_segment, Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 
 /// Maximum bytes we'll buffer for a single open file before forcing a
 /// flush (or rejecting further writes with FBIG). 8 MiB matches the
@@ -732,8 +732,17 @@ impl FileSystem for BethFs {
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             return Err(FsError::InvalidInput);
         }
+        // The kernel splits paths on `/` only and hands us each
+        // component verbatim. Users embed special bytes (space, `?`,
+        // `#`, even `/`) using percent-escapes, so decode here — this
+        // is the single chokepoint where kernel-supplied bytes become
+        // a VFS path segment. See `beth_vfs::percent_decode_segment`.
+        let decoded = percent_decode_segment(name).map_err(|e| {
+            debug!(name = %name, error = %e, "mount.adapter.lookup.bad_percent_escape");
+            FsError::InvalidInput
+        })?;
         let parent_path = Self::path_of(parent);
-        let child = parent_path.join(name);
+        let child = parent_path.join(&decoded);
         let e = self.vfs.lookup(&child).await.map_err(map_err)?;
         Ok(BethHandle::Path {
             kind: HandleKind::from(e.kind),
@@ -1004,8 +1013,14 @@ impl FileSystem for BethFs {
         if name.is_empty() || name.contains('/') {
             return Err(FsError::InvalidInput);
         }
+        // Same chokepoint as `lookup`: percent-decode the kernel-
+        // supplied component before it becomes a VFS path segment.
+        let decoded = percent_decode_segment(name).map_err(|e| {
+            debug!(name = %name, error = %e, "mount.adapter.create.bad_percent_escape");
+            FsError::InvalidInput
+        })?;
         let parent_path = Self::path_of(parent);
-        let child = parent_path.join(name);
+        let child = parent_path.join(&decoded);
         self.vfs.write(&child, &[]).await.map_err(map_err)?;
         let e = self.vfs.lookup(&child).await.map_err(map_err)?;
         // CREATE returns initial attrs; the file has just been written
@@ -1892,5 +1907,85 @@ mod tests {
         tokio::time::advance(RENDER_TIMEOUT + Duration::from_secs(1)).await;
         let attrs = getattr.await.unwrap().unwrap();
         assert_eq!(attrs.size, 0);
+    }
+
+    /// Bug #2 acceptance: kernel-supplied path components arrive as
+    /// percent-encoded bytes (the kernel only splits on `/`), so the
+    /// adapter must decode them before constructing `VfsPath`. A
+    /// handler that echoes its received segment proves the decoded
+    /// bytes — not the literal `%20` form — reach the VFS.
+    struct EchoSegmentHandler;
+
+    #[async_trait]
+    impl Handler for EchoSegmentHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            if p.is_root() {
+                return Ok(Entry::dir(""));
+            }
+            // Any non-root path is a file whose name matches the last
+            // segment. Reading it returns that segment's bytes.
+            Ok(Entry::file(p.segments().last().unwrap()))
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            let last = p
+                .segments()
+                .last()
+                .cloned()
+                .ok_or_else(|| HandlerError::NotAFile(p.to_string_path()))?;
+            Ok(last.into_bytes())
+        }
+        async fn list(&self, _p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_percent_decodes_space() {
+        let vfs = Vfs::builder()
+            .mount("echo", Arc::new(EchoSegmentHandler))
+            .build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "echo").await.unwrap();
+        // Kernel hands us the literal bytes "hello%20world".
+        let leaf = fs
+            .lookup(&ctx, &dir, "hello%20world")
+            .await
+            .unwrap();
+        let r = fs.read(&ctx, &leaf, 0, 1024).await.unwrap();
+        assert_eq!(&r.data[..], b"hello world");
+    }
+
+    #[tokio::test]
+    async fn lookup_decodes_literal_percent_round_trip() {
+        // `%25` -> `%`, so the segment "100%25done" decodes to "100%done".
+        let vfs = Vfs::builder()
+            .mount("echo", Arc::new(EchoSegmentHandler))
+            .build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "echo").await.unwrap();
+        let leaf = fs
+            .lookup(&ctx, &dir, "100%25done")
+            .await
+            .unwrap();
+        let r = fs.read(&ctx, &leaf, 0, 1024).await.unwrap();
+        assert_eq!(&r.data[..], b"100%done");
+    }
+
+    #[tokio::test]
+    async fn lookup_rejects_malformed_percent_escape() {
+        let vfs = Vfs::builder()
+            .mount("echo", Arc::new(EchoSegmentHandler))
+            .build();
+        let fs = BethFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BethHandle::Root, "echo").await.unwrap();
+        // `%2` is truncated; `%ZZ` has bad hex; both should map to
+        // InvalidInput rather than passing through to the VFS.
+        let err = fs.lookup(&ctx, &dir, "ab%2").await.unwrap_err();
+        assert!(matches!(err, FsError::InvalidInput));
+        let err = fs.lookup(&ctx, &dir, "ab%ZZ").await.unwrap_err();
+        assert!(matches!(err, FsError::InvalidInput));
     }
 }

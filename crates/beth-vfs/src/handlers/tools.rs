@@ -524,6 +524,45 @@ mod tests {
         assert!(s.trim().len() == 66);
     }
 
+    /// Bug #2 acceptance: when the mount adapter percent-decodes the
+    /// kernel-supplied component "hello%20world" into "hello world",
+    /// the keccak handler must hash the decoded bytes. We simulate the
+    /// post-decode state by `join`-ing a literal-space segment onto
+    /// the keccak root and checking the hash matches `keccak("hello
+    /// world")`. The expected digest is the canonical reference value.
+    #[tokio::test]
+    async fn keccak_one_shot_with_decoded_space() {
+        let h = ToolsHandler::new();
+        // After percent_decode_segment("hello%20world") the adapter
+        // hands the handler a path whose last segment is "hello world".
+        let p = VfsPath::root().join("keccak").join("hello world");
+        assert_eq!(p.segments(), &["keccak", "hello world"]);
+        let v = h.read(&p).await.unwrap();
+        let s = String::from_utf8(v).unwrap();
+        // keccak256("hello world").
+        assert_eq!(
+            s.trim(),
+            "0x47173285a8d7341e5e972fc677286384f802f8ef42a5ec5f03bbfa254cb01fad"
+        );
+    }
+
+    /// A path component that originally contained a literal `%`
+    /// (encoded by the user as `%25`) must round-trip cleanly: the
+    /// adapter decodes `%25` -> `%`, and the handler hashes the byte
+    /// sequence that includes the `%`.
+    #[tokio::test]
+    async fn keccak_one_shot_with_decoded_percent() {
+        let h = ToolsHandler::new();
+        let p = VfsPath::root().join("keccak").join("100%done");
+        let v = h.read(&p).await.unwrap();
+        let s = String::from_utf8(v).unwrap();
+        // The handler should hash the literal byte sequence "100%done".
+        // We cross-check by re-running the same primitive against the
+        // raw bytes; the post-decode form must match.
+        let expected = format!("{}\n", beth_tools::keccak_hex("100%done".as_bytes()));
+        assert_eq!(s, expected);
+    }
+
     #[tokio::test]
     async fn sha256_one_shot() {
         let h = ToolsHandler::new();

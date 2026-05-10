@@ -25,5 +25,5 @@ pub mod router;
 
 pub use cache::PathCache;
 pub use handler::{Entry, EntryKind, Handler, HandlerError};
-pub use path::VfsPath;
+pub use path::{percent_decode_segment, PercentDecodeError, VfsPath};
 pub use router::Vfs;
