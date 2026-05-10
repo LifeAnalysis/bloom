@@ -173,7 +173,11 @@ pub fn detect_mount_command() -> &'static str {
 /// * **macOS** (`mount_nfs`): `actimeo=0` zeros the attribute-cache
 ///   timeouts. The Linux-only `lookupcache=none`, `nocallback`, and
 ///   `nonegnamecache` knobs are *not* recognised by macOS and would
-///   cause the mount to be rejected.
+///   cause the mount to be rejected. `nolocks` is NFSv2/v3-only per
+///   `mount_nfs(8)` and triggers `EINVAL` on a v4 mount; NFSv4 has
+///   built-in locking so the option is meaningless anyway. `mountport=`
+///   targets the v2/v3 mountd which doesn't exist for v4 — `port=` is
+///   sufficient to reach the embedded server.
 /// * **Other Unix**: mirrored from macOS as a portable default; mount
 ///   tooling that doesn't grok `actimeo=0` will surface its own error.
 pub fn build_mount_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
@@ -200,7 +204,7 @@ fn build_mount_opts(port: u16) -> String {
 #[cfg(target_os = "macos")]
 fn build_mount_opts(port: u16) -> String {
     format!(
-        "actimeo=0,vers=4.1,proto=tcp,nolocks,mountport={port},port={port},rsize=65536,wsize=65536,timeo=10"
+        "actimeo=0,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10"
     )
 }
 
@@ -302,6 +306,14 @@ mod tests {
         assert!(
             !joined.contains("nonegnamecache"),
             "macos opts must not include nonegnamecache: {joined}"
+        );
+        assert!(
+            !joined.contains("nolocks"),
+            "macos opts must not include nolocks (v2/v3-only, EINVAL on v4): {joined}"
+        );
+        assert!(
+            !joined.contains("mountport="),
+            "macos opts must not include mountport= (v2/v3 mountd-only): {joined}"
         );
     }
 
