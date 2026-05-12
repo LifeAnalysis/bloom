@@ -22,6 +22,9 @@ use crate::cache::PathCache;
 use crate::handler::{Entry, EntryKind, Handler, HandlerError};
 use crate::path::VfsPath;
 
+const AGENT_GUIDANCE: &[u8] = include_bytes!("docs/agent-guidance.md");
+const AGENT_GUIDANCE_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+
 /// Audit `kind` discriminants. Keep these in sync with `docs/AUDIT.md`.
 const AUDIT_KIND_WRITE: &str = "vfs.write";
 const AUDIT_KIND_READ: &str = "vfs.read";
@@ -137,11 +140,26 @@ impl Vfs {
     }
 }
 
+fn root_agent_guidance_entry(path: &VfsPath) -> Option<&'static str> {
+    match path.segments() {
+        [name] => AGENT_GUIDANCE_FILES
+            .iter()
+            .copied()
+            .find(|candidate| candidate == &name.as_str()),
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl Handler for Vfs {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         if path.is_root() {
             return Ok(Entry::dir(""));
+        }
+        if let Some(name) = root_agent_guidance_entry(path) {
+            let mut entry = Entry::file(name);
+            entry.size = AGENT_GUIDANCE.len() as u64;
+            return Ok(entry);
         }
         let head = path.first().unwrap();
         let h = self
@@ -156,6 +174,9 @@ impl Handler for Vfs {
     }
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        if root_agent_guidance_entry(path).is_some() {
+            return Ok(AGENT_GUIDANCE.to_vec());
+        }
         let head = path
             .first()
             .ok_or_else(|| HandlerError::NotAFile(path.to_string_path()))?;
@@ -214,6 +235,11 @@ impl Handler for Vfs {
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         if path.is_root() {
             let mut out = Vec::new();
+            for name in AGENT_GUIDANCE_FILES {
+                let mut entry = Entry::file(name);
+                entry.size = AGENT_GUIDANCE.len() as u64;
+                out.push(entry);
+            }
             for name in self.handlers.keys() {
                 out.push(Entry::dir(name));
             }
@@ -330,8 +356,54 @@ mod tests {
     async fn root_lists_top_segments() {
         let vfs = Vfs::builder().mount("echo", Arc::new(EchoHandler)).build();
         let entries = vfs.list(&VfsPath::root()).await.unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "echo");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name == "echo" && e.kind == EntryKind::Dir),
+            "entries={entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_lists_agent_guidance_files() {
+        let vfs = Vfs::builder().mount("echo", Arc::new(EchoHandler)).build();
+        let entries = vfs.list(&VfsPath::root()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"AGENTS.md"), "names={names:?}");
+        assert!(names.contains(&"CLAUDE.md"), "names={names:?}");
+
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let entry = entries.iter().find(|e| e.name == name).unwrap();
+            assert_eq!(entry.kind, EntryKind::File);
+            assert_eq!(entry.mode, 0o444);
+        }
+    }
+
+    #[tokio::test]
+    async fn root_agent_guidance_files_are_identical_to_markdown_source() {
+        let vfs = Vfs::builder().mount("echo", Arc::new(EchoHandler)).build();
+        let expected_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/docs/agent-guidance.md");
+        let expected = std::fs::read(&expected_path).expect("raw agent guidance markdown exists");
+
+        let agents = vfs
+            .read(&VfsPath::parse("/AGENTS.md").unwrap())
+            .await
+            .unwrap();
+        let claude = vfs
+            .read(&VfsPath::parse("/CLAUDE.md").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(agents, expected);
+        assert_eq!(claude, expected);
+        let text = std::str::from_utf8(&agents).expect("guidance is utf-8");
+        assert!(text.contains("/docs"), "guidance should call out /docs");
+        assert!(
+            text.contains("beth vfs"),
+            "guidance should mention the beth vfs CLI"
+        );
     }
 
     #[tokio::test]
