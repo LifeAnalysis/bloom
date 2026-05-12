@@ -151,7 +151,7 @@ impl LooseIntent {
                 return Err(ParseError::Shell(format!(
                     "unknown gas strategy '{}'",
                     other
-                )))
+                )));
             }
         };
         Ok(RawIntent {
@@ -298,7 +298,7 @@ fn parse_nft_shell(line: &str) -> Result<RawIntent, ParseError> {
                 other => {
                     return Err(ParseError::Shell(format!(
                         "expected 'true' or 'false', got '{other}'"
-                    )))
+                    )));
                 }
             };
             RawIntentBody::NftApproveAll {
@@ -310,7 +310,7 @@ fn parse_nft_shell(line: &str) -> Result<RawIntent, ParseError> {
         other => {
             return Err(ParseError::Shell(format!(
                 "unknown nft verb '{other}'; expected transfer | approve | set_approval_for_all"
-            )))
+            )));
         }
     };
     Ok(RawIntent {

@@ -19,13 +19,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use beth_chain::ChainClient;
-use beth_it::{cast_send, spawn_anvil, FUNDER_PRIV_KEY};
+use beth_it::{FUNDER_PRIV_KEY, cast_send, spawn_anvil};
 use beth_proto::ChainSpec;
 use beth_revert::{
-    boxed, AbiSource, BuiltinDecoder, DecodeContext, DecodeSource, DecoderChain,
-    EtherscanAbiDecoder,
+    AbiSource, BuiltinDecoder, DecodeContext, DecodeSource, DecoderChain, EtherscanAbiDecoder,
+    boxed,
 };
 use tokio::time::sleep;
 

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use alloy::eips::BlockNumberOrTag;
 use alloy::network::{Ethereum, TransactionBuilder};
-use alloy::primitives::{Address, BlockHash, Bytes, B256, U256};
+use alloy::primitives::{Address, B256, BlockHash, Bytes, U256};
 use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::eth::state::StateOverride;
 use alloy::rpc::types::eth::{
@@ -1139,9 +1139,8 @@ mod mock_rpc_tests {
                             ),
                         ),
                         Some(MockResponse::Err(code, message, data)) => {
-                            let data_str = data
-                                .map(|d| format!(",\"data\":{}", d))
-                                .unwrap_or_default();
+                            let data_str =
+                                data.map(|d| format!(",\"data\":{}", d)).unwrap_or_default();
                             (
                                 "HTTP/1.1 200 OK",
                                 format!(
@@ -1798,10 +1797,11 @@ mod mock_rpc_tests {
         let url = spawn_mock(r).await;
         let c = client_at(&url);
         let nft = address!("0x1111111111111111111111111111111111111111");
-        assert!(c
-            .supports_interface(nft, ERC165_INTERFACE_ID_ERC721)
-            .await
-            .unwrap());
+        assert!(
+            c.supports_interface(nft, ERC165_INTERFACE_ID_ERC721)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1814,10 +1814,11 @@ mod mock_rpc_tests {
         let url = spawn_mock(r).await;
         let c = client_at(&url);
         let nft = address!("0x2222222222222222222222222222222222222222");
-        assert!(!c
-            .supports_interface(nft, ERC165_INTERFACE_ID_ERC1155)
-            .await
-            .unwrap());
+        assert!(
+            !c.supports_interface(nft, ERC165_INTERFACE_ID_ERC1155)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

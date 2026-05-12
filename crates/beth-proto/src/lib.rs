@@ -16,9 +16,9 @@ pub mod plan;
 pub mod policy;
 pub mod units;
 
-pub use address::{checksum_address, parse_address, AddressBook, AddressBookError};
+pub use address::{AddressBook, AddressBookError, checksum_address, parse_address};
 pub use audit::{AuditLog, AuditRecord};
-pub use chain::{default_endpoint_weight, ChainId, ChainRef, ChainSpec, EndpointSpec};
+pub use chain::{ChainId, ChainRef, ChainSpec, EndpointSpec, default_endpoint_weight};
 pub use config::{Backend, BackendsConfig, Config, ConfigError, EnsoConfig, EtherscanConfig};
 pub use home::{HomeDir, HomeError};
 pub use intent::{
@@ -26,9 +26,9 @@ pub use intent::{
 };
 pub use plan::{NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxStatus};
 pub use policy::{Policy, PolicyCheck, PolicyOutcome};
-pub use units::{format_units, parse_amount, parse_eth, parse_units, ParsedAmount};
+pub use units::{ParsedAmount, format_units, parse_amount, parse_eth, parse_units};
 
 /// Re-exports of alloy types we use across the workspace.
 pub mod prelude {
-    pub use alloy::primitives::{Address, Bytes, B256, U256};
+    pub use alloy::primitives::{Address, B256, Bytes, U256};
 }

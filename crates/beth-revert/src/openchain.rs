@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    dyn_value_to_json, fmt_selector, selector_of, DecodeContext, DecodeSource, DecodedRevert,
-    RevertDecoder,
+    DecodeContext, DecodeSource, DecodedRevert, RevertDecoder, dyn_value_to_json, fmt_selector,
+    selector_of,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openchain.xyz";
@@ -250,7 +250,7 @@ fn render_message(name: &str, args: &[serde_json::Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{address, U256};
+    use alloy::primitives::{U256, address};
     use alloy_dyn_abi::DynSolValue;
     use serde_json::json;
     use wiremock::matchers::{method, path, query_param};

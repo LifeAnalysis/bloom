@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{address, Address, Bytes, FixedBytes};
+use alloy::primitives::{Address, Bytes, FixedBytes, address};
 use alloy::sol;
 use parking_lot::RwLock;
 use tracing::debug;

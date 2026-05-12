@@ -72,10 +72,10 @@ impl WatchHandler {
         let mut out: Vec<String> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for r in rd.flatten() {
-                if let Some(n) = r.file_name().to_str() {
-                    if Self::is_history_segment(n) {
-                        out.push(n.to_string());
-                    }
+                if let Some(n) = r.file_name().to_str()
+                    && Self::is_history_segment(n)
+                {
+                    out.push(n.to_string());
                 }
             }
         }

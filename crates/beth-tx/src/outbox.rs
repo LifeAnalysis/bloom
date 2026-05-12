@@ -227,10 +227,10 @@ impl Outbox {
         let mut out = Vec::new();
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    out.push(name.to_string());
-                }
+            if entry.file_type()?.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                out.push(name.to_string());
             }
         }
         out.sort();
@@ -389,10 +389,10 @@ impl Outbox {
                         continue;
                     }
                     let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
-                    if staged.created_ms >= since_ms {
-                        if let Some(u) = staged.usd_value {
-                            total += u;
-                        }
+                    if staged.created_ms >= since_ms
+                        && let Some(u) = staged.usd_value
+                    {
+                        total += u;
                     }
                 }
             }

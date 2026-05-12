@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::json_abi::JsonAbi;
-use alloy::primitives::{Address, Bytes, B256};
+use alloy::primitives::{Address, B256, Bytes};
 use alloy_dyn_abi::{DynSolType, Specifier};
 use async_trait::async_trait;
 use beth_chain::ChainRegistry;
@@ -27,8 +27,8 @@ use sha3::{Digest, Keccak256};
 use tokio::sync::RwLock;
 
 use crate::{
-    dyn_value_to_json, fmt_selector, selector_of, DecodeContext, DecodeSource, DecodedRevert,
-    RevertDecoder,
+    DecodeContext, DecodeSource, DecodedRevert, RevertDecoder, dyn_value_to_json, fmt_selector,
+    selector_of,
 };
 
 const DECOMPILE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -297,7 +297,7 @@ fn write_disk_cache(dir: &Path, codehash: B256, abi: &JsonAbi) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{address, U256};
+    use alloy::primitives::{U256, address};
 
     /// Hand a fixed bytecode for any (chain_id, addr).
     struct StaticBytecode(Bytes);

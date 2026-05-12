@@ -182,10 +182,10 @@ impl ContractSource {
         }
         if s.starts_with('{') && s.ends_with('}') {
             // some chains return the standard-json without the double wrap
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-                if v.get("sources").is_some() {
-                    return Ok(Some(v));
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
+                && v.get("sources").is_some()
+            {
+                return Ok(Some(v));
             }
         }
         Ok(None)
@@ -566,7 +566,7 @@ impl EtherscanClient {
             other => {
                 return Err(EtherscanError::InvalidResponse(format!(
                     "expected ABI string, got {other:?}"
-                )))
+                )));
             }
         };
         if s == "Contract source code not verified" {
@@ -1079,7 +1079,7 @@ mod tests {
     async fn multi_file_source_unwraps_double_braces() {
         let inner = r#"{"language":"Solidity","sources":{"X.sol":{"content":"contract X{}"}}}"#;
         let wrapped = format!("{{{}}}", inner); // outer {{...}}
-                                                // SourceCode value embedded as a JSON string with quotes/braces escaped.
+        // SourceCode value embedded as a JSON string with quotes/braces escaped.
         let escaped = serde_json::to_string(&wrapped).unwrap();
         let body = format!(
             r#"{{"status":"1","message":"OK","result":[{{

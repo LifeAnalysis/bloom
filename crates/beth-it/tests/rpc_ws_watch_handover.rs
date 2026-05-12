@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::providers::Provider;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use beth_chain::{ChainClient, ChainRegistry};
 use beth_it::spawn_anvil;
 use beth_proto::{ChainSpec, EndpointSpec, HomeDir};
@@ -133,10 +133,10 @@ async fn block_watch_falls_back_to_poll_when_anvil_dies() -> Result<()> {
 async fn wait_for_lines(path: &std::path::Path, min_lines: usize, budget: Duration) -> Result<()> {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
-        if let Ok(body) = std::fs::read_to_string(path) {
-            if body.lines().count() >= min_lines {
-                return Ok(());
-            }
+        if let Ok(body) = std::fs::read_to_string(path)
+            && body.lines().count() >= min_lines
+        {
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

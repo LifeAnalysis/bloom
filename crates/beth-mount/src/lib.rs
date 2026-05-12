@@ -32,7 +32,7 @@ pub mod adapter;
 mod server;
 
 #[cfg(feature = "mount")]
-pub use server::{serve_nfs, NfsMountHandle};
+pub use server::{NfsMountHandle, serve_nfs};
 
 /// Configuration for mounting a bloom-eth VFS over NFS.
 #[derive(Debug, Clone)]
@@ -203,9 +203,7 @@ fn build_mount_opts(port: u16) -> String {
 
 #[cfg(target_os = "macos")]
 fn build_mount_opts(port: u16) -> String {
-    format!(
-        "actimeo=0,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10"
-    )
+    format!("actimeo=0,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -246,10 +244,17 @@ mod tests {
             joined.contains("port=54321"),
             "missing port=54321 in {joined}"
         );
-        assert!(
-            joined.contains("mountport=54321"),
-            "missing mountport=54321 in {joined}"
-        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                joined.contains("mountport=54321"),
+                "missing mountport=54321 in {joined}"
+            );
+        } else if cfg!(target_os = "macos") {
+            assert!(
+                !joined.contains("mountport="),
+                "macos mount_nfs must not include mountport=: {joined}"
+            );
+        }
         assert!(args.last().unwrap().ends_with("/tmp/beth"));
     }
 
@@ -264,7 +269,10 @@ mod tests {
         let server: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let args = build_mount_args(&cfg, server);
         let joined = args.join(" ");
-        assert!(joined.contains("noac"), "linux opts must include noac: {joined}");
+        assert!(
+            joined.contains("noac"),
+            "linux opts must include noac: {joined}"
+        );
         assert!(
             joined.contains("lookupcache=none"),
             "linux opts must include lookupcache=none: {joined}"
@@ -327,7 +335,10 @@ mod tests {
         let server: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let args = build_mount_args(&cfg, server);
         let joined = args.join(" ");
-        assert!(joined.contains(",ro"), "readonly mount must append ,ro: {joined}");
+        assert!(
+            joined.contains(",ro"),
+            "readonly mount must append ,ro: {joined}"
+        );
     }
 
     #[tokio::test]

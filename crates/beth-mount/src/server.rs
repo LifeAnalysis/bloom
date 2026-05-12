@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 use beth_vfs::Vfs;
 
 use crate::adapter::BethFs;
-use crate::{build_mount_args, MountConfig, MountError, MountHandle};
+use crate::{MountConfig, MountError, MountHandle, build_mount_args};
 
 const MOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const UMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -283,7 +283,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::Instant;
-    use tokio::time::{timeout, Duration as TokioDuration};
+    use tokio::time::{Duration as TokioDuration, timeout};
 
     /// A tokio task that pretends to be the NFS server accept loop.
     /// Sleeps long enough that the test will always observe the abort

@@ -67,12 +67,47 @@ fn vfs_ls_root_lists_top_level_handlers() {
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     // The default daemon mounts these handlers; each appears as a Dir
     // entry. We don't assert on extras (defi is config-gated).
-    for required in ["chains", "status", "wallets", "tools", "docs"] {
+    for required in [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "chains",
+        "status",
+        "wallets",
+        "tools",
+        "docs",
+    ] {
         assert!(
             out.lines().any(|l| l.starts_with(required)),
             "expected `{required}` in vfs ls /, got:\n{out}"
         );
     }
+}
+
+#[test]
+fn vfs_cat_root_agent_guidance_returns_identical_content() {
+    let home = fresh_home();
+    let agents = beth_cmd(home.path())
+        .args(["vfs", "cat", "/AGENTS.md"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let claude = beth_cmd(home.path())
+        .args(["vfs", "cat", "/CLAUDE.md"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(agents, claude);
+    let text = String::from_utf8(agents).expect("guidance is utf-8");
+    assert!(text.contains("/docs"), "guidance should call out /docs");
+    assert!(
+        text.contains("beth vfs"),
+        "guidance should mention the beth vfs CLI"
+    );
 }
 
 #[test]
@@ -166,7 +201,7 @@ fn wallet_new_via_env_passphrase() {
 /// would produce.
 #[test]
 fn vfs_routes_via_ipc_when_socket_exists() {
-    use beth_daemon::ipc::{default_socket_path, IpcServer};
+    use beth_daemon::ipc::{IpcServer, default_socket_path};
     use beth_vfs::handler::{Entry, Handler, HandlerError};
     use beth_vfs::{Vfs, VfsPath};
 

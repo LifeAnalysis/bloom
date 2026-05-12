@@ -11,8 +11,8 @@
 
 use std::time::Duration;
 
-use alloy::transports::layers::{RateLimitRetryPolicy, RetryPolicy};
 use alloy::transports::TransportError;
+use alloy::transports::layers::{RateLimitRetryPolicy, RetryPolicy};
 
 /// Beth's retry policy. Composes alloy's default with extra
 /// detection rules; the alloy policy still runs as the fallback so any

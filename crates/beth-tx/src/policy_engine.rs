@@ -17,7 +17,7 @@
 
 use alloy::primitives::{Address, U256};
 use beth_proto::policy::{PolicyAllowDeny, PolicyCaps, PolicyLists};
-use beth_proto::{format_units, Policy, PolicyCheck, PolicyOutcome};
+use beth_proto::{Policy, PolicyCheck, PolicyOutcome, format_units};
 
 const ETHER: u128 = 1_000_000_000_000_000_000;
 
@@ -87,27 +87,27 @@ pub fn evaluate(
         }
     }
 
-    if let Some(soft) = effective_caps.require_override_above_eth {
-        if value_f > soft {
-            out.push(PolicyCheck {
-                rule: "caps.require_override_above_eth".into(),
-                outcome: PolicyOutcome::Warn,
-                message: format!(
-                    "value {} > soft {} — write `override` to confirm",
-                    value_human, soft
-                ),
-            });
-        }
+    if let Some(soft) = effective_caps.require_override_above_eth
+        && value_f > soft
+    {
+        out.push(PolicyCheck {
+            rule: "caps.require_override_above_eth".into(),
+            outcome: PolicyOutcome::Warn,
+            message: format!(
+                "value {} > soft {} — write `override` to confirm",
+                value_human, soft
+            ),
+        });
     }
 
-    if let Some(auto_below) = policy.automation.auto_confirm_below_eth {
-        if value_f <= auto_below {
-            out.push(PolicyCheck {
-                rule: "automation.auto_confirm_below_eth".into(),
-                outcome: PolicyOutcome::Pass,
-                message: "value within auto-confirm threshold".into(),
-            });
-        }
+    if let Some(auto_below) = policy.automation.auto_confirm_below_eth
+        && value_f <= auto_below
+    {
+        out.push(PolicyCheck {
+            rule: "automation.auto_confirm_below_eth".into(),
+            outcome: PolicyOutcome::Pass,
+            message: "value within auto-confirm threshold".into(),
+        });
     }
 
     // ----- USD caps -----------------------------------------------------------
@@ -136,16 +136,16 @@ pub fn evaluate(
                     });
                 }
             }
-            if let Some(soft_usd) = effective_caps.require_confirm_above_usd {
-                if usd > soft_usd {
-                    out.push(PolicyCheck {
-                        rule: "caps.require_confirm_above_usd".into(),
-                        outcome: PolicyOutcome::Warn,
-                        message: format!(
-                            "usd {usd:.2} > soft {soft_usd:.2} — write override token to confirm"
-                        ),
-                    });
-                }
+            if let Some(soft_usd) = effective_caps.require_confirm_above_usd
+                && usd > soft_usd
+            {
+                out.push(PolicyCheck {
+                    rule: "caps.require_confirm_above_usd".into(),
+                    outcome: PolicyOutcome::Warn,
+                    message: format!(
+                        "usd {usd:.2} > soft {soft_usd:.2} — write override token to confirm"
+                    ),
+                });
             }
             // The rolling counter is sourced from the outbox itself by
             // tx_engine::stage (sum of usd_value across this wallet's
@@ -299,15 +299,15 @@ fn check_allow_deny(
 ) {
     let matches_one = |entry: &str| -> bool {
         let e = entry.trim();
-        if let Some(t) = target {
-            if e.eq_ignore_ascii_case(t) {
-                return true;
-            }
+        if let Some(t) = target
+            && e.eq_ignore_ascii_case(t)
+        {
+            return true;
         }
-        if let Some(s) = symbol {
-            if e.eq_ignore_ascii_case(s) {
-                return true;
-            }
+        if let Some(s) = symbol
+            && e.eq_ignore_ascii_case(s)
+        {
+            return true;
         }
         false
     };
@@ -650,9 +650,11 @@ mod tests {
             ..Default::default()
         };
         let checks = evaluate(&p, "anvil", U256::ZERO, 18, ctx);
-        assert!(checks
-            .iter()
-            .any(|c| c.rule == "caps.usd" && matches!(c.outcome, PolicyOutcome::Warn)));
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.rule == "caps.usd" && matches!(c.outcome, PolicyOutcome::Warn))
+        );
     }
 
     /// Fix #11: USD caps with a quote enforce per-tx max as a hard cap.

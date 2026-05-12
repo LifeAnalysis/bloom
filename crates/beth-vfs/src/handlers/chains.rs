@@ -42,7 +42,7 @@ use async_trait::async_trait;
 use beth_chain::{ChainClient, ChainRegistry};
 use beth_ens::{EnsClient, EnsError};
 use beth_etherscan::{AddressHistorySource, ContractMetadataSource, EtherscanClient};
-use beth_proto::{checksum_address, format_units, Backend, BackendsConfig};
+use beth_proto::{Backend, BackendsConfig, checksum_address, format_units};
 use beth_revert::{DecodeContext, DecodedRevert, DecoderChain};
 use parking_lot::Mutex as PlMutex;
 
@@ -50,11 +50,11 @@ use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
 
 use super::chains_contracts::{
-    self, AbiCache, LiveTailState, PendingBodies, EVENT_LEAVES, METHOD_LEAVES, PROXY_LEAVES,
+    self, AbiCache, EVENT_LEAVES, LiveTailState, METHOD_LEAVES, PROXY_LEAVES, PendingBodies,
 };
 use super::chains_history;
 use super::chains_nfts::{
-    self, NftKindCache, NFT_COLLECTION_DIRS, NFT_COLLECTION_LEAVES, NFT_HOLDER_LEAVES,
+    self, NFT_COLLECTION_DIRS, NFT_COLLECTION_LEAVES, NFT_HOLDER_LEAVES, NftKindCache,
     PER_TOKEN_LEAVES,
 };
 
@@ -252,10 +252,10 @@ impl ChainsHandler {
     fn split_method_leaf(seg: &str) -> Option<(&str, &str)> {
         for leaf in METHOD_LEAVES {
             let pat = format!(".{leaf}");
-            if let Some(name) = seg.strip_suffix(&pat) {
-                if !name.is_empty() {
-                    return Some((name, leaf));
-                }
+            if let Some(name) = seg.strip_suffix(&pat)
+                && !name.is_empty()
+            {
+                return Some((name, leaf));
             }
         }
         None
@@ -1106,8 +1106,7 @@ impl ChainsHandler {
                 // file matches what `methods/` enumerates. Falls back
                 // to the proxy's own ABI whenever the slot is zero or
                 // the implementation has no verified ABI upstream.
-                let target =
-                    chains_contracts::resolve_eip1967_implementation(client, addr).await;
+                let target = chains_contracts::resolve_eip1967_implementation(client, addr).await;
                 chains_contracts::read_contract_abi_for(es, chain_id, addr, target).await
             }
             "methods" if segs.len() == 5 => {
@@ -1658,25 +1657,25 @@ mod tests {
                         break;
                     }
                     total += n;
-                    if header_end.is_none() {
-                        if let Some(idx) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
-                            header_end = Some(idx + 4);
-                            // crude content-length parse
-                            let head = std::str::from_utf8(&buf[..idx]).unwrap_or("");
-                            for line in head.split("\r\n") {
-                                if let Some(v) = line
-                                    .strip_prefix("Content-Length:")
-                                    .or_else(|| line.strip_prefix("content-length:"))
-                                {
-                                    content_length = v.trim().parse().unwrap_or(0);
-                                }
+                    if header_end.is_none()
+                        && let Some(idx) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        header_end = Some(idx + 4);
+                        // crude content-length parse
+                        let head = std::str::from_utf8(&buf[..idx]).unwrap_or("");
+                        for line in head.split("\r\n") {
+                            if let Some(v) = line
+                                .strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                            {
+                                content_length = v.trim().parse().unwrap_or(0);
                             }
                         }
                     }
-                    if let Some(he) = header_end {
-                        if total >= he + content_length {
-                            break;
-                        }
+                    if let Some(he) = header_end
+                        && total >= he + content_length
+                    {
+                        break;
                     }
                     if total == buf.len() {
                         break;
@@ -1850,7 +1849,7 @@ mod tests {
         let from_addr = "0x000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045";
         let to_addr = "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let value_hex = format!("0x{}", "00".repeat(31) + "2a"); // 42
-                                                                 // Transfer(address,address,uint256) topic0:
+        // Transfer(address,address,uint256) topic0:
         let topic0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
         let log = serde_json::json!({
             "address": SAMPLE_ADDR,
@@ -2560,11 +2559,9 @@ mod tests {
         map.insert(proxy, serde_json::from_str(ERC20_ABI).unwrap());
         let src: Arc<dyn beth_etherscan::ContractMetadataSource> =
             Arc::new(StaticAbiSource { map });
-        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338))
-            .with_contract_metadata(Some(src));
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338)).with_contract_metadata(Some(src));
 
-        let p =
-            VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/methods")).unwrap();
+        let p = VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/methods")).unwrap();
         let entries = h.list(&p).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         // ERC20_ABI has two functions (balanceOf, transfer). Names are
@@ -2597,8 +2594,9 @@ mod tests {
     #[tokio::test]
     async fn methods_dir_resolves_eip1967_implementation() {
         // The implementation lives at this distinct address.
-        let impl_addr: alloy::primitives::Address =
-            "0x000000000000000000000000000000000000beef".parse().unwrap();
+        let impl_addr: alloy::primitives::Address = "0x000000000000000000000000000000000000beef"
+            .parse()
+            .unwrap();
         let proxy: alloy::primitives::Address = SAMPLE_ADDR.parse().unwrap();
 
         // RPC: storage slot returns the implementation address (right-
@@ -2618,11 +2616,9 @@ mod tests {
         map.insert(impl_addr, serde_json::from_str(ERC20_ABI).unwrap());
         let src: Arc<dyn beth_etherscan::ContractMetadataSource> =
             Arc::new(StaticAbiSource { map });
-        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338))
-            .with_contract_metadata(Some(src));
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338)).with_contract_metadata(Some(src));
 
-        let p =
-            VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/methods")).unwrap();
+        let p = VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/methods")).unwrap();
         let entries = h.list(&p).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         // ERC-20 surface: balanceOf, transfer. NOT the proxy's admin().
@@ -2645,8 +2641,9 @@ mod tests {
     /// proxy's `Upgraded` should not.
     #[tokio::test]
     async fn events_dir_resolves_eip1967_implementation() {
-        let impl_addr: alloy::primitives::Address =
-            "0x000000000000000000000000000000000000beef".parse().unwrap();
+        let impl_addr: alloy::primitives::Address = "0x000000000000000000000000000000000000beef"
+            .parse()
+            .unwrap();
         let proxy: alloy::primitives::Address = SAMPLE_ADDR.parse().unwrap();
         let mut routes = std::collections::HashMap::new();
         routes.insert(
@@ -2660,11 +2657,9 @@ mod tests {
         map.insert(impl_addr, serde_json::from_str(ERC20_ABI).unwrap());
         let src: Arc<dyn beth_etherscan::ContractMetadataSource> =
             Arc::new(StaticAbiSource { map });
-        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338))
-            .with_contract_metadata(Some(src));
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338)).with_contract_metadata(Some(src));
 
-        let p =
-            VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/events")).unwrap();
+        let p = VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/events")).unwrap();
         let entries = h.list(&p).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["Transfer"]);
@@ -2675,8 +2670,9 @@ mod tests {
     /// the test stays robust against pretty-printer changes.
     #[tokio::test]
     async fn abi_path_follows_eip1967_proxy_to_impl() {
-        let impl_addr: alloy::primitives::Address =
-            "0x000000000000000000000000000000000000beef".parse().unwrap();
+        let impl_addr: alloy::primitives::Address = "0x000000000000000000000000000000000000beef"
+            .parse()
+            .unwrap();
         let proxy: alloy::primitives::Address = SAMPLE_ADDR.parse().unwrap();
         let mut routes = std::collections::HashMap::new();
         routes.insert(
@@ -2690,11 +2686,9 @@ mod tests {
         map.insert(impl_addr, serde_json::from_str(ERC20_ABI).unwrap());
         let src: Arc<dyn beth_etherscan::ContractMetadataSource> =
             Arc::new(StaticAbiSource { map });
-        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338))
-            .with_contract_metadata(Some(src));
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338)).with_contract_metadata(Some(src));
 
-        let p =
-            VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/abi")).unwrap();
+        let p = VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/abi")).unwrap();
         let bytes = h.read(&p).await.unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.contains("balanceOf"), "abi missing balanceOf: {s}");
@@ -2722,11 +2716,9 @@ mod tests {
         map.insert(proxy, serde_json::from_str(PROXY_ADMIN_ABI).unwrap());
         let src: Arc<dyn beth_etherscan::ContractMetadataSource> =
             Arc::new(StaticAbiSource { map });
-        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338))
-            .with_contract_metadata(Some(src));
+        let h = ChainsHandler::new(registry_for_rpc(rpc, 31338)).with_contract_metadata(Some(src));
 
-        let p =
-            VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/methods")).unwrap();
+        let p = VfsPath::parse(&format!("/test/contracts/{SAMPLE_ADDR}/methods")).unwrap();
         let entries = h.list(&p).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         // Only `admin` from PROXY_ADMIN_ABI.

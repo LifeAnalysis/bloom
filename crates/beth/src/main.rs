@@ -12,10 +12,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use beth_daemon::ipc::{default_socket_path, IpcClient, IpcServer};
 use beth_daemon::Daemon;
+use beth_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
 use beth_proto::HomeDir;
-use beth_vfs::{handler::Handler, VfsPath};
+use beth_vfs::{VfsPath, handler::Handler};
 use clap::{Parser, Subcommand};
 use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
@@ -192,8 +192,8 @@ async fn run(cli: Cli) -> Result<()> {
                     .get("bytes_b64")
                     .and_then(|v| v.as_str())
                     .context("ipc read: missing bytes_b64")?;
-                use base64::engine::general_purpose::STANDARD as B64;
                 use base64::Engine as _;
+                use base64::engine::general_purpose::STANDARD as B64;
                 B64.decode(b64).context("ipc read: bad base64")?
             } else {
                 debug!("cli.vfs.cat.via_inproc: no daemon socket present");
@@ -246,8 +246,8 @@ async fn run(cli: Cli) -> Result<()> {
             };
             if socket.exists() {
                 debug!(socket = %socket.display(), "cli.vfs.write.via_ipc");
-                use base64::engine::general_purpose::STANDARD as B64;
                 use base64::Engine as _;
+                use base64::engine::general_purpose::STANDARD as B64;
                 let client = IpcClient::new(&socket);
                 client
                     .call(
