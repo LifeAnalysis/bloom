@@ -27,13 +27,13 @@ use embednfs::{
     FileSystem, FsError, FsResult, FsStats, ObjectType, ReadResult, RequestContext, SetAttrs,
     Timestamp, WriteResult, WriteStability,
 };
-use futures::future::{BoxFuture, Shared};
 use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use lru::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
-use beth_vfs::{percent_decode_segment, Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
+use beth_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath, percent_decode_segment};
 
 /// Maximum bytes we'll buffer for a single open file before forcing a
 /// flush (or rejecting further writes with FBIG). 8 MiB matches the
@@ -649,8 +649,7 @@ impl FileSystem for BethFs {
                     match self.render_with_dedup(path).await {
                         Ok(bytes) => {
                             let len = bytes.len() as u64;
-                            self.render_cache
-                                .put(path, bytes, RENDER_CACHE_TTL);
+                            self.render_cache.put(path, bytes, RENDER_CACHE_TTL);
                             len
                         }
                         Err(_) => {
@@ -1774,7 +1773,11 @@ mod tests {
         assert_eq!(attrs.size, body.len() as u64);
         // Read enough to cover the whole body and verify no padding.
         let r = fs.read(&ctx, &readme, 0, 1024).await.unwrap();
-        assert_eq!(&r.data[..], body, "READ must return exactly the rendered bytes");
+        assert_eq!(
+            &r.data[..],
+            body,
+            "READ must return exactly the rendered bytes"
+        );
         assert!(r.eof, "READ must report EOF at the rendered size");
         assert_eq!(r.data.len() as u64, attrs.size);
     }
@@ -1886,7 +1889,9 @@ mod tests {
     /// timer instantly so the test doesn't actually wait 30 seconds.
     #[tokio::test(start_paused = true)]
     async fn render_timeout_falls_back_to_size_0() {
-        let vfs = Vfs::builder().mount("box", Arc::new(NeverResolvesHandler)).build();
+        let vfs = Vfs::builder()
+            .mount("box", Arc::new(NeverResolvesHandler))
+            .build();
         let fs = BethFs::new(vfs);
         let ctx = fake_ctx();
         let dir = fs.lookup(&ctx, &BethHandle::Root, "box").await.unwrap();
@@ -1948,10 +1953,7 @@ mod tests {
         let ctx = fake_ctx();
         let dir = fs.lookup(&ctx, &BethHandle::Root, "echo").await.unwrap();
         // Kernel hands us the literal bytes "hello%20world".
-        let leaf = fs
-            .lookup(&ctx, &dir, "hello%20world")
-            .await
-            .unwrap();
+        let leaf = fs.lookup(&ctx, &dir, "hello%20world").await.unwrap();
         let r = fs.read(&ctx, &leaf, 0, 1024).await.unwrap();
         assert_eq!(&r.data[..], b"hello world");
     }
@@ -1965,10 +1967,7 @@ mod tests {
         let fs = BethFs::new(vfs);
         let ctx = fake_ctx();
         let dir = fs.lookup(&ctx, &BethHandle::Root, "echo").await.unwrap();
-        let leaf = fs
-            .lookup(&ctx, &dir, "100%25done")
-            .await
-            .unwrap();
+        let leaf = fs.lookup(&ctx, &dir, "100%25done").await.unwrap();
         let r = fs.read(&ctx, &leaf, 0, 1024).await.unwrap();
         assert_eq!(&r.data[..], b"100%done");
     }

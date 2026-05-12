@@ -6,7 +6,7 @@ use alloy::primitives::Bytes;
 use alloy::sol_types::SolError;
 use async_trait::async_trait;
 
-use crate::{selector_of, DecodeContext, DecodeSource, DecodedRevert, RevertDecoder};
+use crate::{DecodeContext, DecodeSource, DecodedRevert, RevertDecoder, selector_of};
 
 alloy::sol! {
     #[allow(missing_docs)]

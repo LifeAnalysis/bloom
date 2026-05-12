@@ -674,7 +674,8 @@ mod tests {
             let body = r#"{"error":"unauthorized"}"#;
             let response = format!(
                 "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(), body
+                body.len(),
+                body
             );
             sock.write_all(response.as_bytes()).await.unwrap();
             sock.shutdown().await.ok();

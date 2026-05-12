@@ -432,16 +432,17 @@ impl ToolsHandler {
 
     async fn write_inner(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let segs = path.segments();
-        if let Some((family, rest)) = match_session_family(segs) {
-            if rest.len() == 2 && rest[1].as_str() == "in.json" {
-                // Eagerly validate the JSON shape so writes fail fast; the
-                // actual computation still happens at read time.
-                serde_json::from_slice::<serde_json::Value>(data)
-                    .map_err(|e| HandlerError::invalid(format!("invalid json: {}", e)))?;
-                let session_id = rest[0].as_str();
-                self.sessions.lock().put(family, session_id, data.to_vec());
-                return Ok(());
-            }
+        if let Some((family, rest)) = match_session_family(segs)
+            && rest.len() == 2
+            && rest[1].as_str() == "in.json"
+        {
+            // Eagerly validate the JSON shape so writes fail fast; the
+            // actual computation still happens at read time.
+            serde_json::from_slice::<serde_json::Value>(data)
+                .map_err(|e| HandlerError::invalid(format!("invalid json: {}", e)))?;
+            let session_id = rest[0].as_str();
+            self.sessions.lock().put(family, session_id, data.to_vec());
+            return Ok(());
         }
         let _ = path;
         Err(HandlerError::PermissionDenied)

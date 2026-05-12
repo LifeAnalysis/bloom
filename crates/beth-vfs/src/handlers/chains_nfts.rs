@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use parking_lot::RwLock;
 use serde_json::json;
 use tracing::debug;
@@ -225,11 +225,11 @@ async fn fetch_http(url: &str) -> Result<Vec<u8>, HandlerError> {
 /// Try to render `bytes` as pretty JSON; if it isn't JSON, return
 /// the bytes as-is with a trailing newline.
 pub fn pretty_or_raw(bytes: Vec<u8>) -> Vec<u8> {
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-        if let Ok(mut pretty) = serde_json::to_vec_pretty(&v) {
-            pretty.push(b'\n');
-            return pretty;
-        }
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Ok(mut pretty) = serde_json::to_vec_pretty(&v)
+    {
+        pretty.push(b'\n');
+        return pretty;
     }
     let mut out = bytes;
     if !out.ends_with(b"\n") {

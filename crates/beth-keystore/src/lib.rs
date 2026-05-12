@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
 
-use beth_proto::{checksum_address, Policy};
+use beth_proto::{Policy, checksum_address};
 
 #[derive(Debug, Error)]
 pub enum KeystoreError {

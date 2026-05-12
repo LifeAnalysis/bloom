@@ -197,7 +197,10 @@ mod tests {
 
     #[test]
     fn percent_decode_space() {
-        assert_eq!(percent_decode_segment("hello%20world").unwrap(), "hello world");
+        assert_eq!(
+            percent_decode_segment("hello%20world").unwrap(),
+            "hello world"
+        );
     }
 
     #[test]

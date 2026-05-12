@@ -25,7 +25,7 @@ use alloy::signers::SignerSync;
 use async_trait::async_trait;
 use beth_chain::ChainRegistry;
 use beth_keystore::Keystore;
-use beth_proto::{format_units, AddressBook, RawIntent};
+use beth_proto::{AddressBook, RawIntent, format_units};
 use beth_tx::{intent_parser, outbox::OutboxState, tx_engine::TxEngine};
 
 use crate::handler::{Entry, Handler, HandlerError};
@@ -704,7 +704,7 @@ impl WalletsHandler {
             other => {
                 return Err(HandlerError::invalid(format!(
                     "unknown wallet kind '{other}'; expected local|import|watch"
-                )))
+                )));
             }
         };
         tracing::info!(wallet=%info.name, address=%info.address, kind=?info.kind, "wallet.created");
@@ -777,7 +777,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{Address, Signature, B256};
+    use alloy::primitives::{Address, B256, Signature};
     use beth_proto::AddressBook;
     use beth_tx::outbox::Outbox;
     use beth_tx::tx_engine::TxEngine;

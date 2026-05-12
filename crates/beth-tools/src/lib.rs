@@ -7,7 +7,7 @@
 
 use alloy::dyn_abi::{DynSolType, JsonAbiExt};
 use alloy::json_abi::Function;
-use alloy::primitives::{keccak256, Address, B256};
+use alloy::primitives::{Address, B256, keccak256};
 use thiserror::Error;
 
 pub mod abi;

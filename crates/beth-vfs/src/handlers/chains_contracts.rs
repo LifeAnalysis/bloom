@@ -112,10 +112,10 @@ impl AbiCache {
 
     fn get(&self, key: &(u64, Address)) -> Option<Arc<JsonAbi>> {
         let g = self.inner.read();
-        if let Some((at, abi)) = g.get(key) {
-            if at.elapsed() < ABI_CACHE_TTL {
-                return Some(abi.clone());
-            }
+        if let Some((at, abi)) = g.get(key)
+            && at.elapsed() < ABI_CACHE_TTL
+        {
+            return Some(abi.clone());
         }
         None
     }
@@ -176,7 +176,7 @@ async fn fetch_abi_uncached(
         other => {
             return Err(HandlerError::backend(format!(
                 "unexpected ABI shape: {other}"
-            )))
+            )));
         }
     };
     serde_json::from_str(&s).map_err(|e| HandlerError::backend(format!("abi parse: {e}")))
@@ -233,7 +233,11 @@ pub async fn resolve_eip1967_implementation(
     addr: Address,
 ) -> Option<Address> {
     match client
-        .eth_get_storage_at(addr, U256::from_be_bytes(EIP1967_IMPLEMENTATION_SLOT.0), None)
+        .eth_get_storage_at(
+            addr,
+            U256::from_be_bytes(EIP1967_IMPLEMENTATION_SLOT.0),
+            None,
+        )
         .await
     {
         Ok(slot) if slot != B256::ZERO => {
@@ -685,13 +689,13 @@ pub async fn read_proxy_slot(
         .await
         .map_err(|e| HandlerError::backend(e.to_string()))?;
     let mut value = primary;
-    if value == B256::ZERO {
-        if let Some(f) = fallback {
-            value = client
-                .eth_get_storage_at(addr, U256::from_be_bytes(f.0), None)
-                .await
-                .map_err(|e| HandlerError::backend(e.to_string()))?;
-        }
+    if value == B256::ZERO
+        && let Some(f) = fallback
+    {
+        value = client
+            .eth_get_storage_at(addr, U256::from_be_bytes(f.0), None)
+            .await
+            .map_err(|e| HandlerError::backend(e.to_string()))?;
     }
     if value == B256::ZERO {
         return Ok(b"not a proxy\n".to_vec());
