@@ -121,10 +121,10 @@ impl HomeDir {
 }
 
 fn shellexpand_local(raw: &str) -> String {
-    if let Some(stripped) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped).to_string_lossy().into_owned();
-        }
+    if let Some(stripped) = raw.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped).to_string_lossy().into_owned();
     }
     raw.to_string()
 }

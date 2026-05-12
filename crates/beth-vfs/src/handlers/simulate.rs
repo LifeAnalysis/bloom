@@ -28,16 +28,16 @@
 //! - `simulate/last`                            — read most-recently-allocated id
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{Address, Bytes, B256, U256};
-use alloy::rpc::types::eth::state::{AccountOverride, StateOverride};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
+use alloy::rpc::types::eth::state::{AccountOverride, StateOverride};
 use async_trait::async_trait;
 use beth_chain::ChainRegistry;
-use beth_proto::{checksum_address, parse_eth, AddressBook, RawIntent, RawIntentBody};
+use beth_proto::{AddressBook, RawIntent, RawIntentBody, checksum_address, parse_eth};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -983,7 +983,10 @@ mod tests {
         let p = VfsPath::parse("/new").unwrap();
         let bytes = h.read(&p).await.unwrap();
         let s = String::from_utf8(bytes).unwrap();
-        assert!(s.contains("simulate"), "help text should mention simulate: {s}");
+        assert!(
+            s.contains("simulate"),
+            "help text should mention simulate: {s}"
+        );
         assert!(s.contains("intent"), "help text should mention intent: {s}");
     }
 

@@ -16,7 +16,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use beth_chain::ChainClient;
 use beth_it::spawn_anvil;
 use beth_proto::ChainSpec;

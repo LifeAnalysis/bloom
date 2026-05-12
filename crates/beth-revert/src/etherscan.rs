@@ -10,8 +10,8 @@ use alloy_dyn_abi::{DynSolType, Specifier};
 use async_trait::async_trait;
 
 use crate::{
-    dyn_value_to_json, selector_of, AbiSource, DecodeContext, DecodeSource, DecodedRevert,
-    RevertDecoder,
+    AbiSource, DecodeContext, DecodeSource, DecodedRevert, RevertDecoder, dyn_value_to_json,
+    selector_of,
 };
 
 /// Decoder that consults a verified-contract ABI fetched via
@@ -122,7 +122,7 @@ fn render_arg(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{address, Address, U256};
+    use alloy::primitives::{Address, U256, address};
     use alloy_dyn_abi::{DynSolValue, JsonAbiExt as _};
     use serde_json::json;
 

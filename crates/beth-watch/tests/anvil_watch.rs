@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use beth_chain::{ChainClient, ChainRegistry};
 use beth_proto::{ChainSpec, HomeDir};
 use beth_watch::{WatchExecutor, WatchKind, WatchRegistry, WatchSpec};

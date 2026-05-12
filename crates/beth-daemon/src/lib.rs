@@ -21,8 +21,8 @@ use beth_keystore::Keystore;
 use beth_prices::PricesClient;
 use beth_proto::{AddressBook, AuditLog, Config, HomeDir};
 use beth_revert::{
-    boxed, AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
-    OpenchainDecoder,
+    AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
+    OpenchainDecoder, boxed,
 };
 use beth_tx::outbox::Outbox;
 use beth_tx::tx_engine::TxEngine;
@@ -496,8 +496,8 @@ fn pick_ens_client(chains: &ChainRegistry) -> Option<EnsClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beth_vfs::handler::Handler;
     use beth_vfs::VfsPath;
+    use beth_vfs::handler::Handler;
 
     #[test]
     fn builds_from_tempdir() {

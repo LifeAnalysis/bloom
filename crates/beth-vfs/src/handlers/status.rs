@@ -182,10 +182,10 @@ impl StatusHandler {
     }
 
     async fn probe_chain(&self, name: &str) -> ChainProbeCache {
-        if let Some(cached) = self.chain_cache.read().get(name).cloned() {
-            if cached.fetched.elapsed() < CHAIN_CACHE_TTL {
-                return cached;
-            }
+        if let Some(cached) = self.chain_cache.read().get(name).cloned()
+            && cached.fetched.elapsed() < CHAIN_CACHE_TTL
+        {
+            return cached;
         }
         let mut probe = ChainProbeCache {
             fetched: Instant::now(),

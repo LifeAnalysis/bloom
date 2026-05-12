@@ -23,11 +23,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use beth_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};

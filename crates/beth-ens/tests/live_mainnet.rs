@@ -4,7 +4,7 @@
 //! never runs under a plain `cargo test` — invoke with
 //! `cargo test -p beth-ens -- --ignored`.
 
-use alloy::primitives::{address, Address};
+use alloy::primitives::{Address, address};
 use beth_chain::ChainClient;
 use beth_ens::EnsClient;
 use beth_proto::ChainSpec;

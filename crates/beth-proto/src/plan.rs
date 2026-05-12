@@ -391,7 +391,9 @@ Write `y` to `confirm` to broadcast, `cancel` to discard, `override` to bypass s
             amount: "100".to_string(),
         });
         let out = PlanRender::render(&staged, "ETH", 18);
-        assert!(out.contains("To:     0xtotototototototototototototototototototo (token contract)"));
+        assert!(
+            out.contains("To:     0xtotototototototototototototototototototo (token contract)")
+        );
         assert!(out.contains("Token:  USDC (0xtoken)"));
         assert!(out.contains("Action: Transfer 100 USDC to 0xbob"));
         // The plain "To:" line should not appear in the absence of a token block.

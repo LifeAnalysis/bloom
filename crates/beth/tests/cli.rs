@@ -201,7 +201,7 @@ fn wallet_new_via_env_passphrase() {
 /// would produce.
 #[test]
 fn vfs_routes_via_ipc_when_socket_exists() {
-    use beth_daemon::ipc::{default_socket_path, IpcServer};
+    use beth_daemon::ipc::{IpcServer, default_socket_path};
     use beth_vfs::handler::{Entry, Handler, HandlerError};
     use beth_vfs::{Vfs, VfsPath};
 

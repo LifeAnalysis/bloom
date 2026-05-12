@@ -13,7 +13,7 @@ use alloy::rpc::types::eth::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use beth_chain::{ChainClient, ChainError, NftKind, IERC20};
+use beth_chain::{ChainClient, ChainError, IERC20, NftKind};
 
 // Local NFT-write interfaces. `beth-chain` declares the read shapes for
 // ERC-721/1155; we add the write functions here so calldata encoding stays
@@ -39,8 +39,8 @@ sol! {
     }
 }
 use beth_proto::{
-    parse_amount, parse_eth, parse_units, AddressBook, ChainSpec, NftAction, NftRef, Policy,
-    RawIntent, RawIntentBody, StagedTx, TokenRef, TxStatus,
+    AddressBook, ChainSpec, NftAction, NftRef, Policy, RawIntent, RawIntentBody, StagedTx,
+    TokenRef, TxStatus, parse_amount, parse_eth, parse_units,
 };
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -142,10 +142,10 @@ impl TxEngine {
                 .parse::<Address>()
                 .map_err(|e| TxEngineError::Address(e.to_string()));
         }
-        if let Some(b) = book {
-            if let Some(addr) = b.resolve(to) {
-                return Ok(addr);
-            }
+        if let Some(b) = book
+            && let Some(addr) = b.resolve(to)
+        {
+            return Ok(addr);
         }
         if to.ends_with(".eth") {
             if let Some(r) = &self.resolver {
@@ -1085,14 +1085,14 @@ impl TxEngine {
             "cancel_intent.json",
             &serde_json::to_vec_pretty(&cancel_tx).unwrap(),
         )?;
-        if entry.state != OutboxState::Failed {
-            if let Err(e) = self.outbox.transition(&entry, OutboxState::Failed) {
-                debug!(
-                    id = %original.id,
-                    error = %e,
-                    "tx.cancel_transition_failed"
-                );
-            }
+        if entry.state != OutboxState::Failed
+            && let Err(e) = self.outbox.transition(&entry, OutboxState::Failed)
+        {
+            debug!(
+                id = %original.id,
+                error = %e,
+                "tx.cancel_transition_failed"
+            );
         }
         info!(
             id = %original.id,

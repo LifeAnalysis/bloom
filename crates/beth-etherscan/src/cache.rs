@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tracing::{debug, warn};
 
 use crate::EtherscanError;

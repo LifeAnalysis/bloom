@@ -10,7 +10,7 @@
 //! Decoding produces a JSON tree where every leaf is `{"hex": "0x..."}`
 //! and every list is a JSON array.
 
-use alloy::rlp::{Header, EMPTY_LIST_CODE, EMPTY_STRING_CODE};
+use alloy::rlp::{EMPTY_LIST_CODE, EMPTY_STRING_CODE, Header};
 
 use crate::ToolsError;
 

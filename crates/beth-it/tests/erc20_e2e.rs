@@ -14,11 +14,11 @@ use std::net::TcpListener;
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use beth_chain::ChainClient;
 use beth_proto::{ChainSpec, Policy, RawIntent, RawIntentBody};
-use beth_tx::tx_engine::{TxEngine, TxEngineError};
 use beth_tx::Outbox;
+use beth_tx::tx_engine::{TxEngine, TxEngineError};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;

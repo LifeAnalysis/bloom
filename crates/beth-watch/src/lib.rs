@@ -14,7 +14,7 @@
 
 pub mod executor;
 
-pub use executor::{WatchExecutor, ROTATE_THRESHOLD_BYTES};
+pub use executor::{ROTATE_THRESHOLD_BYTES, WatchExecutor};
 
 use std::collections::HashMap;
 use std::fs;
@@ -246,12 +246,11 @@ impl WatchRegistry {
         let guard = self.inner.specs.read();
         let mut next: u32 = 1;
         for spec in guard.values() {
-            if let Some(rest) = spec.id.strip_prefix("w-") {
-                if let Ok(n) = rest.parse::<u32>() {
-                    if n >= next {
-                        next = n + 1;
-                    }
-                }
+            if let Some(rest) = spec.id.strip_prefix("w-")
+                && let Ok(n) = rest.parse::<u32>()
+                && n >= next
+            {
+                next = n + 1;
             }
         }
         format!("w-{:04}", next)

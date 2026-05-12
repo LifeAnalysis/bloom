@@ -12,12 +12,12 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use beth_daemon::Daemon;
 use beth_it::{cast_send, spawn_anvil};
 use beth_proto::{ChainSpec, Config, HomeDir};
-use beth_vfs::handler::Handler;
 use beth_vfs::VfsPath;
+use beth_vfs::handler::Handler;
 use tokio::time::sleep;
 
 /// Fund `to_addr` with `value_eth` ETH from anvil's prefunded account #0.

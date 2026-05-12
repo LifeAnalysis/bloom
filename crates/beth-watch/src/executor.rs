@@ -44,7 +44,7 @@ use alloy::rpc::types::eth::Filter;
 use futures::StreamExt;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, watch};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, info, trace, warn};
@@ -1064,10 +1064,10 @@ impl WatchExecutor {
         let live = Self::live_path_for_spec(&self.home, spec);
 
         // Rotate first if needed, *before* writing the new record.
-        if let Ok(meta) = tokio::fs::metadata(&live).await {
-            if meta.len() >= ROTATE_THRESHOLD_BYTES {
-                self.rotate(spec).await?;
-            }
+        if let Ok(meta) = tokio::fs::metadata(&live).await
+            && meta.len() >= ROTATE_THRESHOLD_BYTES
+        {
+            self.rotate(spec).await?;
         }
 
         let line = serde_json::to_string(record)
@@ -1314,10 +1314,10 @@ mod tests {
         let live = WatchExecutor::live_path_for_spec(&home, &spec);
         let deadline = std::time::Instant::now() + StdDuration::from_secs(2);
         loop {
-            if let Ok(meta) = std::fs::metadata(&live) {
-                if meta.len() > 0 {
-                    break;
-                }
+            if let Ok(meta) = std::fs::metadata(&live)
+                && meta.len() > 0
+            {
+                break;
             }
             if std::time::Instant::now() > deadline {
                 exec.stop().await;

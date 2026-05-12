@@ -189,19 +189,19 @@ impl Handler for Vfs {
         // Cache fast path. We key on the *full* VFS path (including the
         // top segment) so collisions across handlers are impossible.
         let key = path_to_cache_key(path);
-        if let Some(cache) = &self.cache {
-            if let Some(bytes) = cache.get(&key) {
-                return Ok(bytes);
-            }
+        if let Some(cache) = &self.cache
+            && let Some(bytes) = cache.get(&key)
+        {
+            return Ok(bytes);
         }
 
         let bytes = h.read(&rest).await?;
 
         // Populate cache if the handler declares a TTL for this path.
-        if let (Some(cache), Some(ttl)) = (&self.cache, h.cache_ttl(&rest)) {
-            if !ttl.is_zero() {
-                cache.put(&key, bytes.clone(), ttl);
-            }
+        if let (Some(cache), Some(ttl)) = (&self.cache, h.cache_ttl(&rest))
+            && !ttl.is_zero()
+        {
+            cache.put(&key, bytes.clone(), ttl);
         }
 
         // Side-effecting reads (signing, broadcast triggers, etc) get

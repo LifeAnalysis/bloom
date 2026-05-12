@@ -26,7 +26,7 @@ pub mod policy;
 pub mod session;
 pub mod transport;
 
-pub use endpoint::{is_subscription_capable, EndpointScheme};
+pub use endpoint::{EndpointScheme, is_subscription_capable};
 pub use error::BethRpcError;
 pub use health::EndpointHealthSnapshot;
 pub use policy::BethRetryPolicy;

@@ -26,16 +26,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{address, Address, U256};
+use alloy::primitives::{Address, U256, address};
 use alloy::rpc::types::eth::TransactionRequest;
 use async_trait::async_trait;
 use beth_chain::{ChainClient, ChainRegistry};
 use beth_defi::{
-    parse_natural_intent, resolve_token_symbol, EnsoClient, EnsoError, RouteRequest, RouteResponse,
-    RoutingStrategy,
+    EnsoClient, EnsoError, RouteRequest, RouteResponse, RoutingStrategy, parse_natural_intent,
+    resolve_token_symbol,
 };
 use beth_keystore::Keystore;
-use beth_proto::{checksum_address, AddressBook, GasStrategy, RawIntent, RawIntentBody, StagedTx};
+use beth_proto::{AddressBook, GasStrategy, RawIntent, RawIntentBody, StagedTx, checksum_address};
 use beth_revert::{DecodeContext, DecoderChain};
 use beth_tx::tx_engine::TxEngine;
 use parking_lot::RwLock;

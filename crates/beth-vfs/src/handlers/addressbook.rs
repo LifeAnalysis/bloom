@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use beth_proto::{checksum_address, parse_address, AddressBook};
+use beth_proto::{AddressBook, checksum_address, parse_address};
 use parking_lot::RwLock;
 use tracing::warn;
 
