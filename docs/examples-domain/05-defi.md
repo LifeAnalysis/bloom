@@ -1,6 +1,6 @@
 # DeFi intents
 
-The `defi/intents/<wallet>/` surface is an "intent compiler" that turns a natural-language or JSON DeFi request into one or more concrete `RawIntent`s using the Enso Shortcuts API, and then forwards them — on confirm — into the same wallet outbox the rest of beth uses. The full lifecycle is: write an intent under `defi/intents/<wallet>/new` to open a session; review the routed plan, full Enso response, prepared `RawIntent`s, and an `eth_call` simulation under `defi/intents/<wallet>/<id>/`; write to that session's `confirm` to stage the resulting tx (or `[approve, swap]` pair) into `wallets/<wallet>/chains/<chain>/outbox/pending/<tx-id>/`; then write to the outbox's own `confirm` to actually broadcast. There are always two confirms — one to commit the route into the outbox, one to actually broadcast each pending tx — and the second confirm is where ordering, gas, and policy checks live. Sessions are in-memory only and evaporate on daemon restart; the outbox entry is the durable artefact.
+The `defi/intents/<wallet>/` surface is an "intent compiler" that turns a natural-language or JSON DeFi request into one or more concrete `RawIntent`s using the Enso Shortcuts API, and then forwards them — on confirm — into the same wallet outbox the rest of bloom uses. The full lifecycle is: write an intent under `defi/intents/<wallet>/new` to open a session; review the routed plan, full Enso response, prepared `RawIntent`s, and an `eth_call` simulation under `defi/intents/<wallet>/<id>/`; write to that session's `confirm` to stage the resulting tx (or `[approve, swap]` pair) into `wallets/<wallet>/chains/<chain>/outbox/pending/<tx-id>/`; then write to the outbox's own `confirm` to actually broadcast. There are always two confirms — one to commit the route into the outbox, one to actually broadcast each pending tx — and the second confirm is where ordering, gas, and policy checks live. Sessions are in-memory only and evaporate on daemon restart; the outbox entry is the durable artefact.
 
 All paths below are rooted at `/eth/`. Mainnet broadcast is gated by `block_mainnet_broadcast=false` and per-chain `allow_broadcast=true` in daemon config; the `ethereum` examples below are written as if those are off (demonstration; broadcast disabled by default), and the `base` examples assume per-chain broadcast was opted in.
 
@@ -286,7 +286,7 @@ disabled by default)
 
 ## Token reference
 
-These are the addresses the symbol table resolves (from `beth_defi::resolve_token_symbol`) plus the rest from this doc that you can paste into NL strings as hex tokens.
+These are the addresses the symbol table resolves (from `bloom_defi::resolve_token_symbol`) plus the rest from this doc that you can paste into NL strings as hex tokens.
 
 ### Ethereum mainnet (chain `ethereum`, id 1)
 

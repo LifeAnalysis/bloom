@@ -204,7 +204,7 @@ ls /eth/ens/vitalik.eth/
 ### Namehash
 
 Not exposed through the VFS. The `namehash` implementation lives in
-`beth-ens` but is not currently wired into `tools/` — compute it offline if
+`bloom-ens` but is not currently wired into `tools/` — compute it offline if
 you need the EIP-137 node value.
 
 ## Prices

@@ -11,17 +11,17 @@
 #      calldata) via /eth/wallets/<w>/chains/<c>/outbox/pending/<id>/replace
 #   4. Read tx receipt + chain head + gas via /eth/chains/<c>/...
 #
-# All writes go through the kernel NFS mount; nothing uses `beth ipc
+# All writes go through the kernel NFS mount; nothing uses `bloom ipc
 # call` shortcuts. If this passes, the fork-mode mount surface is
 # wired correctly end-to-end.
 #
-# Driven inside a beth-test-fork container brought up by
+# Driven inside a bloom-test-fork container brought up by
 # tests/docker/docker-compose.yml under the `fork` profile
 # (see run.sh --fork).
 #
 # Required env (set by docker-compose.yml's fork profile)
 #   BASE_FORK_INTERNAL_URL        RPC URL the daemon hits (anvil-fork:8545)
-#   BETH_TEST_WALLET_PASSPHRASE   passphrase for the imported test wallet
+#   BLOOM_TEST_WALLET_PASSPHRASE   passphrase for the imported test wallet
 
 set -euo pipefail
 
@@ -31,12 +31,12 @@ source "$SCRIPT_DIR/lib.sh"
 
 # MNT/PIDFILE/LOGFILE/SENTINEL come from lib.sh defaults.
 # DEST1/RECIPIENT/ANVIL_KEY come from lib.sh fixtures.
-HOME_DIR=/tmp/beth-fork-home
+HOME_DIR=/tmp/bloom-fork-home
 WALLET=dest1
 CHAIN=base
 
-WALLET_PASSPHRASE="${BETH_TEST_WALLET_PASSPHRASE:-}"
-[[ -n "$WALLET_PASSPHRASE" ]] || fail "BETH_TEST_WALLET_PASSPHRASE not set"
+WALLET_PASSPHRASE="${BLOOM_TEST_WALLET_PASSPHRASE:-}"
+[[ -n "$WALLET_PASSPHRASE" ]] || fail "BLOOM_TEST_WALLET_PASSPHRASE not set"
 [[ -n "${BASE_FORK_INTERNAL_URL:-}" ]] || fail "BASE_FORK_INTERNAL_URL not set"
 RPC_URL="$BASE_FORK_INTERNAL_URL"
 
