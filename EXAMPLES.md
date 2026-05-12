@@ -1,6 +1,6 @@
-# beth Examples
+# bloom Examples
 
-`bloom-eth` (binary `beth`) presents Ethereum and EVM L2s as a virtual
+`bloom` (binary `bloom`) presents Ethereum and EVM L2s as a virtual
 filesystem. Reads are blockchain queries, writes are transaction
 intents, and `tail -f` is a live event stream. This document collects
 every notable surface as a runnable shell example, assuming the VFS is
@@ -38,19 +38,19 @@ do not).
 ## 1. Quickstart
 
 ```sh
-# Long-running daemon (also installs the UDS at ~/.bloom-eth/run/beth.sock).
-beth serve &
+# Long-running daemon (also installs the UDS at ~/.bloom/run/bloom.sock).
+bloom serve &
 
 # Optional: NFS mount so the rest of this doc runs verbatim.
-#   build with `cargo build --features beth-daemon/mount` first.
-beth mount /eth
+#   build with `cargo build --features bloom-daemon/mount` first.
+bloom mount /eth
 
 # Without a mount, every `cat /eth/...` below maps 1:1 to:
-#   beth vfs cat /...
+#   bloom vfs cat /...
 # and likewise for `ls`, `echo > path`, and `tail -f`.
 ```
 
-Mainnet broadcasts are gated by two flags in `~/.bloom-eth/config.toml`
+Mainnet broadcasts are gated by two flags in `~/.bloom/config.toml`
 — top-level `block_mainnet_broadcast = false` (the kill-switch) AND
 the chain entry's `allow_broadcast = true`. Both default off; staging
 and reads work regardless.
@@ -58,7 +58,7 @@ and reads work regardless.
 ## 2. Conventions
 
 - Chain segment is `ethereum`, `base`, `anvil`, etc. — exactly the
-  names registered in `~/.bloom-eth/config.toml`.
+  names registered in `~/.bloom/config.toml`.
 - Addresses are 0x-prefixed; the VFS accepts any case but emits
   EIP-55 checksum form on read.
 - Etherscan-backed paths only mount when `[etherscan]` is configured
@@ -73,7 +73,7 @@ and reads work regardless.
 
 ## 3. Chain reads — `chains/`
 
-The chain-read surface lives in `crates/beth-vfs/src/handlers/{chains,chains_contracts,chains_history}.rs`.
+The chain-read surface lives in `crates/bloom-vfs/src/handlers/{chains,chains_contracts,chains_history}.rs`.
 
 ### Chain discovery
 
@@ -589,7 +589,7 @@ kind = "local"
 passphrase = "devonly"
 EOF
 
-# Import an existing private key (BETH_PASSPHRASE applies if 'passphrase' is omitted).
+# Import an existing private key (BLOOM_PASSPHRASE applies if 'passphrase' is omitted).
 cat <<'EOF' > /eth/wallets/new
 name = "imported"
 kind = "import"
@@ -608,7 +608,7 @@ EOF
 Wallet names match `[A-Za-z0-9_-]{1,64}`. Local/import wallets are
 encrypted at rest with argon2id + chacha20poly1305 and are locked on
 daemon start; you must `wallet unlock` before signing or confirming.
-The unlock survives across VFS calls under `beth serve`; one-shot CLI
+The unlock survives across VFS calls under `bloom serve`; one-shot CLI
 re-locks every invocation.
 
 ### Per-wallet leaves
@@ -641,13 +641,13 @@ All three sign endpoints write the resulting hex signature to a
 
 ```sh
 # EIP-191 personal_sign over a UTF-8 message.
-echo -n 'gm beth' > /eth/wallets/alice/sign/message
-cat ~/.bloom-eth/keystore/alice/sign/message.sig
+echo -n 'gm bloom' > /eth/wallets/alice/sign/message
+cat ~/.bloom/keystore/alice/sign/message.sig
 
 # Raw 32-byte hash (must be 0x-hex, exactly 32 bytes).
 echo -n '0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8' \
   > /eth/wallets/alice/sign/hash
-cat ~/.bloom-eth/keystore/alice/sign/hash.sig
+cat ~/.bloom/keystore/alice/sign/hash.sig
 
 # EIP-712 typed data — example: EIP-2612 permit for USDC on mainnet.
 cat <<'EOF' > /eth/wallets/alice/sign/typed_data
@@ -683,7 +683,7 @@ cat <<'EOF' > /eth/wallets/alice/sign/typed_data
   }
 }
 EOF
-cat ~/.bloom-eth/keystore/alice/sign/typed_data.sig
+cat ~/.bloom/keystore/alice/sign/typed_data.sig
 ```
 
 Permit2 typed data has the same shape — swap `domain.name` to
@@ -1234,7 +1234,7 @@ cat /eth/tools/eip712/hash/m1/out.hex
 ```
 
 `namehash` is not currently wired into the `tools/` handler —
-`beth_ens::namehash` exists if you need the EIP-137 node value
+`bloom_ens::namehash` exists if you need the EIP-137 node value
 offline.
 
 ---
@@ -1337,7 +1337,7 @@ ls /eth/status/                                      # daemon.json, version, upt
 cat /eth/status/version                              # daemon version, e.g. 0.0.0
 cat /eth/status/uptime                               # "Ns" under a minute, "HH:MM:SS" otherwise
 cat /eth/status/started_at                           # RFC3339 UTC
-cat /eth/status/home                                 # absolute home dir, e.g. /home/you/.bloom-eth
+cat /eth/status/home                                 # absolute home dir, e.g. /home/you/.bloom
 cat /eth/status/daemon.json                          # JSON: {version, started_unix_ms, started_at, uptime_secs, home, chains}
 ```
 
@@ -1364,7 +1364,7 @@ Every configured RPC endpoint gets an indexed directory under
 `status/chains/<chain>/endpoints/<idx>/`. Indices are zero-based,
 stable for the daemon's lifetime, and map to the `endpoints` array
 in the chain's `ChainSpec`. Leaves are populated by the active probe
-loop in `crates/beth-rpc/src/transport.rs` (15 s tick, 2 s timeout,
+loop in `crates/bloom-rpc/src/transport.rs` (15 s tick, 2 s timeout,
 direct `eth_blockNumber` per endpoint, bypassing the alloy
 `FallbackLayer`).
 
@@ -1385,7 +1385,7 @@ Cooldown semantics:
 - 2 consecutive successes during cooldown clear it.
 - A fresh cooldown within 5 minutes of a recovery escalates to 600 s.
 - Rate-limit responses (HTTP 429) feed `Retry-After` to the cooldown
-  duration via `BethRetryPolicy` in `crates/beth-rpc/src/policy.rs`.
+  duration via `BloomRetryPolicy` in `crates/bloom-rpc/src/policy.rs`.
 
 The WP-4 WebSocket fast path adds no VFS leaves; `supports_subscriptions`
 and `ws_provider` live entirely inside `RpcEngine`. WS reachability
@@ -1394,7 +1394,7 @@ log lines and per-watch state under `/eth/watch/<id>/`.
 
 ### Audit
 
-The audit log file at `~/.bloom-eth/audit.jsonl` is **out-of-band**
+The audit log file at `~/.bloom/audit.jsonl` is **out-of-band**
 — not exposed through the VFS. `status/audit/` exposes the chain's
 tip and a recent-window:
 
@@ -1447,7 +1447,7 @@ cat /eth/status/backends/summary.json                # JSON map of all of the ab
 ```
 
 `status/backends/*` is read-only. Switching a backend is done by
-editing `~/.bloom-eth/config.toml` under `[backends]` and restarting
+editing `~/.bloom/config.toml` under `[backends]` and restarting
 the daemon — the config file is not VFS-writable.
 
 ---
@@ -1455,7 +1455,7 @@ the daemon — the config file is not VFS-writable.
 ## 15. Docs (vendored)
 
 `/eth/docs/` is the daemon's vendored help. The bytes are
-`include_str!`'d at compile time from `crates/beth-vfs/src/docs/`,
+`include_str!`'d at compile time from `crates/bloom-vfs/src/docs/`,
 so the content is stable for the daemon's lifetime — there is no
 on-disk copy to mutate.
 

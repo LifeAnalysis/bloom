@@ -1,6 +1,6 @@
 # NFT examples (ERC-721 / ERC-1155)
 
-These examples assume the beth VFS is mounted at `/eth/`. The NFT
+These examples assume the bloom VFS is mounted at `/eth/`. The NFT
 surface lives under two trees on every chain:
 
 - `chains/<chain>/contracts/<a>/nft/...` — collection-level views.
@@ -169,7 +169,7 @@ cat /eth/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nf
 ERC-1155 token ids are commonly 256-bit and emitted in hex. The VFS
 parses decimal strings, so for hex ids convert first or pass the
 decimal form. The metadata URI returned by the contract may contain
-the literal `{id}` placeholder — beth substitutes it with the
+the literal `{id}` placeholder — bloom substitutes it with the
 lowercase 64-char hex form (no `0x`) before the HTTP fetch, per the
 ERC-1155 metadata spec.
 
@@ -182,7 +182,7 @@ cat /eth/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nf
 cat /eth/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nfts/0x495f947276749Ce646f68AC8c248420045cb7b5e/10/balance
 
 # Metadata: if the contract's URI is "https://api.opensea.io/api/v1/metadata/0x495f.../{id}",
-# beth fetches "https://api.opensea.io/api/v1/metadata/0x495f.../000...000000000a".
+# bloom fetches "https://api.opensea.io/api/v1/metadata/0x495f.../000...000000000a".
 # external HTTP fetch
 cat /eth/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nfts/0x495f947276749Ce646f68AC8c248420045cb7b5e/10/metadata.json
 ```

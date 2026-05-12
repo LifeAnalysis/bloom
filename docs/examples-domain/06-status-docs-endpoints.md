@@ -1,6 +1,6 @@
 # `status/`, `docs/`, and per-endpoint health — domain examples
 
-The `status/` tree is the daemon's introspection layer: uptime and version, per-chain RPC reachability, the audit-log digest, cache and outbox counts, the active backend mapping, and a per-endpoint health snapshot for every configured RPC URL. The `docs/` tree is the daemon's vendored help (the same markdown checked into `crates/beth-vfs/src/docs/`). The per-endpoint leaves under `status/chains/<chain>/endpoints/<idx>/` are the RPC-robustness fleet view added in WP-3 (commit `9f5eab6`): one directory per configured endpoint, populated by a 15 s active probe loop with EWMA latency, success-rate sampling, and a cooldown state machine. All examples below assume the VFS is mounted at `/eth/`.
+The `status/` tree is the daemon's introspection layer: uptime and version, per-chain RPC reachability, the audit-log digest, cache and outbox counts, the active backend mapping, and a per-endpoint health snapshot for every configured RPC URL. The `docs/` tree is the daemon's vendored help (the same markdown checked into `crates/bloom-vfs/src/docs/`). The per-endpoint leaves under `status/chains/<chain>/endpoints/<idx>/` are the RPC-robustness fleet view added in WP-3 (commit `9f5eab6`): one directory per configured endpoint, populated by a 15 s active probe loop with EWMA latency, success-rate sampling, and a cooldown state machine. All examples below assume the VFS is mounted at `/eth/`.
 
 A point of caution on naming: leaves are exactly what the source advertises. There is no `status/chains/<chain>.json`, no `status/chains/summary.json`, no `outbox/list.json`, no `wallets/list.json`, no `cache/count`, and no `audit/tail.jsonl`. Per-wallet policy lives at `/eth/wallets/<wallet>/policy.toml` (handled by the wallets handler, not status); the only policy leaf under `status/` is the global `block_mainnet_broadcast` flag. Use the listings below as the authoritative shape.
 
@@ -11,7 +11,7 @@ ls /eth/status/                                      # daemon.json, version, upt
 cat /eth/status/version                              # daemon version (text, e.g. 0.0.0)
 cat /eth/status/uptime                               # "Ns" under a minute, "HH:MM:SS" otherwise (text)
 cat /eth/status/started_at                           # RFC3339 UTC, e.g. 2026-05-10T08:30:00Z (text)
-cat /eth/status/home                                 # absolute home dir, e.g. /home/you/.bloom-eth (text)
+cat /eth/status/home                                 # absolute home dir, e.g. /home/you/.bloom (text)
 cat /eth/status/daemon.json                          # JSON: { version, started_unix_ms, started_at, uptime_secs, home, chains: [..] }
 ```
 
@@ -36,7 +36,7 @@ The `connected` / `block_number` leaves share a 2-second handler-level probe cac
 
 ## Per-endpoint health (WP-3)
 
-Every configured RPC endpoint gets an indexed directory under `status/chains/<chain>/endpoints/<idx>/`. Indices are zero-based and stable for the daemon's lifetime — they map directly to the `endpoints` array in the chain's `ChainSpec`. The leaves are populated by the active probe loop in `crates/beth-rpc/src/transport.rs`, which issues a direct `eth_blockNumber` against each HTTP endpoint every 15 s with a 2 s timeout, bypassing the alloy `FallbackLayer` so probes measure individual endpoints.
+Every configured RPC endpoint gets an indexed directory under `status/chains/<chain>/endpoints/<idx>/`. Indices are zero-based and stable for the daemon's lifetime — they map directly to the `endpoints` array in the chain's `ChainSpec`. The leaves are populated by the active probe loop in `crates/bloom-rpc/src/transport.rs`, which issues a direct `eth_blockNumber` against each HTTP endpoint every 15 s with a 2 s timeout, bypassing the alloy `FallbackLayer` so probes measure individual endpoints.
 
 ```sh
 ls /eth/status/chains/ethereum/endpoints/            # 0, 1, 2, ... — one dir per configured endpoint
@@ -50,12 +50,12 @@ cat /eth/status/chains/ethereum/endpoints/0/cooldown_until   # Unix-seconds wall
 cat /eth/status/chains/ethereum/endpoints/1/score    # peek at the second endpoint in the failover pool
 ```
 
-Cooldown semantics (from `crates/beth-rpc/src/health.rs`):
+Cooldown semantics (from `crates/bloom-rpc/src/health.rs`):
 
 - 5 consecutive failures arm a 60 s cooldown. The `cooldown_until` leaf becomes a Unix-seconds timestamp.
 - 2 consecutive successes during cooldown clear it; `cooldown_until` reverts to blank.
 - A fresh cooldown within 5 minutes of a recovery escalates to 600 s (chronic-failer).
-- Rate-limit responses (HTTP 429) feed `Retry-After` to `record_failure` as a `backoff_hint`, which is used as the cooldown duration instead of the 60 s default. See `BethRetryPolicy` in `crates/beth-rpc/src/policy.rs`.
+- Rate-limit responses (HTTP 429) feed `Retry-After` to `record_failure` as a `backoff_hint`, which is used as the cooldown duration instead of the 60 s default. See `BloomRetryPolicy` in `crates/bloom-rpc/src/policy.rs`.
 
 Important scope note: cooldowns are observability-only today. Alloy's `FallbackLayer` does not expose a runtime hook to evict cooled-down endpoints, so the parallel fan-out still queries them. The `success_rate` and `cooldown_until` leaves are the operator's signal that a given endpoint is degraded.
 
@@ -65,7 +65,7 @@ The WP-4 commit (`c369dc0`) added per-chain WS-backed `subscribe_*` providers us
 
 ## Audit
 
-The audit log is a hash-chained JSONL file written for every state-mutating operation (sign, broadcast, outbox confirm, etc). The log file itself lives at `~/.bloom-eth/audit.jsonl` and is **out-of-band** — it is not exposed through the VFS. What `status/audit/` exposes is the chain's tip and metadata:
+The audit log is a hash-chained JSONL file written for every state-mutating operation (sign, broadcast, outbox confirm, etc). The log file itself lives at `~/.bloom/audit.jsonl` and is **out-of-band** — it is not exposed through the VFS. What `status/audit/` exposes is the chain's tip and metadata:
 
 ```sh
 ls /eth/status/audit/                                # head, count, last
@@ -74,7 +74,7 @@ cat /eth/status/audit/count                          # total records appended (d
 cat /eth/status/audit/last                           # JSON array of the last 10 records (pretty-printed)
 ```
 
-`status/audit/last` is the right surface for tailing recent events from inside the VFS — not `audit/tail.jsonl` (no such leaf exists). For the full append-only stream, read `~/.bloom-eth/audit.jsonl` directly with normal Unix tools.
+`status/audit/last` is the right surface for tailing recent events from inside the VFS — not `audit/tail.jsonl` (no such leaf exists). For the full append-only stream, read `~/.bloom/audit.jsonl` directly with normal Unix tools.
 
 ### Verifying chain integrity
 
@@ -87,7 +87,7 @@ after=$(cat /eth/status/audit/head)
 [ "$before" != "$after" ] && echo "audit chain advanced"
 ```
 
-To verify the chain is fully intact (no tampering of intermediate records), recompute digests over `~/.bloom-eth/audit.jsonl` end-to-end and compare the final digest to `status/audit/head`. The hashing scheme is the one in `beth_proto::AuditLog::append` — out-of-band tooling territory, not a VFS leaf.
+To verify the chain is fully intact (no tampering of intermediate records), recompute digests over `~/.bloom/audit.jsonl` end-to-end and compare the final digest to `status/audit/head`. The hashing scheme is the one in `bloom_proto::AuditLog::append` — out-of-band tooling territory, not a VFS leaf.
 
 ## Cache, wallets, outbox, policies
 
@@ -124,11 +124,11 @@ cat /eth/status/backends/proxy_detection             # → "rpc"        (EIP-196
 cat /eth/status/backends/summary.json                # JSON map of all of the above
 ```
 
-Switching the backend for a feature is done by editing `~/.bloom-eth/config.toml` under `[backends]` and restarting the daemon. That config file is **out-of-band** and not VFS-writable — `status/backends/*` is read-only in the handler (the `Entry::file` helper sets mode `0o444` and there is no `write` impl). The `status/backends/*` surface reflects the live config snapshot, not a writable dial.
+Switching the backend for a feature is done by editing `~/.bloom/config.toml` under `[backends]` and restarting the daemon. That config file is **out-of-band** and not VFS-writable — `status/backends/*` is read-only in the handler (the `Entry::file` helper sets mode `0o444` and there is no `write` impl). The `status/backends/*` surface reflects the live config snapshot, not a writable dial.
 
 ## Docs
 
-`/eth/docs/` is the daemon's vendored help. The bytes are `include_str!`'d at compile time from `crates/beth-vfs/src/docs/README.md` and `examples.md`, so the content is stable for the daemon's lifetime — there is no on-disk copy to mutate. Both files are mode `0o444`.
+`/eth/docs/` is the daemon's vendored help. The bytes are `include_str!`'d at compile time from `crates/bloom-vfs/src/docs/README.md` and `examples.md`, so the content is stable for the daemon's lifetime — there is no on-disk copy to mutate. Both files are mode `0o444`.
 
 ```sh
 ls /eth/docs/                                        # README.md, examples.md

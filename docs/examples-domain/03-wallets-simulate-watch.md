@@ -29,7 +29,7 @@ kind = "local"
 passphrase = "devonly"
 EOF
 
-# Import an existing private key (BETH_PASSPHRASE applies if 'passphrase' is omitted).
+# Import an existing private key (BLOOM_PASSPHRASE applies if 'passphrase' is omitted).
 cat <<'EOF' > /eth/wallets/new
 name = "imported"
 kind = "import"
@@ -49,7 +49,7 @@ Wallet names must match `[A-Za-z0-9_-]{1,64}`. Local/import wallets are
 encrypted at rest with argon2id + chacha20poly1305 and are *locked* on
 daemon start; you must `wallet unlock` before signing or confirming.
 The keystore is process-scoped — when you go through the long-running
-`beth serve` daemon, the unlock survives across VFS calls; a one-shot
+`bloom serve` daemon, the unlock survives across VFS calls; a one-shot
 CLI process re-locks every invocation, so the daemon path is what the
 runnable examples assume.
 
@@ -68,7 +68,7 @@ cat /eth/wallets/alice/chains/base/balance.raw   # same as balance
 cat /eth/wallets/alice/chains/base/nonce
 ```
 
-`policy.toml` is read-only via this surface — edit `~/.bloom-eth/keystore/<wallet>/policy.toml`
+`policy.toml` is read-only via this surface — edit `~/.bloom/keystore/<wallet>/policy.toml`
 out-of-band and the daemon picks it up on the next `info` call.
 
 ERC-20 reads are not under `wallets/` — they live under the
@@ -88,13 +88,13 @@ All three sign endpoints write the resulting hex signature to a
 
 ```sh
 # EIP-191 personal_sign over a UTF-8 message.
-echo -n 'gm beth' > /eth/wallets/alice/sign/message
-cat ~/.bloom-eth/keystore/alice/sign/message.sig
+echo -n 'gm bloom' > /eth/wallets/alice/sign/message
+cat ~/.bloom/keystore/alice/sign/message.sig
 
 # Raw 32-byte hash (must be 0x-hex, exactly 32 bytes).
 echo -n '0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8' \
   > /eth/wallets/alice/sign/hash
-cat ~/.bloom-eth/keystore/alice/sign/hash.sig
+cat ~/.bloom/keystore/alice/sign/hash.sig
 
 # EIP-712 typed data — body is the standard RPC JSON shape. Example:
 # an EIP-2612 permit for USDC on mainnet (chainId 1).
@@ -131,7 +131,7 @@ cat <<'EOF' > /eth/wallets/alice/sign/typed_data
   }
 }
 EOF
-cat ~/.bloom-eth/keystore/alice/sign/typed_data.sig
+cat ~/.bloom/keystore/alice/sign/typed_data.sig
 ```
 
 Permit2 typed data has the same shape — just swap `domain.name` to
