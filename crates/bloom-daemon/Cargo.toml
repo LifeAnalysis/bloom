@@ -20,6 +20,7 @@ bytecode-decompile = ["bloom-revert/bytecode-decompile"]
 bloom-proto.workspace = true
 bloom-keystore.workspace = true
 bloom-chain.workspace = true
+bloom-mempool.workspace = true
 bloom-tx.workspace = true
 bloom-vfs.workspace = true
 bloom-tools.workspace = true

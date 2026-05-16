@@ -213,7 +213,7 @@ drives a native ETH send and an ERC-20 transfer through the
 stage-confirm-broadcast loop on a local devnet. Optional Uniswap V2 /
 Enso scenarios on a mainnet fork run when `BLOOM_MAINNET_RPC` is set.
 
-`tests/docker/run.sh` is the dockerized harness with five modes:
+`tests/docker/run.sh` is the dockerized harness with six modes:
 
 - `--mount` (default) — privileged container exercising the NFS
   kernel mount (`tests/docker/test.sh`).
@@ -224,6 +224,11 @@ Enso scenarios on a mainnet fork run when `BLOOM_MAINNET_RPC` is set.
   reads through the mount. No Enso key required.
 - `--enso` — `docker compose --profile enso`: same anvil fork, runs
   the full Enso → Aave intent flow. Requires `BLOOM_ENSO_KEY`.
+- `--mempool` — `docker compose --profile mempool`: spins up an
+  in-container WebSocket mock that emulates Alchemy's
+  `alchemy_pendingTransactions` feed and asserts the daemon's
+  `chains/<c>/mempool/{status.json,recent.jsonl}` surface populates.
+  No external keys required.
 - `--enso-live` — runs the Enso + Aave flow against Base **mainnet**
   with real funds through the mounted filesystem surface. Gated on
   a sourced `test.env` with `BLOOM_ENSO_KEY`, `BLOOM_LIVE_HOME`,
@@ -233,3 +238,67 @@ Shared scaffolding (logging, mount lifecycle, pending-stage helpers,
 receipt assertions, deterministic Anvil constants) lives in
 `tests/docker/lib.sh`; the unified `docker-compose.yml` selects modes
 via Compose profiles.
+
+## Watch the mempool
+
+If you have a WebSocket-capable RPC for a chain (an Alchemy key, or
+any Geth/Erigon node with WS enabled), add a `[mempool.<chain>]`
+section to `~/.bloom-eth/config.toml`:
+
+```toml
+[mempool.ethereum]
+provider = "alchemy"
+ws_url = "wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+```
+
+`provider = "generic_eth_subscribe"` works against any node that
+implements `eth_subscribe("newPendingTransactions")`.
+
+Restart the daemon, then tail the live mempool:
+
+```sh
+bloom vfs cat /eth/chains/ethereum/mempool/status.json   # subscription + counts
+bloom vfs cat /eth/chains/ethereum/mempool/live          # long-polls up to ~25s; returns one or more JSON lines when txs arrive, or an empty body if the deadline elapses
+bloom vfs cat /eth/chains/ethereum/mempool/recent.jsonl | head
+bloom vfs cat /eth/chains/ethereum/mempool/by_address/0xYourAddress/pending.jsonl
+```
+
+To opt a wallet into private orderflow:
+
+```toml
+# wallets/<name>/policy.toml
+[private]
+enabled = true
+provider = "mev_blocker"   # or "flashbots"
+```
+
+Future broadcasts from that wallet on supported chains route through
+the configured private RPC instead of the public one. The current
+Flashbots adapter supports Ethereum mainnet and Sepolia; MEV-Blocker
+is mainnet-only. Unsupported chains return an explicit
+`PrivateNotSupportedOnChain` error rather than silently broadcasting
+publicly.
+
+To run the opt-in Sepolia live send test, fund the same keystore wallet
+used by `--enso-live` with Sepolia ETH, then run:
+
+```sh
+set -a && source test.env && set +a
+BLOOM_RUN_SEPOLIA_PRIVATE_SEND=1 \
+BLOOM_SEPOLIA_RPC_URL="https://your-sepolia-rpc" \
+cargo test -p bloom-mempool --features live-providers \
+  --test it_flashbots_sepolia_send -- --nocapture
+```
+
+Required env: `BLOOM_LIVE_HOME`/`BETH_LIVE_HOME`,
+`BLOOM_LIVE_DEST1`/`BETH_LIVE_DEST1`,
+`BLOOM_PASSPHRASE`/`BETH_PASSPHRASE`,
+`BLOOM_SEPOLIA_RPC_URL`/`BETH_SEPOLIA_RPC_URL`, and
+`BLOOM_RUN_SEPOLIA_PRIVATE_SEND=1`. Optional env:
+`BLOOM_LIVE_WALLET`/`BETH_LIVE_WALLET` (defaults to `dest1`),
+`BLOOM_SEPOLIA_RECIPIENT`/`BETH_SEPOLIA_RECIPIENT`,
+`BLOOM_SEPOLIA_TRANSFER_WEI`/`BETH_SEPOLIA_TRANSFER_WEI`
+(defaults to `100000000000000`),
+`BLOOM_SEPOLIA_PRIORITY_FEE_WEI`/`BETH_SEPOLIA_PRIORITY_FEE_WEI`,
+`BLOOM_SEPOLIA_MAX_FEE_PER_GAS_WEI`/`BETH_SEPOLIA_MAX_FEE_PER_GAS_WEI`,
+and `BLOOM_SEPOLIA_FLASHBOTS_URL`/`BETH_SEPOLIA_FLASHBOTS_URL`.

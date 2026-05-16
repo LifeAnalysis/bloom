@@ -6,6 +6,7 @@ license.workspace = true
 description = "Path router and handlers for bloom virtual filesystem"
 
 [dependencies]
+bloom-mempool.workspace = true
 bloom-proto.workspace = true
 bloom-keystore.workspace = true
 bloom-chain.workspace = true

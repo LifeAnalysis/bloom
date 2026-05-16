@@ -2,6 +2,7 @@ pub mod addressbook;
 pub mod chains;
 pub mod chains_contracts;
 mod chains_history;
+pub mod chains_mempool;
 mod chains_nfts;
 pub mod defi;
 pub mod docs;
@@ -15,6 +16,7 @@ pub mod watch;
 
 pub use addressbook::AddressBookHandler;
 pub use chains::ChainsHandler;
+pub use chains_mempool::MempoolHandler;
 pub use defi::DefiHandler;
 pub use docs::DocsHandler;
 pub use ens::EnsHandler;

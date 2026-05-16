@@ -2,7 +2,7 @@
 //! then on confirm sign and broadcast. Also handles same-nonce
 //! replacement / cancel txs and a legacy (non-1559) build path.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,6 +46,7 @@ use parking_lot::RwLock;
 use thiserror::Error;
 use tracing::{debug, info};
 
+use crate::bump_scanner::MempoolIndexes;
 use crate::intent_parser::ParseError;
 use crate::outbox::{Outbox, OutboxError, OutboxState};
 use crate::policy_engine;
@@ -81,10 +82,70 @@ pub enum TxEngineError {
     Signer(String),
     #[error("token: {0}")]
     Token(String),
+    #[error("private RPC provider {0} not configured")]
+    PrivateProviderNotConfigured(String),
+    #[error("private RPC not supported on chain {0}")]
+    PrivateNotSupportedOnChain(String),
+    #[error("private RPC broadcast failed: {0}")]
+    PrivateBroadcast(String),
+    #[error("private RPC provider {provider} does not support chain {chain_id}")]
+    PrivateProviderChainMismatch { provider: String, chain_id: u64 },
 }
 
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
 type TokenCache = Arc<RwLock<HashMap<(u64, Address), TokenMeta>>>;
+
+/// Per-(chain_id, provider_id) map of configured private RPC providers
+/// used by `broadcast` when `policy.private.enabled == true`.
+type PrivateRpcs = Arc<RwLock<BTreeMap<(u64, String), Arc<dyn bloom_mempool::PrivateRpcProvider>>>>;
+
+/// Stub `QuoteOracle` for stage-time MEV heuristics. It holds a
+/// `ChainClient` reference so a real implementation can `eth_call` a
+/// quoter contract, but the current version always returns `None`
+/// (the heuristic then degrades to the `amount_out_min == 0` check
+/// only). Phase 4+ will wire this to a real quoter.
+struct EthCallQuoteOracle<'a> {
+    _chain: &'a ChainClient,
+}
+
+impl bloom_mempool::QuoteOracle for EthCallQuoteOracle<'_> {
+    fn quote(&self, _amount_in: U256, _path: &[Address]) -> Option<U256> {
+        None
+    }
+}
+
+/// Build the `HeuristicConfig` from the active policy. Kept as a free
+/// function so unit tests can exercise it without constructing a
+/// `TxEngine`.
+pub(crate) fn mev_cfg_from_policy(policy: &Policy) -> bloom_mempool::HeuristicConfig {
+    bloom_mempool::HeuristicConfig {
+        max_slippage_bps: policy.mev.max_slippage_bps,
+        // Match `HeuristicConfig::default()` — 1e18 (one whole token /
+        // ETH worth of input). The threshold only fires together with
+        // `amountOutMin == 0`, so it's a sanity gate, not a primary
+        // signal.
+        zero_min_amount_in_threshold: U256::from(10u64).pow(U256::from(18u64)),
+    }
+}
+
+/// Run the stage-time MEV/sandwich heuristic. The `ChainClient` is
+/// held only by the (currently stub) quoter so the function stays
+/// synchronous and safe to call without a live RPC.
+pub(crate) fn evaluate_mev_risk(
+    chain: &ChainClient,
+    data_bytes: &[u8],
+    value_wei: U256,
+    policy: &Policy,
+) -> bloom_mempool::MevRiskReport {
+    let cfg = mev_cfg_from_policy(policy);
+    let quoter = EthCallQuoteOracle { _chain: chain };
+    bloom_mempool::heuristic::evaluate(
+        &alloy::primitives::Bytes::copy_from_slice(data_bytes),
+        value_wei,
+        &cfg,
+        &quoter,
+    )
+}
 
 #[derive(Debug, Clone)]
 struct TokenMeta {
@@ -104,6 +165,16 @@ pub struct TxEngine {
     token_cache: TokenCache,
     resolver: Option<Arc<dyn RecipientResolver>>,
     price_oracle: Option<crate::oracle::DynPriceOracle>,
+    /// Per-chain pending-tx indexes for the nonce-conflict check at
+    /// stage time. Populated externally (by the daemon, after the
+    /// mempool subsystem starts) via [`Self::set_mempool_index`].
+    mempool_indexes: MempoolIndexes,
+    /// Per-(chain_id, provider_id) map of configured private RPC
+    /// providers. Populated externally via
+    /// [`Self::register_private_rpc`]; used by `broadcast` to route
+    /// signed raw txs privately when `policy.private.enabled` is set
+    /// (mainnet only — see `MAINNET_CHAIN_ID`).
+    private_rpcs: PrivateRpcs,
 }
 
 impl TxEngine {
@@ -115,7 +186,104 @@ impl TxEngine {
             token_cache: Arc::new(RwLock::new(HashMap::new())),
             resolver: None,
             price_oracle: None,
+            mempool_indexes: Arc::new(RwLock::new(BTreeMap::new())),
+            private_rpcs: Arc::new(RwLock::new(BTreeMap::new())),
         }
+    }
+
+    /// Register the `PendingTxIndex` for `chain`. Calling stage on this
+    /// chain will then surface a `nonce_conflict.json` artefact if the
+    /// staged `(from, nonce)` collides with an externally-observed
+    /// pending tx.
+    pub fn set_mempool_index(
+        &self,
+        chain: impl Into<String>,
+        idx: Arc<bloom_mempool::PendingTxIndex>,
+    ) {
+        self.mempool_indexes.write().insert(chain.into(), idx);
+    }
+
+    /// Register a `PrivateRpcProvider` for `chain_id`. The provider's
+    /// `id()` becomes the lookup key alongside `chain_id`, matching the
+    /// `policy.private.provider` string written by the user.
+    ///
+    /// Returns `Err(PrivateProviderChainMismatch)` if `chain_id` is not
+    /// listed in `provider.supported_chains()`, catching misconfiguration
+    /// before any tx is submitted.
+    pub fn register_private_rpc(
+        &self,
+        chain_id: u64,
+        provider: Arc<dyn bloom_mempool::PrivateRpcProvider>,
+    ) -> Result<(), TxEngineError> {
+        if !provider.supported_chains().contains(&chain_id) {
+            return Err(TxEngineError::PrivateProviderChainMismatch {
+                provider: provider.id().to_string(),
+                chain_id,
+            });
+        }
+        self.private_rpcs
+            .write()
+            .insert((chain_id, provider.id().to_string()), provider);
+        Ok(())
+    }
+
+    /// Submit a signed raw tx via the configured private RPC provider
+    /// keyed by `(chain_id, provider_id)`. Returns the hash returned by
+    /// the provider on success, or a typed error if the provider is not
+    /// configured or the submission fails. Kept `pub(crate)` so unit
+    /// tests can exercise it without going through the full broadcast
+    /// path (which requires a live chain).
+    pub(crate) async fn submit_via_private(
+        &self,
+        chain_id: u64,
+        provider_id: &str,
+        raw: &alloy::primitives::Bytes,
+    ) -> Result<alloy::primitives::B256, TxEngineError> {
+        // Take the lock, clone the Arc out, drop the guard before .await — no
+        // lock is held across the network call.
+        let provider = self
+            .private_rpcs
+            .read()
+            .get(&(chain_id, provider_id.to_string()))
+            .cloned()
+            .ok_or_else(|| TxEngineError::PrivateProviderNotConfigured(provider_id.to_string()))?;
+        provider
+            .submit(raw)
+            .await
+            .map_err(|e| TxEngineError::PrivateBroadcast(e.to_string()))
+    }
+
+    /// Build the nonce-conflict JSON body if `(from, nonce)` collides
+    /// with an externally observed pending tx on this chain. Returns
+    /// `None` when no index is registered for the chain, or when no
+    /// collision is found.
+    pub(crate) fn build_nonce_conflict_body(
+        &self,
+        chain_name: &str,
+        from: Address,
+        nonce: u64,
+    ) -> Option<serde_json::Value> {
+        let rec = self
+            .mempool_indexes
+            .read()
+            .get(chain_name)?
+            .lookup_by_addr_nonce(from, nonce)?;
+        let observed_at = rec
+            .tx
+            .observed_at
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let hex_hash = hex::encode(rec.tx.hash.as_slice());
+        let hash_str = format!("0x{hex_hash}");
+        Some(serde_json::json!({
+            "conflict_nonce": nonce,
+            "external_hash": &hash_str,
+            "external_observed_at": observed_at,
+            "advice": format!(
+                "external tx {hash_str} is pending at this nonce; use a different nonce or wait for it to mine/drop"
+            ),
+        }))
     }
 
     /// Wire a name resolver (typically an ENS adapter) for recipients.
@@ -539,6 +707,23 @@ impl TxEngine {
         // Build a request to estimate gas; choose 1559 vs legacy fields.
         let data_bytes = decode_data(&data_hex)?;
 
+        // Stage-time MEV/sandwich heuristic. Computed up-front so that
+        // when `policy.mev.fail_on_high_risk` is set we can deny before
+        // any pending-dir write happens (high-risk denials don't leave
+        // a partially-written stage on disk). The artefact write below
+        // — after `write_pending` — only runs when we keep going.
+        let mev_report = evaluate_mev_risk(chain, &data_bytes, value_wei, policy);
+        if policy.mev.fail_on_high_risk && matches!(mev_report.risk, bloom_mempool::MevRisk::High) {
+            debug!(
+                wallet,
+                chain = %spec.name,
+                reason = "mev_high_risk",
+                advice = %mev_report.advice,
+                "tx.policy_denied"
+            );
+            return Err(TxEngineError::PolicyDenied);
+        }
+
         // Open a pinned read session for the nonce + code reads so the
         // staging fanout sees a self-consistent block even when the
         // layered fallback transport rotates upstreams between calls.
@@ -559,6 +744,10 @@ impl TxEngine {
             Some(n) => n,
             None => session.nonce(from).await?,
         };
+        // Check for an externally-observed pending tx at this (from, nonce).
+        // Body is computed up-front but written only after write_pending
+        // creates the pending dir.
+        let conflict_body = self.build_nonce_conflict_body(&spec.name, from, nonce);
         let gas_price = match chain.gas_price().await {
             Ok(g) => g,
             Err(e) => {
@@ -777,6 +966,12 @@ impl TxEngine {
         let plan =
             bloom_proto::PlanRender::render(&staged, &spec.native_symbol, spec.native_decimals);
         self.outbox.write_pending(&staged, &plan)?;
+        if let Some(body) = conflict_body {
+            self.outbox
+                .write_nonce_conflict(&staged.wallet, &staged.chain, &staged.id, &body)?;
+        }
+        self.outbox
+            .write_mev_risk(&staged.wallet, &staged.chain, &staged.id, &mev_report)?;
         debug!(id=%staged.id, wallet=%staged.wallet, chain=%staged.chain, "tx.stage");
         Ok(staged)
     }
@@ -862,7 +1057,7 @@ impl TxEngine {
             return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
         }
 
-        let tx_hash = self.broadcast(&staged, chain, signer).await?;
+        let tx_hash = self.broadcast(&staged, chain, signer, policy).await?;
         info!(id=%staged.id, hash=%format!("{:#x}", tx_hash), "tx.broadcast");
 
         staged.status = TxStatus::Sent;
@@ -885,12 +1080,16 @@ impl TxEngine {
         Ok(staged)
     }
 
-    /// Build, sign and broadcast a single concrete `StagedTx`.
+    /// Build, sign and broadcast a single concrete `StagedTx`. When
+    /// `policy.private.enabled` is set and the staged chain is supported
+    /// by Bloom's private-orderflow policy, routes through the registered
+    /// `PrivateRpcProvider` instead of `ChainClient::send_raw`.
     async fn broadcast(
         &self,
         staged: &StagedTx,
         chain: &ChainClient,
         signer: &PrivateKeySigner,
+        policy: &Policy,
     ) -> Result<alloy::primitives::B256, TxEngineError> {
         let to_addr: Address = staged
             .to
@@ -942,7 +1141,21 @@ impl TxEngine {
         let mut buf = Vec::new();
         alloy::eips::Encodable2718::encode_2718(&tx_envelope, &mut buf);
         let raw = Bytes::from(buf);
-        Ok(chain.send_raw(raw).await?)
+        let hash = if policy.private.enabled {
+            if !matches!(
+                staged.chain_id,
+                bloom_mempool::MAINNET_CHAIN_ID | bloom_mempool::SEPOLIA_CHAIN_ID
+            ) {
+                return Err(TxEngineError::PrivateNotSupportedOnChain(
+                    chain.spec().name.clone(),
+                ));
+            }
+            self.submit_via_private(staged.chain_id, &policy.private.provider, &raw)
+                .await?
+        } else {
+            chain.send_raw(raw).await?
+        };
+        Ok(hash)
     }
 
     /// Issue a same-nonce replacement tx with bumped fees. The original
@@ -950,6 +1163,7 @@ impl TxEngine {
     /// already-broadcast txs cannot be replaced through this path
     /// (fix #2 / #10). Floors `bump_pct` at 10 to satisfy the mempool's
     /// >= 10% rule.
+    #[allow(clippy::too_many_arguments)]
     pub async fn replace(
         &self,
         wallet: &str,
@@ -958,6 +1172,7 @@ impl TxEngine {
         chain: &ChainClient,
         signer: &PrivateKeySigner,
         bump_pct: u32,
+        policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         self.replace_with_intent(
             wallet,
@@ -968,6 +1183,7 @@ impl TxEngine {
             bump_pct,
             None,
             None,
+            policy,
         )
         .await
     }
@@ -990,6 +1206,7 @@ impl TxEngine {
         bump_pct: u32,
         substitute: Option<RawIntent>,
         address_book: Option<&AddressBook>,
+        policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         let bump = bump_pct.max(10);
         let entry =
@@ -1022,7 +1239,7 @@ impl TxEngine {
         }
         bump_fees_in_place(&mut bumped, bump);
 
-        let tx_hash = self.broadcast(&bumped, chain, signer).await?;
+        let tx_hash = self.broadcast(&bumped, chain, signer, policy).await?;
         bumped.tx_hash = Some(format!("{:#x}", tx_hash));
         bumped.status = TxStatus::Sent;
 
@@ -1047,6 +1264,7 @@ impl TxEngine {
 
     /// Issue a same-nonce self-send to cancel the original. Refuses if the
     /// original is no longer pending (fix #2 / #10).
+    #[allow(clippy::too_many_arguments)]
     pub async fn cancel(
         &self,
         wallet: &str,
@@ -1055,6 +1273,7 @@ impl TxEngine {
         chain: &ChainClient,
         signer: &PrivateKeySigner,
         bump_pct: u32,
+        policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         let bump = bump_pct.max(10);
         let entry =
@@ -1071,7 +1290,7 @@ impl TxEngine {
         cancel_tx.token = None;
         bump_fees_in_place(&mut cancel_tx, bump);
 
-        let tx_hash = self.broadcast(&cancel_tx, chain, signer).await?;
+        let tx_hash = self.broadcast(&cancel_tx, chain, signer, policy).await?;
         cancel_tx.tx_hash = Some(format!("{:#x}", tx_hash));
         cancel_tx.status = TxStatus::Cancelled;
 
@@ -1288,6 +1507,8 @@ const _PARSE_UNITS: fn(&str, u8) -> Result<U256, bloom_proto::units::UnitError> 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use bloom_proto::TxStatus;
 
@@ -1361,6 +1582,143 @@ mod tests {
     fn resolve_token_unknown_symbol_errors() {
         let err = TxEngine::resolve_token_address("MOCK", 1).unwrap_err();
         assert!(matches!(err, TxEngineError::Token(_)));
+    }
+
+    // -------------------------------------------------------------------
+    // Nonce-conflict body tests. These exercise the index lookup +
+    // body shape directly; the full stage() path is covered elsewhere
+    // and requires a live RPC.
+    // -------------------------------------------------------------------
+
+    fn make_pending_tx(
+        addr: Address,
+        nonce: u64,
+        hash_byte: u8,
+        observed_secs: u64,
+    ) -> bloom_mempool::PendingTx {
+        use alloy::primitives::{B256, Bytes, U256};
+        let mut hash = [0u8; 32];
+        hash.fill(hash_byte);
+        bloom_mempool::PendingTx {
+            hash: B256::from(hash),
+            from: addr,
+            to: None,
+            nonce,
+            value: U256::ZERO,
+            gas_limit: 21_000,
+            fees: bloom_mempool::TxFees::Legacy { gas_price: 1 },
+            input: Bytes::new(),
+            observed_at: UNIX_EPOCH + Duration::from_secs(observed_secs),
+        }
+    }
+
+    fn nonce_conflict_engine() -> (TxEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = crate::outbox::Outbox::new(dir.path()).unwrap();
+        let engine = TxEngine::new(outbox, 60_000, false);
+        (engine, dir)
+    }
+
+    #[test]
+    fn build_nonce_conflict_body_returns_none_when_no_index() {
+        let (engine, _dir) = nonce_conflict_engine();
+        let addr = "0x0000000000000000000000000000000000000001"
+            .parse::<Address>()
+            .unwrap();
+        assert!(engine.build_nonce_conflict_body("anvil", addr, 0).is_none());
+    }
+
+    #[test]
+    fn build_nonce_conflict_body_returns_none_when_no_match() {
+        let (engine, _dir) = nonce_conflict_engine();
+        let idx = bloom_mempool::PendingTxIndex::new(8);
+        engine.set_mempool_index("anvil", idx);
+        let addr = "0x0000000000000000000000000000000000000001"
+            .parse::<Address>()
+            .unwrap();
+        assert!(engine.build_nonce_conflict_body("anvil", addr, 7).is_none());
+    }
+
+    #[test]
+    fn build_nonce_conflict_body_returns_some_when_match() {
+        let (engine, _dir) = nonce_conflict_engine();
+        let idx = bloom_mempool::PendingTxIndex::new(8);
+        let addr = "0x0000000000000000000000000000000000000001"
+            .parse::<Address>()
+            .unwrap();
+        idx.insert(make_pending_tx(addr, 7, 0xAB, 1_700_000_000));
+        engine.set_mempool_index("anvil", idx);
+
+        let body = engine
+            .build_nonce_conflict_body("anvil", addr, 7)
+            .expect("expected nonce conflict body");
+        assert_eq!(body["conflict_nonce"], 7);
+        let hash_str = body["external_hash"].as_str().unwrap();
+        assert!(
+            hash_str.starts_with("0xabab"),
+            "external_hash should start with 0xabab, got {hash_str}"
+        );
+        // Length: "0x" + 64 hex chars.
+        assert_eq!(hash_str.len(), 66);
+        assert_eq!(body["external_observed_at"], 1_700_000_000);
+        let advice = body["advice"].as_str().unwrap();
+        assert!(advice.contains(hash_str));
+    }
+
+    // -------------------------------------------------------------------
+    // MEV-heuristic helpers. These exercise the policy→config mapping and
+    // the synchronous `evaluate_mev_risk` shim that wraps
+    // `bloom_mempool::heuristic::evaluate` with the stub quoter; the full
+    // `stage()` path is covered elsewhere and needs a live RPC.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mev_cfg_from_policy_uses_policy_slippage_and_default_threshold() {
+        let mut policy = bloom_proto::Policy::default();
+        policy.mev.max_slippage_bps = 250;
+        let cfg = mev_cfg_from_policy(&policy);
+        assert_eq!(cfg.max_slippage_bps, 250);
+        assert_eq!(
+            cfg.zero_min_amount_in_threshold,
+            U256::from(10u64).pow(U256::from(18u64))
+        );
+    }
+
+    #[test]
+    fn evaluate_mev_risk_high_on_zero_amount_out_min() {
+        // The fixture decodes a swap with amountOutMin = 0 and an
+        // amountIn well above 1e18. Even with the stub quoter (always
+        // returns None) this must classify as High via the
+        // amount_out_min_zero check, independent of the slippage path.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let hex_str = std::fs::read_to_string(format!(
+            "{manifest_dir}/../bloom-mempool/tests/fixtures/uniswap_v2_zero_min.hex"
+        ))
+        .unwrap();
+        let cd = alloy::hex::decode(hex_str.trim()).unwrap();
+
+        let spec = bloom_proto::ChainSpec {
+            name: "anvil".into(),
+            chain_id: 31337,
+            // Unreachable URL — the stub quoter doesn't hit the chain.
+            rpc_urls: vec!["http://127.0.0.1:1".into()],
+            rpc_endpoints: Vec::new(),
+            allow_broadcast: true,
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+        };
+        let chain = bloom_chain::ChainClient::new(spec).unwrap();
+        let policy = bloom_proto::Policy::default();
+        let report = evaluate_mev_risk(&chain, &cd, U256::ZERO, &policy);
+        assert_eq!(report.risk, bloom_mempool::MevRisk::High);
+        assert!(
+            report.checks.iter().any(|s| s == "amount_out_min_zero"),
+            "expected amount_out_min_zero in checks, got {:?}",
+            report.checks
+        );
     }
 
     /// Helpers shared by the confirm-flow regression tests below. They
@@ -1825,6 +2183,163 @@ mod tests {
             Err(TxEngineError::PolicyDenied) => panic!("override token did not bypass warn"),
             Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
             Err(_) => {}
+        }
+    }
+
+    /// `submit_via_private` looks up the registered provider by
+    /// `(chain_id, provider_id)` and forwards the raw bytes. The mock
+    /// records every submission so we can verify routing without a
+    /// live chain.
+    #[tokio::test]
+    async fn submit_via_private_routes_to_registered_provider() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mock = Arc::new(bloom_mempool::MockPrivateRpcProvider::new("mev_blocker"));
+        engine
+            .register_private_rpc(bloom_mempool::MAINNET_CHAIN_ID, mock.clone())
+            .expect("register_private_rpc");
+
+        let raw = alloy::primitives::Bytes::from_static(b"\x01\x02\x03");
+        let hash = engine
+            .submit_via_private(bloom_mempool::MAINNET_CHAIN_ID, "mev_blocker", &raw)
+            .await
+            .expect("submit_via_private");
+        assert_eq!(hash, alloy::primitives::keccak256(&raw));
+        assert_eq!(mock.submissions().len(), 1);
+        assert_eq!(mock.submissions()[0], raw);
+    }
+
+    /// When the requested provider id is not registered for the given
+    /// chain id, the helper returns `PrivateProviderNotConfigured` and
+    /// does NOT silently fall through to public broadcast.
+    #[tokio::test]
+    async fn submit_via_private_errors_when_not_configured() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mock = Arc::new(bloom_mempool::MockPrivateRpcProvider::new("mev_blocker"));
+        engine
+            .register_private_rpc(bloom_mempool::MAINNET_CHAIN_ID, mock)
+            .expect("register_private_rpc");
+
+        let raw = alloy::primitives::Bytes::from_static(b"\x01\x02\x03");
+        let r = engine
+            .submit_via_private(bloom_mempool::MAINNET_CHAIN_ID, "flashbots", &raw)
+            .await;
+        match r {
+            Err(TxEngineError::PrivateProviderNotConfigured(id)) => {
+                assert_eq!(id, "flashbots");
+            }
+            other => panic!("expected PrivateProviderNotConfigured, got {other:?}"),
+        }
+    }
+
+    /// The registry is keyed by `(chain_id, provider_id)`, so two
+    /// providers registered on the same chain must be reachable
+    /// independently and only the one keyed by the requested id should
+    /// see the submission.
+    #[tokio::test]
+    async fn register_private_rpc_uses_provider_id_as_key() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mev_blocker = Arc::new(bloom_mempool::MockPrivateRpcProvider::new("mev_blocker"));
+        let flashbots = Arc::new(bloom_mempool::MockPrivateRpcProvider::new("flashbots"));
+        engine
+            .register_private_rpc(bloom_mempool::MAINNET_CHAIN_ID, mev_blocker.clone())
+            .expect("register_private_rpc mev_blocker");
+        engine
+            .register_private_rpc(bloom_mempool::MAINNET_CHAIN_ID, flashbots.clone())
+            .expect("register_private_rpc flashbots");
+
+        let raw_a = alloy::primitives::Bytes::from_static(b"\xaa");
+        let raw_b = alloy::primitives::Bytes::from_static(b"\xbb");
+        engine
+            .submit_via_private(bloom_mempool::MAINNET_CHAIN_ID, "mev_blocker", &raw_a)
+            .await
+            .expect("submit mev_blocker");
+        engine
+            .submit_via_private(bloom_mempool::MAINNET_CHAIN_ID, "flashbots", &raw_b)
+            .await
+            .expect("submit flashbots");
+
+        assert_eq!(mev_blocker.submissions(), vec![raw_a]);
+        assert_eq!(flashbots.submissions(), vec![raw_b]);
+    }
+
+    /// Registering a provider under a chain id it does not declare in
+    /// `supported_chains()` is rejected at the registration call. This
+    /// catches misconfiguration in the daemon wiring before any tx is
+    /// ever submitted.
+    #[tokio::test]
+    async fn register_private_rpc_rejects_unsupported_chain() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mock = Arc::new(bloom_mempool::MockPrivateRpcProvider::new("mev_blocker"));
+        // MockPrivateRpcProvider reports &[MAINNET_CHAIN_ID] (= 1).
+        // Registering against an unsupported chain must fail.
+        let r = engine.register_private_rpc(5, mock);
+        match r {
+            Err(TxEngineError::PrivateProviderChainMismatch { provider, chain_id }) => {
+                assert_eq!(provider, "mev_blocker");
+                assert_eq!(chain_id, 5);
+            }
+            other => panic!("expected PrivateProviderChainMismatch, got {other:?}"),
+        }
+    }
+
+    /// Sepolia is the live low-risk exercise path for Flashbots Protect.
+    /// When a provider explicitly declares Sepolia support, broadcast
+    /// should route privately instead of falling through to public RPC.
+    #[tokio::test]
+    async fn broadcast_routes_private_on_sepolia_when_provider_supports_it() {
+        static SEPOLIA_ONLY: &[u64] = &[bloom_mempool::SEPOLIA_CHAIN_ID];
+
+        let (engine, mut spec, _dir) = fake_engine(60_000);
+        spec.name = "sepolia".into();
+        spec.chain_id = bloom_mempool::SEPOLIA_CHAIN_ID;
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let mut policy = bloom_proto::Policy::default();
+        policy.private.enabled = true;
+        policy.private.provider = "flashbots".into();
+
+        let mock = Arc::new(
+            bloom_mempool::MockPrivateRpcProvider::new("flashbots")
+                .with_supported_chains(SEPOLIA_ONLY),
+        );
+        engine
+            .register_private_rpc(bloom_mempool::SEPOLIA_CHAIN_ID, mock.clone())
+            .expect("register sepolia private provider");
+
+        let mut staged = fake_staged_1559("0001-private-sepolia");
+        staged.chain = "sepolia".into();
+        staged.chain_id = bloom_mempool::SEPOLIA_CHAIN_ID;
+
+        let hash = engine
+            .broadcast(&staged, &chain, &signer, &policy)
+            .await
+            .expect("private sepolia broadcast");
+
+        assert_eq!(mock.submissions().len(), 1);
+        assert_eq!(hash, alloy::primitives::keccak256(&mock.submissions()[0]));
+    }
+
+    /// Private routing is allowlisted by chain. When `policy.private.enabled`
+    /// is set on an unsupported local/test chain, `broadcast` must reject
+    /// before touching the RPC.
+    #[tokio::test]
+    async fn broadcast_rejects_private_on_non_mainnet() {
+        let (engine, spec, _dir) = fake_engine(60_000);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let mut policy = bloom_proto::Policy::default();
+        policy.private.enabled = true;
+        policy.private.provider = "mev_blocker".into();
+
+        // fake_staged_1559 uses chain_id 31337 (anvil) — not mainnet.
+        let staged = fake_staged_1559("0001-private-testnet");
+
+        let r = engine.broadcast(&staged, &chain, &signer, &policy).await;
+        match r {
+            Err(TxEngineError::PrivateNotSupportedOnChain(name)) => {
+                assert_eq!(name, "anvil");
+            }
+            other => panic!("expected PrivateNotSupportedOnChain, got {other:?}"),
         }
     }
 }

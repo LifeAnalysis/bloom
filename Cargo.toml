@@ -7,6 +7,7 @@ members = [
   "crates/bloom-rpc",
   "crates/bloom-tx",
   "crates/bloom-keystore",
+  "crates/bloom-mempool",
   "crates/bloom-defi",
   "crates/bloom-watch",
   "crates/bloom-mount",
@@ -31,6 +32,7 @@ repository = "https://github.com/bloom-directory/bloom"
 anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = "3"
@@ -66,6 +68,7 @@ alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "provi
 alloy-dyn-abi = { version = "1.5", features = ["eip712"] }
 
 # Internal crates
+bloom-mempool  = { path = "crates/bloom-mempool" }
 bloom-proto    = { path = "crates/bloom-proto" }
 bloom-keystore = { path = "crates/bloom-keystore" }
 bloom-rpc      = { path = "crates/bloom-rpc" }
