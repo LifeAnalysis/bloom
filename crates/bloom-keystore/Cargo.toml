@@ -6,6 +6,7 @@ license.workspace = true
 description = "Encrypted local keystore for bloom"
 
 [dependencies]
+bloom-chain-types.workspace = true
 bloom-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -21,6 +22,8 @@ alloy.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 toml.workspace = true
+ml-dsa.workspace = true
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

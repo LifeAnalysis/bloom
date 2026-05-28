@@ -20,12 +20,20 @@ bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
 [dependencies]
 bloom-proto.workspace = true
 bloom-daemon.workspace = true
+bloom-chain-node = { path = "../bloom-chain-node" }
+bloom-chain-types = { path = "../bloom-chain-types" }
+blake3.workspace = true
+wat.workspace = true
 bloom-mount = { workspace = true, optional = true }
 bloom-keystore.workspace = true
 bloom-chain.workspace = true
 bloom-tx.workspace = true
 bloom-vfs.workspace = true
 bloom-tools.workspace = true
+bloom-petals.workspace = true
+bloom-ptb-builder.workspace = true
+bloom-script.workspace = true
+bloom-objects.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
@@ -45,3 +53,5 @@ assert_cmd = "2"
 predicates = "3"
 tempfile.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
+bloom-test-util = { path = "../bloom-test-util" }

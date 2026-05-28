@@ -17,7 +17,32 @@ members = [
   "crates/bloom-ens",
   "crates/bloom-prices",
   "crates/bloom-revert",
+  "crates/bloom-petals",
   "crates/bloom-it",
+  "crates/bloom-chain-types",
+  "crates/bloom-chain-state",
+  "crates/bloom-chain-consensus",
+  "crates/bloom-chain-node",
+  "crates/bloom-chain-abi",
+  "crates/bloom-objects",
+  "crates/bloom-resource",
+  "crates/bloom-resource-macros",
+  "crates/bloom-petal-manifest",
+  "crates/bloom-script",
+  "crates/bloom-ptb-builder",
+  "crates/bloom-petal-fungible",
+  "crates/bloom-test-util",
+  "crates/bloom-petal-it",
+  # ---- example apps (not part of the protocol) ----
+  "examples/petal-dex/crates/bloom-dex-math",
+  "examples/petal-dex/crates/bloom-petal-dex-cpmm",
+  "examples/petal-dex/crates/bloom-petal-dex-faucet",
+  "examples/petal-dex/crates/bloom-petal-dex-pool",
+  "examples/petal-dex/crates/bloom-petal-dex-router",
+  "examples/petal-dex/crates/bloom-petal-dex-wallet",
+  "examples/petal-dex/tests/bloom-petal-dex-it",
+  "examples/petal-identity",
+  "examples/petal-cap",
 ]
 resolver = "2"
 
@@ -53,6 +78,8 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 rand = "0.8"
+ml-dsa = { version = "0.1.0", features = ["getrandom", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"
@@ -62,6 +89,10 @@ tempfile = "3"
 once_cell = "1"
 futures = "0.3"
 lru = "0.12"
+wasmtime = { version = "26", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
+wasmtime-wasi = "26"
+wat = "1"
+wasmparser = "0.218"
 
 # Ethereum stack
 alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract", "transport-throttle", "json-rpc"] }
@@ -83,7 +114,29 @@ bloom-etherscan = { path = "crates/bloom-etherscan" }
 bloom-ens      = { path = "crates/bloom-ens" }
 bloom-prices   = { path = "crates/bloom-prices" }
 bloom-revert   = { path = "crates/bloom-revert" }
+bloom-petals   = { path = "crates/bloom-petals" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
+bloom-chain-types = { path = "crates/bloom-chain-types" }
+bloom-chain-state = { path = "crates/bloom-chain-state" }
+bloom-chain-node = { path = "crates/bloom-chain-node" }
+bloom-chain-abi   = { path = "crates/bloom-chain-abi", default-features = false }
+bloom-objects     = { path = "crates/bloom-objects" }
+bloom-resource    = { path = "crates/bloom-resource" }
+bloom-resource-macros = { path = "crates/bloom-resource-macros" }
+bloom-petal-manifest = { path = "crates/bloom-petal-manifest" }
+bloom-script      = { path = "crates/bloom-script" }
+bloom-ptb-builder = { path = "crates/bloom-ptb-builder" }
+bloom-petal-fungible = { path = "crates/bloom-petal-fungible", version = "0.1.0" }
+# ---- example petal DEX crates (not part of the protocol) ----
+bloom-dex-math    = { path = "examples/petal-dex/crates/bloom-dex-math" }
+bloom-petal-dex-cpmm = { path = "examples/petal-dex/crates/bloom-petal-dex-cpmm", version = "0.1.0" }
+bloom-petal-dex-faucet = { path = "examples/petal-dex/crates/bloom-petal-dex-faucet" }
+bloom-petal-dex-pool = { path = "examples/petal-dex/crates/bloom-petal-dex-pool" }
+bloom-petal-dex-router = { path = "examples/petal-dex/crates/bloom-petal-dex-router" }
+bloom-petal-dex-wallet = { path = "examples/petal-dex/crates/bloom-petal-dex-wallet" }
+bloom-petal-identity = { path = "examples/petal-identity" }
+# ---- example core petal: generic capability primitives (/bloom/core/cap) ----
+bloom-petal-cap   = { path = "examples/petal-cap", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

@@ -128,6 +128,17 @@ pub trait Handler: Send + Sync {
         Err(HandlerError::NotAFile(path.to_string_path()))
     }
 
+    /// Return bytes for a regular file pinned to `block`.
+    ///
+    /// Only handlers with an explicit historical backend should override this.
+    /// The default is intentionally unsupported rather than delegating to
+    /// `read`, so callers that need a pinned view do not silently read latest
+    /// state.
+    async fn read_at_block(&self, path: &VfsPath, block: u64) -> Result<Vec<u8>, HandlerError> {
+        let _ = block;
+        Err(HandlerError::Unsupported(path.to_string_path()))
+    }
+
     /// Handle a write to a writable file. Default: read-only.
     async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
         let _ = path;

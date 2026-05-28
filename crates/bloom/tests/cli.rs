@@ -1,3 +1,5 @@
+//! Category: CLI-subprocess
+//!
 //! CLI smoke tests for the `bloom` binary.
 //!
 //! Each test allocates a fresh `tempfile::tempdir()` home and invokes the
@@ -40,6 +42,7 @@ fn help_lists_all_subcommands() {
         .stdout(predicate::str::contains("wallet"))
         .stdout(predicate::str::contains("serve"))
         .stdout(predicate::str::contains("ipc"))
+        .stdout(predicate::str::contains("petals"))
         .stdout(predicate::str::contains("init"));
 }
 
@@ -202,42 +205,20 @@ fn wallet_new_via_env_passphrase() {
 #[test]
 fn vfs_routes_via_ipc_when_socket_exists() {
     use bloom_daemon::ipc::{IpcServer, default_socket_path};
-    use bloom_vfs::handler::{Entry, Handler, HandlerError};
-    use bloom_vfs::{Vfs, VfsPath};
+    use bloom_test_util::mocks::SingleFileHandler;
+    use bloom_vfs::Vfs;
 
     // A trivial in-memory handler that the production daemon never mounts;
     // if the CLI's `vfs ls /probe` returns this entry, the request must
     // have gone through our test server.
-    struct ProbeHandler;
-    #[async_trait::async_trait]
-    impl Handler for ProbeHandler {
-        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
-            if p.is_root() {
-                Ok(Entry::dir(""))
-            } else if p.segments().len() == 1 && p.segments()[0] == "marker" {
-                Ok(Entry::file("marker"))
-            } else {
-                Err(HandlerError::not_found(p.to_string_path()))
-            }
-        }
-        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
-            if p.is_root() {
-                Ok(vec![Entry::file("marker")])
-            } else {
-                Err(HandlerError::NotADir(p.to_string_path()))
-            }
-        }
-        async fn read(&self, _p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
-            Ok(b"ipc-only-marker\n".to_vec())
-        }
-    }
+    let probe = SingleFileHandler::new("marker", b"ipc-only-marker\n".to_vec());
 
     let home = fresh_home();
     let socket = default_socket_path(home.path());
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
 
     let vfs = Vfs::builder()
-        .mount("probe", std::sync::Arc::new(ProbeHandler))
+        .mount("probe", std::sync::Arc::new(probe))
         .build();
 
     // Build a Tokio runtime for the server in a dedicated thread; the
@@ -305,4 +286,304 @@ fn vfs_routes_via_ipc_when_socket_exists() {
         std::thread::sleep(Duration::from_millis(20));
     }
     server_thread.join().expect("ipc server thread panicked");
+}
+
+/// End-to-end petals smoke test: install a WAT module from a file,
+/// confirm `petals ls` shows it under both its hash and its petname, then
+/// `petals run` it and check that WASI stdout reaches the parent process.
+/// The WAT writes a fixed string via `fd_write` and exits 0, so a success
+/// here proves the wasmtime engine, WASI shims, and the runner are wired
+/// through the daemon end to end.
+#[test]
+fn petals_install_then_ls_then_run() {
+    let home = fresh_home();
+    let wat_path = home.path().join("hello.wat");
+    // Self-contained WASI petal: writes 21 bytes to fd 1 (stdout), exits 0.
+    // The iovec table at offset 32 points at the string at offset 0.
+    let wat = r#"
+        (module
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "hello from cli petal\n")
+          (data (i32.const 32) "\00\00\00\00\15\00\00\00")
+          (func (export "_start")
+            (call $fd_write (i32.const 1) (i32.const 32) (i32.const 1) (i32.const 48))
+            drop
+            (call $exit (i32.const 0)))
+        )
+    "#;
+    std::fs::write(&wat_path, wat).unwrap();
+
+    let install = bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--name",
+            "hello",
+        ])
+        .assert()
+        .success();
+    let install_out = String::from_utf8(install.get_output().stdout.clone()).unwrap();
+    let hash_line = install_out
+        .lines()
+        .find(|l| l.starts_with("hash: "))
+        .expect("install stdout must include a hash line");
+    let hash = hash_line.trim_start_matches("hash: ").trim();
+    assert_eq!(hash.len(), 64, "expected 64-char hex hash, got {hash:?}");
+
+    let ls = bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success();
+    let ls_out = String::from_utf8(ls.get_output().stdout.clone()).unwrap();
+    // ls prints the first 12 chars of the hash plus the petname.
+    let short = &hash[..12];
+    assert!(
+        ls_out.contains(short),
+        "petals ls should mention installed hash {short}; got:\n{ls_out}"
+    );
+    assert!(
+        ls_out.contains("name=hello"),
+        "petals ls should show name=hello; got:\n{ls_out}"
+    );
+
+    // Run via the petname.
+    let run_by_name = bloom_cmd(home.path())
+        .args(["petals", "run", "hello"])
+        .assert()
+        .success();
+    let stdout_name = String::from_utf8(run_by_name.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        stdout_name, "hello from cli petal\n",
+        "stdout from petal didn't match"
+    );
+
+    // Run via the bare hash.
+    let run_by_hash = bloom_cmd(home.path())
+        .args(["petals", "run", hash])
+        .assert()
+        .success();
+    let stdout_hash = String::from_utf8(run_by_hash.get_output().stdout.clone()).unwrap();
+    assert_eq!(stdout_hash, "hello from cli petal\n");
+}
+
+/// `bloom petals name <name> <hash>` binds a petname, and `name <name>`
+/// with no hash unbinds it. Verified by reading `public/<name>` via the
+/// VFS subcommand, which goes through the PetalsHandler we mounted in
+/// `bloom-daemon`.
+#[test]
+fn petals_name_bind_unbind_reflects_in_vfs() {
+    let home = fresh_home();
+    let wat_path = home.path().join("noop.wat");
+    // Minimal valid wasm module: `(module)` compiles to 8 bytes. We use
+    // a slightly fuller WAT just so it survives a wasmtime parse.
+    let wat = r#"(module (memory (export "memory") 1) (func (export "_start")))"#;
+    std::fs::write(&wat_path, wat).unwrap();
+
+    let install = bloom_cmd(home.path())
+        .args(["petals", "install", wat_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let install_out = String::from_utf8(install.get_output().stdout.clone()).unwrap();
+    let hash = install_out
+        .lines()
+        .find(|l| l.starts_with("hash: "))
+        .unwrap()
+        .trim_start_matches("hash: ")
+        .trim()
+        .to_string();
+
+    // Bind a new petname.
+    bloom_cmd(home.path())
+        .args(["petals", "name", "greet", &hash])
+        .assert()
+        .success();
+
+    // `vfs ls /public` should expose the petname as a symlink. We just
+    // check the entry is listed; symlink targets aren't shown by the ls
+    // formatter, but the daemon-side handler emits the entry.
+    let ls = bloom_cmd(home.path())
+        .args(["vfs", "ls", "/public/local"])
+        .assert()
+        .success();
+    let ls_out = String::from_utf8(ls.get_output().stdout.clone()).unwrap();
+    assert!(
+        ls_out.lines().any(|l| l.starts_with("greet")),
+        "expected 'greet' entry under /public/local; got:\n{ls_out}"
+    );
+
+    // Unbind by omitting the hash.
+    bloom_cmd(home.path())
+        .args(["petals", "name", "greet"])
+        .assert()
+        .success();
+
+    let ls_after = bloom_cmd(home.path())
+        .args(["vfs", "ls", "/public/local"])
+        .assert()
+        .success();
+    let ls_after_out = String::from_utf8(ls_after.get_output().stdout.clone()).unwrap();
+    assert!(
+        !ls_after_out.lines().any(|l| l.starts_with("greet")),
+        "expected 'greet' entry removed; got:\n{ls_after_out}"
+    );
+}
+
+#[test]
+fn install_same_hash_same_mode_different_caps_returns_cap_mismatch() {
+    let home = fresh_home();
+    let wat_path = home.path().join("hello.wat");
+    std::fs::write(&wat_path, "(module (func (export \"_start\")))").unwrap();
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--cap",
+            "vfs.read",
+        ])
+        .assert()
+        .success();
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--cap",
+            "vfs.write",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cap mismatch"));
+}
+
+// ---------------------------------------------------------------------------
+// `bloom chain init` — review 2026-05-19 #9
+// ---------------------------------------------------------------------------
+
+/// `chain init` must refuse to overwrite an existing `validator.xdsa` unless
+/// `--force` is passed. Pre-fix the second invocation would silently
+/// generate a fresh keypair and clobber the operator's existing secret.
+#[test]
+fn chain_init_refuses_to_overwrite_validator_key_without_force() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["chain", "init"])
+        .assert()
+        .success();
+    let key_path = home
+        .path()
+        .join("chain")
+        .join("keystore")
+        .join("validator.xdsa");
+    let first = std::fs::read(&key_path).expect("first init wrote a key");
+
+    bloom_cmd(home.path())
+        .args(["chain", "init"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("refusing to overwrite"))
+        .stderr(predicate::str::contains("--force"));
+
+    let after_fail = std::fs::read(&key_path).expect("key still present after refused re-init");
+    assert_eq!(
+        first, after_fail,
+        "refused chain init must not have touched the existing key"
+    );
+
+    bloom_cmd(home.path())
+        .args(["chain", "init", "--force"])
+        .assert()
+        .success();
+    let forced = std::fs::read(&key_path).expect("forced init wrote a key");
+    assert_ne!(
+        first, forced,
+        "--force must mint a fresh keypair (replacing the previous bytes)"
+    );
+}
+
+/// On Unix, the freshly written validator secret must be mode 0o600 — no
+/// group / world read or write. Pre-fix the file landed with umask-default
+/// 0644 and a malicious group member could lift the secret.
+#[cfg(unix)]
+#[test]
+fn chain_init_writes_validator_key_with_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["chain", "init"])
+        .assert()
+        .success();
+    let key_path = home
+        .path()
+        .join("chain")
+        .join("keystore")
+        .join("validator.xdsa");
+    let mode = std::fs::metadata(&key_path)
+        .expect("stat validator.xdsa")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "validator.xdsa must be mode 0o600, got 0o{mode:o}"
+    );
+
+    // `--force` re-init must also leave the file at 0o600, not whatever the
+    // pre-existing mode was.
+    bloom_cmd(home.path())
+        .args(["chain", "init", "--force"])
+        .assert()
+        .success();
+    let mode_after_force = std::fs::metadata(&key_path)
+        .expect("stat validator.xdsa after --force")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode_after_force, 0o600);
+}
+
+/// `chain testnet` writes per-validator key files in fresh `home<i>/chain/`
+/// directories. Those files must also be mode 0o600 on Unix.
+#[cfg(unix)]
+#[test]
+fn chain_testnet_writes_validator_keys_with_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = fresh_home();
+    let outdir = home.path().join("testnet");
+    bloom_cmd(home.path())
+        .args([
+            "chain",
+            "testnet",
+            "--validators",
+            "2",
+            "--output-dir",
+            outdir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    for i in 0..2u8 {
+        let key = outdir
+            .join(format!("home{i}"))
+            .join("chain")
+            .join("keystore")
+            .join("validator.xdsa");
+        let mode = std::fs::metadata(&key)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", key.display()))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} must be mode 0o600, got 0o{mode:o}",
+            key.display()
+        );
+    }
 }
