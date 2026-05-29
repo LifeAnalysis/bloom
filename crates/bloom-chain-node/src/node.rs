@@ -418,6 +418,8 @@ impl Node {
         let rpc_server = RpcServer {
             state: Arc::clone(&shared_state),
             block_store: Arc::clone(&block_store),
+            blob_store: Arc::clone(&blob_store),
+            state_index: Arc::clone(&state_index),
             mempool_persist: Arc::clone(&mempool_persist),
             receipt_store: Arc::clone(&receipt_store),
             validator_set: Arc::new(validator_set.clone()),
@@ -426,6 +428,7 @@ impl Node {
             local_address,
             startup_height: latest_height,
             tx_submit: tx_submit_tx.clone(),
+            max_view_fuel_limit: cfg.fuel_limit,
         };
         let rpc_socket = chain_dir.join("rpc.sock");
         if rpc_uds_enabled() {
@@ -1650,7 +1653,8 @@ async fn apply_state_snapshot<E: PetalExecutor>(
     driver.block_store.put(height, &block)?;
     driver.state_index.put(height, &state_root, &blob_hash)?;
     driver.block_store.prune(height)?;
-    driver.blob_store.gc(&[blob_hash])?;
+    let removed_blobs = driver.blob_store.gc(&[blob_hash])?;
+    driver.state_index.delete_blob_hashes(&removed_blobs)?;
     {
         *driver.state.lock() = state;
     }

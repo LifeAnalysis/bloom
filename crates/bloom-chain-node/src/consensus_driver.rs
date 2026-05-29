@@ -39,8 +39,8 @@ use bloom_keystore::xdsa::{XdsaPublicKey, XdsaSignature};
 use bloom_objects::{OWNER_KIND_ADDRESS, Owner, OwnershipIndexKey, TypeTag};
 use bloom_petal_fungible::ops::decode_coin_value;
 use bloom_script::{
-    CORE_FUNGIBLE_PATH, PtbError, SignatureVerifier, ValidationContext, loom_coin_type_tag,
-    validate_ptb,
+    CORE_FUNGIBLE_PATH, PtbError, SignatureVerifier, ValidationContext, ValidationMode,
+    loom_coin_type_tag, validate_ptb,
 };
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -152,6 +152,7 @@ impl BalanceView for StateAdmissionView<'_> {
             outer_pubkey: &outer.pubkey,
         };
         let ctx = ValidationContext {
+            mode: ValidationMode::Commit,
             current_block: self.current_block,
             chain: &adapter,
             verifier: &verifier,
@@ -1167,7 +1168,8 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
             *self.state.lock() = execution.state.clone();
         }
         self.block_store.prune(height)?;
-        self.blob_store.gc(&[blob_hash])?;
+        let removed_blobs = self.blob_store.gc(&[blob_hash])?;
+        self.state_index.delete_blob_hashes(&removed_blobs)?;
 
         // Persist receipts so CLIs can distinguish a successful tx from a
         // silent revert. The consensus driver bumps the nonce *before*
