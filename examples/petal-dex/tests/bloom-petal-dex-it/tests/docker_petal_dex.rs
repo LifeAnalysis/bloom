@@ -1,7 +1,7 @@
 //! Category: docker-acceptance
 //!
 //! `docker_petal_dex.rs` — LIVE 4-validator docker acceptance test for the
-//! petal-based DEX (`/bloom/dex/{pool,wallet,faucet}`).
+//! petal-based DEX (`/bloom/petals/dex/{pool,wallet,faucet}`).
 //!
 //! This proves the faucet→create_pool and faucet→swap→wallet.receive flows
 //! execute on a live multi-validator network over RPC with REAL signing and
@@ -28,9 +28,9 @@
 //!
 //! `#[ignore]`-gated. Run via `scripts/test-docker-petal-dex.sh`.
 
-use std::path::PathBuf;
-use std::process::Command;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{io::Write, net::TcpStream};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -57,7 +57,7 @@ use bloom_script::{
 use bloom_petal_dex_it::dex_harness::{
     append_manifest_section, build_faucet_wasm, build_pool_wasm, build_router_wasm,
     build_wallet_wasm, erased_type_tag, petal_hash_of, ptb_decode_coin_value, ptb_signer_pubkey,
-    ptb_signer_pubkey_hex, sign_and_encode_ptb, wat_to_wasm,
+    ptb_signer_pubkey_hex, ptb_signer_xdsa_pubkey, sign_and_encode_ptb, wat_to_wasm,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,6 +66,7 @@ use bloom_petal_dex_it::dex_harness::{
 
 const HOST_RPC_PORTS: [u16; 4] = [18545, 18546, 18547, 18548];
 const HOST_P2P_PORTS: [u16; 4] = [18656, 18657, 18658, 18659];
+const PETAL_VFS_PROBE_PATH: &str = "/bloom/petals/dex/view-probe";
 
 /// Settlement recipient for the swap output. A distinct, deterministic 32-byte
 /// address (not the inner-PTB signer) so the receive assertion is unambiguous.
@@ -80,8 +81,8 @@ const PTB_EXPIRY_BLOCK: u64 = 1_000_000_000;
 
 const PTB_GAS_BUDGET: u64 = 2_000_000;
 
-const ADVERSARY_PATH: &str = "/bloom/dex/adversary";
-const LOOM_PROBE_PATH: &str = "/bloom/dex/loom-probe";
+const ADVERSARY_PATH: &str = "/bloom/petals/dex/adversary";
+const LOOM_PROBE_PATH: &str = "/bloom/petals/dex/loom-probe";
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(90);
 const TX_TIMEOUT: Duration = Duration::from_secs(60);
@@ -98,6 +99,17 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
         return Ok(());
     }
     Box::pin(docker_petal_dex_acceptance_inner()).await
+}
+
+#[test]
+fn prints_ptb_signer_registry_entry_for_docker_script() {
+    use base64::Engine as _;
+
+    println!("PTB_SIGNER_PK_HEX={}", ptb_signer_pubkey_hex());
+    println!(
+        "PTB_SIGNER_PUBKEY_B64={}",
+        base64::engine::general_purpose::STANDARD.encode(ptb_signer_xdsa_pubkey().0)
+    );
 }
 
 async fn docker_petal_dex_acceptance_inner() -> Result<()> {
@@ -140,16 +152,19 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
 
     // ── 2. Build the petal wasms + deploy each via the bloom CLI ──────────
     eprintln!();
-    eprintln!("[build] compiling pool/wallet/faucet/router to wasm32-unknown-unknown");
-    let pool_wasm_path = build_pool_wasm();
-    let wallet_wasm_path = build_wallet_wasm();
-    let faucet_wasm_path = build_faucet_wasm();
-    let router_wasm_path = build_router_wasm();
+    eprintln!("[build] resolving pool/wallet/faucet/router wasm artifacts");
+    let pool_wasm_path = docker_petal_wasm_path("bloom_petal_dex_pool", build_pool_wasm)?;
+    let wallet_wasm_path = docker_petal_wasm_path("bloom_petal_dex_wallet", build_wallet_wasm)?;
+    let faucet_wasm_path = docker_petal_wasm_path("bloom_petal_dex_faucet", build_faucet_wasm)?;
+    let router_wasm_path = docker_petal_wasm_path("bloom_petal_dex_router", build_router_wasm)?;
+    let view_probe_wasm_path = tmpdir.join("petal-vfs-view-probe.wasm");
+    std::fs::write(&view_probe_wasm_path, view_probe_wasm()).context("write view probe wasm")?;
 
     let pool_wasm = std::fs::read(&pool_wasm_path).context("read pool wasm")?;
     let wallet_wasm = std::fs::read(&wallet_wasm_path).context("read wallet wasm")?;
     let faucet_wasm = std::fs::read(&faucet_wasm_path).context("read faucet wasm")?;
     let router_wasm = std::fs::read(&router_wasm_path).context("read router wasm")?;
+    let view_probe_wasm = std::fs::read(&view_probe_wasm_path).context("read view probe wasm")?;
 
     // Host-side petal hashes (= blake3_tagged(PETAL, wasm)) — what deploy
     // inserts, and what each PetalRef pins.
@@ -157,32 +172,39 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     let wallet_hash = petal_hash_of(&wallet_wasm);
     let faucet_hash = petal_hash_of(&faucet_wasm);
     let router_hash = petal_hash_of(&router_wasm);
+    let view_probe_hash = petal_hash_of(&view_probe_wasm);
 
     eprintln!();
     eprintln!("[deploy] deploying petals from home0 (outer xDSA envelope):");
     deploy_petal(&home0, HOST_RPC_PORTS[0], &pool_wasm_path)?;
-    assert_resolves(client0, "/bloom/dex/pool", pool_hash).await?;
+    assert_resolves(client0, "/bloom/petals/dex/pool", pool_hash).await?;
     eprintln!(
-        "         /bloom/dex/pool   hash={}",
+        "         /bloom/petals/dex/pool   hash={}",
         hex::encode(pool_hash.0)
     );
     deploy_petal(&home0, HOST_RPC_PORTS[0], &wallet_wasm_path)?;
-    assert_resolves(client0, "/bloom/dex/wallet", wallet_hash).await?;
+    assert_resolves(client0, "/bloom/petals/dex/wallet", wallet_hash).await?;
     eprintln!(
-        "         /bloom/dex/wallet hash={}",
+        "         /bloom/petals/dex/wallet hash={}",
         hex::encode(wallet_hash.0)
     );
     deploy_petal(&home0, HOST_RPC_PORTS[0], &faucet_wasm_path)?;
-    assert_resolves(client0, "/bloom/dex/faucet", faucet_hash).await?;
+    assert_resolves(client0, "/bloom/petals/dex/faucet", faucet_hash).await?;
     eprintln!(
-        "         /bloom/dex/faucet hash={}",
+        "         /bloom/petals/dex/faucet hash={}",
         hex::encode(faucet_hash.0)
     );
     deploy_petal(&home0, HOST_RPC_PORTS[0], &router_wasm_path)?;
-    assert_resolves(client0, "/bloom/dex/router", router_hash).await?;
+    assert_resolves(client0, "/bloom/petals/dex/router", router_hash).await?;
     eprintln!(
-        "         /bloom/dex/router hash={}",
+        "         /bloom/petals/dex/router hash={}",
         hex::encode(router_hash.0)
+    );
+    deploy_petal(&home0, HOST_RPC_PORTS[0], &view_probe_wasm_path)?;
+    assert_resolves(client0, PETAL_VFS_PROBE_PATH, view_probe_hash).await?;
+    eprintln!(
+        "         {PETAL_VFS_PROBE_PATH} hash={}",
+        hex::encode(view_probe_hash.0)
     );
 
     // Deploy receipts are waited on by the CLI. Let every validator catch up
@@ -214,6 +236,11 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         json_str(&merge_b, "id")?,
         json_str(&split_src, "id")?
     );
+
+    exercise_live_petal_vfs_mount(&clients, &tmpdir, &home0, gas_payer, view_probe_hash).await?;
+    if std::env::var_os("BLOOM_DOCKER_PETAL_VFS_ONLY").is_some() {
+        return Ok(());
+    }
 
     eprintln!("[faucet] claiming FaucetAdmin capability for inner PTB signer");
     let faucet_admin_claim = PtbTx {
@@ -473,7 +500,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![PtbCommand::Move(MoveCmd {
             petal: PetalRef {
-                path: "/bloom/dex/router".to_string(),
+                path: "/bloom/petals/dex/router".to_string(),
                 hash: Some(router_hash),
             },
             function: "quote_2hop".to_string(),
@@ -1144,7 +1171,7 @@ fn mint_cmd(
 ) -> PtbCommand {
     PtbCommand::Move(MoveCmd {
         petal: PetalRef {
-            path: "/bloom/dex/faucet".to_string(),
+            path: "/bloom/petals/dex/faucet".to_string(),
             hash: Some(faucet_hash),
         },
         function: "mint".to_string(),
@@ -1164,7 +1191,7 @@ fn mint_cmd(
 fn claim_admin_cmd(faucet_hash: bloom_chain_types::types::Hash32) -> PtbCommand {
     PtbCommand::Move(MoveCmd {
         petal: PetalRef {
-            path: "/bloom/dex/faucet".to_string(),
+            path: "/bloom/petals/dex/faucet".to_string(),
             hash: Some(faucet_hash),
         },
         function: "claim_admin".to_string(),
@@ -1175,7 +1202,7 @@ fn claim_admin_cmd(faucet_hash: bloom_chain_types::types::Hash32) -> PtbCommand 
 
 fn pool_ref(pool_hash: bloom_chain_types::types::Hash32) -> PetalRef {
     PetalRef {
-        path: "/bloom/dex/pool".to_string(),
+        path: "/bloom/petals/dex/pool".to_string(),
         hash: Some(pool_hash),
     }
 }
@@ -2173,6 +2200,226 @@ fn pool_type_tag(pool_hash: bloom_chain_types::types::Hash32) -> TypeTag {
     }
 }
 
+fn u128_type_tag() -> TypeTag {
+    TypeTag::Concrete {
+        petal_hash: [0u8; 32],
+        type_name: "u128".to_string(),
+        type_args: vec![],
+    }
+}
+
+fn counter_type_tag(petal_hash: Hash32) -> TypeTag {
+    TypeTag::Concrete {
+        petal_hash: petal_hash.0,
+        type_name: "Counter".to_string(),
+        type_args: vec![],
+    }
+}
+
+fn view_probe_manifest() -> Vec<u8> {
+    let self_counter = counter_type_tag(Hash32([0u8; 32]));
+    let manifest = PetalManifestV0 {
+        schema_version: SCHEMA_VERSION,
+        module_path: PETAL_VFS_PROBE_PATH.to_string(),
+        functions: vec![
+            FunctionDecl {
+                name: "answer".to_string(),
+                view: true,
+                returns: vec![u128_type_tag()],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "init_counter".to_string(),
+                returns: vec![self_counter.clone()],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "set_counter".to_string(),
+                args: vec![ArgDecl {
+                    name: "counter".to_string(),
+                    kind: ArgKind::Object {
+                        ty: self_counter.clone(),
+                        mode: AccessMode::Mutable,
+                    },
+                }],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "set_counter_99_ret".to_string(),
+                args: vec![ArgDecl {
+                    name: "counter".to_string(),
+                    kind: ArgKind::Object {
+                        ty: self_counter.clone(),
+                        mode: AccessMode::Mutable,
+                    },
+                }],
+                returns: vec![self_counter.clone()],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "set_counter_123_ret".to_string(),
+                args: vec![ArgDecl {
+                    name: "counter".to_string(),
+                    kind: ArgKind::Object {
+                        ty: self_counter.clone(),
+                        mode: AccessMode::Mutable,
+                    },
+                }],
+                returns: vec![self_counter.clone()],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "sink_counter".to_string(),
+                args: vec![ArgDecl {
+                    name: "counter".to_string(),
+                    kind: ArgKind::Object {
+                        ty: self_counter.clone(),
+                        mode: AccessMode::ReadOnly,
+                    },
+                }],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "fail_after_counter".to_string(),
+                args: vec![ArgDecl {
+                    name: "counter".to_string(),
+                    kind: ArgKind::Object {
+                        ty: self_counter.clone(),
+                        mode: AccessMode::ReadOnly,
+                    },
+                }],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "fail_counter".to_string(),
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "counter_value".to_string(),
+                view: true,
+                args: vec![ArgDecl {
+                    name: "counter".to_string(),
+                    kind: ArgKind::Object {
+                        ty: self_counter,
+                        mode: AccessMode::ReadOnly,
+                    },
+                }],
+                returns: vec![u128_type_tag()],
+                ..Default::default()
+            },
+        ],
+        object_types: vec![bloom_petal_manifest::types::ObjectTypeDecl {
+            name: "Counter".to_string(),
+            abilities: AbilitySet::key_store(),
+            fields: vec![bloom_petal_manifest::types::FieldDecl {
+                name: "value".to_string(),
+                ty: u128_type_tag(),
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    bloom_petal_manifest::encode(&manifest).expect("view probe manifest encodes")
+}
+
+fn view_probe_wasm() -> Vec<u8> {
+    let counter_tag = counter_type_tag(Hash32([0u8; 32]))
+        .encode_canonical()
+        .expect("counter type tag encodes");
+    let counter_tag_wat = wat_bytes(&counter_tag);
+    let counter_tag_len = counter_tag.len();
+    let wat = format!(
+        r#"
+(module
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (import "chain" "petal.revert" (func $revert (param i32 i32)))
+  (import "chain" "msg.calldata.read" (func $cdread (param i32 i32 i32) (result i32)))
+  (import "object" "borrow" (func $borrow (param i32 i32) (result i32)))
+  (import "object" "create" (func $create (param i32 i32 i32 i32) (result i32)))
+  (import "object" "id" (func $id (param i32 i32) (result i32)))
+  (import "object" "mutate" (func $mutate (param i32 i32 i32) (result i32)))
+  (import "object" "read" (func $read (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  ;; count=1, len=16, u128=42
+  (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
+  (data (i32.const 64) "{counter_tag_wat}")
+  ;; Counter payloads: initial 42, then mutated values.
+  (data (i32.const 160) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
+  (data (i32.const 192) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\4d")
+  (data (i32.const 208) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\63")
+  (data (i32.const 224) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\7b")
+  (data (i32.const 240) "forced revert")
+  ;; one object-id return slot: count=1, len=32
+  (data (i32.const 512) "\00\00\00\01\00\00\00\20")
+  ;; one u128 return slot: count=1, len=16
+  (data (i32.const 640) "\00\00\00\01\00\00\00\10")
+  (func (export "__petal_answer") (param i32 i32) (result i32)
+    (call $ret (i32.const 0) (i32.const 24))
+    i32.const 0)
+  (func (export "__petal_init_counter") (param i32 i32) (result i32)
+    (local $h i32)
+    (local.set $h
+      (call $create (i32.const 64) (i32.const {counter_tag_len}) (i32.const 160) (i32.const 16)))
+    (drop (call $id (local.get $h) (i32.const 520)))
+    (call $ret (i32.const 512) (i32.const 40))
+    i32.const 0)
+  (func (export "__petal_set_counter") (param i32 i32) (result i32)
+    (local $h i32)
+    ;; Arg 0 is an object: count(4), tag(1), id(32).
+    (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
+    (local.set $h (call $borrow (i32.const 256) (i32.const 1)))
+    (drop (call $mutate (local.get $h) (i32.const 192) (i32.const 16)))
+    i32.const 0)
+  (func (export "__petal_set_counter_99_ret") (param i32 i32) (result i32)
+    (local $h i32)
+    ;; Arg 0 is an object: count(4), tag(1), id(32).
+    (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
+    (local.set $h (call $borrow (i32.const 256) (i32.const 1)))
+    (drop (call $mutate (local.get $h) (i32.const 208) (i32.const 16)))
+    (drop (call $id (local.get $h) (i32.const 520)))
+    (call $ret (i32.const 512) (i32.const 40))
+    i32.const 0)
+  (func (export "__petal_set_counter_123_ret") (param i32 i32) (result i32)
+    (local $h i32)
+    ;; Arg 0 is an object: count(4), tag(1), id(32).
+    (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
+    (local.set $h (call $borrow (i32.const 256) (i32.const 1)))
+    (drop (call $mutate (local.get $h) (i32.const 224) (i32.const 16)))
+    (drop (call $id (local.get $h) (i32.const 520)))
+    (call $ret (i32.const 512) (i32.const 40))
+    i32.const 0)
+  (func (export "__petal_sink_counter") (param i32 i32) (result i32)
+    (local $h i32)
+    ;; Arg 0 is an object: count(4), tag(1), id(32).
+    (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
+    (local.set $h (call $borrow (i32.const 256) (i32.const 0)))
+    i32.const 0)
+  (func (export "__petal_fail_after_counter") (param i32 i32) (result i32)
+    (local $h i32)
+    ;; Arg 0 is an object: count(4), tag(1), id(32).
+    (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
+    (local.set $h (call $borrow (i32.const 256) (i32.const 0)))
+    (call $revert (i32.const 240) (i32.const 13))
+    i32.const 0)
+  (func (export "__petal_fail_counter") (param i32 i32) (result i32)
+    (call $revert (i32.const 240) (i32.const 13))
+    i32.const 0)
+  (func (export "__petal_counter_value") (param i32 i32) (result i32)
+    (local $h i32)
+    ;; Arg 0 is an object: count(4), tag(1), id(32).
+    (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
+    (local.set $h (call $borrow (i32.const 256) (i32.const 0)))
+    (drop (call $read (local.get $h) (i32.const 648) (i32.const 16)))
+    (call $ret (i32.const 640) (i32.const 24))
+    i32.const 0)
+)
+"#,
+        counter_tag_wat = counter_tag_wat,
+        counter_tag_len = counter_tag_len,
+    );
+    append_manifest_section(wat_to_wasm(&wat), &view_probe_manifest())
+}
+
 fn adversary_manifest(pool_hash: bloom_chain_types::types::Hash32) -> Vec<u8> {
     let pool_ty = pool_type_tag(pool_hash);
     let manifest = PetalManifestV0 {
@@ -2386,6 +2633,20 @@ fn bloom_bin() -> PathBuf {
     PathBuf::from(manifest_dir).join("../../../../target/release/bloom")
 }
 
+fn docker_petal_wasm_path(stem: &str, build: fn() -> PathBuf) -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("BLOOM_DOCKER_PREBUILT_WASM_DIR") {
+        let path = PathBuf::from(dir).join(format!("{stem}.wasm"));
+        if path.exists() {
+            return Ok(path);
+        }
+        bail!(
+            "BLOOM_DOCKER_PREBUILT_WASM_DIR was set, but {} is missing",
+            path.display()
+        );
+    }
+    Ok(build())
+}
+
 /// `bloom chain deploy <wasm> --wait` from `home`, dialing the validator at
 /// `127.0.0.1:<port>` via `BLOOM_RPC_TCP`.
 fn deploy_petal(home: &std::path::Path, port: u16, wasm: &std::path::Path) -> Result<()> {
@@ -2424,6 +2685,708 @@ fn deploy_petal(home: &std::path::Path, port: u16, wasm: &std::path::Path) -> Re
         );
     }
     Ok(())
+}
+
+async fn exercise_live_petal_vfs_mount(
+    clients: &[RpcClient],
+    tmpdir: &Path,
+    home: &Path,
+    gas_payer: bloom_objects::ObjectId,
+    probe_hash: Hash32,
+) -> Result<()> {
+    let mount_dir = tmpdir.join("petal-vfs-mount");
+    if mount_dir.exists() {
+        std::fs::remove_dir_all(&mount_dir)
+            .with_context(|| format!("remove old mount dir {}", mount_dir.display()))?;
+    }
+    std::fs::create_dir_all(&mount_dir)
+        .with_context(|| format!("create mount dir {}", mount_dir.display()))?;
+
+    let bloom = bloom_bin();
+    let bloom_dir = bloom
+        .parent()
+        .ok_or_else(|| anyhow!("BLOOM_BIN has no parent: {}", bloom.display()))?;
+    let path_env = match std::env::var_os("PATH") {
+        Some(path) => {
+            let mut paths = std::env::split_paths(&path).collect::<Vec<_>>();
+            paths.insert(0, bloom_dir.to_path_buf());
+            std::env::join_paths(paths).context("build PATH for petal VFS shim")?
+        }
+        None => std::env::join_paths([bloom_dir]).context("build PATH for petal VFS shim")?,
+    };
+
+    let rpc = format!("127.0.0.1:{}", HOST_RPC_PORTS[0]);
+    let short_home = short_home_symlink(home)?;
+    let serve_stdout_path = tmpdir.join("petal-vfs-serve.stdout.log");
+    let serve_stderr_path = tmpdir.join("petal-vfs-serve.stderr.log");
+    let serve_stdout = std::fs::File::create(&serve_stdout_path)
+        .with_context(|| format!("create {}", serve_stdout_path.display()))?;
+    let serve_stderr = std::fs::File::create(&serve_stderr_path)
+        .with_context(|| format!("create {}", serve_stderr_path.display()))?;
+    let mut child = Command::new(&bloom)
+        .env("BLOOM_HOME", &short_home)
+        .env("BLOOM_RPC_TCP", &rpc)
+        .env("PATH", &path_env)
+        .arg("serve")
+        .arg("--mount")
+        .arg(&mount_dir)
+        .stdout(Stdio::from(serve_stdout))
+        .stderr(Stdio::from(serve_stderr))
+        .spawn()
+        .with_context(|| format!("spawn bloom serve --mount {}", mount_dir.display()))?;
+
+    let answer_endpoint = mount_dir.join("petals/dex/view-probe/answer");
+    let counter_endpoint = mount_dir.join("petals/dex/view-probe/counter_value");
+    let set_counter_endpoint = mount_dir.join("petals/dex/view-probe/set_counter");
+    let fail_counter_endpoint = mount_dir.join("petals/dex/view-probe/fail_counter");
+    let pipe_endpoint = mount_dir.join("petals/.pipe");
+    let wait_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().context("poll bloom serve --mount")? {
+            let _ = std::fs::remove_file(&short_home);
+            bail!(
+                "bloom serve --mount exited early ({status}):\nstdout={}\nstderr={}",
+                read_log_lossy(&serve_stdout_path),
+                read_log_lossy(&serve_stderr_path)
+            );
+        }
+        if answer_endpoint.exists()
+            && counter_endpoint.exists()
+            && set_counter_endpoint.exists()
+            && fail_counter_endpoint.exists()
+            && pipe_endpoint.exists()
+        {
+            break;
+        }
+        if Instant::now() >= wait_deadline {
+            stop_child(&mut child);
+            let _ = std::fs::remove_file(&short_home);
+            bail!(
+                "timed out waiting for mounted endpoint {}",
+                counter_endpoint.display()
+            );
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    let direct = direct_petal_vfs_answer(&short_home)?;
+    let argv = run_mounted_petal_endpoint(&answer_endpoint, &short_home, &rpc, &path_env, None)?;
+    let stdin = run_mounted_petal_endpoint(
+        &answer_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        Some(serde_json::json!({
+            "args": [],
+            "fuel_limit": 1_000_000u64,
+        })),
+    )?;
+
+    if view_returns(&argv) != view_returns(&direct) {
+        bail!(
+            "mounted argv view result differed from direct chain_view_call: argv={argv} direct={direct}"
+        );
+    }
+    if view_returns(&stdin) != view_returns(&direct) {
+        bail!(
+            "mounted stdin view result differed from direct chain_view_call: stdin={stdin} direct={direct}"
+        );
+    }
+    eprintln!("[petals-vfs] mounted answer view argv/stdin returns matched direct chain_view_call");
+
+    let before_counters = ls_objects_by_type(&clients[0], "Counter").await?;
+    let create_counter = PtbTx {
+        signers: vec![ptb_signer_pubkey()],
+        commands: vec![
+            PtbCommand::Move(MoveCmd {
+                petal: PetalRef {
+                    path: PETAL_VFS_PROBE_PATH.to_string(),
+                    hash: Some(probe_hash),
+                },
+                function: "init_counter".to_string(),
+                type_args: vec![],
+                args: vec![],
+            }),
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Shared,
+            },
+        ],
+        gas_payer,
+        gas_budget: PTB_GAS_BUDGET,
+        gas_price: 1,
+        expiry_block: PTB_EXPIRY_BLOCK,
+        signatures: vec![],
+    };
+    let create_receipt = submit_ptb(home, HOST_RPC_PORTS[0], create_counter)?;
+    if !create_receipt
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("VFS counter create PTB reverted: {create_receipt}");
+    }
+    let latest = current_height(&clients[0]).await?;
+    wait_all_reach_height(clients, latest).await?;
+
+    let counter = ls_objects_by_type(&clients[0], "Counter")
+        .await?
+        .into_iter()
+        .find(|obj| {
+            let Ok(id) = json_str(obj, "id") else {
+                return false;
+            };
+            !before_counters
+                .iter()
+                .any(|before| json_str(before, "id").ok() == Some(id))
+        })
+        .ok_or_else(|| anyhow!("VFS counter create did not produce a new Counter object"))?;
+    let counter_id = json_str(&counter, "id")?.to_string();
+    let counter_version = object_version(&counter)?;
+    if json_str(&counter, "owner_kind")? != "shared" {
+        bail!("VFS counter was not shared after create: {counter}");
+    }
+
+    let direct_before = direct_petal_vfs_counter_value(&short_home, &counter_id)?;
+    eprintln!("[petals-vfs] reading mounted counter before mutation");
+    let mounted_before = run_mounted_petal_endpoint(
+        &counter_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        Some(serde_json::json!({
+            "args": [{ "kind": "object", "id": counter_id }],
+            "fuel_limit": 1_000_000u64,
+        })),
+    )?;
+    let before_value = first_view_u128_return(&mounted_before)?;
+    if before_value != 42 || view_returns(&mounted_before) != view_returns(&direct_before) {
+        bail!(
+            "mounted counter view before mutation differed: mounted={mounted_before} direct={direct_before}"
+        );
+    }
+
+    let counter_arg = serde_json::json!({
+        "kind": "object",
+        "id": counter_id,
+        "version": counter_version,
+    })
+    .to_string();
+    let set_receipt = run_mounted_petal_endpoint_with_args(
+        &set_counter_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        &["--arg".to_string(), counter_arg],
+        Some(serde_json::json!({
+            "gas_budget": PTB_GAS_BUDGET,
+            "fuel_limit": 10_000_000u64,
+        })),
+    )?;
+    if !set_receipt
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("mounted VFS counter mutation endpoint reverted: {set_receipt}");
+    }
+    let latest = current_height(&clients[0]).await?;
+    wait_all_reach_height(clients, latest).await?;
+
+    let direct_after = direct_petal_vfs_counter_value(&short_home, &counter_id)?;
+    eprintln!("[petals-vfs] reading mounted counter after mutation");
+    let mounted_after = run_mounted_petal_endpoint(
+        &counter_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        Some(serde_json::json!({
+            "args": [{ "kind": "object", "id": counter_id }],
+            "fuel_limit": 1_000_000u64,
+        })),
+    )?;
+    let after_value = first_view_u128_return(&mounted_after)?;
+    if after_value != 77 || view_returns(&mounted_after) != view_returns(&direct_after) {
+        bail!(
+            "mounted counter view after mutation differed: mounted={mounted_after} direct={direct_after}"
+        );
+    }
+
+    let counter_after_set = ls_objects_by_type(&clients[0], "Counter")
+        .await?
+        .into_iter()
+        .find(|obj| json_str(obj, "id").ok() == Some(counter_id.as_str()))
+        .ok_or_else(|| anyhow!("counter disappeared before pipe composition"))?;
+    let counter_version_after_set = object_version(&counter_after_set)?;
+    let pipe_success_expr = format!(
+        "{PETAL_VFS_PROBE_PATH}/set_counter_99_ret obj:{counter_id}@{counter_version_after_set} \
+         | {PETAL_VFS_PROBE_PATH}/sink_counter"
+    );
+    let pipe_success = run_mounted_petal_endpoint_raw_stdin(
+        &pipe_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        &[
+            "--gas-budget".to_string(),
+            PTB_GAS_BUDGET.to_string(),
+            "--fuel-limit".to_string(),
+            "10000000".to_string(),
+        ],
+        Some(&pipe_success_expr),
+    )?;
+    if !pipe_success.status.success() {
+        bail!(
+            "mounted pipe composition unexpectedly failed:\nexpr={pipe_success_expr}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&pipe_success.stdout),
+            String::from_utf8_lossy(&pipe_success.stderr)
+        );
+    }
+    assert_pipe_ndjson("mounted pipe success", &pipe_success.stdout, 2, true)?;
+    let latest = current_height(&clients[0]).await?;
+    wait_all_reach_height(clients, latest).await?;
+
+    let mounted_after_pipe = run_mounted_petal_endpoint(
+        &counter_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        Some(serde_json::json!({
+            "args": [{ "kind": "object", "id": counter_id }],
+            "fuel_limit": 1_000_000u64,
+        })),
+    )?;
+    let after_pipe_value = first_view_u128_return(&mounted_after_pipe)?;
+    if after_pipe_value != 99 {
+        bail!("mounted pipe composition did not mutate counter to 99: {mounted_after_pipe}");
+    }
+    let state_value_path = mount_dir.join(format!(
+        "petals/dex/view-probe/.state/Counter/{counter_id}/value"
+    ));
+    let state_value_text = std::fs::read_to_string(&state_value_path)
+        .with_context(|| format!("read state projection field {}", state_value_path.display()))?;
+    let state_value: Value = serde_json::from_str(&state_value_text).with_context(|| {
+        format!(
+            "parse state projection field {}: {state_value_text}",
+            state_value_path.display()
+        )
+    })?;
+    if state_value != serde_json::json!(after_pipe_value.to_string()) {
+        bail!(
+            "mounted state projection value differed from view result: state={state_value} view={mounted_after_pipe}"
+        );
+    }
+    let state_object_path = mount_dir.join(format!(
+        "petals/dex/view-probe/.state/Counter/{counter_id}/_object.json"
+    ));
+    let state_object_text = std::fs::read_to_string(&state_object_path).with_context(|| {
+        format!(
+            "read state projection object {}",
+            state_object_path.display()
+        )
+    })?;
+    let state_object: Value = serde_json::from_str(&state_object_text).with_context(|| {
+        format!(
+            "parse state projection object {}: {state_object_text}",
+            state_object_path.display()
+        )
+    })?;
+    if state_object.get("id").and_then(Value::as_str) != Some(counter_id.as_str())
+        || state_object.pointer("/fields/value") != Some(&state_value)
+    {
+        bail!(
+            "mounted state projection _object.json did not match field read: object={state_object} field={state_value}"
+        );
+    }
+
+    let counter_after_pipe = ls_objects_by_type(&clients[0], "Counter")
+        .await?
+        .into_iter()
+        .find(|obj| json_str(obj, "id").ok() == Some(counter_id.as_str()))
+        .ok_or_else(|| anyhow!("counter disappeared before reverting pipe composition"))?;
+    let counter_version_after_pipe = object_version(&counter_after_pipe)?;
+    let pipe_revert_expr = format!(
+        "{PETAL_VFS_PROBE_PATH}/set_counter_123_ret obj:{counter_id}@{counter_version_after_pipe} \
+         | {PETAL_VFS_PROBE_PATH}/fail_after_counter"
+    );
+    let pipe_revert = run_mounted_petal_endpoint_raw_stdin(
+        &pipe_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        &[
+            "--gas-budget".to_string(),
+            PTB_GAS_BUDGET.to_string(),
+            "--fuel-limit".to_string(),
+            "10000000".to_string(),
+        ],
+        Some(&pipe_revert_expr),
+    )?;
+    if pipe_revert.status.success() {
+        bail!(
+            "mounted reverting pipe composition unexpectedly succeeded:\nexpr={pipe_revert_expr}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&pipe_revert.stdout),
+            String::from_utf8_lossy(&pipe_revert.stderr)
+        );
+    }
+    assert_pipe_ndjson("mounted pipe revert", &pipe_revert.stdout, 2, false)?;
+    let latest = current_height(&clients[0]).await?;
+    wait_all_reach_height(clients, latest).await?;
+    let mounted_after_revert_pipe = run_mounted_petal_endpoint(
+        &counter_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        Some(serde_json::json!({
+            "args": [{ "kind": "object", "id": counter_id }],
+            "fuel_limit": 1_000_000u64,
+        })),
+    )?;
+    let after_revert_pipe_value = first_view_u128_return(&mounted_after_revert_pipe)?;
+    if after_revert_pipe_value != 99 {
+        bail!(
+            "mounted reverting pipe composition partially mutated state: {mounted_after_revert_pipe}"
+        );
+    }
+
+    eprintln!(
+        "[petals-vfs] mounted counter endpoint and pipe composition mutated atomically: {before_value} -> {after_value} -> {after_pipe_value}"
+    );
+    stop_child(&mut child);
+    let _ = std::fs::remove_file(&short_home);
+    Ok(())
+}
+
+fn short_home_symlink(home: &Path) -> Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let link = PathBuf::from(format!(
+        "/tmp/bloom-vfs-home-{}-{nanos}",
+        std::process::id()
+    ));
+    std::os::unix::fs::symlink(home, &link)
+        .with_context(|| format!("symlink {} -> {}", link.display(), home.display()))?;
+    Ok(link)
+}
+
+fn view_returns(value: &Value) -> Option<&Value> {
+    value
+        .get("commands")
+        .and_then(Value::as_array)
+        .and_then(|commands| commands.first())
+        .and_then(|command| command.get("returns"))
+}
+
+fn first_view_u128_return(value: &Value) -> Result<u128> {
+    view_returns(value)
+        .and_then(Value::as_array)
+        .and_then(|returns| returns.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("view result missing first u128 return: {value}"))?
+        .parse::<u128>()
+        .with_context(|| format!("parse first u128 return from {value}"))
+}
+
+fn direct_petal_vfs_answer(home: &Path) -> Result<Value> {
+    let out = Command::new(bloom_bin())
+        .env("BLOOM_RPC_TCP", format!("127.0.0.1:{}", HOST_RPC_PORTS[0]))
+        .arg("--home")
+        .arg(home)
+        .arg("chain")
+        .arg("view-call")
+        .arg("--path")
+        .arg(PETAL_VFS_PROBE_PATH)
+        .arg("--function")
+        .arg("answer")
+        .output()
+        .context("invoke direct bloom chain view-call")?;
+    parse_json_command_output("direct bloom chain view-call", out)
+}
+
+fn direct_petal_vfs_counter_value(home: &Path, counter_id: &str) -> Result<Value> {
+    let arg = serde_json::json!({ "kind": "object", "id": counter_id }).to_string();
+    let out = Command::new(bloom_bin())
+        .env("BLOOM_RPC_TCP", format!("127.0.0.1:{}", HOST_RPC_PORTS[0]))
+        .arg("--home")
+        .arg(home)
+        .arg("chain")
+        .arg("view-call")
+        .arg("--path")
+        .arg(PETAL_VFS_PROBE_PATH)
+        .arg("--function")
+        .arg("counter_value")
+        .arg("--arg")
+        .arg(arg)
+        .output()
+        .context("invoke direct bloom chain view-call counter_value")?;
+    parse_json_command_output("direct bloom chain view-call counter_value", out)
+}
+
+fn run_mounted_petal_endpoint(
+    endpoint: &Path,
+    home: &Path,
+    rpc: &str,
+    path_env: &std::ffi::OsStr,
+    stdin_json: Option<Value>,
+) -> Result<Value> {
+    run_mounted_petal_endpoint_with_args(endpoint, home, rpc, path_env, &[], stdin_json)
+}
+
+fn run_mounted_petal_endpoint_with_args(
+    endpoint: &Path,
+    home: &Path,
+    rpc: &str,
+    path_env: &std::ffi::OsStr,
+    argv: &[String],
+    stdin_json: Option<Value>,
+) -> Result<Value> {
+    let out = run_mounted_petal_endpoint_raw(endpoint, home, rpc, path_env, argv, stdin_json)?;
+    parse_json_command_output(
+        &format!("mounted petal endpoint {}", endpoint.display()),
+        out,
+    )
+}
+
+fn run_mounted_petal_endpoint_raw(
+    endpoint: &Path,
+    home: &Path,
+    rpc: &str,
+    path_env: &std::ffi::OsStr,
+    argv: &[String],
+    stdin_json: Option<Value>,
+) -> Result<std::process::Output> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut cmd = Command::new(endpoint);
+        cmd.env("BLOOM_HOME", home)
+            .env("BLOOM_RPC_TCP", rpc)
+            .env("PATH", path_env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.args(argv);
+        if stdin_json.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "spawn mounted petal endpoint {} (exists={})",
+                        endpoint.display(),
+                        endpoint.exists()
+                    )
+                });
+            }
+        };
+        if let Some(stdin_json) = stdin_json.clone() {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("mounted endpoint stdin was not piped"))?;
+            stdin
+                .write_all(serde_json::to_string(&stdin_json)?.as_bytes())
+                .context("write mounted endpoint stdin JSON")?;
+        }
+        let out = child
+            .wait_with_output()
+            .context("wait for mounted petal endpoint")?;
+        if is_transient_mounted_endpoint_enoent(endpoint, &out) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        return Ok(out);
+    }
+}
+
+fn is_transient_mounted_endpoint_enoent(endpoint: &Path, out: &std::process::Output) -> bool {
+    if out.status.success() {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    stderr.contains(&endpoint.display().to_string()) && stderr.contains("No such file or directory")
+}
+
+fn run_mounted_petal_endpoint_raw_stdin(
+    endpoint: &Path,
+    home: &Path,
+    rpc: &str,
+    path_env: &std::ffi::OsStr,
+    argv: &[String],
+    stdin_text: Option<&str>,
+) -> Result<std::process::Output> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut cmd = Command::new(endpoint);
+        cmd.env("BLOOM_HOME", home)
+            .env("BLOOM_RPC_TCP", rpc)
+            .env("PATH", path_env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.args(argv);
+        if stdin_text.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "spawn mounted petal endpoint {} (exists={})",
+                        endpoint.display(),
+                        endpoint.exists()
+                    )
+                });
+            }
+        };
+        if let Some(stdin_text) = stdin_text {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("mounted endpoint stdin was not piped"))?;
+            stdin
+                .write_all(stdin_text.as_bytes())
+                .context("write mounted endpoint stdin text")?;
+        }
+        let out = child
+            .wait_with_output()
+            .context("wait for mounted petal endpoint")?;
+        if is_transient_mounted_endpoint_enoent(endpoint, &out) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        return Ok(out);
+    }
+}
+
+fn read_log_lossy(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|err| format!("<failed to read: {err}>"))
+}
+
+fn assert_pipe_ndjson(
+    label: &str,
+    stdout: &[u8],
+    expected_commands: u64,
+    expected_success: bool,
+) -> Result<()> {
+    let text = std::str::from_utf8(stdout).with_context(|| format!("{label} stdout utf8"))?;
+    let lines = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("{label} parse NDJSON stdout: {text}"))?;
+    let expected_lines = expected_commands as usize + 3;
+    if lines.len() != expected_lines {
+        bail!(
+            "{label} expected {expected_lines} NDJSON lines, got {}: {lines:?}",
+            lines.len()
+        );
+    }
+    let header_line = lines
+        .first()
+        .ok_or_else(|| anyhow!("{label} missing PTB header line"))?;
+    if header_line.get("kind").and_then(Value::as_str) != Some("ptb")
+        || header_line.get("commands").and_then(Value::as_u64) != Some(expected_commands)
+    {
+        bail!("{label} unexpected PTB header: {header_line}");
+    }
+    let command_lines = &lines[1..=expected_commands as usize];
+    if command_lines.len() != expected_commands as usize
+        || command_lines
+            .iter()
+            .any(|line| line.get("kind").and_then(Value::as_str) != Some("command"))
+    {
+        bail!("{label} unexpected command lines: {command_lines:?}");
+    }
+    let submit = &lines[expected_commands as usize + 1];
+    if submit.get("kind").and_then(Value::as_str) != Some("submit") {
+        bail!("{label} missing submit line: {submit}");
+    }
+    let submit_tx_hash = submit
+        .get("tx_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{label} submit line missing tx_hash: {submit}"))?;
+    if !submit_tx_hash.starts_with("0x") {
+        bail!("{label} submit tx_hash must be 0x-prefixed: {submit_tx_hash}");
+    }
+    let receipt_line = &lines[expected_commands as usize + 2];
+    if receipt_line.get("kind").and_then(Value::as_str) != Some("receipt")
+        || receipt_line.get("tx_hash").and_then(Value::as_str) != Some(submit_tx_hash)
+    {
+        bail!("{label} unexpected receipt line: {receipt_line}");
+    }
+    let receipt = receipt_line
+        .get("receipt")
+        .ok_or_else(|| anyhow!("{label} receipt line missing receipt object: {receipt_line}"))?;
+    if receipt.get("success").and_then(Value::as_bool) != Some(expected_success) {
+        bail!("{label} unexpected receipt success: {receipt}");
+    }
+    Ok(())
+}
+
+#[test]
+fn pipe_ndjson_assertion_accepts_submitted_receipts() {
+    let out = concat!(
+        r#"{"kind":"ptb","commands":2}"#,
+        "\n",
+        r#"{"kind":"command","cmd_idx":0}"#,
+        "\n",
+        r#"{"kind":"command","cmd_idx":1}"#,
+        "\n",
+        r#"{"kind":"submit","tx_hash":"0xabc"}"#,
+        "\n",
+        r#"{"kind":"receipt","tx_hash":"0xabc","receipt":{"success":true}}"#,
+        "\n",
+    );
+    assert_pipe_ndjson("test pipe", out.as_bytes(), 2, true).unwrap();
+}
+
+fn parse_json_command_output(label: &str, out: std::process::Output) -> Result<Value> {
+    if !out.status.success() {
+        bail!(
+            "{label} failed (status={}):\nstdout={}\nstderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    serde_json::from_slice(&out.stdout).with_context(|| {
+        format!(
+            "parse {label} JSON stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
+}
+
+fn stop_child(child: &mut Child) {
+    if let Ok(None) = child.try_wait() {
+        let _ = Command::new("kill")
+            .arg("-INT")
+            .arg(child.id().to_string())
+            .status();
+        for _ in 0..20 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// xDSA-sign + encode `ptb`, write the bytes to a temp file, and run

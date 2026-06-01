@@ -74,7 +74,7 @@ impl ChainStateIface for MockChain {
 // ---------------------------------------------------------------------------
 
 const POOL_HASH: Hash32 = Hash32([0xAB; 32]);
-const POOL_PATH: &str = "/bloom/dex/pool";
+const POOL_PATH: &str = "/bloom/petals/dex/pool";
 
 fn concrete(name: &str) -> TypeTag {
     TypeTag::Concrete {
@@ -91,6 +91,8 @@ fn func(name: &str, args: Vec<ArgDeclStub>, returns: Vec<TypeTag>) -> FunctionDe
         type_params: vec![],
         args,
         returns,
+        required_signers: 0,
+        required_capabilities: vec![],
         attached_invariants: vec![],
     }
 }
@@ -138,8 +140,8 @@ fn ready_session(chain: &MockChain, signer: [u8; 32]) -> PtbSession<'_> {
 #[test]
 fn split_endpoint_path_basic() {
     assert_eq!(
-        split_endpoint_path("/bloom/dex/pool/swap").unwrap(),
-        ("/bloom/dex/pool", "swap")
+        split_endpoint_path("/bloom/petals/dex/pool/swap").unwrap(),
+        ("/bloom/petals/dex/pool", "swap")
     );
 }
 
@@ -151,7 +153,7 @@ fn split_endpoint_path_rejects_no_function() {
     ));
     // Trailing slash → empty function.
     assert!(matches!(
-        split_endpoint_path("/bloom/dex/pool/"),
+        split_endpoint_path("/bloom/petals/dex/pool/"),
         Err(ResolveError::MalformedPath { .. })
     ));
 }
@@ -159,7 +161,7 @@ fn split_endpoint_path_rejects_no_function() {
 #[test]
 fn resolve_endpoint_returns_hash_fn_abi() {
     let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
-    let ep = resolve_endpoint(&chain, "/bloom/dex/pool/swap").unwrap();
+    let ep = resolve_endpoint(&chain, "/bloom/petals/dex/pool/swap").unwrap();
     assert_eq!(ep.petal_path, POOL_PATH);
     assert_eq!(ep.petal_hash, POOL_HASH);
     assert_eq!(ep.function, "swap");
@@ -178,7 +180,7 @@ fn resolve_endpoint_unknown_path_fails_closed() {
 #[test]
 fn resolve_endpoint_unknown_function_fails_closed() {
     let chain = chain_with_pool(vec![func("swap", vec![], vec![])]);
-    let err = resolve_endpoint(&chain, "/bloom/dex/pool/absent").unwrap_err();
+    let err = resolve_endpoint(&chain, "/bloom/petals/dex/pool/absent").unwrap_err();
     assert!(matches!(err, ResolveError::UnknownFunction { .. }));
 }
 
@@ -187,7 +189,7 @@ fn resolve_endpoint_manifest_missing_fails_closed() {
     // Path resolves to a hash, but no manifest is stored under it.
     let chain = MockChain::new();
     chain.put_path(POOL_PATH, POOL_HASH);
-    let err = resolve_endpoint(&chain, "/bloom/dex/pool/swap").unwrap_err();
+    let err = resolve_endpoint(&chain, "/bloom/petals/dex/pool/swap").unwrap_err();
     assert!(matches!(err, ResolveError::ManifestNotFound { .. }));
 }
 
@@ -199,7 +201,9 @@ fn resolve_endpoint_manifest_missing_fails_closed() {
 fn append_signer_only_command() {
     let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
     let mut s = PtbSession::new(&chain);
-    let idx = s.append_command("/bloom/dex/pool/swap signer:0").unwrap();
+    let idx = s
+        .append_command("/bloom/petals/dex/pool/swap signer:0")
+        .unwrap();
     assert_eq!(idx, 0);
     match &s.commands()[0] {
         Command::Move(m) => {
@@ -220,7 +224,7 @@ fn append_const_literal_u64() {
     )]);
     let mut s = PtbSession::new(&chain);
     // positional form.
-    s.append_command("/bloom/dex/pool/set 980").unwrap();
+    s.append_command("/bloom/petals/dex/pool/set 980").unwrap();
     match &s.commands()[0] {
         Command::Move(m) => {
             assert_eq!(m.args, vec![Arg::Const(980u64.to_be_bytes().to_vec())]);
@@ -230,9 +234,27 @@ fn append_const_literal_u64() {
 
     // key=value form.
     let mut s2 = PtbSession::new(&chain);
-    s2.append_command("/bloom/dex/pool/set min-out=980")
+    s2.append_command("/bloom/petals/dex/pool/set min-out=980")
         .unwrap();
     match &s2.commands()[0] {
+        Command::Move(m) => {
+            assert_eq!(m.args, vec![Arg::Const(980u64.to_be_bytes().to_vec())]);
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn append_raw_const_bytes_preserves_abi_hex() {
+    let chain = chain_with_pool(vec![func(
+        "set",
+        vec![ArgDeclStub::Const(concrete("u64"))],
+        vec![],
+    )]);
+    let mut s = PtbSession::new(&chain);
+    s.append_command("/bloom/petals/dex/pool/set const:0x00000000000003d4")
+        .unwrap();
+    match &s.commands()[0] {
         Command::Move(m) => {
             assert_eq!(m.args, vec![Arg::Const(980u64.to_be_bytes().to_vec())]);
         }
@@ -260,7 +282,7 @@ fn append_object_arg_with_version_and_mode() {
     });
     let mut s = PtbSession::new(&chain);
     let id_hex = "55".repeat(32);
-    s.append_command(&format!("/bloom/dex/pool/touch obj:{id_hex}@3"))
+    s.append_command(&format!("/bloom/petals/dex/pool/touch obj:{id_hex}@3"))
         .unwrap();
     match &s.commands()[0] {
         Command::Move(m) => {
@@ -288,10 +310,12 @@ fn append_type_arg_for_generic_endpoint() {
         }],
         args: vec![ArgDeclStub::TypeArg(0)],
         returns: vec![],
+        required_signers: 0,
+        required_capabilities: vec![],
         attached_invariants: vec![],
     }]);
     let mut s = PtbSession::new(&chain);
-    s.append_command("/bloom/dex/pool/identity type:USDC")
+    s.append_command("/bloom/petals/dex/pool/identity type:USDC")
         .unwrap();
     match &s.commands()[0] {
         Command::Move(m) => {
@@ -313,10 +337,12 @@ fn append_call_type_arg_for_generic_endpoint_without_type_arg_value() {
         }],
         args: vec![],
         returns: vec![],
+        required_signers: 0,
+        required_capabilities: vec![],
         attached_invariants: vec![],
     }]);
     let mut s = PtbSession::new(&chain);
-    s.append_command("/bloom/dex/pool/identity type:USDC")
+    s.append_command("/bloom/petals/dex/pool/identity type:USDC")
         .unwrap();
     match &s.commands()[0] {
         Command::Move(m) => {
@@ -331,7 +357,7 @@ fn append_call_type_arg_for_generic_endpoint_without_type_arg_value() {
 fn append_with_label_records_label() {
     let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
     let mut s = PtbSession::new(&chain);
-    s.append_command("/bloom/dex/pool/swap signer:0 as hop1")
+    s.append_command("/bloom/petals/dex/pool/swap signer:0 as hop1")
         .unwrap();
     let status = s.status();
     assert_eq!(status.labels, vec![("hop1".to_string(), 0)]);
@@ -352,8 +378,10 @@ fn explicit_use_edge_typechecks_against_upstream_return() {
         ),
     ]);
     let mut s = PtbSession::new(&chain);
-    s.append_command("/bloom/dex/pool/producer").unwrap();
-    let idx = s.append_command("/bloom/dex/pool/consumer @0.0").unwrap();
+    s.append_command("/bloom/petals/dex/pool/producer").unwrap();
+    let idx = s
+        .append_command("/bloom/petals/dex/pool/consumer @0.0")
+        .unwrap();
     assert_eq!(idx, 1);
     match &s.commands()[1] {
         Command::Move(m) => assert_eq!(
@@ -378,8 +406,10 @@ fn label_use_edge_resolves_to_producing_command() {
         ),
     ]);
     let mut s = PtbSession::new(&chain);
-    s.append_command("/bloom/dex/pool/producer as p").unwrap();
-    s.append_command("/bloom/dex/pool/consumer @p").unwrap();
+    s.append_command("/bloom/petals/dex/pool/producer as p")
+        .unwrap();
+    s.append_command("/bloom/petals/dex/pool/consumer @p")
+        .unwrap();
     match &s.commands()[1] {
         Command::Move(m) => assert_eq!(
             m.args,
@@ -406,7 +436,7 @@ fn dangling_use_forward_ref_rejected_session_unchanged() {
     let mut s = PtbSession::new(&chain);
     // @0.0 refers to a command that does not exist yet (this is cmd 0).
     let err = s
-        .append_command("/bloom/dex/pool/consumer @0.0")
+        .append_command("/bloom/petals/dex/pool/consumer @0.0")
         .unwrap_err();
     assert!(matches!(err, BuildError::DanglingUse { .. }));
     assert!(s.is_empty(), "session must be unchanged after a bad append");
@@ -423,10 +453,10 @@ fn dangling_use_out_of_range_after_one_command() {
         ),
     ]);
     let mut s = PtbSession::new(&chain);
-    s.append_command("/bloom/dex/pool/producer").unwrap();
+    s.append_command("/bloom/petals/dex/pool/producer").unwrap();
     // @5.0 — no such command.
     let err = s
-        .append_command("/bloom/dex/pool/consumer @5.0")
+        .append_command("/bloom/petals/dex/pool/consumer @5.0")
         .unwrap_err();
     assert!(matches!(err, BuildError::DanglingUse { .. }));
     assert_eq!(s.len(), 1, "only the good command remains");
@@ -441,7 +471,7 @@ fn unknown_label_rejected() {
     )]);
     let mut s = PtbSession::new(&chain);
     let err = s
-        .append_command("/bloom/dex/pool/consumer @nope")
+        .append_command("/bloom/petals/dex/pool/consumer @nope")
         .unwrap_err();
     assert!(matches!(err, BuildError::UnknownLabel(ref l) if l == "nope"));
     assert!(s.is_empty());
@@ -459,9 +489,9 @@ fn use_edge_type_mismatch_rejected() {
         ),
     ]);
     let mut s = PtbSession::new(&chain);
-    s.append_command("/bloom/dex/pool/producer").unwrap();
+    s.append_command("/bloom/petals/dex/pool/producer").unwrap();
     let err = s
-        .append_command("/bloom/dex/pool/consumer @0.0")
+        .append_command("/bloom/petals/dex/pool/consumer @0.0")
         .unwrap_err();
     match err {
         BuildError::Validation(bloom_script::PtbError::TypeMismatch { reason, .. }) => {
@@ -484,7 +514,9 @@ fn const_type_mismatch_rejected() {
     )]);
     let mut s = PtbSession::new(&chain);
     // ObjectId requires 32 bytes; "0xAA" is 1 byte.
-    let err = s.append_command("/bloom/dex/pool/set 0xAA").unwrap_err();
+    let err = s
+        .append_command("/bloom/petals/dex/pool/set 0xAA")
+        .unwrap_err();
     // Length is caught at literal-encoding time (Parse) — fails closed.
     assert!(matches!(err, BuildError::Parse(_)));
     assert!(s.is_empty());
@@ -509,7 +541,7 @@ fn const_bytes_invalid_caught_by_validator() {
     let mut s = PtbSession::new(&chain);
     // 0x000000 03 claims 3 elements but provides none → validator Invalid.
     let err = s
-        .append_command("/bloom/dex/pool/set 0x00000003")
+        .append_command("/bloom/petals/dex/pool/set 0x00000003")
         .unwrap_err();
     assert!(matches!(
         err,
@@ -535,7 +567,7 @@ fn unknown_function_rejected() {
     let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
     let mut s = PtbSession::new(&chain);
     let err = s
-        .append_command("/bloom/dex/pool/absent signer:0")
+        .append_command("/bloom/petals/dex/pool/absent signer:0")
         .unwrap_err();
     assert!(matches!(
         err,
@@ -554,14 +586,14 @@ fn arity_mismatch_rejected() {
     let mut s = PtbSession::new(&chain);
     // Only one arg given; function wants two.
     let err = s
-        .append_command("/bloom/dex/pool/swap signer:0")
+        .append_command("/bloom/petals/dex/pool/swap signer:0")
         .unwrap_err();
     assert!(matches!(err, BuildError::Parse(_)));
     assert!(s.is_empty());
 
     // Too many args.
     let err2 = s
-        .append_command("/bloom/dex/pool/swap signer:0 980 990")
+        .append_command("/bloom/petals/dex/pool/swap signer:0 980 990")
         .unwrap_err();
     assert!(matches!(err2, BuildError::Parse(_)));
     assert!(s.is_empty());
@@ -572,7 +604,9 @@ fn arg_kind_mismatch_rejected() {
     // Function wants a Signer; we pass a literal.
     let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
     let mut s = PtbSession::new(&chain);
-    let err = s.append_command("/bloom/dex/pool/swap 980").unwrap_err();
+    let err = s
+        .append_command("/bloom/petals/dex/pool/swap 980")
+        .unwrap_err();
     assert!(matches!(err, BuildError::Parse(_)));
     assert!(s.is_empty());
 }
@@ -599,11 +633,16 @@ fn status_reports_endpoints_returns_and_gas() {
         ),
     ]);
     let mut s = PtbSession::new(&chain);
-    s.append_command("/bloom/dex/pool/producer as p").unwrap();
-    s.append_command("/bloom/dex/pool/consumer @p").unwrap();
+    s.append_command("/bloom/petals/dex/pool/producer as p")
+        .unwrap();
+    s.append_command("/bloom/petals/dex/pool/consumer @p")
+        .unwrap();
     let st = s.status();
     assert_eq!(st.commands.len(), 2);
-    assert_eq!(st.commands[0].endpoint_path, "/bloom/dex/pool/producer");
+    assert_eq!(
+        st.commands[0].endpoint_path,
+        "/bloom/petals/dex/pool/producer"
+    );
     assert_eq!(st.commands[0].return_types, vec![concrete("u64")]);
     assert_eq!(st.commands[0].label, Some("p".to_string()));
     assert_eq!(st.commands[1].return_types, vec![]);
@@ -616,14 +655,16 @@ fn status_reports_endpoints_returns_and_gas() {
 fn abort_discards_state() {
     let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
     let mut s = PtbSession::new(&chain);
-    s.append_command("/bloom/dex/pool/swap signer:0 as x")
+    s.append_command("/bloom/petals/dex/pool/swap signer:0 as x")
         .unwrap();
     assert_eq!(s.len(), 1);
     s.abort();
     assert!(s.is_empty());
     assert!(s.status().labels.is_empty());
     // The label table is cleared, so a fresh append starts at index 0.
-    let idx = s.append_command("/bloom/dex/pool/swap signer:0").unwrap();
+    let idx = s
+        .append_command("/bloom/petals/dex/pool/swap signer:0")
+        .unwrap();
     assert_eq!(idx, 0);
 }
 
@@ -637,7 +678,8 @@ fn build_unsigned_requires_signers_and_gas_payer() {
     let mut s = PtbSession::new(&chain);
     // No commands yet.
     assert!(matches!(s.build_unsigned(), Err(BuildError::NotReady(_))));
-    s.append_command("/bloom/dex/pool/swap signer:0").unwrap();
+    s.append_command("/bloom/petals/dex/pool/swap signer:0")
+        .unwrap();
     // No signers / gas payer.
     assert!(matches!(s.build_unsigned(), Err(BuildError::NotReady(_))));
 }
@@ -647,7 +689,8 @@ fn build_unsigned_assembles_and_validates() {
     let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
     let signer = [0x11; 32];
     let mut s = ready_session(&chain, signer);
-    s.append_command("/bloom/dex/pool/swap signer:0").unwrap();
+    s.append_command("/bloom/petals/dex/pool/swap signer:0")
+        .unwrap();
     let tx = s.build_unsigned().unwrap();
     assert_eq!(tx.signers, vec![signer]);
     assert_eq!(tx.commands.len(), 1);
@@ -678,7 +721,8 @@ fn build_unsigned_derives_fungible_hash_from_chain_vfs() {
     s.set_signers(vec![signer]);
     s.set_gas_payer(gas_id);
     s.set_expiry_block(100);
-    s.append_command("/bloom/dex/pool/swap signer:0").unwrap();
+    s.append_command("/bloom/petals/dex/pool/swap signer:0")
+        .unwrap();
 
     let tx = s.build_unsigned().unwrap();
     assert_eq!(tx.gas_payer, gas_id);
@@ -703,7 +747,8 @@ fn build_unsigned_requires_fungible_vfs_binding_without_override() {
     s.set_signers(vec![signer]);
     s.set_gas_payer(gas_id);
     s.set_expiry_block(100);
-    s.append_command("/bloom/dex/pool/swap signer:0").unwrap();
+    s.append_command("/bloom/petals/dex/pool/swap signer:0")
+        .unwrap();
 
     let err = s.build_unsigned().unwrap_err();
     assert!(
@@ -718,27 +763,31 @@ fn build_unsigned_requires_fungible_vfs_binding_without_override() {
 
 #[test]
 fn lower_linear_pipe_inserts_use_edges() {
-    let lines =
-        lower_pipe_expr("/bloom/dex/pool/a | /bloom/dex/pool/b | /bloom/dex/pool/c").unwrap();
+    let lines = lower_pipe_expr(
+        "/bloom/petals/dex/pool/a | /bloom/petals/dex/pool/b | /bloom/petals/dex/pool/c",
+    )
+    .unwrap();
     assert_eq!(
         lines,
         vec![
-            "/bloom/dex/pool/a".to_string(),
-            "/bloom/dex/pool/b @0.0".to_string(),
-            "/bloom/dex/pool/c @1.0".to_string(),
+            "/bloom/petals/dex/pool/a".to_string(),
+            "/bloom/petals/dex/pool/b @0.0".to_string(),
+            "/bloom/petals/dex/pool/c @1.0".to_string(),
         ]
     );
 }
 
 #[test]
 fn lower_linear_pipe_keeps_stage_args() {
-    let lines =
-        lower_pipe_expr("/bloom/dex/pool/spend 1000 | /bloom/dex/pool/swap min-out=980").unwrap();
+    let lines = lower_pipe_expr(
+        "/bloom/petals/dex/pool/spend 1000 | /bloom/petals/dex/pool/swap min-out=980",
+    )
+    .unwrap();
     assert_eq!(
         lines,
         vec![
-            "/bloom/dex/pool/spend 1000".to_string(),
-            "/bloom/dex/pool/swap @0.0 min-out=980".to_string(),
+            "/bloom/petals/dex/pool/spend 1000".to_string(),
+            "/bloom/petals/dex/pool/swap @0.0 min-out=980".to_string(),
         ]
     );
 }
@@ -747,7 +796,7 @@ fn lower_linear_pipe_keeps_stage_args() {
 fn lower_named_dag_inputs() {
     // add-liquidity DAG (litmus 5.3): two sub-pipes feed --a and --b.
     let lines = lower_pipe_expr(
-        "/bloom/dex/pool/add-liquidity --a <(/bloom/dex/pool/spend-eth)> --b <(/bloom/dex/pool/spend-usdc)> min-lp=10 | /bloom/wallet/receive",
+        "/bloom/petals/dex/pool/add-liquidity --a <(/bloom/petals/dex/pool/spend-eth)> --b <(/bloom/petals/dex/pool/spend-usdc)> min-lp=10 | /bloom/wallet/receive",
     )
     .unwrap();
     // Sub-expressions lower first (cmd 0, cmd 1), then the main stage
@@ -755,9 +804,9 @@ fn lower_named_dag_inputs() {
     assert_eq!(
         lines,
         vec![
-            "/bloom/dex/pool/spend-eth".to_string(),
-            "/bloom/dex/pool/spend-usdc".to_string(),
-            "/bloom/dex/pool/add-liquidity min-lp=10 a=@0.0 b=@1.0".to_string(),
+            "/bloom/petals/dex/pool/spend-eth".to_string(),
+            "/bloom/petals/dex/pool/spend-usdc".to_string(),
+            "/bloom/petals/dex/pool/add-liquidity min-lp=10 a=@0.0 b=@1.0".to_string(),
             "/bloom/wallet/receive @2.0".to_string(),
         ]
     );
@@ -766,15 +815,15 @@ fn lower_named_dag_inputs() {
 #[test]
 fn lower_named_dag_inputs_are_name_ordered() {
     let lines = lower_pipe_expr(
-        "/bloom/dex/pool/add-liquidity --b <(/bloom/dex/pool/spend-usdc)> --a <(/bloom/dex/pool/spend-eth)> --min-lp 10",
+        "/bloom/petals/dex/pool/add-liquidity --b <(/bloom/petals/dex/pool/spend-usdc)> --a <(/bloom/petals/dex/pool/spend-eth)> --min-lp 10",
     )
     .unwrap();
     assert_eq!(
         lines,
         vec![
-            "/bloom/dex/pool/spend-usdc".to_string(),
-            "/bloom/dex/pool/spend-eth".to_string(),
-            "/bloom/dex/pool/add-liquidity min-lp=10 a=@1.0 b=@0.0".to_string(),
+            "/bloom/petals/dex/pool/spend-usdc".to_string(),
+            "/bloom/petals/dex/pool/spend-eth".to_string(),
+            "/bloom/petals/dex/pool/add-liquidity min-lp=10 a=@1.0 b=@0.0".to_string(),
         ]
     );
 }
@@ -782,14 +831,14 @@ fn lower_named_dag_inputs_are_name_ordered() {
 #[test]
 fn lower_pipe_accepts_scalar_flags_next_to_named_inputs() {
     let lines = lower_pipe_expr(
-        "/bloom/dex/pool/add-liquidity --min-lp 10 --a <(/bloom/dex/pool/spend-eth)>",
+        "/bloom/petals/dex/pool/add-liquidity --min-lp 10 --a <(/bloom/petals/dex/pool/spend-eth)>",
     )
     .unwrap();
     assert_eq!(
         lines,
         vec![
-            "/bloom/dex/pool/spend-eth".to_string(),
-            "/bloom/dex/pool/add-liquidity min-lp=10 a=@0.0".to_string(),
+            "/bloom/petals/dex/pool/spend-eth".to_string(),
+            "/bloom/petals/dex/pool/add-liquidity min-lp=10 a=@0.0".to_string(),
         ]
     );
 }
@@ -840,7 +889,7 @@ fn pipe_to_session_linear_two_hop() {
     let signer = [0x11; 32];
     let mut s = ready_session(&chain, signer);
     let lines =
-        lower_pipe_expr("/bloom/dex/pool/spend | /bloom/dex/pool/swap | /bloom/dex/pool/receive")
+        lower_pipe_expr("/bloom/petals/dex/pool/spend | /bloom/petals/dex/pool/swap | /bloom/petals/dex/pool/receive")
             .unwrap();
     for line in &lines {
         s.append_command(line).unwrap();
@@ -903,7 +952,7 @@ fn pipe_to_session_dag_add_liquidity() {
     let signer = [0x22; 32];
     let mut s = ready_session(&chain, signer);
     let lines = lower_pipe_expr(
-        "/bloom/dex/pool/add_liquidity --b <(/bloom/dex/pool/spend_usdc)> --a <(/bloom/dex/pool/spend_eth)> --min-lp 10",
+        "/bloom/petals/dex/pool/add_liquidity --b <(/bloom/petals/dex/pool/spend_usdc)> --a <(/bloom/petals/dex/pool/spend_eth)> --min-lp 10",
     )
     .unwrap();
     // Sub-pipes first, then add_liquidity.

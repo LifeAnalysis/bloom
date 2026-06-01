@@ -232,7 +232,7 @@ fn deploy_missing_manifest_fails_without_writes() {
 #[test]
 fn deploy_disallowed_import_fails_without_writes() {
     let mut state = State::new();
-    let path = "/bad/import";
+    let path = "/bloom/petals/bad/import";
     let out = ChainPetalExecutor.execute_tx(
         &deploy_tx(wasm_with_disallowed_import_and_manifest(path)),
         &mut state,
@@ -255,7 +255,7 @@ fn deploy_disallowed_import_fails_without_writes() {
 #[test]
 fn deploy_unknown_host_import_fails_without_writes() {
     let mut state = State::new();
-    let path = "/bad/import-name";
+    let path = "/bloom/petals/bad/import-name";
     let out = ChainPetalExecutor.execute_tx(
         &deploy_tx(wasm_with_unknown_allowed_module_import_and_manifest(path)),
         &mut state,
@@ -275,7 +275,7 @@ fn deploy_unknown_host_import_fails_without_writes() {
 fn deploy_non_function_imports_from_allowed_modules_fail_without_writes() {
     for (kind, label) in [(0x01, "table"), (0x02, "memory"), (0x03, "global")] {
         let mut state = State::new();
-        let path = format!("/bad/non-func-{label}");
+        let path = format!("/bloom/petals/bad/non-func-{label}");
         let out = ChainPetalExecutor.execute_tx(
             &deploy_tx(wasm_with_non_function_import_and_manifest(&path, kind)),
             &mut state,
@@ -299,7 +299,7 @@ fn deploy_non_function_imports_from_allowed_modules_fail_without_writes() {
 #[test]
 fn deploy_manifest_function_missing_export_fails_without_writes() {
     let mut state = State::new();
-    let path = "/bad/missing-export";
+    let path = "/bloom/petals/bad/missing-export";
     let out = ChainPetalExecutor.execute_tx(
         &deploy_tx(wasm_with_function_manifest_missing_export(path, "swap")),
         &mut state,
@@ -318,7 +318,7 @@ fn deploy_manifest_function_missing_export_fails_without_writes() {
 #[test]
 fn deploy_allowed_chain_return_import_succeeds() {
     let mut state = State::new();
-    let path = "/ok/chain-return";
+    let path = "/bloom/petals/ok/chain-return";
     let out = ChainPetalExecutor.execute_tx(
         &deploy_tx(wasm_with_chain_return_import_and_function(path, "ping")),
         &mut state,
@@ -341,7 +341,7 @@ fn deploy_allowed_chain_return_import_succeeds() {
 #[test]
 fn deploy_existing_path_fails_without_rebinding() {
     let mut state = State::new();
-    let path = "/bloom/existing";
+    let path = "/bloom/petals/existing";
     let existing_hash = Hash32([0x44; 32]);
     state.set_vfs_binding(path.to_string(), existing_hash);
 
@@ -358,4 +358,222 @@ fn deploy_existing_path_fails_without_rebinding() {
     assert!(out.write_set.is_none());
     assert_eq!(state.vfs_lookup(path), Some(existing_hash));
     assert!(String::from_utf8_lossy(&out.return_data).contains("already bound"));
+}
+
+#[test]
+fn deploy_path_function_collision_fails_without_writes() {
+    let mut state = State::new();
+    let parent_path = "/bloom/petals/dex";
+    let child_path = "/bloom/petals/dex/pool";
+
+    let parent = ChainPetalExecutor.execute_tx(
+        &deploy_tx(wasm_with_chain_return_import_and_function(
+            parent_path,
+            "pool",
+        )),
+        &mut state,
+        1,
+        1_700_000_000_000,
+        Address([0xAA; 32]),
+        Hash32([0; 32]),
+    );
+    assert!(
+        parent.success,
+        "parent deploy failed: {}",
+        String::from_utf8_lossy(&parent.return_data)
+    );
+    state
+        .apply(parent.write_set.expect("parent deploy emits writes"))
+        .expect("parent deploy applies");
+
+    let child = ChainPetalExecutor.execute_tx(
+        &deploy_tx(wasm_with_manifest(child_path)),
+        &mut state,
+        2,
+        1_700_000_000_000,
+        Address([0xAA; 32]),
+        Hash32([0; 32]),
+    );
+    assert!(!child.success);
+    assert!(child.write_set.is_none());
+    assert!(state.vfs_lookup(child_path).is_none());
+    assert!(String::from_utf8_lossy(&child.return_data).contains("collides"));
+}
+
+#[test]
+fn deploy_function_descendant_collision_fails_without_writes() {
+    let mut state = State::new();
+    let parent_path = "/bloom/petals/dex";
+    let child_path = "/bloom/petals/dex/pool";
+
+    let child = ChainPetalExecutor.execute_tx(
+        &deploy_tx(wasm_with_manifest(child_path)),
+        &mut state,
+        1,
+        1_700_000_000_000,
+        Address([0xAA; 32]),
+        Hash32([0; 32]),
+    );
+    assert!(
+        child.success,
+        "child deploy failed: {}",
+        String::from_utf8_lossy(&child.return_data)
+    );
+    state
+        .apply(child.write_set.expect("child deploy emits writes"))
+        .expect("child deploy applies");
+
+    let parent = ChainPetalExecutor.execute_tx(
+        &deploy_tx(wasm_with_chain_return_import_and_function(
+            parent_path,
+            "pool",
+        )),
+        &mut state,
+        2,
+        1_700_000_000_000,
+        Address([0xAA; 32]),
+        Hash32([0; 32]),
+    );
+    assert!(!parent.success);
+    assert!(parent.write_set.is_none());
+    assert!(state.vfs_lookup(parent_path).is_none());
+    assert!(String::from_utf8_lossy(&parent.return_data).contains("collides"));
+}
+
+#[test]
+fn deploy_outside_petals_prefix_fails_without_writes() {
+    let mut state = State::new();
+    let path = "/bloom/dex/pool";
+    let out = ChainPetalExecutor.execute_tx(
+        &deploy_tx(wasm_with_manifest(path)),
+        &mut state,
+        1,
+        1_700_000_000_000,
+        Address([0xAA; 32]),
+        Hash32([0; 32]),
+    );
+
+    assert!(!out.success);
+    assert!(out.write_set.is_none());
+    assert!(state.vfs_lookup(path).is_none());
+    assert!(String::from_utf8_lossy(&out.return_data).contains("/bloom/petals/"));
+}
+
+#[test]
+fn deploy_dot_prefixed_path_fails_without_writes() {
+    for path in [
+        "/bloom/petals/.pipe",
+        "/bloom/petals/.pipe/foo",
+        "/bloom/petals/dex/.state",
+        "/bloom/petals/dex/.foo",
+    ] {
+        let mut state = State::new();
+        let out = ChainPetalExecutor.execute_tx(
+            &deploy_tx(wasm_with_manifest(path)),
+            &mut state,
+            1,
+            1_700_000_000_000,
+            Address([0xAA; 32]),
+            Hash32([0; 32]),
+        );
+
+        assert!(!out.success, "{path} should fail admission");
+        assert!(out.write_set.is_none(), "{path} should not emit writes");
+        assert!(state.vfs_lookup(path).is_none());
+        assert!(
+            String::from_utf8_lossy(&out.return_data).contains("dot-prefixed"),
+            "unexpected error for {path}: {}",
+            String::from_utf8_lossy(&out.return_data)
+        );
+    }
+}
+
+#[test]
+fn deploy_reserved_page_path_fails_without_writes() {
+    for path in ["/bloom/petals/page", "/bloom/petals/dex/page"] {
+        let mut state = State::new();
+        let out = ChainPetalExecutor.execute_tx(
+            &deploy_tx(wasm_with_manifest(path)),
+            &mut state,
+            1,
+            1_700_000_000_000,
+            Address([0xAA; 32]),
+            Hash32([0; 32]),
+        );
+
+        assert!(!out.success, "{path} should fail admission");
+        assert!(out.write_set.is_none(), "{path} should not emit writes");
+        assert!(state.vfs_lookup(path).is_none());
+        assert!(
+            String::from_utf8_lossy(&out.return_data).contains("page"),
+            "unexpected error for {path}: {}",
+            String::from_utf8_lossy(&out.return_data)
+        );
+    }
+}
+
+#[test]
+fn deploy_vfs_invalid_path_segment_fails_without_writes() {
+    for path in [
+        "/bloom/petals/dex\\pool",
+        "/bloom/petals/dex/\0pool",
+        "/bloom/petals/my app/pool",
+        "/bloom/petals/dex/\tpool",
+    ] {
+        let mut state = State::new();
+        let out = ChainPetalExecutor.execute_tx(
+            &deploy_tx(wasm_with_manifest(path)),
+            &mut state,
+            1,
+            1_700_000_000_000,
+            Address([0xAA; 32]),
+            Hash32([0; 32]),
+        );
+
+        assert!(!out.success, "{path:?} should fail admission");
+        assert!(out.write_set.is_none(), "{path:?} should not emit writes");
+        assert!(state.vfs_lookup(path).is_none());
+        assert!(
+            String::from_utf8_lossy(&out.return_data).contains("VFS-invalid"),
+            "unexpected error for {path:?}: {}",
+            String::from_utf8_lossy(&out.return_data)
+        );
+    }
+}
+
+#[test]
+fn deploy_vfs_invalid_function_name_fails_without_writes() {
+    let path = "/bloom/petals/dex/bad-function";
+    for function in [
+        "foo/bar",
+        "foo\\bar",
+        "foo\0bar",
+        "page",
+        ".state",
+        ".pipe",
+        "set counter",
+        "set\tcounter",
+    ] {
+        let mut state = State::new();
+        let out = ChainPetalExecutor.execute_tx(
+            &deploy_tx(wasm_with_function_manifest_missing_export(path, function)),
+            &mut state,
+            1,
+            1_700_000_000_000,
+            Address([0xAA; 32]),
+            Hash32([0; 32]),
+        );
+
+        assert!(!out.success, "{function:?} should fail admission");
+        assert!(
+            out.write_set.is_none(),
+            "{function:?} should not emit writes"
+        );
+        assert!(state.vfs_lookup(path).is_none());
+        assert!(
+            String::from_utf8_lossy(&out.return_data).contains("VFS path segment"),
+            "unexpected error for {function:?}: {}",
+            String::from_utf8_lossy(&out.return_data)
+        );
+    }
 }

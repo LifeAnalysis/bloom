@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test-docker-petal-dex.sh — drive the dockerized 4-validator
 # bloom-chain LIVE acceptance test for the petal-based DEX
-# (/bloom/dex/{pool,wallet,faucet}).
+# (/bloom/petals/dex/{pool,wallet,faucet}).
 #
 # Proves, on a real 4-validator network over RPC, the two PTB flows that
 # `examples/petal-dex/tests/.../faucet_provision.rs` proves in-process:
@@ -14,7 +14,8 @@
 #   2. Build the docker image (`bloom-eth:test` via docker-compose.yml). REQUIRED
 #      so the in-container validator binary matches the current tree (the
 #      driver pins petal hashes computed from the host-built wasm).
-#   3. Build the host-side `bloom` binary (release).
+#   3. Extract the already-built `bloom` binary from the docker image for
+#      host-side provisioning and CLI shellouts.
 #   4. Provision per-validator homes via `bloom chain testnet`, wiring peers to
 #      the docker DNS names val0..val3.
 #   5. APPEND a genesis allocation and key-registry entry for the inner-PTB
@@ -36,7 +37,7 @@ source "$REPO_ROOT/scripts/lib.sh"
 log()  { printf '\033[1;35m[docker-petal-dex]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[docker-petal-dex:fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
-require_cmd docker cargo
+require_cmd docker
 detect_docker_compose
 
 # This driver is hard-wired to 4 validators (val0..val3, host ports
@@ -58,7 +59,18 @@ BLOOM_DOCKER_TMPDIR="${BLOOM_DOCKER_TMPDIR:-$(mktemp -d -t bloom-docker-petal-de
 export BLOOM_DOCKER_TMPDIR
 log "tmpdir: $BLOOM_DOCKER_TMPDIR"
 
-BLOOM_BIN="$REPO_ROOT/target/release/bloom"
+# Prefer an existing host-native release binary for local iteration. CI starts
+# from a clean checkout, so Linux still extracts the image-built binary below.
+BLOOM_BIN="${BLOOM_BIN:-$REPO_ROOT/target/release/bloom}"
+HOST_DOCKER_TEST_BIN=""
+if [ -d "$REPO_ROOT/target/release/deps" ]; then
+    HOST_DOCKER_TEST_BIN=$(find "$REPO_ROOT/target/release/deps" -maxdepth 1 -type f \
+        -perm -111 -name 'docker_petal_dex-*' -print0 \
+        | xargs -0 ls -t 2>/dev/null \
+        | head -n1 || true)
+fi
+BLOOM_DOCKER_TEST_BIN="${BLOOM_DOCKER_TEST_BIN:-${HOST_DOCKER_TEST_BIN:-$BLOOM_DOCKER_TMPDIR/host-bin/docker_petal_dex}}"
+BLOOM_DOCKER_PREBUILT_WASM_DIR="${BLOOM_DOCKER_PREBUILT_WASM_DIR:-$BLOOM_DOCKER_TMPDIR/wasm}"
 
 # Teardown runs unconditionally on exit so we don't leak containers or tmpdirs
 # even if the test panics. Capture and re-raise the original exit code.
@@ -69,12 +81,53 @@ teardown() {
     TEARDOWN_RAN=1
     local log_dir="${BLOOM_DOCKER_LOG_DIR:-/tmp/bloom-petal-dex-run}"
     mkdir -p "$log_dir" || true
+    {
+        printf 'exit_code=%s\n' "$rc"
+        printf 'tmpdir=%s\n' "$BLOOM_DOCKER_TMPDIR"
+        printf 'repo=%s\n' "$REPO_ROOT"
+        printf 'compose_file=%s\n' "$COMPOSE_FILE"
+        printf 'petal_vfs_only=%s\n' "${BLOOM_DOCKER_PETAL_VFS_ONLY:-0}"
+    } >"$log_dir/run.env" 2>&1 || true
+    (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" ps --all) \
+        >"$log_dir/docker-compose-ps.txt" 2>&1 || true
     for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
         name="bloom-val$i"
         docker logs "$name" >"$log_dir/val$i.log" 2>&1 || true
+        docker inspect "$name" >"$log_dir/$name.inspect.json" 2>&1 || true
+        {
+            printf '=== docker health status ===\n'
+            docker inspect --format='{{.State.Health.Status}}' "$name" 2>&1 || true
+            printf '\n=== chain health ===\n'
+            docker exec "$name" /bin/sh -lc \
+                'BLOOM_RPC_TCP=127.0.0.1:8545 /usr/local/bin/bloom --home /home/bloom chain health' \
+                2>&1 || true
+            printf '\n=== chain validators ===\n'
+            docker exec "$name" /bin/sh -lc \
+                'BLOOM_RPC_TCP=127.0.0.1:8545 /usr/local/bin/bloom --home /home/bloom chain ls-validators' \
+                2>&1 || true
+        } >"$log_dir/$name.health.txt" 2>&1 || true
+        chain_dir="$BLOOM_DOCKER_TMPDIR/home$i/chain"
+        if [ -d "$chain_dir" ]; then
+            mkdir -p "$log_dir/home$i" || true
+            cp "$chain_dir/genesis.toml" "$log_dir/home$i/genesis.toml" 2>/dev/null || true
+            cp "$chain_dir/config.toml" "$log_dir/home$i/config.toml" 2>/dev/null || true
+        fi
     done
     log "captured per-validator logs to $log_dir/val{0..$((BLOOM_VALIDATOR_COUNT - 1))}.log"
     if [ "$rc" -ne 0 ]; then
+        {
+            printf '=== docker compose ps ===\n'
+            cat "$log_dir/docker-compose-ps.txt" 2>/dev/null || true
+            for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
+                printf '\n=== bloom-val%s health ===\n' "$i"
+                cat "$log_dir/bloom-val$i.health.txt" 2>/dev/null || true
+                printf '\n=== bloom-val%s recent consensus warnings/errors ===\n' "$i"
+                grep -E 'ERROR|WARN|fatal|rejected|invalid|block\.committed|sync\.block_applied|consensus\.timeout|frame\.(proposal|vote)' \
+                    "$log_dir/val$i.log" 2>/dev/null | tail -n 160 || true
+            done
+        } >"$log_dir/failure-summary.txt" 2>&1 || true
+        log "test failed (exit $rc) — dumping failure summary"
+        sed 's/^/[docker-debug] /' "$log_dir/failure-summary.txt" || true
         log "test failed (exit $rc) — dumping recent compose logs"
         (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" logs --tail=600) \
             2>&1 | sed 's/^/[compose-logs] /' || true
@@ -105,19 +158,111 @@ teardown() {
 }
 trap teardown EXIT INT TERM
 
-if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
-    log "running petal DEX package preflight tests"
-    (cd "$REPO_ROOT" && cargo test \
-        -p bloom-dex-math \
-        -p bloom-petal-dex-pool \
-        -p bloom-petal-dex-router)
+prepare_bloom_cli() {
+    if [ -x "$BLOOM_BIN" ]; then
+        log "using host-side bloom CLI: $BLOOM_BIN"
+        return 0
+    fi
 
-    log "building docker image (bloom-eth:test) — must match current tree"
-    (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" build)
+    if [ "$(uname -s)" = "Linux" ] && docker image inspect bloom-eth:test >/dev/null 2>&1; then
+        log "extracting host-side bloom CLI from bloom-eth:test"
+        mkdir -p "$(dirname "$BLOOM_BIN")"
+        local cid=""
+        cid=$(docker create bloom-eth:test)
+        if ! docker cp "$cid:/usr/local/bin/bloom" "$BLOOM_BIN"; then
+            docker rm "$cid" >/dev/null 2>&1 || true
+            fail "failed to extract /usr/local/bin/bloom from bloom-eth:test"
+        fi
+        docker rm "$cid" >/dev/null
+        chmod +x "$BLOOM_BIN"
+        [ -x "$BLOOM_BIN" ] || fail "extracted bloom binary is not executable: $BLOOM_BIN"
+        return 0
+    fi
 
-    log "building host-side bloom (release)"
-    (cd "$REPO_ROOT" && cargo build --release -p bloom)
+    log "building host-side bloom (release) because no compatible docker image binary is available"
+    require_cmd cargo
+    (cd "$REPO_ROOT" && cargo build --release -p bloom --all-features)
+    BLOOM_BIN="$REPO_ROOT/target/release/bloom"
     [ -x "$BLOOM_BIN" ] || fail "bloom binary missing: $BLOOM_BIN"
+}
+
+extract_prebuilt_acceptance_artifacts() {
+    docker image inspect bloom-eth:test >/dev/null \
+        || fail "BLOOM_DOCKER_IMAGE_PREBUILT=1 but bloom-eth:test is missing"
+
+    local can_run_image_bins=0
+    [ "$(uname -s)" = "Linux" ] && can_run_image_bins=1
+
+    if { [ "$can_run_image_bins" -eq 0 ] || [ -x "$BLOOM_DOCKER_TEST_BIN" ]; } \
+        && [ -f "$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_dex_pool.wasm" ]; then
+        log "using extracted docker acceptance artifacts"
+        return 0
+    fi
+
+    if [ "$can_run_image_bins" -eq 1 ]; then
+        log "extracting docker acceptance test binary and wasm artifacts from bloom-eth:test"
+    else
+        log "extracting docker wasm artifacts from bloom-eth:test"
+    fi
+    mkdir -p "$(dirname "$BLOOM_DOCKER_TEST_BIN")" "$BLOOM_DOCKER_PREBUILT_WASM_DIR"
+    local cid=""
+    cid=$(docker create bloom-eth:test)
+    if [ "$can_run_image_bins" -eq 1 ]; then
+        if ! docker cp "$cid:/tests/docker_petal_dex" "$BLOOM_DOCKER_TEST_BIN"; then
+            docker rm "$cid" >/dev/null 2>&1 || true
+            fail "failed to extract /tests/docker_petal_dex from bloom-eth:test"
+        fi
+    fi
+    if ! docker cp "$cid:/wasm/." "$BLOOM_DOCKER_PREBUILT_WASM_DIR/"; then
+        docker rm "$cid" >/dev/null 2>&1 || true
+        fail "failed to extract /wasm from bloom-eth:test"
+    fi
+    docker rm "$cid" >/dev/null
+    if [ "$can_run_image_bins" -eq 1 ]; then
+        chmod +x "$BLOOM_DOCKER_TEST_BIN"
+        [ -x "$BLOOM_DOCKER_TEST_BIN" ] || fail "extracted test binary is not executable: $BLOOM_DOCKER_TEST_BIN"
+    fi
+    [ -f "$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_dex_faucet.wasm" ] \
+        || fail "extracted faucet wasm missing from $BLOOM_DOCKER_PREBUILT_WASM_DIR"
+}
+
+derive_ptb_signer_registry() {
+    local signer_vars=""
+    if [ -x "$BLOOM_DOCKER_TEST_BIN" ]; then
+        signer_vars=$("$BLOOM_DOCKER_TEST_BIN" \
+            prints_ptb_signer_registry_entry_for_docker_script \
+            --exact --nocapture)
+    else
+        require_cmd cargo
+        signer_vars=$(cargo test -q -p bloom-petal-dex-it --lib \
+            prints_ptb_signer_registry_entry -- --nocapture)
+    fi
+    PTB_SIGNER_PK_HEX=$(printf '%s\n' "$signer_vars" | sed -n 's/^PTB_SIGNER_PK_HEX=//p' | tail -n1)
+    PTB_SIGNER_PUBKEY_B64=$(printf '%s\n' "$signer_vars" | sed -n 's/^PTB_SIGNER_PUBKEY_B64=//p' | tail -n1)
+    [ -n "$PTB_SIGNER_PK_HEX" ] || fail "failed to derive PTB signer address"
+    [ -n "$PTB_SIGNER_PUBKEY_B64" ] || fail "failed to derive PTB signer pubkey"
+}
+
+if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
+    if [ "${BLOOM_DOCKER_IMAGE_PREBUILT:-0}" = "1" ]; then
+        log "using prebuilt docker image (bloom-eth:test)"
+        docker image inspect bloom-eth:test >/dev/null \
+            || fail "BLOOM_DOCKER_IMAGE_PREBUILT=1 but bloom-eth:test is missing"
+        extract_prebuilt_acceptance_artifacts
+    else
+        require_cmd cargo
+        log "running petal DEX package preflight tests"
+        (cd "$REPO_ROOT" && cargo test \
+            -p bloom-dex-math \
+            -p bloom-petal-dex-pool \
+            -p bloom-petal-dex-router)
+
+        log "building docker image (bloom-eth:test) — must match current tree"
+        (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" build)
+        extract_prebuilt_acceptance_artifacts
+    fi
+
+    prepare_bloom_cli
 
     peer_hosts="val0,val1,val2,val3"
 
@@ -131,11 +276,7 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
         --unsafe-rpc-public-bind \
         --allocation 1000000000000000000000000
 
-    signer_vars=$(cargo test -q -p bloom-petal-dex-it prints_ptb_signer_registry_entry -- --nocapture)
-    PTB_SIGNER_PK_HEX=$(printf '%s\n' "$signer_vars" | sed -n 's/^PTB_SIGNER_PK_HEX=//p' | tail -n1)
-    PTB_SIGNER_PUBKEY_B64=$(printf '%s\n' "$signer_vars" | sed -n 's/^PTB_SIGNER_PUBKEY_B64=//p' | tail -n1)
-    [ -n "$PTB_SIGNER_PK_HEX" ] || fail "failed to derive PTB signer address"
-    [ -n "$PTB_SIGNER_PUBKEY_B64" ] || fail "failed to derive PTB signer pubkey"
+    derive_ptb_signer_registry
 
     # Append the inner-PTB xDSA gas allocation and key-registry entry to ALL
     # FOUR genesis.toml files. They MUST stay byte-identical (same genesis hash)
@@ -185,20 +326,33 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
     done
 else
     log "BLOOM_DOCKER_COMPOSE_UP=0 — skipping build/provision/up"
-    [ -x "$BLOOM_BIN" ] || fail "bloom binary missing: $BLOOM_BIN (build it first or unset BLOOM_DOCKER_COMPOSE_UP)"
+    if [ "${BLOOM_DOCKER_IMAGE_PREBUILT:-0}" = "1" ]; then
+        extract_prebuilt_acceptance_artifacts
+    fi
+    prepare_bloom_cli
 fi
 
 if [ -z "$PTB_SIGNER_PK_HEX" ]; then
-    signer_vars=$(cargo test -q -p bloom-petal-dex-it prints_ptb_signer_registry_entry -- --nocapture)
-    PTB_SIGNER_PK_HEX=$(printf '%s\n' "$signer_vars" | sed -n 's/^PTB_SIGNER_PK_HEX=//p' | tail -n1)
-    [ -n "$PTB_SIGNER_PK_HEX" ] || fail "failed to derive PTB signer address"
+    derive_ptb_signer_registry
 fi
 
 log "running bloom-petal-dex-it::docker_petal_dex"
-BLOOM_DOCKER_TMPDIR="$BLOOM_DOCKER_TMPDIR" \
-BLOOM_BIN="$BLOOM_BIN" \
-BLOOM_DEX_FAUCET_ADMIN_HEX="$PTB_SIGNER_PK_HEX" \
-RUST_LOG="${RUST_LOG:-warn}" \
-RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}" \
-    cargo test -p bloom-petal-dex-it --test docker_petal_dex \
-    -- --ignored --nocapture
+if [ -x "$BLOOM_DOCKER_TEST_BIN" ]; then
+    BLOOM_DOCKER_TMPDIR="$BLOOM_DOCKER_TMPDIR" \
+    BLOOM_BIN="$BLOOM_BIN" \
+    BLOOM_DOCKER_PREBUILT_WASM_DIR="$BLOOM_DOCKER_PREBUILT_WASM_DIR" \
+    BLOOM_DEX_FAUCET_ADMIN_HEX="$PTB_SIGNER_PK_HEX" \
+    RUST_LOG="${RUST_LOG:-warn}" \
+    RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}" \
+        "$BLOOM_DOCKER_TEST_BIN" docker_petal_dex_acceptance \
+        --exact --ignored --nocapture
+else
+    require_cmd cargo
+    BLOOM_DOCKER_TMPDIR="$BLOOM_DOCKER_TMPDIR" \
+    BLOOM_BIN="$BLOOM_BIN" \
+    BLOOM_DEX_FAUCET_ADMIN_HEX="$PTB_SIGNER_PK_HEX" \
+    RUST_LOG="${RUST_LOG:-warn}" \
+    RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}" \
+        cargo test -p bloom-petal-dex-it --test docker_petal_dex \
+        -- --ignored --nocapture
+fi

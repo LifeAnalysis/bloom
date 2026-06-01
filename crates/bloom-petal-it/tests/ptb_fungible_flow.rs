@@ -136,6 +136,8 @@ fn move_split_transfer_happy_path() {
                     mode: AccessMode::Mutable,
                 }],
                 returns: vec![type_tag_coin_loom()],
+                required_signers: 0,
+                required_capabilities: vec![],
                 attached_invariants: vec![],
             }],
             ..Default::default()
@@ -286,7 +288,7 @@ fn smoke_ptb_log_emit_succeeds() {
 // Previously `#[ignore]`d pending `wasm32-unknown-unknown` + a pre-built
 // fungible petal wasm. With `wrap_with_real_manifest` we now pair a tiny
 // WAT body (no wasm32 toolchain required) with the **real** canonical
-// `PetalManifestV0` bytes the macro emits for `/bloom/core/fungible` —
+// `PetalManifestV0` bytes the macro emits for `/bloom/petals/core/fungible` —
 // the validator sees the same chain-authoritative manifest the
 // production node would extract from the real petal's wasm custom
 // section. This exercises `PtbChainAdapter::load_manifest`'s layer-2

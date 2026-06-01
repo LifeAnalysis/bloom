@@ -29,7 +29,7 @@ use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
 };
-use bloom_script::{CORE_FUNGIBLE_PATH, ChainStateIface, PqSignature, PtbTx, loom_coin_type_tag};
+use bloom_script::{ChainStateIface, PqSignature, PtbTx};
 use bloom_tx::outbox::Outbox;
 use bloom_tx::tx_engine::TxEngine;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
@@ -490,6 +490,10 @@ impl Daemon {
                 _ => RpcClient::new(&rpc_sock),
             };
             let submitter = Arc::new(RpcPtbSubmitter::new(home.clone(), rpc_client));
+            vfs_builder = vfs_builder.mount(
+                "petals",
+                Arc::new(bloom_vfs::PetalsEndpointHandler::new(chain_state.clone())) as _,
+            );
             vfs_builder = vfs_builder.mount(
                 "tx",
                 Arc::new(bloom_vfs::TxHandler::new(chain_state).with_submitter(submitter)) as _,
@@ -989,43 +993,9 @@ impl PtbSubmitter for RpcPtbSubmitter {
         let signer = signers
             .first()
             .ok_or_else(|| HandlerError::invalid("no signers set"))?;
-        let objects = self
-            .client
-            .call(
-                "chain_ls_objects",
-                serde_json::json!({ "owner_addr": hex::encode(signer) }),
-            )
+        bloom_chain_node::gas_select::select_loom_gas_payer_rpc(&self.client, *signer, 1_000_000)
             .await
-            .map_err(err_he)?;
-        let arr = objects
-            .as_array()
-            .ok_or_else(|| HandlerError::backend("chain_ls_objects returned non-array"))?;
-        let fungible_petal_hash = self.resolve_fungible_petal_hash().await?;
-        let coin_type = loom_coin_type_tag(fungible_petal_hash);
-        let mut best: Option<(u128, bloom_objects::ObjectId)> = None;
-        for value in arr {
-            let Some(bytes_hex) = value.get("bytes").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Ok(bytes) = hex::decode(bytes_hex) else {
-                continue;
-            };
-            let Ok(obj) = bloom_objects::Object::decode_canonical(&bytes) else {
-                continue;
-            };
-            if obj.type_tag != coin_type {
-                continue;
-            }
-            let Some(amount) = decode_coin_value(&obj.payload) else {
-                continue;
-            };
-            match best {
-                Some((prev, _)) if prev >= amount => {}
-                _ => best = Some((amount, obj.id)),
-            }
-        }
-        best.map(|(_, id)| id)
-            .ok_or_else(|| HandlerError::invalid("no Coin<LOOM> gas payer found for signer"))
+            .map_err(|e| HandlerError::invalid(e.to_string()))
     }
 
     async fn submit_ptb(
@@ -1071,46 +1041,6 @@ impl PtbSubmitter for RpcPtbSubmitter {
     }
 }
 
-impl RpcPtbSubmitter {
-    async fn resolve_fungible_petal_hash(
-        &self,
-    ) -> Result<bloom_chain_types::types::Hash32, HandlerError> {
-        let value = self
-            .client
-            .call(
-                "chain_resolve_path",
-                serde_json::json!({ "path": CORE_FUNGIBLE_PATH }),
-            )
-            .await
-            .map_err(err_he)?;
-        let Some(hex_hash) = value.get("hash").and_then(|v| v.as_str()) else {
-            return Err(HandlerError::backend(format!(
-                "missing required VFS binding for {CORE_FUNGIBLE_PATH}"
-            )));
-        };
-        let bytes = hex::decode(hex_hash)
-            .map_err(|e| HandlerError::backend(format!("decode fungible petal hash: {e}")))?;
-        if bytes.len() != 32 {
-            return Err(HandlerError::backend(format!(
-                "fungible petal hash has length {}, expected 32",
-                bytes.len()
-            )));
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(bloom_chain_types::types::Hash32(arr))
-    }
-}
-
-fn decode_coin_value(bytes: &[u8]) -> Option<u128> {
-    if bytes.len() < 48 {
-        return None;
-    }
-    let mut buf = [0u8; 16];
-    buf.copy_from_slice(&bytes[32..48]);
-    Some(u128::from_be_bytes(buf))
-}
-
 fn err_he(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
 }
@@ -1146,6 +1076,7 @@ mod tests {
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("public").is_some());
+        assert!(d.vfs.handler("petals").is_some());
     }
 
     #[test]

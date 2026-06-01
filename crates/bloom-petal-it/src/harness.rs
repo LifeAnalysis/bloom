@@ -263,7 +263,7 @@ fn leb128(out: &mut Vec<u8>, mut v: u64) {
 }
 
 /// The canonical-encoded `PetalManifestV0` bytes embedded in the real
-/// `/bloom/core/fungible` petal — i.e. the exact same blob the macro
+/// `/bloom/petals/core/fungible` petal — i.e. the exact same blob the macro
 /// emits into the wasm `bloom_petal_manifest_v0` custom section. Use
 /// with [`wrap_with_real_manifest`] to build a chain-authoritative
 /// fixture for the fungible petal.
@@ -287,6 +287,8 @@ pub fn manifest_nullary(fn_name: &str) -> PetalManifestStub {
             type_params: vec![],
             args: vec![],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         }],
         ..Default::default()

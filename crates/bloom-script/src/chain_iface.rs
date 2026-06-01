@@ -63,6 +63,10 @@ pub struct FunctionDeclStub {
     pub args: Vec<ArgDeclStub>,
     /// Declared return TypeTags (in order).
     pub returns: Vec<TypeTag>,
+    /// Count of distinct signer authorities required by the manifest.
+    pub required_signers: u8,
+    /// Capability authorities required by the manifest.
+    pub required_capabilities: Vec<TypeTag>,
     /// Attached invariants (resolved by the executor after the call).
     pub attached_invariants: Vec<InvariantDeclStub>,
 }
@@ -157,6 +161,17 @@ pub trait ChainStateIface {
     /// by the validator to verify a `(path, hash)` PetalRef agrees
     /// with the on-chain VFS state).
     fn resolve_path(&self, path: &str) -> Option<Hash32>;
+    /// Iterate VFS path bindings as `(path, petal_hash)`. Handlers use this
+    /// for namespace projection; callers should not assume a particular order.
+    fn iter_vfs(&self) -> Vec<(String, Hash32)> {
+        Vec::new()
+    }
+    /// Iterate every live object as `(id, object)`. Handlers use this for
+    /// latest-snapshot projections; callers should not assume a particular
+    /// order.
+    fn iter_objects(&self) -> Vec<(ObjectId, Object)> {
+        Vec::new()
+    }
     /// Current block height for the expiry check.
     fn current_block(&self) -> u64;
 }

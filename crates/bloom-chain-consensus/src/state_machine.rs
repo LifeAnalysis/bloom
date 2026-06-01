@@ -23,6 +23,7 @@ use bloom_chain_types::{
     types::Hash32,
     vote::{Commit, Proposal, Vote, VoteKind},
 };
+use tracing::{debug, warn};
 
 use crate::{round_validation::judge_proposer_round, validator_set::ValidatorSet};
 
@@ -159,6 +160,16 @@ impl VoteTally {
         self.per_hash.values().sum()
     }
 
+    /// Accumulated power for nil votes.
+    pub fn nil_power(&self) -> u64 {
+        self.power_for(None)
+    }
+
+    /// Number of distinct concrete block hashes observed in this tally.
+    pub fn distinct_block_hashes(&self) -> usize {
+        self.per_hash.keys().filter(|hash| hash.is_some()).count()
+    }
+
     /// Validators that emitted conflicting votes for this height/round/kind.
     pub fn equivocators(&self) -> impl Iterator<Item = bloom_chain_types::types::Address> + '_ {
         self.equivocators.iter().copied()
@@ -176,6 +187,13 @@ impl VoteTally {
 /// sub-second local-network timeout on shared CI runners, so keep enough budget
 /// for block execution before peers nil-prevote the round.
 pub const ROUND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum future-round proposal lookahead kept for the current height.
+///
+/// The buffer exists only to bridge normal gossip skew between adjacent rounds;
+/// far-future proposals are cheap for a Byzantine peer to generate and are not
+/// useful until many timeout cycles later.
+const FUTURE_PROPOSAL_ROUND_LOOKAHEAD: u32 = 16;
 
 /// The Tendermint-style BFT state machine for a single local validator.
 ///
@@ -212,6 +230,14 @@ pub struct ConsensusState {
     /// moments later.
     pub pending_proposal: Option<Proposal>,
 
+    /// Same-height proposals received for rounds ahead of the local round.
+    ///
+    /// Network delivery can race round transitions: a peer may enter round N+1
+    /// and gossip its proposal while this validator is still finishing round N.
+    /// Dropping that proposal means we enter N+1 with votes but no proposal to
+    /// prevote, so keep it until `advance_round` reaches the matching slot.
+    future_proposals: BTreeMap<u32, Proposal>,
+
     /// Prevote tallies: round → VoteTally.
     pub prevotes: BTreeMap<u32, VoteTally>,
     /// Precommit tallies: round → VoteTally.
@@ -245,6 +271,7 @@ impl ConsensusState {
             valid_block: None,
             proposal: None,
             pending_proposal: None,
+            future_proposals: BTreeMap::new(),
             prevotes: BTreeMap::new(),
             precommits: BTreeMap::new(),
             all_precommit_votes: BTreeMap::new(),
@@ -276,6 +303,7 @@ impl ConsensusState {
         self.valid_block = None;
         self.proposal = None;
         self.pending_proposal = None;
+        self.future_proposals.clear();
         self.prevotes.clear();
         self.precommits.clear();
         self.all_precommit_votes.clear();
@@ -385,6 +413,12 @@ impl ConsensusState {
                 if self.step != Step::Propose {
                     return vec![];
                 }
+                warn!(
+                    height = self.height,
+                    round = self.round,
+                    pending_block_hash = ?self.pending_proposal.as_ref().map(|p| p.block_hash),
+                    "consensus.timeout_propose: nil prevote"
+                );
                 self.step = Step::Prevote;
                 let actions = vec![
                     Action::Broadcast(ProposalOrVote::Vote(self.make_prevote(None))),
@@ -397,6 +431,19 @@ impl ConsensusState {
                 if self.step != Step::Prevote {
                     return vec![];
                 }
+                let quorum = self.validator_set.quorum();
+                let tally = self.prevotes.get(&self.round);
+                warn!(
+                    height = self.height,
+                    round = self.round,
+                    total_power = tally.map(VoteTally::total_power).unwrap_or(0),
+                    nil_power = tally.map(VoteTally::nil_power).unwrap_or(0),
+                    distinct_block_hashes =
+                        tally.map(VoteTally::distinct_block_hashes).unwrap_or(0),
+                    quorum = quorum,
+                    quorum_hash = ?tally.and_then(|t| t.quorum_hash(quorum)),
+                    "consensus.timeout_prevote: nil precommit"
+                );
                 self.step = Step::Precommit;
                 let actions = vec![
                     Action::Broadcast(ProposalOrVote::Vote(self.make_precommit(None))),
@@ -409,6 +456,19 @@ impl ConsensusState {
                 if self.step != Step::Precommit {
                     return vec![];
                 }
+                let quorum = self.validator_set.quorum();
+                let tally = self.precommits.get(&self.round);
+                warn!(
+                    height = self.height,
+                    round = self.round,
+                    total_power = tally.map(VoteTally::total_power).unwrap_or(0),
+                    nil_power = tally.map(VoteTally::nil_power).unwrap_or(0),
+                    distinct_block_hashes =
+                        tally.map(VoteTally::distinct_block_hashes).unwrap_or(0),
+                    quorum = quorum,
+                    quorum_hash = ?tally.and_then(|t| t.quorum_hash(quorum)),
+                    "consensus.timeout_precommit: advance round"
+                );
                 self.advance_round(blocks)
             }
         }
@@ -419,10 +479,88 @@ impl ConsensusState {
     // ---------------------------------------------------------------------------
 
     fn on_proposal(&mut self, p: Proposal, blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
-        if p.height != self.height || p.round != self.round {
+        if p.height != self.height {
+            debug!(
+                proposal_height = p.height,
+                proposal_round = p.round,
+                height = self.height,
+                round = self.round,
+                "consensus.proposal_ignored: wrong slot"
+            );
+            return vec![];
+        }
+        if p.round > self.round {
+            let max_future_round = self.round.saturating_add(FUTURE_PROPOSAL_ROUND_LOOKAHEAD);
+            if p.round > max_future_round {
+                debug!(
+                    height = self.height,
+                    proposal_round = p.round,
+                    round = self.round,
+                    max_future_round,
+                    block_hash = %p.block_hash,
+                    "consensus.proposal_ignored: future round beyond buffer window"
+                );
+                return vec![];
+            }
+            let Ok(judgment) = judge_proposer_round(
+                self.height,
+                p.proposer,
+                p.round,
+                p.pol_round,
+                &self.validator_set,
+                false,
+            ) else {
+                warn!(
+                    height = self.height,
+                    proposal_round = p.round,
+                    proposer = %p.proposer,
+                    pol_round = p.pol_round,
+                    block_hash = %p.block_hash,
+                    "consensus.proposal_rejected: invalid future proposer round"
+                );
+                return vec![];
+            };
+            if !judgment.proposer_ok {
+                let expected = self.validator_set.proposer_for(self.height, p.round);
+                warn!(
+                    height = self.height,
+                    proposal_round = p.round,
+                    proposer = %p.proposer,
+                    expected = %expected.address,
+                    pol_round = p.pol_round,
+                    block_hash = %p.block_hash,
+                    "consensus.proposal_rejected: unexpected future proposer"
+                );
+                return vec![];
+            }
+            debug!(
+                height = self.height,
+                proposal_round = p.round,
+                round = self.round,
+                block_hash = %p.block_hash,
+                "consensus.proposal_buffered: future round"
+            );
+            self.future_proposals.entry(p.round).or_insert(p);
+            return vec![];
+        }
+        if p.round < self.round {
+            debug!(
+                height = self.height,
+                proposal_round = p.round,
+                round = self.round,
+                block_hash = %p.block_hash,
+                "consensus.proposal_ignored: stale round"
+            );
             return vec![];
         }
         if self.step != Step::Propose {
+            debug!(
+                height = self.height,
+                round = self.round,
+                step = ?self.step,
+                block_hash = %p.block_hash,
+                "consensus.proposal_ignored: wrong step"
+            );
             return vec![];
         }
         let Ok(judgment) = judge_proposer_round(
@@ -433,9 +571,27 @@ impl ConsensusState {
             &self.validator_set,
             false,
         ) else {
+            warn!(
+                height = self.height,
+                round = self.round,
+                proposer = %p.proposer,
+                pol_round = p.pol_round,
+                block_hash = %p.block_hash,
+                "consensus.proposal_rejected: invalid proposer round"
+            );
             return vec![];
         };
         if !judgment.proposer_ok {
+            let expected = self.validator_set.proposer_for(self.height, self.round);
+            warn!(
+                height = self.height,
+                round = self.round,
+                proposer = %p.proposer,
+                expected = %expected.address,
+                pol_round = p.pol_round,
+                block_hash = %p.block_hash,
+                "consensus.proposal_rejected: unexpected proposer"
+            );
             return vec![];
         }
         // Refuse to prevote a block we have not yet seen. Stash the proposal
@@ -445,6 +601,14 @@ impl ConsensusState {
         // makes us attest to a body we have not validated — exactly the
         // surface the 2026-05-19 review flagged at state_machine.rs:307.
         if !blocks.contains_key(&p.block_hash) {
+            warn!(
+                height = self.height,
+                round = self.round,
+                proposer = %p.proposer,
+                pol_round = p.pol_round,
+                block_hash = %p.block_hash,
+                "consensus.proposal_stashed: missing block body"
+            );
             self.pending_proposal = Some(p);
             return vec![];
         }
@@ -459,6 +623,16 @@ impl ConsensusState {
         // - If locked on the proposed block: prevote it.
         // - If not locked: prevote the proposal (we trust the proposer has a valid block).
         let prevote_hash = self.choose_prevote_hash(p.block_hash, p.pol_round);
+        debug!(
+            height = self.height,
+            round = self.round,
+            proposer = %p.proposer,
+            block_hash = %p.block_hash,
+            prevote_hash = ?prevote_hash,
+            locked_block = ?self.locked_block,
+            valid_block = ?self.valid_block,
+            "consensus.proposal_accepted"
+        );
         let prevote = self.make_prevote(prevote_hash);
 
         vec![
@@ -518,10 +692,25 @@ impl ConsensusState {
 
         match v.kind {
             VoteKind::Prevote => {
-                self.prevotes
-                    .entry(v.round)
-                    .or_default()
-                    .record(v.validator, power, v.block_hash);
+                let voted_power = self.prevotes.entry(v.round).or_default().record(
+                    v.validator,
+                    power,
+                    v.block_hash,
+                );
+                let tally = self.prevotes.get(&v.round).expect("prevote tally exists");
+                debug!(
+                    height = v.height,
+                    round = v.round,
+                    validator = %v.validator,
+                    block_hash = ?v.block_hash,
+                    voted_power,
+                    total_power = tally.total_power(),
+                    nil_power = tally.nil_power(),
+                    distinct_block_hashes = tally.distinct_block_hashes(),
+                    quorum = quorum,
+                    quorum_hash = ?tally.quorum_hash(quorum),
+                    "consensus.prevote_recorded"
+                );
 
                 // Check for 2f+1 prevotes for a non-nil hash in the current round.
                 if v.round == self.round && self.step == Step::Prevote {
@@ -556,30 +745,58 @@ impl ConsensusState {
                 }
 
                 let tally = self.precommits.entry(v.round).or_default();
-                tally.record(v.validator, power, v.block_hash);
+                let voted_power = tally.record(v.validator, power, v.block_hash);
+                debug!(
+                    height = v.height,
+                    round = v.round,
+                    validator = %v.validator,
+                    block_hash = ?v.block_hash,
+                    voted_power,
+                    total_power = tally.total_power(),
+                    nil_power = tally.nil_power(),
+                    distinct_block_hashes = tally.distinct_block_hashes(),
+                    quorum = quorum,
+                    quorum_hash = ?tally.quorum_hash(quorum),
+                    "consensus.precommit_recorded"
+                );
 
                 // Check for 2f+1 precommits for a concrete hash.
                 if let Some(Some(hash)) = tally.quorum_hash(quorum)
                     && self.step != Step::Commit
-                    && let Some(block) = blocks.get(&hash)
                 {
-                    self.step = Step::Commit;
-                    let commit_votes: Vec<Vote> = self
-                        .all_precommit_votes
-                        .get(&v.round)
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|vote| vote.block_hash == Some(hash))
-                        .collect();
-                    let commit = Commit {
-                        height: self.height,
-                        round: v.round,
-                        block_hash: hash,
-                        votes: commit_votes,
-                    };
-                    self.committed_block = Some(block.clone());
-                    actions.push(Action::Commit(Box::new(block.clone()), commit));
+                    if let Some(block) = blocks.get(&hash) {
+                        debug!(
+                            height = self.height,
+                            round = v.round,
+                            block_hash = %hash,
+                            "consensus.commit_ready"
+                        );
+                        self.step = Step::Commit;
+                        let commit_votes: Vec<Vote> = self
+                            .all_precommit_votes
+                            .get(&v.round)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|vote| vote.block_hash == Some(hash))
+                            .collect();
+                        let commit = Commit {
+                            height: self.height,
+                            round: v.round,
+                            block_hash: hash,
+                            votes: commit_votes,
+                        };
+                        self.committed_block = Some(block.clone());
+                        actions.push(Action::Commit(Box::new(block.clone()), commit));
+                    } else {
+                        warn!(
+                            height = self.height,
+                            round = v.round,
+                            block_hash = %hash,
+                            quorum = quorum,
+                            "consensus.commit_blocked: precommit quorum but missing block body"
+                        );
+                    }
                 }
             }
         }
@@ -603,6 +820,13 @@ impl ConsensusState {
         match quorum_hash {
             Some(Some(hash)) => {
                 if !blocks.contains_key(&hash) {
+                    warn!(
+                        height = self.height,
+                        round = self.round,
+                        block_hash = %hash,
+                        quorum = quorum,
+                        "consensus.precommit_blocked: prevote quorum but missing block body"
+                    );
                     return vec![];
                 }
                 // 2f+1 prevotes for a concrete block — update valid_block
@@ -619,6 +843,12 @@ impl ConsensusState {
             }
             Some(None) => {
                 // 2f+1 nil-prevotes — unlock and nil-precommit.
+                debug!(
+                    height = self.height,
+                    round = self.round,
+                    quorum = quorum,
+                    "consensus.nil_precommit: nil prevote quorum"
+                );
                 self.locked_block = None;
                 self.step = Step::Precommit;
                 let precommit = self.make_precommit(None);
@@ -635,12 +865,17 @@ impl ConsensusState {
     // Round advancement
     // ---------------------------------------------------------------------------
 
-    fn advance_round(&mut self, _blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
+    fn advance_round(&mut self, blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
         self.round += 1;
         self.step = Step::Propose;
         self.proposal = None;
+        self.pending_proposal = None;
 
-        let actions = vec![Action::StartTimeout(TimeoutKind::Propose, ROUND_TIMEOUT)];
+        let mut actions = vec![Action::StartTimeout(TimeoutKind::Propose, ROUND_TIMEOUT)];
+        if let Some(p) = self.future_proposals.remove(&self.round) {
+            actions.extend(self.on_proposal(p, blocks));
+            actions.extend(self.try_precommit_current_round_from_prevotes(blocks));
+        }
 
         // If this validator is the new proposer, they need to build and broadcast.
         // The engine layer handles building; here we just signal a propose timeout
@@ -957,5 +1192,119 @@ mod tests {
         assert!(sm.handle(Event::ReceiveVote(vote(2)), &blocks).is_empty());
 
         assert_eq!(sm.valid_block, None);
+    }
+
+    #[test]
+    fn future_round_proposal_is_replayed_when_round_catches_up() {
+        let mut sm = ConsensusState::new(1, make_addr(0), make_validator_set());
+        let (hash, block) = make_block(0xF0);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(hash, block);
+        let proposal = Proposal {
+            height: 1,
+            round: 1,
+            block_hash: hash,
+            pol_round: -1,
+            proposer: make_addr(2), // proposer for (height=1, round=1)
+            sig: SigBytes(vec![]),
+        };
+
+        assert!(
+            sm.handle(Event::ReceiveProposal(proposal), &blocks)
+                .is_empty()
+        );
+        let _ = sm.handle(Event::Tick(TimeoutKind::Propose), &blocks);
+        let _ = sm.handle(Event::Tick(TimeoutKind::Prevote), &blocks);
+        let actions = sm.handle(Event::Tick(TimeoutKind::Precommit), &blocks);
+
+        assert_eq!(sm.round, 1);
+        assert_eq!(sm.step, Step::Prevote);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::Broadcast(ProposalOrVote::Vote(v))
+                if v.kind == VoteKind::Prevote && v.round == 1 && v.block_hash == Some(hash)
+        )));
+    }
+
+    #[test]
+    fn invalid_future_round_proposal_does_not_block_valid_one() {
+        let mut sm = ConsensusState::new(1, make_addr(0), make_validator_set());
+        let (hash, block) = make_block(0xF1);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(hash, block);
+        let invalid = Proposal {
+            height: 1,
+            round: 1,
+            block_hash: hash,
+            pol_round: -1,
+            proposer: make_addr(3), // proposer for (height=1, round=1) is addr(2)
+            sig: SigBytes(vec![]),
+        };
+        let valid = Proposal {
+            proposer: make_addr(2),
+            ..invalid.clone()
+        };
+
+        assert!(
+            sm.handle(Event::ReceiveProposal(invalid), &blocks)
+                .is_empty()
+        );
+        assert!(sm.handle(Event::ReceiveProposal(valid), &blocks).is_empty());
+        let _ = sm.handle(Event::Tick(TimeoutKind::Propose), &blocks);
+        let _ = sm.handle(Event::Tick(TimeoutKind::Prevote), &blocks);
+        let actions = sm.handle(Event::Tick(TimeoutKind::Precommit), &blocks);
+
+        assert_eq!(sm.round, 1);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::Broadcast(ProposalOrVote::Vote(v))
+                if v.kind == VoteKind::Prevote && v.round == 1 && v.block_hash == Some(hash)
+        )));
+    }
+
+    #[test]
+    fn far_future_round_proposal_is_not_buffered() {
+        let vs = make_validator_set();
+        let far_round = FUTURE_PROPOSAL_ROUND_LOOKAHEAD + 1;
+        let proposer = vs.proposer_for(1, far_round).address;
+        let mut sm = ConsensusState::new(1, make_addr(0), vs);
+        let (hash, _block) = make_block(0xF2);
+        let proposal = Proposal {
+            height: 1,
+            round: far_round,
+            block_hash: hash,
+            pol_round: -1,
+            proposer,
+            sig: SigBytes(vec![]),
+        };
+
+        assert!(
+            sm.handle(Event::ReceiveProposal(proposal), &BTreeMap::new())
+                .is_empty()
+        );
+        assert!(sm.future_proposals.is_empty());
+    }
+
+    #[test]
+    fn future_round_proposal_at_buffer_window_is_kept() {
+        let vs = make_validator_set();
+        let round = FUTURE_PROPOSAL_ROUND_LOOKAHEAD;
+        let proposer = vs.proposer_for(1, round).address;
+        let mut sm = ConsensusState::new(1, make_addr(0), vs);
+        let (hash, _block) = make_block(0xF3);
+        let proposal = Proposal {
+            height: 1,
+            round,
+            block_hash: hash,
+            pol_round: -1,
+            proposer,
+            sig: SigBytes(vec![]),
+        };
+
+        assert!(
+            sm.handle(Event::ReceiveProposal(proposal), &BTreeMap::new())
+                .is_empty()
+        );
+        assert!(sm.future_proposals.contains_key(&round));
     }
 }

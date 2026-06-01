@@ -66,6 +66,19 @@ pub fn lower_and_build(
     signers: Vec<[u8; 32]>,
     gas_payer: ObjectId,
 ) -> Result<LoweredPlan> {
+    lower_and_build_with_gas(chain, expr, signers, gas_payer, 1_000_000, 1)
+}
+
+/// Lower a pipe expression and build the validated [`LoweredPlan`] with an
+/// explicit gas policy.
+pub fn lower_and_build_with_gas(
+    chain: &dyn ChainStateIface,
+    expr: &str,
+    signers: Vec<[u8; 32]>,
+    gas_payer: ObjectId,
+    gas_budget: u64,
+    gas_price: u128,
+) -> Result<LoweredPlan> {
     let lines = lower_pipe_expr(expr).context("lower pipe expression")?;
     let mut session = PtbSession::new(chain);
     for line in &lines {
@@ -75,6 +88,7 @@ pub fn lower_and_build(
     }
     session.set_signers(signers);
     session.set_gas_payer(gas_payer);
+    session.set_gas(gas_budget, gas_price);
     let tx = session.build_unsigned().context("build unsigned PTB")?;
     let status = session.status();
     Ok(LoweredPlan { tx, status })
@@ -443,7 +457,7 @@ mod tests {
     }
 
     const POOL_HASH: Hash32 = Hash32([0xAB; 32]);
-    const POOL_PATH: &str = "/bloom/dex/pool";
+    const POOL_PATH: &str = "/bloom/petals/dex/pool";
 
     fn concrete(name: &str) -> TypeTag {
         TypeTag::Concrete {
@@ -468,6 +482,8 @@ mod tests {
             type_params: vec![],
             args,
             returns,
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         }
     }
@@ -527,7 +543,7 @@ mod tests {
         );
         let plan = lower_and_build(
             &chain,
-            "/bloom/dex/pool/spend | /bloom/dex/pool/swap | /bloom/dex/pool/receive",
+            "/bloom/petals/dex/pool/spend | /bloom/petals/dex/pool/swap | /bloom/petals/dex/pool/receive",
             vec![signer],
             gas,
         )
@@ -595,7 +611,7 @@ mod tests {
         );
         let plan = lower_and_build(
             &chain,
-            "/bloom/dex/pool/add_liquidity min-lp=10 --a <(/bloom/dex/pool/spend_eth)> --b <(/bloom/dex/pool/spend_usdc)>",
+            "/bloom/petals/dex/pool/add_liquidity min-lp=10 --a <(/bloom/petals/dex/pool/spend_eth)> --b <(/bloom/petals/dex/pool/spend_usdc)>",
             vec![signer],
             gas,
         )
@@ -637,8 +653,13 @@ mod tests {
             )],
             signer,
         );
-        let err = lower_and_build(&chain, "/bloom/dex/pool/consumer @9.0", vec![signer], gas)
-            .unwrap_err();
+        let err = lower_and_build(
+            &chain,
+            "/bloom/petals/dex/pool/consumer @9.0",
+            vec![signer],
+            gas,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("dangling") || msg.contains("@9.0"), "{msg}");
     }
@@ -663,7 +684,7 @@ mod tests {
             ],
             signer,
         );
-        let expr = "/bloom/dex/pool/spend | /bloom/dex/pool/receive";
+        let expr = "/bloom/petals/dex/pool/spend | /bloom/petals/dex/pool/receive";
 
         // CLI path.
         let cli = lower_and_build(&chain, expr, vec![signer], gas).unwrap();

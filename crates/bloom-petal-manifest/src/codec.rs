@@ -24,6 +24,8 @@ use crate::types::{
     SCHEMA_VERSION, SemVer, TypeParamDecl, TypeParamKind, WasmFuncSig, WasmValType,
 };
 
+const MAX_MANIFEST_LIST_ITEMS: usize = 16_384;
+
 // ===========================================================================
 // Public API
 // ===========================================================================
@@ -123,6 +125,9 @@ where
     F: FnMut(&mut &[u8]) -> Result<T, CodecError>,
 {
     let len = read_u32_be(rdr)? as usize;
+    if len > MAX_MANIFEST_LIST_ITEMS || len > rdr.len() {
+        return Err(CodecError::InvalidLength(len as u64));
+    }
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
         out.push(r(rdr)?);
@@ -554,7 +559,7 @@ mod tests {
     fn sample() -> PetalManifestV0 {
         PetalManifestV0 {
             schema_version: SCHEMA_VERSION,
-            module_path: "/bloom/dex/pool".to_string(),
+            module_path: "/bloom/petals/dex/pool".to_string(),
             framework_version: SemVer::new(0, 1, 0),
             parent_version: None,
             object_types: vec![ObjectTypeDecl {
@@ -633,7 +638,7 @@ mod tests {
             }],
             external_type_refs: vec![ExternalTypeRef {
                 placeholder: "$external_0".to_string(),
-                declared_petal_path: "/bloom/core/fungible".to_string(),
+                declared_petal_path: "/bloom/petals/core/fungible".to_string(),
                 declared_type_name: "LOOM".to_string(),
                 declared_content_hash: Some([0x42u8; 32]),
             }],
@@ -704,6 +709,19 @@ mod tests {
         let mut bytes = encode(&m).unwrap();
         bytes.push(0xFF);
         assert!(decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_list_length_before_preallocating() {
+        let mut bytes = Vec::new();
+        write_u32_be(&mut bytes, SCHEMA_VERSION);
+        write_string(&mut bytes, "/p").unwrap();
+        write_semver(&mut bytes, &SemVer::new(0, 0, 1));
+        write_option_hash(&mut bytes, None);
+        write_u32_be(&mut bytes, u32::MAX);
+
+        let err = decode(&bytes).unwrap_err();
+        assert!(matches!(err, CodecError::InvalidLength(n) if n == u32::MAX as u64));
     }
 
     #[test]
