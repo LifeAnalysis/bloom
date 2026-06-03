@@ -29,6 +29,7 @@ use bloom_objects::{
 use bloom_petal_fungible::ops::{
     coin_payload, decode_coin_value as fungible_decode_coin_value, type_tag_coin_loom,
 };
+use bloom_resource::BloomType;
 use bloom_script::{
     Arg, CORE_FUNGIBLE_PATH, Command, DEFAULT_FUNGIBLE_PETAL_HASH, ExpectedVersion,
     FunctionDeclStub, MoveCmd, PetalManifestStub, PetalRef, PqSignature, UseRef, encode_ptb,
@@ -39,13 +40,13 @@ use bloom_script::{
 // Coin payload helpers
 // ---------------------------------------------------------------------------
 
-/// Canonical 48-byte coin payload: `[ObjectId placeholder (32)] || [value BE (16)]`.
+/// Canonical 16-byte coin payload: `[value BE (16)]`.
 /// Delegates to `bloom_petal_fungible::ops::coin_payload`.
 pub fn ptb_coin_payload(value: u128) -> Vec<u8> {
     coin_payload(value)
 }
 
-/// Decode the value from a canonical 48-byte coin payload.
+/// Decode the value from a canonical 16-byte coin payload.
 /// Returns 0 on malformed input (test-harness convenience).
 pub fn ptb_decode_coin_value(payload: &[u8]) -> u128 {
     fungible_decode_coin_value(payload).unwrap_or(0)
@@ -482,20 +483,16 @@ pub fn erased_pair_type_args() -> Vec<TypeTag> {
     vec![erased_type_tag(), erased_type_tag()]
 }
 
-/// `TypeTag` for `Capability<FaucetAdmin>` with zero-petal sentinels.
+/// `TypeTag` for `FaucetAdmin` with a zero-petal self sentinel.
 pub fn faucet_admin_cap_tag() -> TypeTag {
     TypeTag::Concrete {
         petal_hash: [0u8; 32],
-        type_name: "Capability".to_string(),
-        type_args: vec![TypeTag::Concrete {
-            petal_hash: [0u8; 32],
-            type_name: "FaucetAdmin".to_string(),
-            type_args: vec![],
-        }],
+        type_name: "FaucetAdmin".to_string(),
+        type_args: vec![],
     }
 }
 
-/// Seed a `Capability<FaucetAdmin>` object owned by `owner` at `id`.
+/// Seed a `FaucetAdmin` capability object owned by `owner` at `id`.
 pub fn seed_faucet_admin_cap(state: &mut State, id: ObjectId, owner: Address) {
     let obj = Object {
         id,
@@ -610,7 +607,7 @@ pub fn create_shared_pool(
         .map(|(id, _)| *id)
         .collect();
 
-    let params_bytes = fee_bps.to_be_bytes().to_vec();
+    let params_bytes = fee_bps.to_be_bytes().to_vec().canonical_encode();
     let gas_payer = genesis_coin_id(alice, 0);
     let ptb = PtbTx {
         signers: vec![alice.0],
