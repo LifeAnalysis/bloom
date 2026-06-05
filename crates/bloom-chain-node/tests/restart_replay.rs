@@ -55,7 +55,6 @@ impl PetalExecutor for FuelOnlyNonPtbExecutor {
             fuel_used: 100,
             return_data: vec![],
             logs: vec![],
-            invariant_outcomes: Vec::new(),
             write_set: Some(state.snapshot().commit()),
         }
     }

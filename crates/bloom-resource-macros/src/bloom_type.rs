@@ -511,13 +511,9 @@ fn field_decl(
     generic_names: &[String],
 ) -> syn::Result<FieldDecl> {
     crate::type_tag::reject_plain_generic_in_payload(&field.ty, generic_names)?;
-    let ty = ctx.lower(&field.ty)?;
-    let width = bloom_petal_manifest::types::canonical_byte_width(&ty);
     Ok(FieldDecl {
         name,
-        ty,
-        offset: None,
-        width,
+        ty: ctx.lower(&field.ty)?,
     })
 }
 

@@ -2032,7 +2032,6 @@ mod tests {
                     fuel_used: 0,
                     return_data: b"missing gas payer".to_vec(),
                     logs: vec![],
-                    invariant_outcomes: Vec::new(),
                     write_set: None,
                 };
             }
@@ -2042,7 +2041,6 @@ mod tests {
                 fuel_used: 1,
                 return_data: vec![],
                 logs: vec![],
-                invariant_outcomes: Vec::new(),
                 write_set: Some(state.snapshot().commit()),
             }
         }

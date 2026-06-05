@@ -17,15 +17,13 @@
 use bloom_chain_types::Hash32;
 use bloom_script::{
     ArgDeclStub, CapabilityTypeDeclStub, DataTypeDeclStub, EnumTypeDeclStub, ExternalTypeRefStub,
-    FieldDeclStub, FieldLayoutStub, FunctionDeclStub, InvariantDeclStub, InvariantTargetStub,
-    ObjectTypeDeclStub, PetalManifestStub, TypeParamDeclStub, VariantDeclStub,
-    VariantFieldsDeclStub,
+    FieldDeclStub, FunctionDeclStub, InvariantDeclStub, ObjectTypeDeclStub, PetalManifestStub,
+    TypeParamDeclStub, VariantDeclStub, VariantFieldsDeclStub,
 };
 
 use crate::types::{
     ArgKind, CapabilityDecl, DataTypeDecl, EnumTypeDecl, FieldDecl, FunctionDecl, InvariantDecl,
-    InvariantTarget, ObjectTypeDecl, PetalManifestV0, TypeParamDecl, TypeParamKind, VariantDecl,
-    VariantFieldsDecl, is_numeric_invariant_field,
+    ObjectTypeDecl, PetalManifestV0, TypeParamDecl, TypeParamKind, VariantDecl, VariantFieldsDecl,
 };
 
 /// Project a full canonical manifest down to the validator-facing stub.
@@ -37,11 +35,7 @@ use crate::types::{
 pub fn to_petal_manifest_stub(m: &PetalManifestV0) -> PetalManifestStub {
     PetalManifestStub {
         module_path: m.module_path.clone(),
-        functions: m
-            .functions
-            .iter()
-            .map(|f| project_function(f, &m.invariants))
-            .collect(),
+        functions: m.functions.iter().map(project_function).collect(),
         object_types: m.object_types.iter().map(project_object_type).collect(),
         capability_types: m
             .capability_types
@@ -63,7 +57,7 @@ pub fn to_petal_manifest_stub(m: &PetalManifestV0) -> PetalManifestStub {
     }
 }
 
-fn project_function(f: &FunctionDecl, all_invariants: &[InvariantDecl]) -> FunctionDeclStub {
+fn project_function(f: &FunctionDecl) -> FunctionDeclStub {
     FunctionDeclStub {
         name: f.name.clone(),
         view: f.view,
@@ -87,30 +81,17 @@ fn project_function(f: &FunctionDecl, all_invariants: &[InvariantDecl]) -> Funct
         attached_invariants: f
             .attached_invariants
             .iter()
-            .filter_map(|idx| all_invariants.get(*idx as usize).map(project_invariant))
+            .map(|idx| project_invariant_idx(*idx))
             .collect(),
     }
 }
 
 fn project_object_type(o: &ObjectTypeDecl) -> ObjectTypeDeclStub {
-    // Project only statically-addressable unsigned integer fields into the
-    // invariant numeric scope. Bool is fixed-width but not a numeric u8 domain.
-    let field_layout = o
-        .fields
-        .iter()
-        .filter(|f| is_numeric_invariant_field(f))
-        .map(|f| FieldLayoutStub {
-            name: f.name.clone(),
-            offset: f.offset.expect("numeric invariant field has offset"),
-            width: f.width.expect("numeric invariant field has width"),
-        })
-        .collect();
     ObjectTypeDeclStub {
         name: o.name.clone(),
         abilities: o.abilities,
         type_params: o.type_params.iter().map(project_type_param).collect(),
         fields: o.fields.iter().map(project_field).collect(),
-        field_layout,
     }
 }
 
@@ -165,34 +146,35 @@ fn project_type_param(p: &TypeParamDecl) -> TypeParamDeclStub {
     }
 }
 
-/// The base type name with any generic arguments stripped:
-/// `"Pool<A, B, S>"` → `"Pool"`. Object-type invariant targets are
-/// matched against a borrow row's type name, which carries no generics.
-fn base_type_name(s: &str) -> String {
-    s.split('<').next().unwrap_or(s).trim().to_string()
+/// Best-effort `InvariantDeclStub` from just the manifest-index `idx`.
+///
+/// The validator never reads invariant bodies; it only needs the wasm
+/// export name + the argspec to know whether to fire it post-call. We
+/// don't have access to the full invariant list at projection time
+/// because `attached_invariants` carries indices, not handles. The
+/// chain-side executor resolves the actual export by looking up the
+/// invariant inside the canonical manifest via the same index.
+///
+/// For Phase 1 we record only the index-derived export name
+/// (`__inv_<idx>`); a richer projection (including the predicate AST
+/// and argspec) is a Phase 2 follow-up once the executor wants to
+/// auto-marshal scope buffers.
+fn project_invariant_idx(idx: u16) -> InvariantDeclStub {
+    InvariantDeclStub {
+        name: format!("__inv_{idx}"),
+        wasm_export: format!("__inv_{idx}"),
+        argspec: vec![],
+    }
 }
 
-/// Project a single canonical `InvariantDecl` into the runtime stub,
-/// preserving its target so the executor can route function-exit vs
-/// object-type invariants. The `__inv_<idx>` export is carried by
-/// `inv.wasm_export`.
-pub fn project_invariant(inv: &InvariantDecl) -> InvariantDeclStub {
-    let target = match &inv.target {
-        InvariantTarget::ObjectType { name } => InvariantTargetStub::ObjectType {
-            name: base_type_name(name),
-        },
-        InvariantTarget::FunctionExit { name } => {
-            InvariantTargetStub::FunctionExit { name: name.clone() }
-        }
-    };
+/// Optional helper: project a single invariant decl. Not used by the
+/// projector above (which is bound by manifest's argspec-less `Vec<u16>`
+/// representation of attached invariants) but kept for tooling.
+pub fn project_invariant(inv: &InvariantDecl, idx: u16) -> InvariantDeclStub {
     InvariantDeclStub {
         name: inv.name.clone(),
         wasm_export: inv.wasm_export.clone(),
-        // human_text is excluded — it is only used by tooling/arbitration
-        // (ADR-003 spec↔intent), not by the runtime validator or executor.
-        // InvariantDeclStub has no human_text field.
-        argspec: vec![],
-        target,
+        argspec: vec![idx],
     }
 }
 
@@ -200,8 +182,7 @@ pub fn project_invariant(inv: &InvariantDecl) -> InvariantDeclStub {
 mod tests {
     use super::*;
     use crate::types::{
-        ArgDecl, FunctionDecl, InvariantDecl, InvariantTarget, ObjectTypeDecl, PetalManifestV0,
-        PredicateAst, TypeParamDecl, TypeParamKind,
+        ArgDecl, FunctionDecl, ObjectTypeDecl, PetalManifestV0, TypeParamDecl, TypeParamKind,
     };
     use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 
@@ -249,14 +230,7 @@ mod tests {
                 returns: vec![concrete("u128")],
                 required_signers: 1,
                 required_capabilities: vec![],
-                attached_invariants: vec![0],
-            }],
-            invariants: vec![InvariantDecl {
-                name: "inv".into(),
-                target: InvariantTarget::FunctionExit { name: "f".into() },
-                predicate: PredicateAst::Opaque,
-                wasm_export: "__inv_0".into(),
-                human_text: String::new(),
+                attached_invariants: vec![3],
             }],
             ..Default::default()
         };
@@ -281,11 +255,7 @@ mod tests {
         assert!(matches!(f.args[3], ArgDeclStub::TypeArg(0)));
         assert_eq!(f.returns.len(), 1);
         assert_eq!(f.attached_invariants.len(), 1);
-        assert_eq!(f.attached_invariants[0].wasm_export, "__inv_0");
-        assert!(matches!(
-            f.attached_invariants[0].target,
-            InvariantTargetStub::FunctionExit { .. }
-        ));
+        assert_eq!(f.attached_invariants[0].wasm_export, "__inv_3");
     }
 
     #[test]
@@ -304,36 +274,5 @@ mod tests {
         assert_eq!(s.object_types.len(), 1);
         assert_eq!(s.object_types[0].name, "Pool");
         assert_eq!(s.object_types[0].abilities, AbilitySet::key_store());
-    }
-
-    #[test]
-    fn object_field_layout_excludes_bool_from_numeric_invariant_scope() {
-        let m = PetalManifestV0 {
-            module_path: "/p".into(),
-            object_types: vec![ObjectTypeDecl {
-                name: "Flags".into(),
-                abilities: AbilitySet::key_store(),
-                type_params: vec![],
-                fields: vec![
-                    FieldDecl {
-                        name: "enabled".into(),
-                        ty: concrete("bool"),
-                        offset: Some(0),
-                        width: Some(1),
-                    },
-                    FieldDecl {
-                        name: "count".into(),
-                        ty: concrete("u64"),
-                        offset: Some(1),
-                        width: Some(8),
-                    },
-                ],
-            }],
-            ..Default::default()
-        };
-
-        let s = to_petal_manifest_stub(&m);
-        assert_eq!(s.object_types[0].field_layout.len(), 1);
-        assert_eq!(s.object_types[0].field_layout[0].name, "count");
     }
 }

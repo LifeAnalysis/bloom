@@ -882,8 +882,6 @@ mod tests {
                 .map(|(name, ty)| FieldDecl {
                     name: name.to_string(),
                     ty,
-                    offset: None,
-                    width: None,
                 })
                 .collect(),
             ..Default::default()
@@ -1177,8 +1175,6 @@ mod tests {
             .map(|i| FieldDecl {
                 name: format!("field_{i:03}"),
                 ty: prim("u8"),
-                offset: None,
-                width: None,
             })
             .collect::<Vec<_>>();
         let counter_type = ObjectTypeDecl {
@@ -1380,8 +1376,6 @@ mod tests {
                 fields: vec![FieldDecl {
                     name: "value".to_string(),
                     ty: prim("u64"),
-                    offset: None,
-                    width: Some(8),
                 }],
                 ..Default::default()
             }],
@@ -1423,8 +1417,6 @@ mod tests {
                 fields: vec![FieldDecl {
                     name: "leaf".to_string(),
                     ty: TypeTag::External { ref_idx: 0 },
-                    offset: None,
-                    width: None,
                 }],
                 ..Default::default()
             }],
@@ -1443,8 +1435,6 @@ mod tests {
                 fields: vec![FieldDecl {
                     name: "value".to_string(),
                     ty: prim("u64"),
-                    offset: None,
-                    width: Some(8),
                 }],
                 ..Default::default()
             }],
@@ -1532,8 +1522,6 @@ mod tests {
                 fields: vec![FieldDecl {
                     name: "value".to_string(),
                     ty: prim("u64"),
-                    offset: None,
-                    width: Some(8),
                 }],
                 ..Default::default()
             }],

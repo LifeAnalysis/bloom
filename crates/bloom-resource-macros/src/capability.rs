@@ -104,7 +104,6 @@ pub(crate) fn build_decl(item: &ItemStruct, attr: &CapabilityAttr) -> syn::Resul
         }
         Fields::Unit => Box::new(std::iter::empty()),
     };
-    let mut running_offset: Option<u32> = Some(0);
     for (field, i) in field_iter {
         if crate::bloom_type::is_phantom_data_type(&field.ty) {
             continue;
@@ -114,18 +113,9 @@ pub(crate) fn build_decl(item: &ItemStruct, attr: &CapabilityAttr) -> syn::Resul
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_else(|| i.to_string());
-        let ty = ctx.lower(&field.ty)?;
-        let width = bloom_petal_manifest::types::canonical_byte_width(&ty);
-        let offset = running_offset;
-        running_offset = match (running_offset, width) {
-            (Some(off), Some(w)) => Some(off + w),
-            _ => None,
-        };
         fields.push(FieldDecl {
             name: field_name,
-            ty,
-            offset: offset.filter(|_| width.is_some()),
-            width,
+            ty: ctx.lower(&field.ty)?,
         });
     }
     Ok(CapabilityDecl {

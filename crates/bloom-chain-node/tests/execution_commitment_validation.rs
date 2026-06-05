@@ -42,7 +42,6 @@ impl PetalExecutor for FreeFailedPtbExecutor {
             fuel_used: 0,
             return_data: b"ptb validation error: synthetic".to_vec(),
             logs: vec![],
-            invariant_outcomes: Vec::new(),
             write_set: None,
         }
     }
@@ -65,7 +64,6 @@ impl PetalExecutor for FuelOnlyFailedPtbExecutor {
             fuel_used: 1,
             return_data: b"ptb settlement missing: synthetic".to_vec(),
             logs: vec![],
-            invariant_outcomes: Vec::new(),
             write_set: None,
         }
     }
@@ -88,7 +86,6 @@ impl PetalExecutor for OverFuelPtbExecutor {
             fuel_used: 8,
             return_data: vec![],
             logs: vec![],
-            invariant_outcomes: Vec::new(),
             write_set: Some(state.snapshot().commit()),
         }
     }
@@ -111,7 +108,6 @@ impl PetalExecutor for OverFuelNonPtbExecutor {
             fuel_used: 1_001,
             return_data: vec![],
             logs: vec![],
-            invariant_outcomes: Vec::new(),
             write_set: Some(state.snapshot().commit()),
         }
     }
@@ -134,7 +130,6 @@ impl PetalExecutor for FuelOnlyNonPtbExecutor {
             fuel_used: 100,
             return_data: vec![],
             logs: vec![],
-            invariant_outcomes: Vec::new(),
             write_set: Some(state.snapshot().commit()),
         }
     }
@@ -492,7 +487,6 @@ fn successful_submit_ptb_cannot_advance_nonce_with_zero_fuel() {
                 fuel_used: 0,
                 return_data: vec![],
                 logs: vec![],
-                invariant_outcomes: Vec::new(),
                 write_set: Some(state.snapshot().commit()),
             }
         }

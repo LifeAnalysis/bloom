@@ -30,7 +30,7 @@ use bloom_chain_state::{Account, State, WriteSet};
 use bloom_chain_types::{
     block::Block,
     digest::blake3_tagged,
-    receipt::{InvariantRecord, Log, Receipt, receipts_root},
+    receipt::{Log, Receipt, receipts_root},
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
     vote::VoteKind,
@@ -66,10 +66,6 @@ pub struct ExecOutput {
     pub fuel_used: u64,
     pub return_data: Vec<u8>,
     pub logs: Vec<Log>,
-    /// Per-invariant verdicts recorded during execution (ADR-002), to be
-    /// copied into the transaction `Receipt`. Empty on pre-execution
-    /// failures and for txs that fire no invariants.
-    pub invariant_outcomes: Vec<InvariantRecord>,
     /// State mutations to apply on success (None = no mutations or already failed).
     pub write_set: Option<WriteSet>,
 }
@@ -227,7 +223,6 @@ impl PetalExecutor for NoopExecutor {
             fuel_used: 0,
             return_data: vec![],
             logs: vec![],
-            invariant_outcomes: Vec::new(),
             write_set: None,
         }
     }
@@ -755,7 +750,6 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
                 fuel_used: 0,
                 return_data: format!("tx admission rejected: {reject:?}").into_bytes(),
                 logs: vec![],
-                invariant_outcomes: Vec::new(),
             });
             continue;
         }
@@ -839,7 +833,6 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
                 fuel_used: output.fuel_used,
                 logs: output.logs,
                 return_data: output.return_data,
-                invariant_outcomes: output.invariant_outcomes,
             });
             continue;
         }
@@ -857,7 +850,6 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
                 return_data: b"missing required VFS binding for /bloom/petals/core/fungible"
                     .to_vec(),
                 logs: vec![],
-                invariant_outcomes: Vec::new(),
             });
             continue;
         };
@@ -955,7 +947,6 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
             fuel_used: output.fuel_used,
             logs: output.logs,
             return_data: output.return_data,
-            invariant_outcomes: output.invariant_outcomes,
         });
     }
 
