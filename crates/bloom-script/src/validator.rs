@@ -366,12 +366,6 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
             .chain
             .load_object(&tx.gas_payer)
             .ok_or(PtbError::ObjectNotFound { id: tx.gas_payer })?;
-        if objects.contains_key(&tx.gas_payer.0) {
-            return Err(PtbError::InvalidGasPayer {
-                id: tx.gas_payer,
-                reason: "gas payer cannot also be used as a PTB object input".to_string(),
-            });
-        }
         if gas_obj.owner != Owner::Address(first_signer_addr) {
             return Err(PtbError::InvalidGasPayer {
                 id: tx.gas_payer,
@@ -400,7 +394,7 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                 available: coin_value,
             });
         }
-        objects.insert(gas_obj.id.0, gas_obj);
+        objects.entry(gas_obj.id.0).or_insert(gas_obj);
     }
 
     resolve_loaded_object_manifests(ctx, &objects, &mut manifests)?;
@@ -2328,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gas_payer_as_object_input() {
+    fn accepts_gas_payer_as_object_input() {
         let (chain, signer, gas_id) = setup();
         let mut manifest = sample_manifest();
         manifest.functions[0].args = vec![ArgDeclStub::Object {
@@ -2347,11 +2341,7 @@ mod tests {
         }
 
         let verifier = AlwaysOkVerifier;
-        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
-        assert!(matches!(
-            err,
-            PtbError::InvalidGasPayer { reason, .. } if reason.contains("object input")
-        ));
+        validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
     }
 
     #[test]
