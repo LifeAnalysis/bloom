@@ -376,6 +376,7 @@ impl IpcServer {
                     &bytes,
                     Some(bloom_proto::checksum_address(&info.address)),
                     keystore.root().parent().map(|home| home.join("outbox")),
+                    keystore.raw_policy(wallet).ok().map(|(p, _)| p).as_deref(),
                 );
                 let reviewed_intent_hash = intent.intent_hash();
                 if let Some(home) = keystore.root().parent() {
@@ -418,6 +419,36 @@ impl IpcServer {
                 .unlock(wallet, passphrase.unwrap_or(""))
                 .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?,
         }
+        // For a policy-session mint, persist the one-time reviewed-intent approval
+        // marker the VFS mint handler requires. The passkey branch bound this exact
+        // descriptor in its ceremony; the passphrase branch's unlock is the presence
+        // proof. Either way a real ceremony happened, so the marker is authorized.
+        if is_policy_session_new(wallet, &path)
+            && let Some(home) = keystore.root().parent()
+        {
+            let intent =
+                bloom_proto::policy_session_mint_intent(wallet, &path.to_string_path(), &bytes);
+            bloom_vfs::policy_session_review::persist_review_approved(
+                home,
+                wallet,
+                &intent.intent_hash(),
+            )
+            .map_err(|e| HandlerError::backend(e.to_string()))?;
+        }
+        // Paid request confirms can sign x402 or Tempo MPP credentials. The VFS
+        // handler consumes this one-time marker so direct mounted writes cannot
+        // reuse a cached signer without passing through write_unlocked.
+        if let Some(home) = keystore.root().parent()
+            && let Some(id) = request_confirm_id(home, &path)
+        {
+            let confirm_value = String::from_utf8_lossy(&bytes).trim().to_ascii_lowercase();
+            bloom_vfs::handlers::requests::persist_request_confirm_approved(
+                home,
+                &id,
+                wallet,
+                &confirm_value,
+            )?;
+        }
         self.vfs.write(&path, &bytes).await
     }
 
@@ -443,7 +474,7 @@ impl IpcServer {
             let policy_digest = blake3::hash(policy_toml.as_bytes()).to_hex().to_string();
             let mut intent =
                 CeremonyIntent::new(wallet, "Sign Wallet Policy", CeremonyIntentKind::SignPolicy);
-            intent.wallet_address = address;
+            intent.wallet_address = address.clone();
             intent.summary_lines = vec![
                 format!("Review rules for wallet '{wallet}'."),
                 "This does not move money or place a trade.".into(),
@@ -462,15 +493,49 @@ impl IpcServer {
                 "policy_path": policy_path,
                 "policy_blake3": policy_digest,
             });
-            if let Ok(bytes) = serde_json::to_vec_pretty(&intent) {
+            keystore.lock(wallet);
+            let reviewed_policy = keystore
+                .unlock_passkey_with_intent_and_policy_edit(
+                    wallet,
+                    Some(intent),
+                    Some(policy_toml.clone()),
+                )
+                .await
+                .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
+            let final_policy = reviewed_policy.unwrap_or(policy_toml);
+            toml::from_str::<bloom_proto::Policy>(&final_policy)
+                .map_err(|e| HandlerError::backend(format!("reviewed policy.toml: {e}")))?;
+            if final_policy != std::fs::read_to_string(&policy_path).unwrap_or_default() {
+                std::fs::write(&policy_path, final_policy.as_bytes())
+                    .map_err(|e| HandlerError::backend(format!("write policy.toml: {e}")))?;
+            }
+            let final_digest = blake3::hash(final_policy.as_bytes()).to_hex().to_string();
+            let mut reviewed_intent =
+                CeremonyIntent::new(wallet, "Sign Wallet Policy", CeremonyIntentKind::SignPolicy);
+            reviewed_intent.wallet_address = address;
+            reviewed_intent.summary_lines = vec![
+                format!("Review rules for wallet '{wallet}'."),
+                "This does not move money or place a trade.".into(),
+                "After approval, Bloom uses these rules to decide what is allowed.".into(),
+                format!("Policy digest: {final_digest}"),
+            ];
+            reviewed_intent.policy_lines = final_policy.lines().map(str::to_string).collect();
+            reviewed_intent.risk_lines = vec![
+                "Approving these rules can change what Bloom allows later.".into(),
+                "The OS passkey prompt only proves your presence; review the details on this page."
+                    .into(),
+            ];
+            reviewed_intent.artifact_paths = vec![policy_path.display().to_string()];
+            reviewed_intent.canonical_subject = serde_json::json!({
+                "kind": "sign_policy",
+                "wallet": wallet,
+                "policy_path": policy_path,
+                "policy_blake3": final_digest,
+            });
+            if let Ok(bytes) = serde_json::to_vec_pretty(&reviewed_intent) {
                 let review_path = wallet_dir.join("policy.review.json");
                 let _ = std::fs::write(&review_path, bytes);
             }
-            keystore.lock(wallet);
-            keystore
-                .unlock_passkey_with_intent(wallet, Some(intent))
-                .await
-                .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
         }
         keystore
             .sign_policy(wallet)
@@ -659,14 +724,97 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
+        // Confirming a paid HTTP request can sign x402 or Tempo MPP payment
+        // credentials. It must go through write_unlocked rather than plain IPC
+        // so a cached daemon signer is not consumed silently.
+        [root, _reference, action] if root == "requests" && action == "confirm" => true,
+        [root, state, _id, action]
+            if root == "requests" && state == "pending" && action == "confirm" =>
+        {
+            true
+        }
+        // Minting a bounded policy session authorizes many future broadcasts; gate
+        // it behind the same human-presence ceremony as a signature so an agent
+        // cannot silently mint a broad batch-signing session.
+        [root, _wallet, ps, leaf]
+            if root == "wallets" && ps == "policy-session" && leaf == "new" =>
+        {
+            true
+        }
+        // Hyperliquid owner-signer writes either approve a standing API wallet
+        // or sign actions directly with the owner wallet. They require the
+        // write_unlocked ceremony; already-approved agent-session actions stay
+        // available to plain IPC because they use the bounded API wallet.
+        [root, _network, branch, _wallet, leaf]
+            if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
+        {
+            true
+        }
+        [root, _network, branch, _wallet, _session, leaf]
+            if root == "hyperliquid"
+                && branch == "agent_sessions"
+                && matches!(leaf.as_str(), "orphan_cancel_all" | "orphan_close_all") =>
+        {
+            true
+        }
+        [root, _network, branch, _wallet, leaf]
+            if root == "hyperliquid"
+                && branch == "exchange"
+                && matches!(
+                    leaf.as_str(),
+                    "order.json"
+                        | "cancel.json"
+                        | "schedule_cancel.json"
+                        | "update_leverage.json"
+                        | "send_asset.json"
+                ) =>
+        {
+            true
+        }
+        // Wallet policy writes (policy.toml) redefine what the daemon allows.
+        // They must go through write_unlocked so the user reviews the change
+        // before the re-sign — never silently re-signed with a cached signer.
+        [root, _wallet, file] if root == "wallets" && file == "policy.toml" => true,
         _ => false,
     }
+}
+
+fn request_confirm_id(home: &Path, path: &VfsPath) -> Option<String> {
+    match path.segments() {
+        [root, reference, action] if root == "requests" && action == "confirm" => {
+            if reference == "latest" {
+                latest_pending_request_id(home)
+            } else {
+                Some(reference.to_string())
+            }
+        }
+        [root, state, id, action]
+            if root == "requests" && state == "pending" && action == "confirm" =>
+        {
+            Some(id.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn latest_pending_request_id(home: &Path) -> Option<String> {
+    let latest = std::fs::read_to_string(home.join("requests").join("latest")).ok()?;
+    let (state, id) = latest.trim().split_once('/')?;
+    (state == "pending").then(|| id.to_string())
 }
 
 fn is_wallet_policy_write(wallet: &str, path: &VfsPath) -> bool {
     matches!(
         path.segments(),
         [root, w, file] if root == "wallets" && w == wallet && file == "policy.toml"
+    )
+}
+
+fn is_policy_session_new(wallet: &str, path: &VfsPath) -> bool {
+    matches!(
+        path.segments(),
+        [root, w, ps, leaf]
+            if root == "wallets" && w == wallet && ps == "policy-session" && leaf == "new"
     )
 }
 
@@ -746,6 +894,7 @@ fn write_unlocked_intent(
     body: &[u8],
     wallet_address: Option<String>,
     outbox_root: Option<PathBuf>,
+    wallet_policy_toml: Option<&str>,
 ) -> CeremonyIntent {
     let path_s = path.to_string_path();
     let segs = path.segments();
@@ -783,12 +932,37 @@ fn write_unlocked_intent(
         return intent;
     }
 
+    // Minting a bounded policy session: render the full envelope (chains, USD
+    // cap, TTL, and the exact pending-tx ids) so the human approves a concrete,
+    // finite authorization rather than an open-ended one.
+    let is_policy_session_new = matches!(
+        segs,
+        [root, w, ps, leaf]
+            if root == "wallets" && w == wallet && ps == "policy-session" && leaf == "new"
+    );
+    if is_policy_session_new {
+        let mut intent = bloom_proto::policy_session_mint_intent(wallet, &path_s, body);
+        intent.wallet_address = wallet_address;
+        return intent;
+    }
+
     if let Some(intent) = outbox_confirm_unlock_intent(
         wallet,
         &path_s,
         segs,
         wallet_address.clone(),
         outbox_root.as_deref(),
+    ) {
+        return intent;
+    }
+
+    if let Some(intent) = bloom_proto::hyperliquid_write_unlock_intent(
+        wallet,
+        &path_s,
+        segs,
+        body,
+        wallet_address.clone(),
+        wallet_policy_toml,
     ) {
         return intent;
     }
@@ -888,7 +1062,7 @@ fn outbox_confirm_unlock_intent(
         .join("plan.md");
     let plan = std::fs::read_to_string(&plan_path).ok()?;
     let plan_hash = blake3::hash(plan.as_bytes()).to_hex().to_string();
-    let defi_review = find_defi_review_for_outbox(outbox_root?, wallet, id);
+    let defi_review = find_defi_review_for_outbox(outbox_root?, wallet, chain, id);
     let mut intent = CeremonyIntent::new(
         wallet,
         format!("Approve {} Transaction", chain),
@@ -971,6 +1145,7 @@ struct DefiReview {
 fn find_defi_review_for_outbox(
     outbox_root: &Path,
     wallet: &str,
+    chain: &str,
     outbox_id: &str,
 ) -> Option<DefiReview> {
     let home = if outbox_root.file_name().is_some_and(|name| name == "outbox") {
@@ -980,17 +1155,29 @@ fn find_defi_review_for_outbox(
     };
     let sessions = home.join("defi").join(wallet).join("sessions");
     for entry in std::fs::read_dir(sessions).ok()? {
-        let path = entry.ok()?.path();
+        // Skip an unreadable/corrupt sibling rather than aborting the whole scan
+        // (which would silently drop a valid same-chain review later in the dir).
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let raw = std::fs::read_to_string(&path).ok()?;
-        let value: Value = serde_json::from_str(&raw).ok()?;
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        // Outbox ids are scoped per chain (`.../wallet/<chain>/pending/<id>`),
+        // so the same id can exist on two chains. Bind the review to the chain
+        // being confirmed, or a session for a *different* chain (e.g. a Polygon
+        // route) could shadow this confirm's copy with the wrong chain.
+        let chain_matches = value.get("chain").and_then(|v| v.as_str()) == Some(chain);
         let staged = value
             .get("staged_ids")
             .and_then(|v| v.as_array())
             .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(outbox_id)));
-        if !staged {
+        if !chain_matches || !staged {
             continue;
         }
         let id = value
@@ -1221,7 +1408,19 @@ mod tests {
             "/wallets/minnow/sign/message",
             "/wallets/minnow/sign/hash",
             "/wallets/minnow/sign/typed_data",
+            "/wallets/minnow/policy.toml",
             "/polymarket/onboard/minnow/begin",
+            "/requests/latest/confirm",
+            "/requests/req_123/confirm",
+            "/requests/pending/req_123/confirm",
+            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_cancel_all",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_close_all",
+            "/hyperliquid/mainnet/exchange/minnow/order.json",
+            "/hyperliquid/mainnet/exchange/minnow/cancel.json",
+            "/hyperliquid/mainnet/exchange/minnow/schedule_cancel.json",
+            "/hyperliquid/mainnet/exchange/minnow/update_leverage.json",
+            "/hyperliquid/mainnet/exchange/minnow/send_asset.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(write_path_uses_wallet_signer(&p), "{path}");
@@ -1232,6 +1431,12 @@ mod tests {
             "/polymarket/trade/minnow/new",
             "/wallets/minnow/chains/polygon/outbox/new.tx",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/confirm",
+            "/requests/new",
+            "/requests/pending/req_123/cancel",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
+            "/hyperliquid/mainnet/exchange/minnow/raw_signed.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!write_path_uses_wallet_signer(&p), "{path}");
@@ -1249,7 +1454,7 @@ mod tests {
     #[test]
     fn onboard_begin_unlock_intent_lists_grants_not_just_the_path() {
         let p = VfsPath::parse("/polymarket/onboard/minnow/begin").unwrap();
-        let intent = write_unlocked_intent("minnow", &p, b"y", None, None);
+        let intent = write_unlocked_intent("minnow", &p, b"y", None, None, None);
         // The reviewer must see the concrete onboarding effects, not a bare path.
         let text = intent.summary_lines.join("\n");
         assert!(text.contains("approve(MAX) -> CTF Exchange V2"), "{text}");
@@ -1266,6 +1471,7 @@ mod tests {
             b"hello",
             None,
             None,
+            None,
         );
         assert_eq!(g.canonical_subject["kind"], "vfs_write_unlocked");
         assert!(g.intent_hash() != intent.intent_hash());
@@ -1275,13 +1481,52 @@ mod tests {
     fn policy_write_unlock_intent_shows_policy_body() {
         let p = VfsPath::parse("/wallets/minnow/policy.toml").unwrap();
         let body = b"[defi]\nrequire_calldata_verification = false\n";
-        let intent = write_unlocked_intent("minnow", &p, body, Some("0xabc".into()), None);
+        let intent = write_unlocked_intent("minnow", &p, body, Some("0xabc".into()), None, None);
         assert_eq!(intent.kind, CeremonyIntentKind::SignPolicy);
         assert_eq!(intent.canonical_subject["kind"], "vfs_policy_write");
         assert_eq!(intent.wallet_address.as_deref(), Some("0xabc"));
         let policy = intent.policy_lines.join("\n");
         assert!(policy.contains("require_calldata_verification = false"));
         assert!(intent.summary_lines.join("\n").contains("Review rules"));
+    }
+
+    #[test]
+    fn hyperliquid_agent_session_intent_shows_authority_and_bounds() {
+        let p = VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/new.json").unwrap();
+        let body = br#"{"id":"btc-hour-1","agent_name":"bloom-btc-hour"}"#;
+        let policy = r#"
+[hyperliquid]
+allowed_assets = ["BTC"]
+allowed_order_types = ["limit"]
+max_notional_usd = "12"
+max_position_usd = "12"
+max_loss_usd = "5"
+max_leverage = 3
+max_session_secs = 1800
+allow_reduce_only = true
+allow_trigger_orders = false
+allow_twap = false
+allow_builder_fees = false
+allow_vault_or_subaccount = false
+"#;
+        let intent =
+            write_unlocked_intent("minnow", &p, body, Some("0xabc".into()), None, Some(policy));
+        let summary = intent.summary_lines.join("\n");
+        let review = intent.policy_lines.join("\n");
+        assert_eq!(intent.title, "Authorize Hyperliquid Trading Session");
+        assert_eq!(
+            intent.canonical_subject["kind"],
+            "hyperliquid_agent_session_grant"
+        );
+        assert!(summary.contains("trade-only API wallet"));
+        assert!(summary.contains("Session id: btc-hour-1"));
+        assert!(summary.contains("Agent name: bloom-btc-hour"));
+        assert!(summary.contains("without more passkey prompts"));
+        assert!(review.contains("session_key = \"trade-only API wallet\""));
+        assert!(review.contains("allowed_assets = \"BTC\""));
+        assert!(review.contains("max_notional_usd = \"$12"));
+        assert!(review.contains("max_session_secs = \"1800\""));
+        assert!(review.contains("withdrawals = \"not allowed\""));
     }
 
     #[test]
@@ -1307,6 +1552,7 @@ mod tests {
             b"y",
             Some("0xabc".into()),
             Some(tmp.path().to_path_buf()),
+            None,
         );
         assert_eq!(intent.title, "Approve base Transaction");
         assert_eq!(intent.kind, CeremonyIntentKind::EvmTransaction);
@@ -1341,6 +1587,7 @@ mod tests {
             sessions.join("0001-route.json"),
             serde_json::to_vec_pretty(&json!({
                 "id": "0001-route",
+                "chain": "base",
                 "staged_ids": ["0001-test"],
                 "plan_md": "# DeFi intent\n\nIntent:    swap 5 USDC to MATIC\nChain:     base (id 8453)\nDest chain:polygon (id 137)\nReceiver:  0xabc\nToken in:  USDC amount=5000000 (raw)\nToken out: MATIC amountOut≈1\nSlippage:  50 bps\nRouter:    0xrouter\nProtocols: stargate -> 1inch\nTx value:  1 wei\n",
                 "policy_checks": [
@@ -1356,8 +1603,14 @@ mod tests {
         .unwrap();
         let p =
             VfsPath::parse("/wallets/minnow/chains/base/outbox/pending/0001-test/confirm").unwrap();
-        let intent =
-            write_unlocked_intent("minnow", &p, b"y", Some("0xabc".into()), Some(outbox_root));
+        let intent = write_unlocked_intent(
+            "minnow",
+            &p,
+            b"y",
+            Some("0xabc".into()),
+            Some(outbox_root),
+            None,
+        );
         let summary = intent.summary_lines.join("\n");
         assert!(summary.contains("DeFi route intent 0001-route"));
         assert!(summary.contains("Intent:    swap 5 USDC to MATIC"));
@@ -1371,6 +1624,56 @@ mod tests {
                 .contains("# Staged tx 0001-test")
         );
         assert_eq!(intent.canonical_subject["defi_session_id"], "0001-route");
+    }
+
+    #[test]
+    fn outbox_confirm_ignores_defi_review_for_a_different_chain() {
+        // Regression: outbox ids are per-chain, so a same-id session on another
+        // chain must NOT shadow this confirm's copy (the stale "Polygon" bleed).
+        let tmp = tempfile::tempdir().unwrap();
+        let outbox_root = tmp.path().join("outbox");
+        let dir = outbox_root
+            .join("minnow")
+            .join("base")
+            .join("pending")
+            .join("0001-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plan.md"),
+            "# Staged tx 0001-test\n\nWallet: minnow\nFrom:   0xabc\nTo:     0xdef\nChain:  base (id 8453)\nValue:  0.1 ETH\nNonce:  7\nGas:    limit=1\nData:   4 bytes\n",
+        )
+        .unwrap();
+        // A *Polygon* session that happens to reference the same outbox id.
+        let sessions = tmp.path().join("defi").join("minnow").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("0001-route.json"),
+            serde_json::to_vec_pretty(&json!({
+                "id": "0001-route",
+                "chain": "polygon",
+                "staged_ids": ["0001-test"],
+                "plan_md": "# DeFi intent\n\nIntent:    swap 1 USDC to MATIC\nChain:     polygon (id 137)\n",
+                "policy_checks": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let p =
+            VfsPath::parse("/wallets/minnow/chains/base/outbox/pending/0001-test/confirm").unwrap();
+        let intent = write_unlocked_intent(
+            "minnow",
+            &p,
+            b"y",
+            Some("0xabc".into()),
+            Some(outbox_root),
+            None,
+        );
+        let summary = intent.summary_lines.join("\n");
+        // The Base confirm shows Base, never the Polygon session's copy.
+        assert!(summary.contains("Chain:  base (id 8453)"));
+        assert!(!summary.contains("DeFi route intent"));
+        assert!(!summary.to_lowercase().contains("polygon"));
+        assert!(intent.canonical_subject["defi_session_id"].is_null());
     }
 
     #[tokio::test]

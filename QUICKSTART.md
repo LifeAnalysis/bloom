@@ -11,6 +11,21 @@ If you are delegating setup to an agent, the fastest path is:
 Read https://bloom.directory/SKILL.md and set up Bloom.
 ```
 
+## Agent-first shape
+
+Bloom's primary surface is the VFS. Use `init` to create the home directory,
+`wallet` commands for explicit key management, and `vfs cat|ls|write` for the
+same paths an agent sees through the mount. There is no separate top-level
+onboarding dashboard; first-run setup is just the same primitives in sequence:
+create a wallet, show its deposit QR, then inspect balances and staged actions
+through the VFS.
+
+Fund the deposit address, then review every staged plan before signing. Caps
+and allow/deny live in each wallet's `policy.toml`; value-moving actions still
+go through the stage → review → confirm outbox flow. Polymarket trading
+additionally requires `bloom polymarket onboard <wallet>` (see `AGENTS.md`).
+Re-display a deposit address any time with `bloom wallet address <name> --qr`.
+
 ## Prerequisites
 
 - Rust toolchain — pinned via `rust-toolchain.toml` (installed
@@ -47,28 +62,31 @@ ignore them and create our own wallet.
 
 ## 3. Create a wallet
 
-The keystore encrypts the key with `BLOOM_PASSPHRASE` (argon2id +
-chacha20poly1305). For a demo, any passphrase works.
-
-The CLI shortcut and the VFS write are equivalent — wallets are
-first-class VFS citizens:
+The default wallet kind is **passkey** (WebAuthn) — a browser ceremony runs
+and no passphrase is needed. For a quick local demo you can instead create a
+**passphrase** wallet with `--local` (non-interactive creation also needs
+`--allow-passphrase-wallet` and `--passphrase-file`):
 
 ```sh
-# CLI shortcut
-BLOOM_HOME=/tmp/bloom-demo BLOOM_PASSPHRASE=devonly \
-  cargo run -p bloom -- wallet new alice --passphrase devonly
+# Passkey wallet (default) — opens a browser WebAuthn ceremony:
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet new alice
+
+# Passphrase wallet for dev/CI (writes a RECOVERY.txt next to the key):
+echo devonly > /tmp/pw.txt
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet new alice \
+  --local --allow-passphrase-wallet --passphrase-file /tmp/pw.txt
 
 # Equivalent VFS write (what an agent would do over the mount).
-# Plain text body = create a local wallet with that name.
-BLOOM_HOME=/tmp/bloom-demo BLOOM_PASSPHRASE=devonly \
-  cargo run -p bloom -- vfs write /wallets/new --data 'alice'
+# Plain text body = create a passkey wallet with that name.
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- vfs write /wallets/new --data 'alice'
 
-# Full TOML form for import / watch:
+# Full TOML form for import / watch / passphrase:
 #   name = "alice"
-#   kind = "import"        # or "local" (default) | "watch"
-#   private_key = "0x..."  # required for import
-#   address = "0x..."      # required for watch
-#   passphrase = "..."     # optional; falls back to BLOOM_PASSPHRASE
+#   kind = "local"        # or "passkey" (default) | "import" | "watch"
+#   private_key = "0x..." # required for import
+#   address = "0x..."     # required for watch
+#   passphrase = "..."    # required for local/import
+#   allow_passphrase_wallet = true  # required for local/import
 ```
 
 You'll get back something like `created wallet 'alice': 0x...`. List
@@ -179,7 +197,7 @@ it expire after the configured TTL) cancels the stage.
   and contract `source` / `abi`. Requires an `[etherscan]` block in
   `config.toml`.
 - **ERC-20 reads** — `chains/<c>/addresses/<a>/tokens/<token>/{balance,
-  balance.raw,balance.formatted,symbol,decimals}` (live `eth_call`).
+  balance.raw,balance.json,symbol,decimals}` (live `eth_call`).
 - **ENS** — recipient names like `vitalik.eth` resolve in tx intents
   via the canonical mainnet registry; forward resolution is also
   exposed at `ens/<name>.eth`.
@@ -191,6 +209,17 @@ it expire after the configured TTL) cancels the stage.
   needed; default slippage is 50 bps.
 - **Prices** — keyless DefiLlama at `prices/spot/<coin>(.usd)` and
   `prices/change_24h/<coin>`.
+- **Hyperliquid** — perp and spot market data, order books, candles,
+  account state at `/hyperliquid/<network>/...`. Agent sessions
+  (one-time approveAgent, then bounded trading) at
+  `/hyperliquid/<network>/agent_sessions/<wallet>/...`. One-off
+  owner-signed writes at `/hyperliquid/<network>/exchange/<wallet>/...`
+  labeled ADVANCED. Read `/hyperliquid/README.md`.
+- **Polymarket** — prediction-market trading via CLI (`bloom polymarket
+  ...`). VFS staging at `/polymarket/...`. A capability primitive
+  (scoped approve, TTL, caps) is in active development — see
+  `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
+  Read `/polymarket/README.md`.
 - **Zero-config chain reads** — Ethereum, Base, Arbitrum, Optimism,
   Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and
   Anvil are present after `bloom init`; live-network broadcasts remain

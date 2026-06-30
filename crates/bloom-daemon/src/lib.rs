@@ -21,11 +21,13 @@ use bloom_chain_types::types::{Address as ChainAddress, PubKeyBytes, SigBytes};
 use bloom_defi::EnsoClient;
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
+use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
 use bloom_keystore::Keystore;
+use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::{NameRegistry, PetalRunner, PetalStore, PetalVm, PetalsHandler};
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
 use bloom_prices::PricesClient;
-use bloom_proto::{AddressBook, AuditLog, Config, HomeDir, HomeWritePermit};
+use bloom_proto::{AddressBook, AuditLog, ChainSpec, Config, HomeDir, HomeWritePermit};
 use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
@@ -36,8 +38,9 @@ use bloom_tx::tx_engine::TxEngine;
 use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
-    AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, PolymarketHandler,
-    PricesHandler, SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
+    AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, HyperliquidHandler,
+    PolymarketHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler,
+    ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::tx_handler::PtbSubmitter;
 use bloom_vfs::{HandlerError, PathCache, Vfs};
@@ -134,6 +137,8 @@ impl Daemon {
         for c in clients {
             chains.add(c);
         }
+        let paid_http_rpc_resolver: Arc<dyn PaidHttpChainRpcResolver> =
+            Arc::new(ConfigPaidHttpRpcResolver::from_config(&config));
 
         // Build per-chain mempool indexes + handlers from [mempool.<chain>]
         // config. Each entry creates an LRU index, a VFS handler, and
@@ -462,7 +467,43 @@ impl Daemon {
                         .with_mempool_handlers(mempool_handlers.clone())
                         .with_revert_decoder(decoder_chain.clone()),
                 ) as _,
-            )
+            );
+
+        let hyperliquid_handler: Option<Arc<HyperliquidHandler>> = if let Some(hl_cfg) =
+            &config.hyperliquid
+        {
+            let hl_url = |raw: &str| match url::Url::parse(raw) {
+                Ok(u) => Some(u),
+                Err(e) => {
+                    warn!(url = %raw, error = %e, "daemon.hyperliquid_url_invalid_using_default");
+                    None
+                }
+            };
+            let mut mainnet = HyperliquidClient::new(HyperliquidNetwork::Mainnet);
+            if let Some(u) = hl_url(&hl_cfg.mainnet_url) {
+                mainnet = mainnet.with_base_url(u);
+            }
+            let mut testnet = HyperliquidClient::new(HyperliquidNetwork::Testnet);
+            if let Some(u) = hl_url(&hl_cfg.testnet_url) {
+                testnet = testnet.with_base_url(u);
+            }
+            debug!("daemon.hyperliquid_mounted");
+            let handler = Arc::new(
+                HyperliquidHandler::new(mainnet, testnet, keystore.clone())
+                    .with_store_root(home.root().join("hyperliquid")),
+            );
+            handler.clone().start_monitoring();
+            Some(handler)
+        } else {
+            debug!("daemon.hyperliquid_skipped: no [hyperliquid] config");
+            None
+        };
+
+        if let Some(ref hl) = hyperliquid_handler {
+            vfs_builder = vfs_builder.mount("hyperliquid", hl.clone() as _);
+        }
+
+        vfs_builder = vfs_builder
             .mount(
                 "wallets",
                 Arc::new(
@@ -473,10 +514,23 @@ impl Daemon {
                         address_book.clone(),
                     )
                     .with_home_write_permit_opt(home_write_permit.clone())
-                    .with_mempool_indexes(mempool_indexes.clone()),
+                    .with_mempool_indexes(mempool_indexes.clone())
+                    .with_polymarket_root(home.polymarket_dir())
+                    .with_hyperliquid_handler(hyperliquid_handler.clone()),
                 ) as _,
             )
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
+            .mount(
+                "requests",
+                Arc::new(
+                    RequestsHandler::new(
+                        home.root().to_path_buf(),
+                        keystore.clone(),
+                        config.default_wallet.clone(),
+                    )
+                    .with_paid_http_rpc_resolver(paid_http_rpc_resolver.clone()),
+                ) as _,
+            )
             .mount("status", status_handler.clone() as _)
             .mount("docs", Arc::new(DocsHandler::new()) as _)
             .mount(
@@ -542,6 +596,18 @@ impl Daemon {
                 warn!("enso api_key empty; mounting defi/ for keyless access (rate-limited)");
             }
             debug!("daemon.defi_mounted");
+            // Hyperliquid deposit goal: bridge address + deposit chain, from
+            // `[hyperliquid]` config when present, else the mainnet defaults.
+            let (hl_bridge, hl_deposit_chain_id) = {
+                let cfg = config.hyperliquid.clone().unwrap_or_default();
+                let bridge = cfg.bridge_address.parse().unwrap_or_else(|_| {
+                    warn!(addr = %cfg.bridge_address, "daemon.hyperliquid_bridge_invalid_using_default");
+                    bloom_proto::hyperliquid::MAINNET_BRIDGE
+                        .parse()
+                        .expect("valid bridge const")
+                });
+                (bridge, cfg.deposit_chain_id)
+            };
             vfs_builder = vfs_builder.mount(
                 "defi",
                 Arc::new(
@@ -556,7 +622,8 @@ impl Daemon {
                     .with_default_chain(config.default_chain.clone())
                     .with_store_root(home.root().join("defi"))
                     .with_polymarket_root(home.polymarket_dir())
-                    .with_revert_decoder(decoder_chain.clone()),
+                    .with_revert_decoder(decoder_chain.clone())
+                    .with_hyperliquid(hl_bridge, hl_deposit_chain_id),
                 ) as _,
             );
         } else {
@@ -633,6 +700,149 @@ impl Daemon {
             debug!("daemon.polymarket_skipped: no [polymarket] config");
         }
 
+        // /next.md — brutally-scoped next-action aggregator for agents.
+        // Answers: what wallets need attention, what confirms are pending,
+        // what capabilities are active/expired/orphaned, what risk data is stale.
+        let next_keystore = keystore.clone();
+        let next_tx_engine = tx_engine.clone();
+        let next_hl = hyperliquid_handler.clone();
+        let next_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> = Arc::new(move || {
+            let mut md = String::from("# Next Actions\n\n");
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+
+            // 1. Unsigned-policy passkey wallets
+            let mut unsigned = Vec::new();
+            if let Ok(infos) = next_keystore.list() {
+                for info in &infos {
+                    let status = next_keystore
+                        .policy_status(&info.name)
+                        .unwrap_or(bloom_keystore::PolicyStatus::NotApplicable);
+                    if status == bloom_keystore::PolicyStatus::Unsigned
+                        || status == bloom_keystore::PolicyStatus::Stale
+                    {
+                        unsigned.push(format!(
+                            "- `{}`: policy is **{:?}** — run `bloom wallet sign-policy {}` to enable agent trading",
+                            info.name, status, info.name
+                        ));
+                    }
+                }
+            }
+            if !unsigned.is_empty() {
+                md.push_str("## Unsigned Policies\n\n");
+                for u in &unsigned {
+                    md.push_str(u);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+
+            // 2. Pending outbox confirms
+            let mut pending_confirms = Vec::new();
+            if let Ok(infos) = next_keystore.list() {
+                for info in &infos {
+                    let sessions = next_tx_engine.session_store().active(now_ms);
+                    let has_session = sessions.iter().any(|s| s.wallet == info.name);
+                    if has_session {
+                        for s in &sessions {
+                            if s.wallet != info.name {
+                                continue;
+                            }
+                            if s.expires_ms > now_ms {
+                                pending_confirms.push(format!(
+                                    "- `{}`: {} pending tx ids, session `{}` active (expires in {}s)",
+                                    info.name,
+                                    s.allowed_pending_ids.len(),
+                                    s.id,
+                                    ((s.expires_ms - now_ms) / 1000)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            if !pending_confirms.is_empty() {
+                md.push_str("## Pending Outbox Confirms\n\n");
+                for p in &pending_confirms {
+                    md.push_str(p);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+
+            // 3. Capability status (HL sessions)
+            if let Some(ref hl) = next_hl {
+                let mut expired = Vec::new();
+                let mut orphaned = Vec::new();
+                let mut stale = Vec::new();
+                if let Ok(infos) = next_keystore.list() {
+                    for info in &infos {
+                        let views = hl.capability_views_for(&info.name);
+                        for v in &views {
+                            match v.status {
+                                bloom_proto::CapabilityStatus::Expired => {
+                                    expired.push(format!(
+                                        "- `{}` session `{}`: **expired** — no new orders accepted",
+                                        info.name, v.id
+                                    ));
+                                }
+                                bloom_proto::CapabilityStatus::Orphaned => {
+                                    orphaned.push(format!(
+                                        "- `{}` session `{}`: **orphaned** — daemon lost the agent key after restart. Owner must recover via `orphan_cancel_all` or `orphan_close_all` at `{}`",
+                                        info.name, v.id, v.revoke_path
+                                    ));
+                                }
+                                bloom_proto::CapabilityStatus::Active => {
+                                    if let Some(secs) = v.expires_in_secs
+                                        && secs < 300
+                                    {
+                                        stale.push(format!(
+                                            "- `{}` session `{}`: expiring in {}s",
+                                            info.name, v.id, secs
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if !expired.is_empty() {
+                    md.push_str("## Expired Sessions\n\n");
+                    for e in &expired {
+                        md.push_str(e);
+                        md.push('\n');
+                    }
+                    md.push('\n');
+                }
+                if !orphaned.is_empty() {
+                    md.push_str("## Orphaned Sessions (Needs Owner)\n\n");
+                    for o in &orphaned {
+                        md.push_str(o);
+                        md.push('\n');
+                    }
+                    md.push('\n');
+                }
+                if !stale.is_empty() {
+                    md.push_str("## Expiring Soon\n\n");
+                    for s in &stale {
+                        md.push_str(s);
+                        md.push('\n');
+                    }
+                    md.push('\n');
+                }
+            }
+
+            if unsigned.is_empty() && pending_confirms.is_empty() && next_hl.is_none() {
+                md.push_str("No wallets with pending actions.\n\n");
+                md.push_str("All policies are signed, no outbox confirms await review, and no Hyperliquid sessions are active.\n");
+            }
+            md.into_bytes()
+        });
+        vfs_builder = vfs_builder.with_root_dynamic("next.md", next_renderer);
+
         let vfs = vfs_builder
             .with_audit(audit_arc.clone())
             .with_cache(path_cache)
@@ -704,6 +914,19 @@ impl Daemon {
             let shutdown = scanner.spawn();
             bump_shutdown.push(shutdown);
             debug!("daemon.bump_scanner_spawned");
+        }
+
+        // Spawn the receipt reconciler: every ~15s it walks sent/ entries and
+        // records each broadcast tx's mined outcome (success/reverted) as a
+        // `receipt.json` sibling. The same-chain dependency gate and the bump
+        // scanner read it. Runs regardless of mempool config.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let reconciler = Arc::new(bloom_tx::reconcile::Reconciler::new(
+                tx_engine.outbox.clone(),
+                chains.clone(),
+            ));
+            bump_shutdown.push(reconciler.spawn());
+            debug!("daemon.reconciler_spawned");
         }
 
         // Spawn the backends probe task. Every 60s it:
@@ -779,7 +1002,10 @@ impl Daemon {
             debug!("daemon.backends_probe_spawned");
         }
 
-        info!(
+        // `debug!`, not `info!`: the CLI builds a daemon in-process for
+        // every `vfs cat`/`ls`, so at default verbosity this line would
+        // print before each value and clutter agent/visual output.
+        debug!(
             home = %home.root().display(),
             chains = ?config.chains.keys().collect::<Vec<_>>(),
             etherscan = etherscan_arc.is_some(),
@@ -953,6 +1179,41 @@ impl bloom_tx::bump_scanner::BasefeeProvider for ChainBasefeeProvider {
         let fh = client.fee_history(1).await.ok()?;
         fh.base_fee_per_gas.last().copied()
     }
+}
+
+#[derive(Debug, Clone)]
+struct ConfigPaidHttpRpcResolver {
+    by_chain_id: std::collections::BTreeMap<u64, Vec<String>>,
+}
+
+impl ConfigPaidHttpRpcResolver {
+    fn from_config(config: &Config) -> Self {
+        let by_chain_id = config
+            .chains
+            .values()
+            .filter_map(|spec| {
+                let urls = http_rpc_urls(spec);
+                (!urls.is_empty()).then_some((spec.chain_id, urls))
+            })
+            .collect();
+        Self { by_chain_id }
+    }
+}
+
+impl PaidHttpChainRpcResolver for ConfigPaidHttpRpcResolver {
+    fn http_rpc_urls_for_chain_id(&self, chain_id: u64) -> Vec<String> {
+        self.by_chain_id.get(&chain_id).cloned().unwrap_or_default()
+    }
+}
+
+fn http_rpc_urls(spec: &ChainSpec) -> Vec<String> {
+    let mut endpoints = spec.endpoints();
+    endpoints.sort_by_key(|endpoint| std::cmp::Reverse(endpoint.weight));
+    endpoints
+        .into_iter()
+        .map(|endpoint| endpoint.url)
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .collect()
 }
 
 fn pick_ens_client(chains: &ChainRegistry) -> Option<EnsClient> {
@@ -1370,6 +1631,7 @@ ws_url = "wss://example.invalid"
             token: None,
             nft: None,
             usd_value: None,
+            depends_on: None,
         };
         d.tx_engine.outbox.write_pending(&staged, "p").unwrap();
         let n = d.tx_engine.outbox.sweep_expired(2).unwrap();

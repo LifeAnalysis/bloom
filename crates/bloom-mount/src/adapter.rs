@@ -128,6 +128,77 @@ fn blake3_like_hash(bytes: &[u8]) -> u64 {
     h
 }
 
+fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
+    let segs = path.segments();
+    match segs {
+        [root, _wallet, chains, _chain, outbox, pending, _id, action]
+            if root == "wallets"
+                && chains == "chains"
+                && outbox == "outbox"
+                && pending == "pending"
+                && matches!(action.as_str(), "cancel" | "replace") =>
+        {
+            true
+        }
+        [root, _wallet, sign, kind]
+            if root == "wallets"
+                && sign == "sign"
+                && matches!(kind.as_str(), "message" | "hash" | "typed_data") =>
+        {
+            true
+        }
+        [root, action, _wallet, begin]
+            if root == "polymarket" && action == "onboard" && begin == "begin" =>
+        {
+            true
+        }
+        [root, _reference, action] if root == "requests" && action == "confirm" => true,
+        [root, state, _id, action]
+            if root == "requests" && state == "pending" && action == "confirm" =>
+        {
+            true
+        }
+        [root, _wallet, ps, leaf]
+            if root == "wallets" && ps == "policy-session" && leaf == "new" =>
+        {
+            true
+        }
+        [root, _network, branch, _wallet, leaf]
+            if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
+        {
+            true
+        }
+        [root, _network, branch, _wallet, _session, leaf]
+            if root == "hyperliquid"
+                && branch == "agent_sessions"
+                && matches!(leaf.as_str(), "orphan_cancel_all" | "orphan_close_all") =>
+        {
+            true
+        }
+        [root, _network, branch, _wallet, leaf]
+            if root == "hyperliquid"
+                && branch == "exchange"
+                && matches!(
+                    leaf.as_str(),
+                    "order.json"
+                        | "cancel.json"
+                        | "schedule_cancel.json"
+                        | "update_leverage.json"
+                        | "send_asset.json"
+                ) =>
+        {
+            true
+        }
+        [root, _wallet, leaf] if root == "wallets" && leaf == "policy.toml" => true,
+        [root, _wallet, chains, _chain, leaf]
+            if root == "wallets" && chains == "chains" && leaf == "policy.toml" =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Convert a `HandlerError` from the VFS into the matching NFS error.
 fn map_err(e: HandlerError) -> FsError {
     match e {
@@ -371,6 +442,13 @@ impl MountRenderCache {
         };
         self.inner.lock().put(path.clone(), entry);
     }
+
+    /// Drop any cached render for `path` — called after a successful write so a
+    /// follow-up GETATTR/READ/READDIR re-renders the live body instead of
+    /// serving the pre-write bytes still sitting in the cache within its TTL.
+    fn invalidate(&self, path: &VfsPath) {
+        self.inner.lock().pop(path);
+    }
 }
 
 /// Shared future type for in-flight render dedup. Concurrent GETATTR /
@@ -517,8 +595,13 @@ impl BloomFs {
     /// defensive about it).
     async fn flush_path(&self, path: &VfsPath) -> FsResult<()> {
         if let Some(bytes) = self.take_complete_buffer(path) {
+            if mount_write_path_uses_wallet_signer(path) {
+                return Err(FsError::PermissionDenied);
+            }
             trace!(path = %path.to_string_path(), bytes = bytes.len(), "mount.adapter.flush");
             self.vfs.write(path, &bytes).await.map_err(map_err)?;
+            // The rendered view is now stale; drop it so the next read re-renders.
+            self.render_cache.invalidate(path);
         } else {
             trace!(path = %path.to_string_path(), "mount.adapter.flush.nothing_to_flush");
         }
@@ -660,28 +743,32 @@ impl FileSystem for BloomFs {
                 // critical to avoid a `stat` triggering a sign or
                 // broadcast.
                 let size = if self.should_render_for_attrs(path, &e) {
-                    match self.render_with_dedup(path).await {
-                        Ok(bytes) => {
-                            let len = bytes.len() as u64;
-                            self.render_cache.put(path, bytes, RENDER_CACHE_TTL);
-                            len
-                        }
-                        Err(_) => {
-                            // Render failed (timeout, backend error,
-                            // write-only sink that errors on read).
-                            // Falling through with `size = 0` keeps
-                            // metadata-only inspection (`stat`,
-                            // `ls -l`) working, but remember the
-                            // negative render so a follow-up READ can
-                            // surface EIO instead of looking like a
-                            // legitimate empty file.
-                            self.render_cache.put_error(path, RENDER_CACHE_TTL);
-                            warn!(
-                                path = %path.to_string_path(),
-                                "mount.adapter.getattr.render_failed_falling_back_to_size_0"
-                            );
-                            0
-                        }
+                    match self.render_cache.get(path) {
+                        Some(MountRenderResult::Bytes(bytes)) => bytes.len() as u64,
+                        Some(MountRenderResult::Error) => 0,
+                        None => match self.render_with_dedup(path).await {
+                            Ok(bytes) => {
+                                let len = bytes.len() as u64;
+                                self.render_cache.put(path, bytes, RENDER_CACHE_TTL);
+                                len
+                            }
+                            Err(_) => {
+                                // Render failed (timeout, backend error,
+                                // write-only sink that errors on read).
+                                // Falling through with `size = 0` keeps
+                                // metadata-only inspection (`stat`,
+                                // `ls -l`) working, but remember the
+                                // negative render so a follow-up READ can
+                                // surface EIO instead of looking like a
+                                // legitimate empty file.
+                                self.render_cache.put_error(path, RENDER_CACHE_TTL);
+                                warn!(
+                                    path = %path.to_string_path(),
+                                    "mount.adapter.getattr.render_failed_falling_back_to_size_0"
+                                );
+                                0
+                            }
+                        },
                     }
                 } else {
                     0
@@ -1009,7 +1096,12 @@ impl FileSystem for BloomFs {
         };
 
         if let Some(payload) = complete_payload {
+            if mount_write_path_uses_wallet_signer(&path) {
+                return Err(FsError::PermissionDenied);
+            }
             self.vfs.write(&path, &payload).await.map_err(map_err)?;
+            // Persisted new bytes — invalidate any stale rendered view.
+            self.render_cache.invalidate(&path);
         }
 
         Ok(WriteResult {
@@ -1043,7 +1135,11 @@ impl FileSystem for BloomFs {
         })?;
         let parent_path = Self::path_of(parent);
         let child = parent_path.join(&decoded);
+        if mount_write_path_uses_wallet_signer(&child) {
+            return Err(FsError::PermissionDenied);
+        }
         self.vfs.write(&child, &[]).await.map_err(map_err)?;
+        self.render_cache.invalidate(&child);
         let e = self.vfs.lookup(&child).await.map_err(map_err)?;
         // CREATE returns initial attrs; the file has just been written
         // empty (or with a zero-byte body). Report `e.size` so a
@@ -1236,6 +1332,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mount_write_rejects_signer_consuming_paths() {
+        let fs = BloomFs::new(Vfs::builder().build());
+        let ctx = fake_ctx();
+        let handle = BloomHandle::Path {
+            kind: HandleKind::File,
+            path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow/order.json").unwrap(),
+        };
+
+        let err = fs
+            .write(
+                &ctx,
+                &handle,
+                0,
+                Bytes::from_static(b"{}"),
+                WriteStability::FileSync,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn mount_create_rejects_signer_consuming_paths() {
+        let fs = BloomFs::new(Vfs::builder().build());
+        let ctx = fake_ctx();
+        let parent = BloomHandle::Path {
+            kind: HandleKind::Dir,
+            path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow").unwrap(),
+        };
+
+        let err = fs
+            .create(
+                &ctx,
+                &parent,
+                "order.json",
+                CreateRequest {
+                    kind: CreateKind::File,
+                    attrs: SetAttrs::default(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::PermissionDenied));
+    }
+
+    #[tokio::test]
     async fn lookup_then_read_yields_file_contents() {
         let vfs = Vfs::builder()
             .mount("echo", Arc::new(StaticHandler))
@@ -1261,7 +1403,7 @@ mod tests {
             .await
             .unwrap();
         let names: Vec<&str> = page.entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["echo"]);
+        assert_eq!(names, vec!["AGENTS.md", "CLAUDE.md", "echo"]);
         assert!(page.eof);
     }
 
@@ -1711,6 +1853,50 @@ mod tests {
         let attrs = fs.getattr(&ctx, &inbox).await.unwrap();
         assert_eq!(attrs.size, b"hello\n".len() as u64);
         assert_eq!(attrs.mode & 0o777, 0o644);
+    }
+
+    /// Regression: a write through the mount must invalidate the render cache,
+    /// so a follow-up GETATTR/READ reflects the new bytes instead of the
+    /// pre-write render still cached within `RENDER_CACHE_TTL`.
+    #[tokio::test]
+    async fn write_invalidates_render_cache() {
+        let recorder = RecordingHandler::new();
+        recorder.writes.lock().push(b"hello\n".to_vec());
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+
+        // Populate the render cache: GETATTR renders + caches "hello\n".
+        assert_eq!(
+            fs.getattr(&ctx, &inbox).await.unwrap().size,
+            b"hello\n".len() as u64
+        );
+
+        // Overwrite through the mount (complete FILE_SYNC write flushes to VFS).
+        let new = b"GOODBYE WORLD\n";
+        fs.write(
+            &ctx,
+            &inbox,
+            0,
+            Bytes::copy_from_slice(new),
+            WriteStability::FileSync,
+        )
+        .await
+        .unwrap();
+
+        // Pre-fix these would still see the cached "hello\n".
+        assert_eq!(
+            fs.getattr(&ctx, &inbox).await.unwrap().size,
+            new.len() as u64,
+            "GETATTR served a stale cached size after write"
+        );
+        assert_eq!(
+            &fs.read(&ctx, &inbox, 0, 4096).await.unwrap().data[..],
+            new,
+            "READ served stale cached bytes after write"
+        );
     }
 
     /// Handler exposing a writable file whose `read` errors out — the

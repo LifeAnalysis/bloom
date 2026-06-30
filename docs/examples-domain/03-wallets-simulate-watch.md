@@ -62,23 +62,31 @@ cat /bloom/wallets/alice/kind             # local | watch
 cat /bloom/wallets/alice/policy.toml      # current policy
 
 # Per-chain native balance + nonce.
-cat /bloom/wallets/alice/chains/base/balance       # raw wei
-cat /bloom/wallets/alice/chains/base/balance.eth   # human "0.123 ETH"
-cat /bloom/wallets/alice/chains/base/balance.raw   # same as balance
+cat /bloom/wallets/alice/chains/base/balance       # human "0.123 ETH" (display, with symbol)
+cat /bloom/wallets/alice/chains/base/balance.raw   # raw wei (integer base units)
+cat /bloom/wallets/alice/chains/base/balance.json  # { symbol, decimals, raw, formatted, display }
 cat /bloom/wallets/alice/chains/base/nonce
 ```
 
-`policy.toml` is read-only via this surface — edit `~/.bloom/keystore/<wallet>/policy.toml`
-out-of-band and the daemon picks it up on the next `info` call.
+`policy.toml` can be read through the VFS and may be edited by the wallet
+policy surfaces. For passkey wallets, any policy edit invalidates the previous
+signature until the owner runs:
+
+```sh
+bloom wallet sign-policy <wallet>
+```
+
+That browser review is where the owner chooses whether Bloom should ask before
+every money-moving action or may act later only when the signed rules allow it.
 
 ERC-20 reads are not under `wallets/` — they live under the
 chain-rooted reader at
-`chains/<c>/addresses/<addr>/tokens/<token>/{balance,balance.formatted,balance.raw,symbol,decimals}`.
+`chains/<c>/addresses/<addr>/tokens/<token>/{balance,balance.raw,balance.json,symbol,decimals}`.
 For example, alice's USDC balance on Base:
 
 ```sh
 ALICE=$(cat /bloom/wallets/alice/address)
-cat /bloom/chains/base/addresses/$ALICE/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance.formatted
+cat /bloom/chains/base/addresses/$ALICE/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance
 ```
 
 ### Signing

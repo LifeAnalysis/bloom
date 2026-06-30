@@ -31,6 +31,7 @@ bloom-defi.workspace = true
 bloom-tx.workspace = true
 url.workspace = true
 bloom-vfs.workspace = true
+bloom-hyperliquid.workspace = true
 bloom-polymarket.workspace = true
 bloom-tools.workspace = true
 bloom-petals.workspace = true
@@ -54,6 +55,8 @@ shellexpand.workspace = true
 hex.workspace = true
 alloy.workspace = true
 base64.workspace = true
+qrcode.workspace = true
+rpassword.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2"

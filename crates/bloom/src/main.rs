@@ -12,18 +12,24 @@ mod commands {
     pub mod chain;
     pub mod pipe;
     pub mod polymarket;
+    pub mod qr;
 }
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
-use bloom_proto::{CeremonyIntent, CeremonyIntentKind, HomeDir, HomeWritePermit};
+use bloom_hyperliquid::{
+    CancelWire, ExchangeAction, Grouping, HyperliquidClient, HyperliquidNetwork, HyperliquidSigner,
+    LimitOrderType, OrderTypeWire, OrderWire, SignSubmit, TimeInForce, UsdSendRequest, pretty_json,
+    sign_submit_payload,
+};
+use bloom_proto::{AuditRecord, CeremonyIntent, CeremonyIntentKind, HomeDir, HomeWritePermit};
 use bloom_vfs::{VfsPath, handler::Handler};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
@@ -126,6 +132,24 @@ fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {
     Ok((permit, daemon))
 }
 
+fn set_default_wallet_if_empty(home: &HomeDir, wallet: &str) -> Result<bool> {
+    let path = home.config_path();
+    let mut cfg = bloom_proto::Config::load_or_init(&path)
+        .with_context(|| format!("load config {}", path.display()))?;
+    if cfg
+        .default_wallet
+        .as_deref()
+        .is_none_or(|w| w.trim().is_empty())
+    {
+        cfg.default_wallet = Some(wallet.to_string());
+        cfg.save(&path)
+            .with_context(|| format!("save config {}", path.display()))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "bloom",
@@ -150,6 +174,11 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     ipc_socket: Option<PathBuf>,
 
+    /// Suppress daemon/diagnostic logs on stderr (values still print on
+    /// stdout). `RUST_LOG` overrides this when set.
+    #[arg(long, short, global = true)]
+    quiet: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -164,6 +193,9 @@ enum Cmd {
     /// Wallet management.
     #[command(subcommand)]
     Wallet(WalletCmd),
+    /// Paid/free HTTP requests via the `/requests` VFS surface.
+    #[command(subcommand)]
+    Request(RequestCmd),
     /// Run the daemon as a long-lived process.
     Serve {
         /// IPC endpoint to bind.
@@ -191,9 +223,12 @@ enum Cmd {
     /// Manage wasm petals: install, run, list, name.
     #[command(subcommand)]
     Petals(PetalsCmd),
-    /// Polymarket: onboard a wallet.
+    /// Polymarket venue workflows.
     #[command(subcommand)]
     Polymarket(PolymarketCmd),
+    /// Hyperliquid HyperCore reads and tightly scoped test actions.
+    #[command(subcommand)]
+    Hyperliquid(HyperliquidCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init,
     /// Sovereign bloom-chain: init, run-validator, submit, query.
@@ -492,27 +527,265 @@ enum BuilderKeysCmd {
 }
 
 #[derive(Subcommand, Debug)]
-enum WalletCmd {
-    /// Create a new wallet. Pass `--passkey` for a browser WebAuthn ceremony;
-    /// defaults to passphrase-encrypted local wallet.
+enum RequestCmd {
+    /// Create a request from one-line, TOML, or HTTP-message-like input.
     New {
-        name: String,
+        /// Request text, e.g. `GET https://example.com/data`.
+        request: String,
+        /// Paying wallet. If omitted, config.default_wallet or the only wallet is used.
         #[arg(long)]
-        passkey: bool,
+        wallet: Option<String>,
+        /// Stage/probe only; never spends or signs.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the staged payment plan for an id or `latest`.
+    Plan { id: String },
+    /// Confirm a pending paid request.
+    Confirm {
+        id: String,
+        /// Confirmation text: `y`/`yes`/`confirm`, or the wallet's policy override
+        /// sentinel to bypass soft limits. Defaults to `confirm`.
+        #[arg(long, default_value = "confirm")]
+        text: String,
+        /// Paying wallet to unlock for signing. If omitted, it is read from the
+        /// staged request.
+        #[arg(long)]
+        wallet: Option<String>,
+        /// Passphrase for a local/imported paying wallet (passkey wallets prompt).
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
+    /// Print response body for an id or `latest`.
+    Body { id: String },
+    /// Print receipt JSON for an id or `latest`.
+    Receipt { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum HyperliquidCmd {
+    /// Print account clearinghouse state.
+    Account {
+        user: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Print spot/unified clearinghouse state.
+    SpotState {
+        user: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Print open orders.
+    OpenOrders {
+        user: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Print user fills.
+    Fills {
+        user: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Print user funding history for a coin.
+    Funding {
+        user: String,
+        coin: String,
+        #[arg(long)]
+        start_time: Option<u64>,
+        #[arg(long)]
+        end_time: Option<u64>,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Print an L2 order book snapshot.
+    Book {
+        coin: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Print candle snapshots for a time range.
+    Candles {
+        coin: String,
+        interval: String,
+        start_time: u64,
+        end_time: u64,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Print market metadata.
+    Metadata {
+        #[arg(long, default_value = "perp")]
+        kind: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Manage daemon-held ephemeral API-wallet sessions.
+    Session {
+        #[command(subcommand)]
+        command: HyperliquidSessionCmd,
+    },
+    /// Run the read-only smoke suite for an account.
+    TestReads {
+        user: String,
+        #[arg(long, default_value = "BTC")]
+        coin: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Transfer USDC internally between Hyperliquid accounts (usdSend, owner-signed).
+    /// Requires transfer_cap_usd in the wallet [hyperliquid] policy.
+    SendAsset {
+        wallet: String,
+        destination: String,
+        amount: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
+        passphrase: Option<String>,
+    },
+    /// Unlock once, place a far-away post-only perp order, then cancel it if it rests.
+    TestPostOnlyCancel {
+        wallet: String,
+        #[arg(long, default_value = "BTC")]
+        coin: String,
+        /// Perp asset id. BTC is normally 0 on mainnet.
+        #[arg(long, default_value_t = 0)]
+        asset: u32,
+        /// Explicit limit price. Defaults to roughly 50% of current mid.
+        #[arg(long)]
+        price: Option<String>,
+        /// Explicit size. Defaults to a size whose limit notional is just above $10.
+        #[arg(long)]
+        size: Option<String>,
+        /// Refuse if price * size is above this USD cap.
+        #[arg(long, default_value_t = 15.0)]
+        max_notional_usd: f64,
+        /// Make the one passkey policy-session ceremony explicit.
+        #[arg(long)]
+        policy_session: bool,
+        /// Required acknowledgement for a live-order test command.
+        #[arg(long)]
+        danger_accept_live_orders: bool,
+        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
+        passphrase: Option<String>,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HyperliquidSessionCmd {
+    /// Create an approved ephemeral API-wallet session in the running daemon.
+    Create {
+        wallet: String,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        agent_name: Option<String>,
+        /// Vault/subaccount address this session trades on. When set, risk
+        /// monitoring and cleanup target this account and every submit must
+        /// carry a matching vaultAddress.
+        #[arg(long)]
+        vault_address: Option<String>,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
         #[arg(long, env = "BLOOM_PASSPHRASE")]
         passphrase: Option<String>,
     },
-    /// Import a wallet from a hex private key.
+    /// Print session status.
+    Status {
+        wallet: String,
+        id: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Print session audit records.
+    Audit {
+        wallet: String,
+        id: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Stop a session without submitting cleanup orders.
+    Stop {
+        wallet: String,
+        id: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Cancel all open orders for the session account.
+    CancelAll {
+        wallet: String,
+        id: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Cancel orders and submit reduce-only IOC closes for open positions.
+    CloseAll {
+        wallet: String,
+        id: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WalletCmd {
+    /// Create a new wallet. Defaults to a passkey (WebAuthn) ceremony; pass
+    /// `--local` for a passphrase-encrypted wallet. Passphrase wallets created
+    /// non-interactively require `--allow-passphrase-wallet` and
+    /// `--passphrase-file`, and a recovery file is written to the keystore.
+    New {
+        name: String,
+        /// Create a passphrase-encrypted local wallet (default is passkey).
+        #[arg(long)]
+        local: bool,
+        /// Acknowledge creating a passphrase wallet non-interactively (no tty).
+        /// Required for `--local` when stdin is not a terminal. Writes a
+        /// recovery file containing the passphrase next to the key.
+        #[arg(long)]
+        allow_passphrase_wallet: bool,
+        /// Read the passphrase from this file instead of an interactive
+        /// prompt. Avoids leaking the passphrase via /proc/<pid>/cmdline.
+        /// Only used with `--local` for non-interactive creation.
+        #[arg(long, value_name = "PATH")]
+        passphrase_file: Option<PathBuf>,
+    },
+    /// Import a wallet from a hex private key. Defaults to passkey; pass
+    /// `--local` for passphrase-encrypted (same passphrase rules as `new`).
     Import {
         name: String,
         private_key: String,
         #[arg(long)]
-        passkey: bool,
-        #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: Option<String>,
+        local: bool,
+        #[arg(long)]
+        allow_passphrase_wallet: bool,
+        #[arg(long, value_name = "PATH")]
+        passphrase_file: Option<PathBuf>,
     },
     /// List configured wallets.
     List,
+    /// Print a table of all wallets with their total portfolio value across
+    /// all connected chains. Queries Hyperliquid clearinghouse state for each
+    /// wallet. Use `--network` to select mainnet (default) or testnet.
+    Portfolio {
+        /// Hyperliquid network to query. Defaults to mainnet.
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// Print a wallet's deposit address. Default output is the bare checksummed
+    /// address (one line, scriptable); `--qr` adds a scannable QR block above it,
+    /// and `--qr-out <path>` writes a scannable SVG of the address to a file.
+    Address {
+        name: String,
+        #[arg(long)]
+        qr: bool,
+        /// Write a scannable SVG QR of the deposit address to this path.
+        #[arg(long, value_name = "PATH")]
+        qr_out: Option<PathBuf>,
+    },
     /// Unlock a wallet for the lifetime of the process.
     /// For passkey wallets the passphrase is not needed — a browser
     /// ceremony is opened instead.
@@ -544,6 +817,23 @@ enum WalletCmd {
         /// policy warnings).
         #[arg(long, default_value = "y")]
         text: String,
+    },
+    /// Unlock once, review a batch of staged txs, then broadcast them in order.
+    ///
+    /// Each TX is `chain:id`, for example `base:0001-abc`.
+    ConfirmBatch {
+        wallet: String,
+        /// Staged tx references in the exact order to broadcast.
+        txs: Vec<String>,
+        #[arg(long, env = "BLOOM_PASSPHRASE")]
+        passphrase: Option<String>,
+        /// Confirmation text for each tx. Defaults to `override`, which
+        /// acknowledges soft policy warnings after the aggregate passkey review.
+        #[arg(long, default_value = "override")]
+        text: String,
+        /// Require an aggregate passkey policy-session review for passkey wallets.
+        #[arg(long)]
+        policy_session: bool,
     },
     /// Sign the current policy.toml for a passkey-gated wallet.
     /// The wallet must already be unlocked (run `unlock` first).
@@ -589,17 +879,173 @@ fn acknowledge_recovery_key(name: &str, key: &str) {
     println!();
 }
 
+/// Resolve the passphrase for a new/imported local wallet.
+///
+/// Interactive (tty): prompts twice via `rpassword` and requires a match.
+/// Non-interactive: requires `--allow-passphrase-wallet` + `--passphrase-file`
+/// so an agent cannot silently mint a passphrase wallet with a machine-chosen
+/// secret — passkey is the default, and passphrase creation must be explicit.
+fn resolve_new_wallet_passphrase(
+    allow_passphrase_wallet: bool,
+    passphrase_file: Option<&Path>,
+) -> Result<String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        let p1 = rpassword::prompt_password("Enter passphrase: ")?;
+        if p1.is_empty() {
+            bail!("passphrase must not be empty");
+        }
+        let p2 = rpassword::prompt_password("Confirm passphrase: ")?;
+        if p1 != p2 {
+            bail!("passphrases do not match");
+        }
+        Ok(p1)
+    } else {
+        if !allow_passphrase_wallet {
+            bail!(
+                "creating a passphrase wallet non-interactively requires --allow-passphrase-wallet \
+                 and --passphrase-file <PATH>; passkey is the default — run without --local for a \
+                 WebAuthn ceremony"
+            );
+        }
+        let path = passphrase_file.ok_or_else(|| {
+            anyhow::anyhow!("--passphrase-file <PATH> is required with --allow-passphrase-wallet")
+        })?;
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("read passphrase file {}", path.display()))?;
+        // Strip a single trailing newline pair only — never interior whitespace,
+        // which may be a legitimate part of the passphrase.
+        let pass = raw.trim_end_matches(['\n', '\r']).to_string();
+        if pass.is_empty() {
+            bail!("passphrase file is empty");
+        }
+        Ok(pass)
+    }
+}
+
+/// Write `bytes` to `path` with mode 0600 via a temp file + atomic rename.
+fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = path.with_extension("tmp");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
+/// Record the passphrase for a newly-created local wallet to a 0600
+/// `RECOVERY.txt` next to the key. Surfacing the secret the caller chose is
+/// the last line of defense against silent agent-created passphrase wallets.
+fn write_wallet_recovery(home: &HomeDir, name: &str, passphrase: &str) -> Result<PathBuf> {
+    let path = home.wallet_dir(name).join("RECOVERY.txt");
+    let body = format!(
+        "Bloom passphrase-wallet recovery\n\
+         wallet: {name}\n\
+         \n\
+         passphrase: {passphrase}\n\
+         \n\
+         This wallet was created with a passphrase. Store this file securely or\n\
+         migrate to a passkey wallet (`bloom wallet new {name}` without --local)\n\
+         and then remove this file.\n"
+    );
+    write_secret_file_0600(&path, body.as_bytes())?;
+    Ok(path)
+}
+
+/// Append a first-class `wallet.created` audit entry (kind + source). The CLI
+/// path does not flow through the VFS router, so without this a wallet created
+/// via `bloom wallet new` leaves no audit trail at all.
+fn audit_wallet_created(audit: &bloom_proto::AuditLog, name: &str, kind: &str) {
+    let _ = audit.append(AuditRecord {
+        ts_ms: 0,
+        kind: "wallet.created".into(),
+        wallet: Some(name.into()),
+        chain: None,
+        data: serde_json::json!({"kind": kind, "source": "cli"}),
+        prev: String::new(),
+        digest: String::new(),
+    });
+}
+
+struct WalletPortfolioRow {
+    name: String,
+    address: String,
+    account_value: f64,
+    withdrawable: f64,
+    positions: Vec<String>,
+}
+
+fn print_portfolio_table(rows: &[WalletPortfolioRow], network: &str) {
+    if rows.is_empty() {
+        println!("no wallets found");
+        return;
+    }
+    println!("\n  Bloom Wallet Portfolio — Hyperliquid {network}\n");
+    println!(
+        "  {:<18} {:<44} {:>12} {:>12} POSITIONS",
+        "WALLET", "ADDRESS", "ACCT VALUE", "WITHDRAWABLE"
+    );
+    println!("  {}", "-".repeat(120));
+    for row in rows {
+        let pos_str = if row.positions.is_empty() {
+            "—".to_string()
+        } else {
+            row.positions.join(", ")
+        };
+        println!(
+            "  {:<18} {:<44} ${:>11} ${:>11} {}",
+            row.name.chars().take(18).collect::<String>(),
+            &row.address[..row.address.len().min(44)],
+            format!("{:.4}", row.account_value),
+            format!("{:.4}", row.withdrawable),
+            pos_str
+        );
+    }
+    println!("  {}", "-".repeat(120));
+    let total_value: f64 = rows.iter().map(|r| r.account_value).sum();
+    let total_wd: f64 = rows.iter().map(|r| r.withdrawable).sum();
+    let total_pos: usize = rows.iter().map(|r| r.positions.len()).sum();
+    println!(
+        "  {:<18} {:<44} ${:>11} ${:>11} {} position(s)\n",
+        "TOTAL",
+        "",
+        format!("{:.4}", total_value),
+        format!("{:.4}", total_wd),
+        total_pos
+    );
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    // RUST_LOG wins when set; otherwise default to `info`, or `error`
+    // under `--quiet` so `vfs cat`/`ls` output stays clean.
+    let default_level = if cli.quiet { "error" } else { "info" };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
         .with_target(false)
         .with_writer(std::io::stderr)
         .try_init();
 
-    let cli = Cli::parse();
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -721,8 +1167,9 @@ async fn run(cli: Cli) -> Result<()> {
             println!("home: {}", d.home.root().display());
             println!("config: {}", d.home.config_path().display());
             println!("chains: {:?}", d.chains.list_names());
-            println!("next: mkdir -p ~/bloom && bloom serve --mount ~/bloom");
-            println!("then: ls ~/bloom && cat ~/bloom/docs/README.md");
+            println!("next: bloom wallet new main");
+            println!("then: bloom wallet address main --qr");
+            println!("mount: mkdir -p ~/bloom && bloom serve --mount ~/bloom");
             println!("fallback: bloom vfs cat /docs/README.md");
             println!("agent setup: https://bloom.directory/SKILL.md");
             Ok(())
@@ -734,11 +1181,42 @@ async fn run(cli: Cli) -> Result<()> {
             println!("chains: {:?}", d.chains.list_names());
             println!("default_chain: {}", d.config.default_chain);
             println!(
+                "default_wallet: {}",
+                d.config.default_wallet.as_deref().unwrap_or("<none>")
+            );
+            println!(
                 "block_mainnet_broadcast: {}",
                 d.config.block_mainnet_broadcast
             );
+            if d.config.hyperliquid.is_some() {
+                println!("hyperliquid_vfs: enabled (/hyperliquid)");
+                // Which wallets have an actual trading boundary in force.
+                let policed: Vec<String> = d
+                    .keystore
+                    .list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|w| w.policy.hyperliquid.is_configured())
+                    .map(|w| w.name)
+                    .collect();
+                if policed.is_empty() {
+                    println!(
+                        "hyperliquid_policy: none configured (any wallet can trade unconstrained \
+                         once unlocked — add [hyperliquid] to a wallet policy)"
+                    );
+                } else {
+                    println!("hyperliquid_policy: configured for {}", policed.join(", "));
+                }
+            } else {
+                println!("hyperliquid_vfs: disabled (add [hyperliquid] to config.toml)");
+            }
             println!("try: bloom vfs ls /");
-            println!("wallet: bloom wallet new alice --passphrase <passphrase>");
+            if d.keystore.list()?.is_empty() {
+                println!("no wallets yet — create one with bloom wallet new main");
+            } else {
+                println!("deposit: bloom wallet address <wallet> --qr");
+                println!("agent workflow: browse the mounted VFS or use bloom vfs cat/ls/write");
+            }
             Ok(())
         }
         Cmd::Vfs(VfsCmd::Cat { path }) => {
@@ -846,6 +1324,11 @@ async fn run(cli: Cli) -> Result<()> {
                             &body,
                             Some(bloom_proto::checksum_address(&info.address)),
                             Some(&d.home.outbox_dir()),
+                            d.keystore
+                                .raw_policy(&wallet)
+                                .ok()
+                                .map(|(p, _)| p)
+                                .as_deref(),
                         );
                         let reviewed_intent_hash = intent.intent_hash();
                         persist_outbox_review_intent(&wallet, &p, &d.home.outbox_dir(), &intent)?;
@@ -880,6 +1363,18 @@ async fn run(cli: Cli) -> Result<()> {
                         d.keystore
                             .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
                     }
+                }
+                if is_policy_session_new(&wallet, &p) {
+                    let intent = bloom_proto::policy_session_mint_intent(
+                        &wallet,
+                        &p.to_string_path(),
+                        &body,
+                    );
+                    bloom_vfs::policy_session_review::persist_review_approved(
+                        d.home.root(),
+                        &wallet,
+                        &intent.intent_hash(),
+                    )?;
                 }
                 d.vfs.write(&p, &body).await.context("vfs write")?;
 
@@ -938,44 +1433,203 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Wallet(WalletCmd::New {
-            name,
-            passkey,
-            passphrase,
+        Cmd::Request(RequestCmd::New {
+            request,
+            wallet,
+            dry_run,
         }) => {
             let (_home_permit, d) = build_write_daemon(home)?;
-            let info = if passkey {
-                d.keystore.create_passkey(&name).await?
-            } else {
-                let pass = passphrase.as_deref().unwrap_or("");
-                if pass.is_empty() {
-                    anyhow::bail!("passphrase required (use --passphrase or BLOOM_PASSPHRASE)");
-                }
-                d.keystore.create_local(&name, pass)?
+            let body = request_body_with_wallet(request, wallet.as_deref());
+            d.vfs
+                .write(
+                    &VfsPath::parse(if dry_run {
+                        "/requests/new.dry-run"
+                    } else {
+                        "/requests/new"
+                    })?,
+                    body.as_bytes(),
+                )
+                .await
+                .context("request new")?;
+            let latest = d
+                .vfs
+                .read(&VfsPath::parse("/requests/latest")?)
+                .await
+                .context("read latest request")?;
+            let latest = String::from_utf8_lossy(&latest);
+            println!("request: {}", latest.trim());
+            if dry_run {
+                println!("dry_run: true (unpaid probe/staging only; no spend/signing)");
+            }
+            Ok(())
+        }
+        Cmd::Request(RequestCmd::Plan { id }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            let path = VfsPath::parse(&format!("/requests/{id}/plan.md"))?;
+            let bytes = d.vfs.read(&path).await.context("request plan")?;
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            Ok(())
+        }
+        Cmd::Request(RequestCmd::Confirm {
+            id,
+            text,
+            wallet,
+            passphrase,
+        }) => {
+            let path = format!("/requests/{id}/confirm");
+            let p = VfsPath::parse(&path)?;
+            let body = text.into_bytes();
+            // Confirming a paid request signs payment credentials, so it must go
+            // through the wallet-signer ceremony — resolve the paying wallet
+            // (from --wallet or the staged request) and route via write_unlocked.
+            let client = IpcClient::new(&client_endpoint.socket);
+            let wallet = match wallet {
+                Some(w) => Some(w),
+                None => read_request_wallet(&client, &client_endpoint, &home, &id).await?,
             };
+            let wallet = wallet
+                .context("could not determine paying wallet for this request; pass --wallet")?;
+            let ipc_res = try_ipc(
+                &client,
+                &client_endpoint,
+                "write_unlocked",
+                serde_json::json!({
+                    "path": path,
+                    "bytes_b64": B64.encode(&body),
+                    "wallet": &wallet,
+                    "passphrase": passphrase.as_deref(),
+                }),
+            )
+            .await
+            .with_context(|| format!("ipc request confirm via {}", client_endpoint.display))?;
+            if ipc_res.is_some() {
+                debug!(endpoint = %client_endpoint.display, "cli.request.confirm.via_ipc");
+                return Ok(());
+            }
+            // No daemon: fall back to an in-process unlock + write.
+            debug!("cli.request.confirm.via_inproc: no daemon socket present");
+            let (_home_permit, d) = build_write_daemon(home)?;
+            let info = d.keystore.info(&wallet)?;
+            match info.kind {
+                bloom_keystore::WalletKind::PasskeyGated => {
+                    let intent = vfs_write_unlock_intent(
+                        &wallet,
+                        &p,
+                        &body,
+                        Some(bloom_proto::checksum_address(&info.address)),
+                        Some(&d.home.outbox_dir()),
+                        d.keystore
+                            .raw_policy(&wallet)
+                            .ok()
+                            .map(|(p, _)| p)
+                            .as_deref(),
+                    );
+                    d.keystore
+                        .unlock_passkey_with_intent_and_policy_edit(&wallet, Some(intent), None)
+                        .await?;
+                }
+                _ => {
+                    d.keystore
+                        .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
+                }
+            }
+            d.vfs.write(&p, &body).await.context("request confirm")?;
+            Ok(())
+        }
+        Cmd::Request(RequestCmd::Body { id }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            let path = VfsPath::parse(&format!("/requests/{id}/response/body"))?;
+            let bytes = d.vfs.read(&path).await.context("request body")?;
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            Ok(())
+        }
+        Cmd::Request(RequestCmd::Receipt { id }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            let path = VfsPath::parse(&format!("/requests/{id}/receipt.json"))?;
+            let bytes = d.vfs.read(&path).await.context("request receipt")?;
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            Ok(())
+        }
+        Cmd::Wallet(WalletCmd::New {
+            name,
+            local,
+            allow_passphrase_wallet,
+            passphrase_file,
+        }) => {
+            let (_home_permit, d) = build_write_daemon(home)?;
+            let info = if local {
+                let pass = resolve_new_wallet_passphrase(
+                    allow_passphrase_wallet,
+                    passphrase_file.as_deref(),
+                )?;
+                let info = d.keystore.create_local(&name, &pass)?;
+                let recovery = write_wallet_recovery(&d.home, &info.name, &pass)?;
+                eprintln!(
+                    "passphrase recovery file: {} (mode 0600) — store or delete after migrating to passkey",
+                    recovery.display()
+                );
+                info
+            } else {
+                d.keystore.create_passkey(&name).await?
+            };
+            audit_wallet_created(
+                &d.audit,
+                &info.name,
+                if local { "local" } else { "passkey" },
+            );
             println!("created wallet '{}': {}", info.name, info.address);
+            if set_default_wallet_if_empty(&d.home, &info.name)? {
+                println!(
+                    "default_wallet: {} (set in {})",
+                    info.name,
+                    d.home.config_path().display()
+                );
+            }
             if let Some(ref key) = info.recovery_key {
                 acknowledge_recovery_key(&info.name, key);
             }
+            // Show the deposit QR + address right away — a fresh wallet's first
+            // need is to receive funds.
+            println!("\n── deposit ──");
+            commands::qr::print_deposit(&bloom_proto::checksum_address(&info.address));
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Import {
             name,
             private_key,
-            passkey,
-            passphrase,
+            local,
+            allow_passphrase_wallet,
+            passphrase_file,
         }) => {
             let (_home_permit, d) = build_write_daemon(home)?;
-            let info = if passkey {
-                d.keystore.import_passkey(&name, &private_key).await?
+            let info = if local {
+                let pass = resolve_new_wallet_passphrase(
+                    allow_passphrase_wallet,
+                    passphrase_file.as_deref(),
+                )?;
+                let info = d.keystore.import_hex(&name, &private_key, &pass)?;
+                let recovery = write_wallet_recovery(&d.home, &info.name, &pass)?;
+                eprintln!(
+                    "passphrase recovery file: {} (mode 0600) — store or delete after migrating to passkey",
+                    recovery.display()
+                );
+                info
             } else {
-                let pass = passphrase.as_deref().unwrap_or("");
-                if pass.is_empty() {
-                    anyhow::bail!("passphrase required (use --passphrase or BLOOM_PASSPHRASE)");
-                }
-                d.keystore.import_hex(&name, &private_key, pass)?
+                d.keystore.import_passkey(&name, &private_key).await?
             };
+            audit_wallet_created(
+                &d.audit,
+                &info.name,
+                if local { "local" } else { "passkey" },
+            );
             println!("imported wallet '{}': {}", info.name, info.address);
+            if set_default_wallet_if_empty(&d.home, &info.name)? {
+                println!(
+                    "default_wallet: {} (set in {})",
+                    info.name,
+                    d.home.config_path().display()
+                );
+            }
             if let Some(ref key) = info.recovery_key {
                 acknowledge_recovery_key(&info.name, key);
             }
@@ -983,14 +1637,112 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Wallet(WalletCmd::List) => {
             let d = Daemon::from_home(home).context("build daemon")?;
+            let onboard = bloom_polymarket::OnboardStore::new(d.home.polymarket_dir());
             for info in d.keystore.list()? {
                 let kind = match info.kind {
                     bloom_keystore::WalletKind::Local => "local",
                     bloom_keystore::WalletKind::Watch => "watch",
                     bloom_keystore::WalletKind::PasskeyGated => "passkey",
                 };
-                println!("{}\t{}\t{}", info.name, info.address, kind);
+                // Surface the Polymarket deposit/funder address (if onboarded)
+                // so it is never mistaken for the wallet's own owner address.
+                let deposit = onboard
+                    .load(&info.name)
+                    .ok()
+                    .flatten()
+                    .map(|st| st.deposit_wallet)
+                    .unwrap_or_else(|| "-".to_string());
+                println!("{}\t{}\t{}\t{}", info.name, info.address, kind, deposit);
             }
+            Ok(())
+        }
+        Cmd::Wallet(WalletCmd::Portfolio { network }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            let client = hl_client(&d.home, &network)?;
+            let wallets = d.keystore.list()?;
+            let mut set = tokio::task::JoinSet::new();
+            for (idx, info) in wallets.into_iter().enumerate() {
+                let client = client.clone();
+                set.spawn(async move {
+                    let address = format!("{:?}", info.address).to_ascii_lowercase();
+                    let res = client
+                        .info(serde_json::json!({
+                            "type": "clearinghouseState",
+                            "user": address,
+                        }))
+                        .await;
+                    (idx, info, address, res)
+                });
+            }
+            let mut rows: Vec<(usize, WalletPortfolioRow)> = Vec::new();
+            while let Some(joined) = set.join_next().await {
+                let (idx, info, address, ch_result) = joined?;
+                let (account_value, withdrawable, positions) = match ch_result {
+                    Ok(v) => {
+                        let av = v
+                            .get("marginSummary")
+                            .and_then(|m| m.get("accountValue"))
+                            .and_then(|a| a.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let wd = v
+                            .get("withdrawable")
+                            .and_then(|w| w.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let positions: Vec<String> = v
+                            .get("assetPositions")
+                            .and_then(|a| a.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|ap| {
+                                        ap.get("position")
+                                            .and_then(|p| p.get("coin"))
+                                            .and_then(|c| c.as_str())
+                                            .map(|s| s.to_string())
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (av, wd, positions)
+                    }
+                    Err(_) => (0.0, 0.0, Vec::new()),
+                };
+                rows.push((
+                    idx,
+                    WalletPortfolioRow {
+                        name: info.name,
+                        address,
+                        account_value,
+                        withdrawable,
+                        positions,
+                    },
+                ));
+            }
+            rows.sort_by_key(|(i, _)| *i);
+            let table: Vec<WalletPortfolioRow> = rows.into_iter().map(|(_, r)| r).collect();
+            print_portfolio_table(&table, &network);
+            Ok(())
+        }
+        Cmd::Wallet(WalletCmd::Address { name, qr, qr_out }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            // Read-only: an unsigned/stale passkey policy must not block this.
+            let info = d.keystore.info_unverified(&name)?;
+            let address = bloom_proto::checksum_address(&info.address);
+            if let Some(path) = qr_out {
+                match commands::qr::render_qr_svg(&address) {
+                    Some(svg) => {
+                        std::fs::write(&path, svg)
+                            .with_context(|| format!("write QR SVG to {}", path.display()))?;
+                        eprintln!("wrote deposit QR SVG: {}", path.display());
+                    }
+                    None => anyhow::bail!("address too large to encode as a QR code"),
+                }
+            }
+            if qr && let Some(code) = commands::qr::render_qr(&address) {
+                println!("{code}");
+            }
+            println!("{address}");
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Unlock { name, passphrase }) => {
@@ -1044,7 +1796,7 @@ async fn run(cli: Cli) -> Result<()> {
                     "Sign Wallet Policy",
                     CeremonyIntentKind::SignPolicy,
                 );
-                intent.wallet_address = address;
+                intent.wallet_address = address.clone();
                 intent.summary_lines = vec![
                     format!("Review rules for wallet '{name}'."),
                     "This does not move money or place a trade.".into(),
@@ -1068,17 +1820,52 @@ async fn run(cli: Cli) -> Result<()> {
                     "policy_path": policy_path,
                     "policy_blake3": policy_digest,
                 });
-                // Persist the full reviewed intent next to policy.toml.sig so the
-                // approval is re-readable later (the .sig is the cryptographic
-                // record; this is the human-readable reviewed context).
-                if let Ok(bytes) = serde_json::to_vec_pretty(&intent) {
+                d.keystore.lock(&name);
+                let reviewed_policy = d
+                    .keystore
+                    .unlock_passkey_with_intent_and_policy_edit(
+                        &name,
+                        Some(intent),
+                        Some(policy_toml.clone()),
+                    )
+                    .await?;
+                let final_policy = reviewed_policy.unwrap_or(policy_toml);
+                toml::from_str::<bloom_proto::Policy>(&final_policy)
+                    .context("reviewed policy.toml is invalid")?;
+                if final_policy != std::fs::read_to_string(&policy_path).unwrap_or_default() {
+                    std::fs::write(&policy_path, final_policy.as_bytes())
+                        .with_context(|| format!("write {}", policy_path.display()))?;
+                }
+                let final_digest = blake3::hash(final_policy.as_bytes()).to_hex().to_string();
+                let mut reviewed_intent = CeremonyIntent::new(
+                    &name,
+                    "Sign Wallet Policy",
+                    CeremonyIntentKind::SignPolicy,
+                );
+                reviewed_intent.wallet_address = address;
+                reviewed_intent.summary_lines = vec![
+                    format!("Review rules for wallet '{name}'."),
+                    "This does not move money or place a trade.".into(),
+                    "After approval, Bloom uses these rules to decide what is allowed.".into(),
+                    format!("Policy digest: {final_digest}"),
+                ];
+                reviewed_intent.policy_lines = final_policy.lines().map(str::to_string).collect();
+                reviewed_intent.risk_lines = vec![
+                    "Approving these rules can change what Bloom allows later.".into(),
+                    "The OS passkey prompt only proves your presence; review the details on this page."
+                        .into(),
+                ];
+                reviewed_intent.artifact_paths = vec![policy_path.display().to_string()];
+                reviewed_intent.canonical_subject = serde_json::json!({
+                    "kind": "sign_policy",
+                    "wallet": name,
+                    "policy_path": policy_path,
+                    "policy_blake3": final_digest,
+                });
+                if let Ok(bytes) = serde_json::to_vec_pretty(&reviewed_intent) {
                     let review_path = home.keystore_dir().join(&name).join("policy.review.json");
                     let _ = std::fs::write(&review_path, bytes);
                 }
-                d.keystore.lock(&name);
-                d.keystore
-                    .unlock_passkey_with_intent(&name, Some(intent))
-                    .await?;
             }
             d.keystore.sign_policy(&name)?;
             println!("policy.toml signed for '{name}'");
@@ -1251,6 +2038,168 @@ async fn run(cli: Cli) -> Result<()> {
                 staged.id,
                 staged.tx_hash.as_deref().unwrap_or("?")
             );
+            Ok(())
+        }
+        Cmd::Wallet(WalletCmd::ConfirmBatch {
+            wallet,
+            txs,
+            passphrase,
+            text,
+            policy_session,
+        }) => {
+            if txs.is_empty() {
+                bail!("confirm-batch needs at least one tx ref like base:0001-abc");
+            }
+            let refs: Vec<(String, String)> = txs
+                .iter()
+                .map(|s| parse_batch_tx_ref(s))
+                .collect::<Result<Vec<_>>>()?;
+            let (home_permit, d) = build_write_daemon(home)?;
+            let info = d.keystore.info(&wallet)?;
+
+            let mut entries = Vec::new();
+            for (chain, id) in &refs {
+                let entry = d
+                    .tx_engine
+                    .outbox
+                    .read(&wallet, chain, id)
+                    .with_context(|| format!("read pending tx {chain}:{id}"))?;
+                if entry.staged.status != bloom_proto::TxStatus::Pending {
+                    bail!(
+                        "tx {}:{} is {}, not pending",
+                        chain,
+                        id,
+                        entry.staged.status
+                    );
+                }
+                entries.push(entry);
+            }
+
+            let mut reviewed_intent_hash: Option<String> = None;
+            match info.kind {
+                bloom_keystore::WalletKind::PasskeyGated => {
+                    if !policy_session {
+                        bail!(
+                            "passkey confirm-batch requires --policy-session so the one ceremony is explicit"
+                        );
+                    }
+                    let mut intent = CeremonyIntent::new(
+                        &wallet,
+                        "Authorize Batch Transaction Session",
+                        CeremonyIntentKind::EvmTransaction,
+                    )
+                    .with_address(bloom_proto::checksum_address(&info.address))
+                    .summary(format!(
+                        "Broadcast {} staged transaction(s).",
+                        entries.len()
+                    ))
+                    .summary("Policy is rechecked for every transaction before broadcast.")
+                    .risk("One passkey approval unlocks this process to sign this exact batch.")
+                    .risk("If a transaction fails, later transactions are not attempted.");
+
+                    let mut subjects = Vec::new();
+                    for entry in &entries {
+                        let s = &entry.staged;
+                        let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex().to_string();
+                        intent = intent
+                            .summary(format!(
+                                "{}:{} chain={} nonce={} to={} value={} wei data={}B",
+                                s.chain,
+                                s.id,
+                                s.chain_id,
+                                s.nonce,
+                                s.to,
+                                s.value_wei,
+                                s.data_hex.len() / 2
+                            ))
+                            .artifact(entry.dir.display().to_string());
+                        for c in &s.policy_checks {
+                            intent = intent.policy(format!(
+                                "{}:{} [{:?}] {}: {}",
+                                s.chain, s.id, c.outcome, c.rule, c.message
+                            ));
+                        }
+                        subjects.push(serde_json::json!({
+                            "id": s.id,
+                            "chain": s.chain,
+                            "chain_id": s.chain_id,
+                            "from": s.from,
+                            "to": s.to,
+                            "value_wei": s.value_wei,
+                            "nonce": s.nonce,
+                            "data_blake3": data_hash,
+                        }));
+                    }
+                    intent = intent.subject(serde_json::json!({
+                        "action": "evm_transaction_batch",
+                        "wallet": wallet,
+                        "txs": subjects,
+                        "confirm_text": text,
+                    }));
+
+                    let review_bytes = serde_json::to_vec_pretty(&intent)?;
+                    let hash = intent.intent_hash();
+                    for entry in &entries {
+                        let _ = d.tx_engine.outbox.write_artefact(
+                            &entry.dir,
+                            "review_intent.json",
+                            &review_bytes,
+                        );
+                    }
+                    d.keystore.lock(&wallet);
+                    d.keystore
+                        .unlock_passkey_with_intent(&wallet, Some(intent))
+                        .await?;
+                    let approved = serde_json::json!({
+                        "schema": "bloom.review_approved.v1",
+                        "intent_hash": hash,
+                        "scope": "batch",
+                    });
+                    let approved_bytes = serde_json::to_vec_pretty(&approved)?;
+                    for entry in &entries {
+                        let _ = d.tx_engine.outbox.write_artefact(
+                            &entry.dir,
+                            "review_approved.json",
+                            &approved_bytes,
+                        );
+                    }
+                    reviewed_intent_hash = Some(hash);
+                }
+                _ => {
+                    d.keystore
+                        .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
+                }
+            }
+
+            let signer = d.keystore.signer(&wallet)?;
+            let info = d.keystore.info(&wallet)?;
+            for (chain, id) in refs {
+                let client = d
+                    .chains
+                    .get(&chain)
+                    .with_context(|| format!("chain '{}'", chain))?;
+                let staged = d
+                    .tx_engine
+                    .confirm(
+                        &home_permit,
+                        &wallet,
+                        &chain,
+                        &id,
+                        &client,
+                        &signer,
+                        &info.policy,
+                        &text,
+                        reviewed_intent_hash.as_deref(),
+                    )
+                    .await
+                    .with_context(|| format!("confirm {chain}:{id}"))?;
+                println!(
+                    "broadcast {}:{} hash={}",
+                    chain,
+                    staged.id,
+                    staged.tx_hash.as_deref().unwrap_or("?")
+                );
+            }
             Ok(())
         }
         Cmd::Serve { endpoint, mount } => {
@@ -1502,6 +2451,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .await
             }
         }
+        Cmd::Hyperliquid(cmd) => handle_hyperliquid(home, &client_endpoint, cmd).await,
         Cmd::Petals(cmd) => {
             let _home_permit = HomeWritePermit::acquire(&home)?;
             run_petals(home, cmd).await
@@ -1724,6 +2674,7 @@ fn vfs_write_unlock_intent(
     body: &[u8],
     wallet_address: Option<String>,
     outbox_root: Option<&std::path::Path>,
+    wallet_policy_toml: Option<&str>,
 ) -> CeremonyIntent {
     let path_s = path.to_string_path();
     let segs = path.segments();
@@ -1761,9 +2712,26 @@ fn vfs_write_unlock_intent(
         return intent;
     }
 
+    if is_policy_session_new(wallet, path) {
+        let mut intent = bloom_proto::policy_session_mint_intent(wallet, &path_s, body);
+        intent.wallet_address = wallet_address;
+        return intent;
+    }
+
     if let Some(intent) =
         outbox_confirm_unlock_intent(wallet, &path_s, segs, wallet_address.clone(), outbox_root)
     {
+        return intent;
+    }
+
+    if let Some(intent) = bloom_proto::hyperliquid_write_unlock_intent(
+        wallet,
+        &path_s,
+        segs,
+        body,
+        wallet_address.clone(),
+        wallet_policy_toml,
+    ) {
         return intent;
     }
 
@@ -1811,7 +2779,7 @@ fn outbox_confirm_unlock_intent(
         .join("plan.md");
     let plan = std::fs::read_to_string(&plan_path).ok()?;
     let plan_hash = blake3::hash(plan.as_bytes()).to_hex().to_string();
-    let defi_review = find_defi_review_for_outbox(outbox_root?, wallet, id);
+    let defi_review = find_defi_review_for_outbox(outbox_root?, wallet, chain, id);
     let mut intent = CeremonyIntent::new(
         wallet,
         format!("Approve {} Transaction", chain),
@@ -1894,6 +2862,7 @@ struct DefiReview {
 fn find_defi_review_for_outbox(
     outbox_root: &std::path::Path,
     wallet: &str,
+    chain: &str,
     outbox_id: &str,
 ) -> Option<DefiReview> {
     let home = if outbox_root.file_name().is_some_and(|name| name == "outbox") {
@@ -1903,17 +2872,26 @@ fn find_defi_review_for_outbox(
     };
     let sessions = home.join("defi").join(wallet).join("sessions");
     for entry in std::fs::read_dir(sessions).ok()? {
-        let path = entry.ok()?.path();
+        // Skip an unreadable/corrupt sibling rather than aborting the whole scan.
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let raw = std::fs::read_to_string(&path).ok()?;
-        let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        // Outbox ids are scoped per chain, so bind the review to the chain
+        // being confirmed — a different chain's session must not shadow it.
+        let chain_matches = value.get("chain").and_then(|v| v.as_str()) == Some(chain);
         let staged = value
             .get("staged_ids")
             .and_then(|v| v.as_array())
             .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(outbox_id)));
-        if !staged {
+        if !chain_matches || !staged {
             continue;
         }
         let id = value
@@ -1973,6 +2951,14 @@ fn is_wallet_policy_write(wallet: &str, path: &VfsPath) -> bool {
     matches!(
         path.segments(),
         [root, w, file] if root == "wallets" && w == wallet && file == "policy.toml"
+    )
+}
+
+fn is_policy_session_new(wallet: &str, path: &VfsPath) -> bool {
+    matches!(
+        path.segments(),
+        [root, w, ps, leaf]
+            if root == "wallets" && w == wallet && ps == "policy-session" && leaf == "new"
     )
 }
 
@@ -2048,6 +3034,711 @@ fn persist_outbox_review_approved(
     Ok(())
 }
 
+fn request_body_with_wallet(mut request: String, wallet: Option<&str>) -> String {
+    let Some(wallet) = wallet else {
+        return request;
+    };
+    if request.trim_start().starts_with("url") || request.trim_start().starts_with("method") {
+        request.push('\n');
+        request.push_str(&format!("wallet = \"{wallet}\""));
+        return request;
+    }
+    let Some(first_newline) = request.find('\n') else {
+        request.push(' ');
+        request.push_str(&format!("wallet={wallet}"));
+        return request;
+    };
+    request.insert_str(first_newline, &format!(" wallet={wallet}"));
+    request
+}
+
+fn parse_batch_tx_ref(s: &str) -> Result<(String, String)> {
+    let (chain, id) = s
+        .split_once(':')
+        .with_context(|| format!("tx ref '{s}' must be chain:id"))?;
+    let chain = chain.trim();
+    let id = id.trim();
+    if chain.is_empty() || id.is_empty() {
+        bail!("tx ref '{s}' must include non-empty chain and id");
+    }
+    Ok((chain.to_string(), id.to_string()))
+}
+
+async fn handle_hyperliquid(
+    home: HomeDir,
+    endpoint: &ResolvedEndpoint,
+    cmd: HyperliquidCmd,
+) -> Result<()> {
+    match cmd {
+        HyperliquidCmd::Account { user, network } => {
+            print_hl_info(&home, &network, hl_user_req("clearinghouseState", &user)).await
+        }
+        HyperliquidCmd::SpotState { user, network } => {
+            print_hl_info(
+                &home,
+                &network,
+                hl_user_req("spotClearinghouseState", &user),
+            )
+            .await
+        }
+        HyperliquidCmd::OpenOrders { user, network } => {
+            print_hl_info(&home, &network, hl_user_req("openOrders", &user)).await
+        }
+        HyperliquidCmd::Fills { user, network } => {
+            print_hl_info(&home, &network, hl_user_req("userFills", &user)).await
+        }
+        HyperliquidCmd::Funding {
+            user,
+            coin,
+            start_time,
+            end_time,
+            network,
+        } => {
+            let mut req = serde_json::json!({
+                "type": "userFunding",
+                "user": user.to_ascii_lowercase(),
+                "coin": coin,
+            });
+            let obj = req.as_object_mut().expect("json object");
+            if let Some(start) = start_time {
+                obj.insert("startTime".into(), serde_json::json!(start));
+            }
+            if let Some(end) = end_time {
+                obj.insert("endTime".into(), serde_json::json!(end));
+            }
+            print_hl_info(&home, &network, req).await
+        }
+        HyperliquidCmd::Book { coin, network } => {
+            print_hl_info(
+                &home,
+                &network,
+                serde_json::json!({"type": "l2Book", "coin": coin}),
+            )
+            .await
+        }
+        HyperliquidCmd::Candles {
+            coin,
+            interval,
+            start_time,
+            end_time,
+            network,
+        } => {
+            print_hl_info(
+                &home,
+                &network,
+                serde_json::json!({
+                    "type": "candleSnapshot",
+                    "req": {
+                        "coin": coin,
+                        "interval": interval,
+                        "startTime": start_time,
+                        "endTime": end_time,
+                    }
+                }),
+            )
+            .await
+        }
+        HyperliquidCmd::Metadata { kind, network } => {
+            let body = match kind.as_str() {
+                "perp" => serde_json::json!({"type": "meta"}),
+                "perp-contexts" => serde_json::json!({"type": "metaAndAssetCtxs"}),
+                "spot" => serde_json::json!({"type": "spotMeta"}),
+                "spot-contexts" => serde_json::json!({"type": "spotMetaAndAssetCtxs"}),
+                "mids" => serde_json::json!({"type": "allMids"}),
+                other => bail!(
+                    "unknown metadata kind '{other}' (use perp, perp-contexts, spot, spot-contexts, mids)"
+                ),
+            };
+            print_hl_info(&home, &network, body).await
+        }
+        HyperliquidCmd::Session { command } => handle_hl_session(endpoint, command).await,
+        HyperliquidCmd::SendAsset {
+            wallet,
+            destination,
+            amount,
+            network,
+            passphrase,
+        } => {
+            let path = format!("/hyperliquid/{network}/exchange/{wallet}/send_asset.json");
+            let body = serde_json::to_vec(&UsdSendRequest {
+                destination,
+                amount,
+                nonce: None,
+            })?;
+            hl_session_ipc_write_unlocked(endpoint, &path, body, &wallet, passphrase.as_deref())
+                .await?;
+            let last_response =
+                format!("/hyperliquid/{network}/exchange/{wallet}/last_response.json");
+            match hl_session_ipc_read(endpoint, &last_response).await {
+                Ok(bytes) => std::io::Write::write_all(&mut std::io::stdout(), &bytes)?,
+                Err(_) => println!("usdSend submitted"),
+            }
+            Ok(())
+        }
+        HyperliquidCmd::TestReads {
+            user,
+            coin,
+            network,
+        } => test_hl_reads(&home, &network, &user, &coin).await,
+        HyperliquidCmd::TestPostOnlyCancel {
+            wallet,
+            coin,
+            asset,
+            price,
+            size,
+            max_notional_usd,
+            policy_session,
+            danger_accept_live_orders,
+            passphrase,
+            network,
+        } => {
+            test_hl_post_only_cancel(
+                home,
+                TestPostOnlyCancelArgs {
+                    wallet,
+                    coin,
+                    asset,
+                    price,
+                    size,
+                    max_notional_usd,
+                    policy_session,
+                    danger_accept_live_orders,
+                    passphrase,
+                    network,
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_hl_session(endpoint: &ResolvedEndpoint, cmd: HyperliquidSessionCmd) -> Result<()> {
+    match cmd {
+        HyperliquidSessionCmd::Create {
+            wallet,
+            id,
+            agent_name,
+            vault_address,
+            network,
+            passphrase,
+        } => {
+            let path = hl_session_wallet_path(&network, &wallet, "new.json");
+            let body = serde_json::json!({
+                "id": id,
+                "agent_name": agent_name,
+                "vault_address": vault_address,
+            });
+            hl_session_ipc_write_unlocked(
+                endpoint,
+                &path,
+                serde_json::to_vec(&body)?,
+                &wallet,
+                passphrase.as_deref(),
+            )
+            .await?;
+            let last_response =
+                format!("/hyperliquid/{network}/exchange/{wallet}/last_response.json");
+            match hl_session_ipc_read(endpoint, &last_response).await {
+                Ok(bytes) => std::io::Write::write_all(&mut std::io::stdout(), &bytes)?,
+                Err(_) => println!("created Hyperliquid agent session"),
+            }
+            Ok(())
+        }
+        HyperliquidSessionCmd::Status {
+            wallet,
+            id,
+            network,
+        } => {
+            let path = hl_session_path(&network, &wallet, &id, "status.json");
+            let bytes = hl_session_ipc_read(endpoint, &path).await?;
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            Ok(())
+        }
+        HyperliquidSessionCmd::Audit {
+            wallet,
+            id,
+            network,
+        } => {
+            let path = hl_session_path(&network, &wallet, &id, "audit.jsonl");
+            let bytes = hl_session_ipc_read(endpoint, &path).await?;
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            Ok(())
+        }
+        HyperliquidSessionCmd::Stop {
+            wallet,
+            id,
+            network,
+        } => {
+            hl_session_ipc_write(
+                endpoint,
+                &hl_session_path(&network, &wallet, &id, "stop"),
+                Vec::new(),
+            )
+            .await
+        }
+        HyperliquidSessionCmd::CancelAll {
+            wallet,
+            id,
+            network,
+        } => {
+            hl_session_ipc_write(
+                endpoint,
+                &hl_session_path(&network, &wallet, &id, "cancel_all"),
+                Vec::new(),
+            )
+            .await
+        }
+        HyperliquidSessionCmd::CloseAll {
+            wallet,
+            id,
+            network,
+        } => {
+            hl_session_ipc_write(
+                endpoint,
+                &hl_session_path(&network, &wallet, &id, "close_all"),
+                Vec::new(),
+            )
+            .await
+        }
+    }
+}
+
+fn hl_session_wallet_path(network: &str, wallet: &str, file: &str) -> String {
+    format!("/hyperliquid/{network}/agent_sessions/{wallet}/{file}")
+}
+
+fn hl_session_path(network: &str, wallet: &str, id: &str, file: &str) -> String {
+    format!("/hyperliquid/{network}/agent_sessions/{wallet}/{id}/{file}")
+}
+
+/// Resolve a staged request's paying wallet from its `request.toml`, IPC-first
+/// with an in-process read fallback. Returns `None` if the field is absent.
+async fn read_request_wallet(
+    client: &IpcClient,
+    endpoint: &ResolvedEndpoint,
+    home: &HomeDir,
+    id: &str,
+) -> Result<Option<String>> {
+    let path = format!("/requests/{id}/request.toml");
+    let bytes = match try_ipc(
+        client,
+        endpoint,
+        "read",
+        serde_json::json!({ "path": path }),
+    )
+    .await
+    .with_context(|| format!("ipc read via {}", endpoint.display))?
+    {
+        Some(res) => {
+            let b64 = res
+                .get("bytes_b64")
+                .and_then(|v| v.as_str())
+                .context("ipc read: missing bytes_b64")?;
+            B64.decode(b64).context("ipc read: bad base64")?
+        }
+        None => {
+            let d = Daemon::from_home(home.clone()).context("build daemon")?;
+            let p = VfsPath::parse(&path)?;
+            d.vfs.read(&p).await.context("read request.toml")?
+        }
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).context("parse request.toml")?;
+    Ok(value
+        .get("wallet")
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
+}
+
+async fn hl_session_ipc_read(endpoint: &ResolvedEndpoint, path: &str) -> Result<Vec<u8>> {
+    let client = IpcClient::new(&endpoint.socket);
+    let Some(res) = try_ipc(
+        &client,
+        endpoint,
+        "read",
+        serde_json::json!({ "path": path }),
+    )
+    .await
+    .with_context(|| format!("ipc read via {}", endpoint.display))?
+    else {
+        bail!("Hyperliquid agent sessions require a running bloom serve daemon");
+    };
+    let b64 = res
+        .get("bytes_b64")
+        .and_then(|v| v.as_str())
+        .context("ipc read: missing bytes_b64")?;
+    B64.decode(b64).context("ipc read: bad base64")
+}
+
+async fn hl_session_ipc_write(
+    endpoint: &ResolvedEndpoint,
+    path: &str,
+    body: Vec<u8>,
+) -> Result<()> {
+    let client = IpcClient::new(&endpoint.socket);
+    let res = try_ipc(
+        &client,
+        endpoint,
+        "write",
+        serde_json::json!({
+            "path": path,
+            "bytes_b64": B64.encode(&body),
+        }),
+    )
+    .await
+    .with_context(|| format!("ipc write via {}", endpoint.display))?;
+    if res.is_none() {
+        bail!("Hyperliquid agent sessions require a running bloom serve daemon");
+    }
+    Ok(())
+}
+
+async fn hl_session_ipc_write_unlocked(
+    endpoint: &ResolvedEndpoint,
+    path: &str,
+    body: Vec<u8>,
+    wallet: &str,
+    passphrase: Option<&str>,
+) -> Result<()> {
+    let client = IpcClient::new(&endpoint.socket);
+    let res = try_ipc(
+        &client,
+        endpoint,
+        "write_unlocked",
+        serde_json::json!({
+            "path": path,
+            "bytes_b64": B64.encode(&body),
+            "wallet": wallet,
+            "passphrase": passphrase,
+        }),
+    )
+    .await
+    .with_context(|| format!("ipc unlocked write via {}", endpoint.display))?;
+    if res.is_none() {
+        bail!("Hyperliquid agent sessions require a running bloom serve daemon");
+    }
+    Ok(())
+}
+
+fn hl_network(raw: &str) -> Result<HyperliquidNetwork> {
+    match raw {
+        "mainnet" => Ok(HyperliquidNetwork::Mainnet),
+        "testnet" => Ok(HyperliquidNetwork::Testnet),
+        other => bail!("unknown Hyperliquid network '{other}' (use mainnet or testnet)"),
+    }
+}
+
+fn hl_client(home: &HomeDir, raw: &str) -> Result<HyperliquidClient> {
+    let network = hl_network(raw)?;
+    let mut client = HyperliquidClient::new(network);
+    // Honor [hyperliquid] mainnet_url/testnet_url overrides, same as the daemon
+    // (so local/staging/proxy deployments work from the CLI too).
+    if let Ok(config) = bloom_proto::Config::load_or_init(&home.config_path())
+        && let Some(hl) = config.hyperliquid
+    {
+        let raw_url = match network {
+            HyperliquidNetwork::Mainnet => hl.mainnet_url,
+            HyperliquidNetwork::Testnet => hl.testnet_url,
+        };
+        if let Ok(url) = raw_url.parse::<url::Url>() {
+            client = client.with_base_url(url);
+        }
+    }
+    Ok(client)
+}
+
+fn hl_user_req(kind: &str, user: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": kind,
+        "user": user.to_ascii_lowercase(),
+    })
+}
+
+async fn print_hl_info(home: &HomeDir, network: &str, body: serde_json::Value) -> Result<()> {
+    let client = hl_client(home, network)?;
+    let value = client.info(body).await?;
+    std::io::Write::write_all(&mut std::io::stdout(), &pretty_json(&value))?;
+    Ok(())
+}
+
+async fn test_hl_reads(home: &HomeDir, network: &str, user: &str, coin: &str) -> Result<()> {
+    let client = hl_client(home, network)?;
+    let now = bloom_hyperliquid::now_ms();
+    let start = now.saturating_sub(60 * 60 * 1000);
+    let calls = [
+        ("account", hl_user_req("clearinghouseState", user)),
+        ("spot_state", hl_user_req("spotClearinghouseState", user)),
+        ("open_orders", hl_user_req("openOrders", user)),
+        (
+            "frontend_open_orders",
+            hl_user_req("frontendOpenOrders", user),
+        ),
+        ("fills", hl_user_req("userFills", user)),
+        (
+            "funding",
+            serde_json::json!({
+                "type": "userFunding",
+                "user": user.to_ascii_lowercase(),
+                "coin": coin,
+                "startTime": start,
+                "endTime": now,
+            }),
+        ),
+        ("portfolio", hl_user_req("portfolio", user)),
+        ("rate_limit", hl_user_req("userRateLimit", user)),
+        ("mids", serde_json::json!({"type": "allMids"})),
+        ("perp_meta", serde_json::json!({"type": "meta"})),
+        (
+            "perp_contexts",
+            serde_json::json!({"type": "metaAndAssetCtxs"}),
+        ),
+        ("spot_meta", serde_json::json!({"type": "spotMeta"})),
+        (
+            "spot_contexts",
+            serde_json::json!({"type": "spotMetaAndAssetCtxs"}),
+        ),
+        ("book", serde_json::json!({"type": "l2Book", "coin": coin})),
+        (
+            "candles",
+            serde_json::json!({
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": coin,
+                    "interval": "1m",
+                    "startTime": start,
+                    "endTime": now,
+                }
+            }),
+        ),
+    ];
+
+    let mut out = serde_json::Map::new();
+    for (name, body) in calls {
+        match client.info(body).await {
+            Ok(value) => {
+                out.insert(name.to_string(), value);
+            }
+            Err(e) => {
+                out.insert(
+                    name.to_string(),
+                    serde_json::json!({"error": e.to_string()}),
+                );
+            }
+        }
+    }
+    std::io::Write::write_all(
+        &mut std::io::stdout(),
+        &pretty_json(&serde_json::Value::Object(out)),
+    )?;
+    Ok(())
+}
+
+struct TestPostOnlyCancelArgs {
+    wallet: String,
+    coin: String,
+    asset: u32,
+    price: Option<String>,
+    size: Option<String>,
+    max_notional_usd: f64,
+    policy_session: bool,
+    danger_accept_live_orders: bool,
+    passphrase: Option<String>,
+    network: String,
+}
+
+async fn test_hl_post_only_cancel(home: HomeDir, args: TestPostOnlyCancelArgs) -> Result<()> {
+    if !args.danger_accept_live_orders {
+        bail!("refusing live Hyperliquid test order without --danger-accept-live-orders");
+    }
+    if args.max_notional_usd <= 0.0 {
+        bail!("--max-notional-usd must be positive");
+    }
+    let network = hl_network(&args.network)?;
+    let client = hl_client(&home, &args.network)?;
+    let (price, size, notional) =
+        resolve_post_only_test_order(&client, &args.coin, args.price, args.size).await?;
+    if notional > args.max_notional_usd {
+        bail!(
+            "refusing test order notional ${notional:.4}; cap is ${:.4}",
+            args.max_notional_usd
+        );
+    }
+
+    let (_home_permit, d) = build_write_daemon(home)?;
+    let info = d.keystore.info(&args.wallet)?;
+    match info.kind {
+        bloom_keystore::WalletKind::PasskeyGated => {
+            if !args.policy_session {
+                bail!("passkey Hyperliquid signed test requires --policy-session");
+            }
+            let mut intent = CeremonyIntent::new(
+                &args.wallet,
+                "Authorize Hyperliquid Test Session",
+                CeremonyIntentKind::Other,
+            )
+            .with_address(bloom_proto::checksum_address(&info.address))
+            .summary(format!("Network: {}", args.network))
+            .summary(format!("Place one post-only {} perp order.", args.coin))
+            .summary(format!(
+                "Asset: {} price={} size={} notional≈${notional:.4}",
+                args.asset, price, size
+            ))
+            .summary("Cancel the order immediately if Hyperliquid accepts it as resting.")
+            .risk("This is a signed Hyperliquid Exchange action.")
+            .risk("The order is ALO/post-only and should not take liquidity.")
+            .risk(
+                "If Hyperliquid rejects the order, Bloom stops without trying a riskier fallback.",
+            )
+            .subject(serde_json::json!({
+                "action": "hyperliquid_post_only_cancel_test",
+                "network": args.network,
+                "wallet": args.wallet,
+                "asset": args.asset,
+                "coin": args.coin,
+                "price": price,
+                "size": size,
+                "max_notional_usd": args.max_notional_usd,
+            }));
+            intent = intent.policy("Denied in this test: withdrawals, market orders, third-party transfers, leverage changes, builder fees, vault/subaccount changes.");
+            d.keystore.lock(&args.wallet);
+            d.keystore
+                .unlock_passkey_with_intent(&args.wallet, Some(intent))
+                .await?;
+        }
+        _ => {
+            d.keystore
+                .unlock(&args.wallet, args.passphrase.as_deref().unwrap_or(""))?;
+        }
+    }
+
+    let signer = d.keystore.signer(&args.wallet)?;
+    let signer = HyperliquidSigner::new(signer);
+    let order = ExchangeAction::Order {
+        orders: vec![OrderWire {
+            asset: args.asset,
+            is_buy: true,
+            price: price.clone(),
+            size: size.clone(),
+            reduce_only: false,
+            order_type: OrderTypeWire {
+                limit: Some(LimitOrderType {
+                    tif: TimeInForce::Alo,
+                }),
+                trigger: None,
+            },
+            cloid: None,
+        }],
+        grouping: Grouping::Na,
+        builder: None,
+    };
+    let order_payload = sign_submit_payload(
+        &signer,
+        network,
+        SignSubmit {
+            action: order,
+            nonce: Some(bloom_hyperliquid::now_ms()),
+            vault_address: None,
+            expires_after: Some(bloom_hyperliquid::now_ms() + 60_000),
+        },
+    )
+    .await?;
+    let order_response = client
+        .exchange(order_payload)
+        .await
+        .context("submit post-only order")?;
+    let Some(oid) = order_response
+        .pointer("/response/data/statuses/0/resting/oid")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        let result = serde_json::json!({
+            "order": order_response,
+            "cancel": null,
+            "note": "order did not rest, so no cancel was submitted",
+        });
+        std::io::Write::write_all(&mut std::io::stdout(), &pretty_json(&result))?;
+        return Ok(());
+    };
+
+    let cancel = ExchangeAction::Cancel {
+        cancels: vec![CancelWire {
+            asset: args.asset,
+            oid,
+        }],
+        fast: None,
+    };
+    let cancel_payload = sign_submit_payload(
+        &signer,
+        network,
+        SignSubmit {
+            action: cancel,
+            nonce: Some(bloom_hyperliquid::now_ms() + 1),
+            vault_address: None,
+            expires_after: Some(bloom_hyperliquid::now_ms() + 60_000),
+        },
+    )
+    .await?;
+    let cancel_response = client
+        .exchange(cancel_payload)
+        .await
+        .context("submit cancel")?;
+    let result = serde_json::json!({
+        "order": order_response,
+        "cancel": cancel_response,
+    });
+    std::io::Write::write_all(&mut std::io::stdout(), &pretty_json(&result))?;
+    Ok(())
+}
+
+async fn resolve_post_only_test_order(
+    client: &HyperliquidClient,
+    coin: &str,
+    price: Option<String>,
+    size: Option<String>,
+) -> Result<(String, String, f64)> {
+    let price = match price {
+        Some(price) => price,
+        None => {
+            let mids = client.info(serde_json::json!({"type": "allMids"})).await?;
+            let mid = mids
+                .get(coin)
+                .and_then(serde_json::Value::as_str)
+                .with_context(|| format!("allMids did not include coin '{coin}'"))?
+                .parse::<f64>()
+                .with_context(|| format!("parse {coin} mid"))?;
+            // Far below the current mid: valid post-only smoke test, not a
+            // marketable buy under normal conditions.
+            format_decimal((mid * 0.5).floor(), 0)
+        }
+    };
+    let price_f = price.parse::<f64>().context("parse test price")?;
+    let size = match size {
+        Some(size) => size,
+        None => format_decimal((10.5 / price_f * 100_000.0).ceil() / 100_000.0, 5),
+    };
+    let size_f = size.parse::<f64>().context("parse test size")?;
+    let notional = price_f * size_f;
+    if notional < 10.0 {
+        bail!("test order notional ${notional:.4} is below Hyperliquid's documented $10 minimum");
+    }
+    Ok((price, size, notional))
+}
+
+fn format_decimal(value: f64, decimals: usize) -> String {
+    let mut s = if decimals == 0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.decimals$}")
+    };
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    s
+}
+
 #[cfg(not(feature = "mount"))]
 async fn mount_bloom(daemon: &Daemon, mount: Option<&std::path::Path>) -> Result<Option<()>> {
     let _ = daemon;
@@ -2074,4 +3765,86 @@ async fn unmount_bloom(handle: Option<bloom_mount::NfsMountHandle>) -> Result<()
 async fn unmount_bloom(handle: Option<()>) -> Result<()> {
     let _ = handle;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_body_with_wallet;
+
+    #[test]
+    fn request_wallet_injection_preserves_http_message_body() {
+        let input = concat!(
+            "POST https://api.example.com/data\n",
+            "content-type: application/json\n",
+            "\n",
+            "{\"ok\":true}"
+        )
+        .to_string();
+
+        let output = request_body_with_wallet(input, Some("gavin"));
+
+        assert!(output.starts_with("POST https://api.example.com/data wallet=gavin\n"));
+        assert!(output.ends_with("\n\n{\"ok\":true}"));
+        assert!(!output.ends_with("wallet=gavin"));
+    }
+
+    #[test]
+    fn request_wallet_injection_keeps_one_line_request_attrs() {
+        let output = request_body_with_wallet(
+            "GET https://api.example.com/data max_amount_usd=0.05".to_string(),
+            Some("gavin"),
+        );
+
+        assert_eq!(
+            output,
+            "GET https://api.example.com/data max_amount_usd=0.05 wallet=gavin"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hl_cli_tests {
+    use super::*;
+
+    #[test]
+    fn post_only_cancel_test_requires_danger_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(test_hl_post_only_cancel(
+                HomeDir::at(tmp.path()),
+                TestPostOnlyCancelArgs {
+                    wallet: "minnow".into(),
+                    coin: "BTC".into(),
+                    asset: 0,
+                    price: None,
+                    size: None,
+                    max_notional_usd: 15.0,
+                    policy_session: false,
+                    danger_accept_live_orders: false,
+                    passphrase: None,
+                    network: "mainnet".into(),
+                },
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("--danger-accept-live-orders"));
+    }
+
+    #[test]
+    fn hl_client_honors_config_endpoint_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(tmp.path());
+        let mut cfg = bloom_proto::Config::local_default();
+        cfg.hyperliquid = Some(bloom_proto::config::HyperliquidConfig {
+            mainnet_url: "http://localhost:9999/".into(),
+            ..Default::default()
+        });
+        std::fs::write(home.config_path(), toml::to_string(&cfg).unwrap()).unwrap();
+        // Mainnet uses the configured override.
+        let client = hl_client(&home, "mainnet").unwrap();
+        assert_eq!(client.base_url().as_str(), "http://localhost:9999/");
+        // Testnet wasn't overridden → default public endpoint.
+        let tclient = hl_client(&home, "testnet").unwrap();
+        assert!(tclient.base_url().as_str().contains("hyperliquid-testnet"));
+    }
 }

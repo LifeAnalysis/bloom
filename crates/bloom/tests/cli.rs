@@ -8,7 +8,13 @@
 //! in-process `IpcServer` to verify the "socket exists → route via IPC"
 //! branch in the CLI's vfs subcommand.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use assert_cmd::Command;
@@ -30,6 +36,50 @@ fn fresh_home() -> TempDir {
     tempfile::tempdir().expect("create temp home")
 }
 
+/// Write `passphrase` to a file under `home` and return its path string. Used
+/// to feed `--passphrase-file` for non-interactive passphrase-wallet creation
+/// (the only way to create a local wallet without a tty — passkey is default).
+fn write_passphrase_file(home: &Path, passphrase: &str) -> String {
+    let path = home.join(".passphrase");
+    std::fs::write(&path, passphrase).expect("write passphrase file");
+    path.to_string_lossy().into_owned()
+}
+
+fn http_fixture(
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &'static [u8],
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock HTTP server");
+    let addr = listener.local_addr().expect("mock server addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_thread = hits.clone();
+    let header_lines = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect::<String>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            hits_for_thread.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let reason = if status == 402 {
+                "Payment Required"
+            } else {
+                "OK"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\n{header_lines}\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        }
+    });
+    (format!("http://{addr}/resource"), hits)
+}
+
 #[test]
 fn help_lists_all_subcommands() {
     let home = fresh_home();
@@ -40,6 +90,7 @@ fn help_lists_all_subcommands() {
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("vfs"))
         .stdout(predicate::str::contains("wallet"))
+        .stdout(predicate::str::contains("request"))
         .stdout(predicate::str::contains("serve"))
         .stdout(predicate::str::contains("ipc"))
         .stdout(predicate::str::contains("petals"))
@@ -103,6 +154,7 @@ fn vfs_ls_root_lists_top_level_handlers() {
         "status",
         "wallets",
         "tools",
+        "requests",
         "docs",
     ] {
         assert!(
@@ -322,14 +374,32 @@ fn chain_ls_validators_does_not_take_home_write_lock() {
 #[test]
 fn wallet_new_then_list_round_trip() {
     let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "smoke-test-pass");
     let create = bloom_cmd(home.path())
-        .args(["wallet", "new", "alice", "--passphrase", "smoke-test-pass"])
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
         .assert()
         .success();
     let create_out = String::from_utf8(create.get_output().stdout.clone()).unwrap();
     assert!(
         create_out.contains("created wallet 'alice'"),
         "unexpected create output: {create_out}"
+    );
+    assert!(
+        create_out.contains("default_wallet: alice"),
+        "first wallet creation should announce default wallet selection: {create_out}"
+    );
+    let config = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    assert!(
+        config.contains("default_wallet = \"alice\""),
+        "config should persist default wallet, got:\n{config}"
     );
     // Address line is `created wallet 'alice': 0x...` — capture and reuse
     // the address to assert the listing matches what was just minted.
@@ -355,13 +425,22 @@ fn wallet_new_then_list_round_trip() {
 }
 
 #[test]
-fn wallet_new_via_env_passphrase() {
-    // BLOOM_PASSPHRASE feeds the same arg via env. Confirms the env path
-    // works and that the wallet ends up in the keystore directory on disk.
+fn wallet_new_local_via_passphrase_file() {
+    // BLOOM_PASSPHRASE no longer creates wallets — passkey is the default, and
+    // passphrase-wallet creation must be explicit: --local +
+    // --allow-passphrase-wallet + --passphrase-file (non-interactive).
     let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "env-pass-1");
     bloom_cmd(home.path())
-        .args(["wallet", "new", "bob"])
-        .env("BLOOM_PASSPHRASE", "env-pass-1")
+        .args([
+            "wallet",
+            "new",
+            "bob",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("created wallet 'bob'"));
@@ -373,6 +452,224 @@ fn wallet_new_via_env_passphrase() {
     assert!(
         bob_dir.join("encrypted.key").exists(),
         "expected keystore/bob/encrypted.key to be written"
+    );
+    assert!(
+        bob_dir.join("RECOVERY.txt").exists(),
+        "passphrase wallets must write a RECOVERY.txt"
+    );
+}
+
+/// Creating a passphrase wallet non-interactively WITHOUT --allow-passphrase-wallet
+/// must fail closed — this is the gate that stops an agent from silently minting
+/// a passphrase wallet. (assert_cmd stdin is not a tty.)
+#[test]
+fn wallet_new_local_refused_without_ack_when_noninteractive() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "pw");
+    let assert = bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "sneaky",
+            "--local",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .failure();
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        err.contains("--allow-passphrase-wallet"),
+        "error should demand the ack flag, got: {err}"
+    );
+    // Nothing was created.
+    assert!(
+        !home.path().join("keystore").join("sneaky").exists(),
+        "no wallet directory should exist after a refused creation"
+    );
+}
+
+/// A successful wallet creation appends a first-class `wallet.created` audit
+/// record — the CLI path does not flow through the VFS router, so without this
+/// event a CLI-created wallet leaves no trail (the original eth-long-1 bug).
+#[test]
+fn wallet_created_audit_event() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "audit-pass");
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "audited",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .success();
+    let audit = std::fs::read_to_string(home.path().join("audit.jsonl")).unwrap();
+    assert!(
+        audit.contains("\"kind\":\"wallet.created\"") && audit.contains("audited"),
+        "audit log should contain a wallet.created event for 'audited', got:\n{audit}"
+    );
+}
+
+#[test]
+fn request_cli_dry_run_uses_vfs_lifecycle_and_body_receipt_helpers() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "pw");
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .success();
+
+    let (url, hits) = http_fixture(200, &[("content-type", "text/plain")], b"cli-body\n");
+    let new = bloom_cmd(home.path())
+        .args(["request", "new", "--dry-run", &format!("GET {url}")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("request: sent/"))
+        .stdout(predicate::str::contains("dry_run: true"))
+        .get_output()
+        .stdout
+        .clone();
+    let new = String::from_utf8(new).unwrap();
+    let id = new
+        .lines()
+        .find_map(|line| line.strip_prefix("request: sent/"))
+        .expect("request id in request new output")
+        .trim()
+        .to_string();
+
+    bloom_cmd(home.path())
+        .args(["request", "plan", "latest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run: true"));
+    bloom_cmd(home.path())
+        .args(["request", "body", &id])
+        .assert()
+        .success()
+        .stdout(predicate::eq("cli-body\n"));
+    bloom_cmd(home.path())
+        .args(["request", "receipt", &id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"protocol\": \"free\""));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "read helpers must not re-issue HTTP"
+    );
+}
+
+#[test]
+fn status_on_empty_keystore_points_to_wallet_creation() {
+    let home = fresh_home();
+    let assert = bloom_cmd(home.path()).args(["status"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("no wallets yet"),
+        "empty status should say no wallet exists:\n{out}"
+    );
+    assert!(
+        out.contains("bloom wallet new main"),
+        "status should point at the explicit wallet command:\n{out}"
+    );
+}
+
+/// `wallet address <name>` prints the bare checksummed address; adding `--qr`
+/// prepends a scannable QR block while keeping the address line.
+#[test]
+fn wallet_address_with_and_without_qr() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "addr-smoke-pass");
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .success();
+
+    let plain = bloom_cmd(home.path())
+        .args(["wallet", "address", "alice"])
+        .assert()
+        .success();
+    let plain_out = String::from_utf8(plain.get_output().stdout.clone()).unwrap();
+    let addr = plain_out.trim();
+    assert!(
+        addr.starts_with("0x") && addr.len() == 42,
+        "plain output should be a bare address, got: {plain_out:?}"
+    );
+
+    let qr = bloom_cmd(home.path())
+        .args(["wallet", "address", "alice", "--qr"])
+        .assert()
+        .success();
+    let qr_out = String::from_utf8(qr.get_output().stdout.clone()).unwrap();
+    assert!(
+        qr_out.contains(addr),
+        "--qr output must still include the address:\n{qr_out}"
+    );
+    assert!(
+        qr_out.lines().count() > plain_out.lines().count(),
+        "--qr should add a QR block above the address:\n{qr_out}"
+    );
+}
+
+/// `wallet address <name> --qr-out <path>` writes a scannable SVG QR file and
+/// still prints the address; the SVG is a real `<svg>` document.
+#[test]
+fn wallet_address_qr_out_writes_svg() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "qr-out-pass");
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .success();
+    let svg_path = home.path().join("deposit.svg");
+    let out = bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "address",
+            "alice",
+            "--qr-out",
+            svg_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    // The bare address still goes to stdout (scriptable).
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.trim().starts_with("0x"), "stdout: {stdout:?}");
+    // The SVG file exists and is a real SVG document.
+    let svg = std::fs::read_to_string(&svg_path).expect("qr svg written");
+    assert!(
+        svg.contains("<svg") && svg.contains("</svg>"),
+        "expected an SVG document, got: {}",
+        &svg[..svg.len().min(80)]
     );
 }
 

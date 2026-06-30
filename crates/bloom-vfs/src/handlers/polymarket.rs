@@ -11,7 +11,7 @@ use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
 use bloom_chain::ChainClient;
 use bloom_keystore::{Keystore, KeystoreError};
-use bloom_polymarket::eip712::PUSD;
+use bloom_polymarket::eip712::{PUSD, PUSD_DECIMALS};
 use bloom_polymarket::onboard::OnEvent;
 use bloom_polymarket::order::{self, OrderType};
 use bloom_polymarket::order_store::{OrderDraft, render_plan_md};
@@ -34,7 +34,13 @@ pub const MARKETS_LIST_LIMIT: u32 = 20;
 const MARKET_FILES: [&str; 3] = ["market.json", "book.json", "prices.json"];
 const POSITION_FILES: [&str; 3] = ["positions.json", "trades.json", "activity.json"];
 const ONBOARD_RO_FILES: [&str; 3] = ["status.json", "plan.md", "approvals.json"];
-const ACCOUNT_FILES: [&str; 2] = ["portfolio.json", "orders.json"];
+const ACCOUNT_FILES: [&str; 5] = [
+    "portfolio.json",
+    "orders.json",
+    "status.json",
+    "buying_power.json",
+    "funding_options.json",
+];
 const FUND_FILES: [&str; 3] = ["plan.md", "request.json", "status.json"];
 const DRAFT_FILES: [&str; 5] = [
     "plan.md",
@@ -43,6 +49,48 @@ const DRAFT_FILES: [&str; 5] = [
     "quote.json",
     "review_intent.json",
 ];
+
+const ROOT_FILES: [&str; 1] = ["README.md"];
+
+const README: &[u8] = br#"# Polymarket Trading
+
+## Quick Start for Agents
+
+### 1. Read market data (no wallet needed)
+```json
+ /polymarket/markets/        # List active markets
+ /polymarket/markets/<slug>/         # Market detail (title, outcomes, prices)
+ /polymarket/positions/<wallet>/     # Current positions
+ /polymarket/account/<wallet>/status.json  # Onboarding state
+```
+
+### 2. Trading (CURRENT: per-trade human ceremony)
+Every value-moving action re-crosses the owner gate today:
+```json
+ bloom polymarket order <wallet> ...
+ bloom polymarket sell <wallet> ...
+ bloom polymarket confirm <wallet> <id>
+```
+
+A Polymarket capability primitive (scoped approve, TTL, caps, bounded window
+with no per-trade ceremony) is in active development. See
+`docs/plans/2026-06-20-agent-obvious-capability-model.md` for status.
+
+### 3. VFS staging (read-only review)
+Drafts can be created in the VFS but signing still requires the CLI:
+```json
+ write: /polymarket/trade/<wallet>/new     # Create a reviewable draft
+ read:  /polymarket/trade/<wallet>/drafts/<id>/plan.md
+```
+
+## Safety Model
+
+- Reads are always safe (no signing needed)
+- Policy checks (slug allow/deny, max order, max daily) run per action
+- Onboarding must complete (`bloom polymarket onboard <wallet>`) before any trade
+- Every value-moving CLI action requires a passkey ceremony or unlocked local wallet
+- Funds move only through the CLI; the VFS stages and reviews, it never signs
+"#;
 
 const BEGIN_HINT: &[u8] = b"write anything here to (re)run onboarding; run in the foreground for passkey wallets; rests at 'fund' for pUSD; progress + liveness: status.json\n";
 const TRADE_NEW_HINT: &[u8] = br#"write JSON to create a reviewable draft, e.g.
@@ -717,6 +765,9 @@ impl PolymarketHandler {
         if segs.is_empty() {
             return Ok(Entry::dir(""));
         }
+        if segs.len() == 1 && ROOT_FILES.contains(&segs[0].as_str()) {
+            return Ok(Entry::file(&segs[0]));
+        }
         match segs[0].as_str() {
             "markets" => match segs.len() {
                 1 => Ok(Entry::dir("markets")),
@@ -825,6 +876,7 @@ impl PolymarketHandler {
             (Some("fund"), 4) => self.read_fund(path, &segs[1], &segs[2], &segs[3]),
             (Some("trade"), 3) if segs[2] == "new" => Ok(TRADE_NEW_HINT.to_vec()),
             (Some("trade"), 5) => self.read_trade(path, &segs[1], &segs[2], &segs[3], &segs[4]),
+            (Some("README.md"), 1) => Ok(README.to_vec()),
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
@@ -1192,16 +1244,16 @@ impl PolymarketHandler {
     ) -> Result<Vec<u8>, HandlerError> {
         let ob = self.onboarding_or_not_found(path)?;
         let owner = self.wallet_address(wallet)?;
-        let creds = ob.creds.load(wallet).map_err(err_be)?.ok_or_else(|| {
-            HandlerError::invalid(format!(
-                "wallet '{wallet}' is not onboarded (no CLOB credentials); \
-                     write polymarket/onboard/{wallet}/begin first"
-            ))
-        })?;
         match file {
             // Sectioned by source so provenance is unambiguous: what the CLOB
             // believes vs. what the chain holds vs. where onboarding stands.
             "portfolio.json" => {
+                let creds = ob.creds.load(wallet).map_err(err_be)?.ok_or_else(|| {
+                    HandlerError::invalid(format!(
+                        "wallet '{wallet}' is not onboarded (no CLOB credentials); \
+                         write polymarket/onboard/{wallet}/begin first"
+                    ))
+                })?;
                 let st = ob.onboarder.status(wallet, owner).map_err(err_be)?;
                 let deposit: Address = st.deposit_wallet.parse().map_err(|_| {
                     HandlerError::backend("corrupt deposit_wallet in onboarding state")
@@ -1232,9 +1284,119 @@ impl PolymarketHandler {
                 }))
             }
             "orders.json" => {
+                let creds = ob.creds.load(wallet).map_err(err_be)?.ok_or_else(|| {
+                    HandlerError::invalid(format!(
+                        "wallet '{wallet}' is not onboarded (no CLOB credentials); \
+                         write polymarket/onboard/{wallet}/begin first"
+                    ))
+                })?;
                 let orders = self.clob.open_orders(&creds, owner).await.map_err(err_be)?;
                 pretty(&orders)
             }
+            // Polymarket *trading* state only. Owner native balance is NOT here;
+            // it is a chain fact at wallets/<w>/chains/<chain>/balance.json.
+            "status.json" => {
+                use bloom_polymarket::onboard::Stage;
+                let st = ob.onboarder.status(wallet, owner).map_err(err_be)?;
+                let deposit: Address = st.deposit_wallet.parse().map_err(|_| {
+                    HandlerError::backend("corrupt deposit_wallet in onboarding state")
+                })?;
+                let pusd = ob
+                    .chain
+                    .erc20_balance(PUSD, deposit)
+                    .await
+                    .map_err(err_be)?;
+                let tradeable = matches!(st.stage, Stage::Sync) && st.creds_present;
+                let approvals_granted = matches!(st.stage, Stage::Creds | Stage::Sync);
+                let next_required_action = if tradeable {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(format!(
+                        "continue onboarding (stage: {})",
+                        st.stage.as_str()
+                    ))
+                };
+                let fmt = bloom_proto::format_units(pusd, PUSD_DECIMALS);
+                pretty(&serde_json::json!({
+                    "wallet": wallet,
+                    "owner_address": bloom_proto::checksum_address(&owner),
+                    "deposit_wallet": st.deposit_wallet,
+                    "deposit_wallet_source": st.deposit_wallet_source,
+                    "mode": "deposit_wallet",
+                    "tradeable": tradeable,
+                    "onboarding_stage": st.stage.as_str(),
+                    "chain_id": st.chain_id,
+                    "approvals_granted": approvals_granted,
+                    "approve_tx_id": st.approve_tx_id,
+                    "balances": {
+                        "deposit_pusd": {
+                            "symbol": "pUSD",
+                            "raw": pusd.to_string(),
+                            "formatted": fmt,
+                            "display": format!("{fmt} pUSD"),
+                        }
+                    },
+                    "next_required_action": next_required_action,
+                }))
+            }
+            "buying_power.json" => {
+                let creds = ob.creds.load(wallet).map_err(err_be)?.ok_or_else(|| {
+                    HandlerError::invalid(format!(
+                        "wallet '{wallet}' is not onboarded (no CLOB credentials); \
+                         write polymarket/onboard/{wallet}/begin first"
+                    ))
+                })?;
+                use bloom_polymarket::onboard::Stage;
+                let st = ob.onboarder.status(wallet, owner).map_err(err_be)?;
+                let deposit: Address = st.deposit_wallet.parse().map_err(|_| {
+                    HandlerError::backend("corrupt deposit_wallet in onboarding state")
+                })?;
+                let clob_ba = self
+                    .clob
+                    .balance_allowance(&creds, owner, "COLLATERAL", 3)
+                    .await
+                    .map_err(err_be)?;
+                let pusd = ob
+                    .chain
+                    .erc20_balance(PUSD, deposit)
+                    .await
+                    .map_err(err_be)?;
+                let tradeable = matches!(st.stage, Stage::Sync) && st.creds_present;
+                let fmt = bloom_proto::format_units(pusd, PUSD_DECIMALS);
+                pretty(&serde_json::json!({
+                    "wallet": wallet,
+                    "spendable": {
+                        "asset": "pUSD",
+                        "raw": pusd.to_string(),
+                        "formatted": fmt,
+                        "source": "deposit_wallet",
+                        "clob_balance_allowance": clob_ba,
+                    },
+                    "native_funding_capacity_ref":
+                        format!("wallets/{wallet}/chains/polygon/balance.json"),
+                    "can_trade_now": tradeable && pusd > U256::ZERO,
+                    "funding_needed": pusd == U256::ZERO,
+                    "notes": [
+                        "Order size must be based on spendable pUSD, not owner native balance.",
+                        "Native funding capacity is not embedded here; read native_funding_capacity_ref."
+                    ],
+                }))
+            }
+            "funding_options.json" => pretty(&serde_json::json!({
+                "wallet": wallet,
+                "target_asset": "pUSD",
+                "options": [{
+                    "from": "native",
+                    "supported": true,
+                    "review_required": true,
+                    "notes": "Use Bloom Polymarket funding (`bloom polymarket fund` / `onboard --target-pusd`); do not call external DEX APIs directly."
+                }],
+                "limits": {
+                    "policy_caps_apply": true,
+                    "requires_quote": true,
+                    "native_value_caps_are_quantity_caps": true
+                }
+            })),
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
@@ -1279,7 +1441,7 @@ impl PolymarketHandler {
             deposit_wallet_source: st.deposit_wallet_source,
             deposit_wallet_fundable: st.deposit_wallet_fundable,
             current_pusd_raw: pusd.to_string(),
-            current_pusd: bloom_proto::units::format_units(pusd, 6),
+            current_pusd: bloom_proto::units::format_units(pusd, PUSD_DECIMALS),
             target_pusd: req.target_pusd,
             max_spend: req.max_spend,
             from_token: req.from_token.unwrap_or_else(|| "native".to_string()),
@@ -1399,6 +1561,7 @@ impl PolymarketHandler {
         match (segs.first().map(String::as_str), segs.len()) {
             (None, 0) => {
                 let mut entries = Vec::new();
+                entries.push(Entry::file("README.md"));
                 if self.onboarding_wired() {
                     entries.push(Entry::dir("account"));
                 }
@@ -1848,7 +2011,7 @@ mod tests {
             .into_iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(names, vec!["markets", "positions", "search"]);
+        assert_eq!(names, vec!["README.md", "markets", "positions", "search"]);
     }
 
     #[tokio::test]
@@ -1979,6 +2142,7 @@ mod tests {
         assert_eq!(
             root,
             vec![
+                "README.md",
                 "account",
                 "markets",
                 "onboard",
@@ -2188,6 +2352,38 @@ mod tests {
             .unwrap();
         let ov: serde_json::Value = serde_json::from_slice(&orders).unwrap();
         assert_eq!(ov[0]["id"], "order-1");
+    }
+
+    #[tokio::test]
+    async fn account_status_and_funding_options_do_not_need_creds() {
+        let (addr, _s) = spawn_scripted(vec![]).await;
+        let f = onboard_fixture(addr, true).await;
+
+        let status = f
+            .handler
+            .read(&p("/account/alice/status.json"))
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+        assert_eq!(status["wallet"], "alice");
+        assert_eq!(status["tradeable"], false);
+        assert_eq!(status["onboarding_stage"], "derive");
+        assert_eq!(status["balances"]["deposit_pusd"]["display"], "25 pUSD");
+
+        let funding = f
+            .handler
+            .read(&p("/account/alice/funding_options.json"))
+            .await
+            .unwrap();
+        let funding: serde_json::Value = serde_json::from_slice(&funding).unwrap();
+        assert_eq!(funding["target_asset"], "pUSD");
+
+        let err = f
+            .handler
+            .read(&p("/account/alice/buying_power.json"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not onboarded"), "{err}");
     }
 
     #[tokio::test]

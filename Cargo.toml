@@ -3,6 +3,9 @@ members = [
   "crates/bloom",
   "crates/bloom-daemon",
   "crates/bloom-vfs",
+  "crates/bloom-paid-mpp",
+  "crates/bloom-paid-x402",
+  "crates/bloom-paid-http",
   "crates/bloom-chain",
   "crates/bloom-rpc",
   "crates/bloom-tx",
@@ -10,6 +13,7 @@ members = [
   "crates/bloom-mempool",
   "crates/bloom-defi",
   "crates/bloom-polymarket",
+  "crates/bloom-hyperliquid",
   "crates/bloom-watch",
   "crates/bloom-mount",
   "crates/bloom-proto",
@@ -86,6 +90,7 @@ ml-dsa = { version = "0.1.0", features = ["getrandom", "zeroize"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+mpp = { version = "0.10.4", default-features = false, features = ["client", "tempo", "reqwest-rustls-tls"] }
 url = "2"
 humantime = "2"
 humantime-serde = "1"
@@ -106,6 +111,12 @@ wasmparser = "0.218"
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
 open = "5"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+# QR rendering for deposit addresses. `svg` is a dependency-free string renderer
+# (for `wallet address --qr-out`); we drop the heavy `image`/PNG renderer. The
+# built-in unicode renderer covers the terminal QR.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Echo-free passphrase entry for interactive wallet creation.
+rpassword = "7"
 
 # Ethereum stack
 alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract", "transport-throttle", "json-rpc"] }
@@ -119,9 +130,13 @@ bloom-rpc      = { path = "crates/bloom-rpc" }
 bloom-chain    = { path = "crates/bloom-chain" }
 bloom-tx       = { path = "crates/bloom-tx" }
 bloom-vfs      = { path = "crates/bloom-vfs" }
+bloom-paid-mpp = { path = "crates/bloom-paid-mpp" }
+bloom-paid-x402 = { path = "crates/bloom-paid-x402" }
+bloom-paid-http = { path = "crates/bloom-paid-http" }
 bloom-tools    = { path = "crates/bloom-tools" }
 bloom-defi     = { path = "crates/bloom-defi" }
 bloom-polymarket = { path = "crates/bloom-polymarket" }
+bloom-hyperliquid = { path = "crates/bloom-hyperliquid" }
 bloom-watch    = { path = "crates/bloom-watch" }
 bloom-mount    = { path = "crates/bloom-mount" }
 bloom-etherscan = { path = "crates/bloom-etherscan" }
