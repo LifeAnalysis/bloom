@@ -40,19 +40,123 @@ bloom gatekeeps every value-moving action through capabilities:
 To see what a wallet can do without a human, check its per-chain state and
 outbox, or its Hyperliquid sessions under `/hyperliquid/<net>/agent_sessions/`.
 A read-only `/wallets/<wallet>/capabilities/` roll-up and a VFS-root `/next.md`
-aggregator are in active development (see
-`docs/plans/2026-06-20-agent-obvious-capability-model.md`).
+aggregator expose the current capability and next-action view when the daemon
+has the relevant handlers mounted.
 
 Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
 Read `/polymarket/README.md` for prediction-market trading.
 Read `/defi/README.md` for DeFi intents via Enso shortcuts.
 
+## Mounted Sealed Approval flow
+
+When working through a mounted tree, a confirm write that needs fresh owner
+approval does **not** open a browser by itself. The daemon exposes the challenge
+first, then denies the triggering write so the writing agent can deliberately
+open or forward the ceremony URL.
+
+Expected mounted flow for value-moving outbox actions:
+
+```sh
+# 1. Stage a Petal action, then discover its concrete central action id.
+ls /bloom/outbox/pending
+cat /bloom/outbox/pending/<action_id>/plan.md
+
+# 2. Confirm through the Petal projection. This should fail with permission denied
+#    after the daemon writes approval_challenge.json.
+printf 'confirm\n' > /bloom/wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm
+
+# 3. Read the challenge from the same central action directory.
+cat /bloom/outbox/pending/<action_id>/approval_challenge.json
+```
+
+Before opening the ceremony, verify that `approval_challenge.json` has the same
+`action_id` as the directory you are acting on and that `expiry_ms` is still in
+the future. Then open or forward `ceremony_url`.
+
+The ceremony page offers two modes:
+
+- **grant**: mints only an in-memory daemon grant. Retry the same mounted
+  confirm write to execute from the sealed bytes.
+- **grant + execute**: mints the grant and executes immediately in the daemon.
+
+After execution, inspect `/outbox/sent/<action_id>/` or
+`/outbox/failed/<action_id>/` for `status.json`, `result.json`, and audit/result
+artifacts. Petal-specific wallet paths are projections of the same central
+action id; do not treat them as separate approval queues.
+
+## Editing a passkey wallet policy
+
+For a passkey (WebAuthn-gated) wallet, `policy.toml` is signed authorization
+state (`policy.toml.sig`). Editing it through the mount is a Sealed Approval
+action — the daemon installs both the new `policy.toml` and its matching
+signature only after owner approval. Local (passphrase) wallets keep their
+old behavior: the write applies immediately.
+
+```sh
+# 1. Read the current signed policy and edit it locally.
+cat /bloom/wallets/<wallet>/policy.toml
+
+# 2. Write the proposed policy. For a passkey wallet the first write fails with
+#    permission denied after the daemon stages a Sealed Approval challenge.
+printf '%s' "$edited_policy" > /bloom/wallets/<wallet>/policy.toml
+
+# 3. Discover and read the challenge through the mount (no BLOOM_HOME access).
+ls /bloom/wallets/<wallet>/policy-updates
+cat /bloom/wallets/<wallet>/policy-updates/<action_id>/status.json
+cat /bloom/wallets/<wallet>/policy-updates/<action_id>/approval_challenge.json
+
+# 4. Open or forward ceremony_url, approve, then retry the identical write.
+printf '%s' "$edited_policy" > /bloom/wallets/<wallet>/policy.toml
+```
+
+The retry must send the **same** proposed bytes: the action id (and therefore
+the grant) is bound to `blake3(old_policy)` and `blake3(proposed_policy)`.
+Different retry bytes re-derive a fresh action id and start a new challenge
+rather than reusing the prior approval. On the approved retry Bloom also
+re-checks that the current on-disk policy still matches the sealed baseline,
+signs the approved proposed policy through the host signer, writes
+`policy.toml.sig`, then installs `policy.toml` — so the wallet is never left with
+a new policy that lacks its matching signature.
+
+`status.json` and `approval_challenge.json` are read-only views: they carry
+bounded challenge metadata and `ceremony_url` only, never the signed approval or
+any key/PRF/grant material.
+
+Direct edits to `BLOOM_HOME/keystore/<wallet>/policy.toml` are **unsupported**
+for this flow. If a policy is mutated out of band and its `policy.toml.sig` goes
+stale, the passkey wallet fails closed on every signed path (including the first
+VFS policy write) with the signed-policy error; the mounted flow does not repair
+it. Recovering an externally-broken policy needs the admin helper
+`bloom wallet sign-policy <wallet>`, not this edit surface.
+
 ## Paid HTTP
 
 Paid HTTP requests live under `/requests`. Agents should stage the request,
 read `plan.md`, and confirm only when the quoted cost, network, asset, and
-merchant match the task. Bloom handles x402 internally; agents should not look
-for a separate `/x402` path.
+merchant match the task. Bloom handles x402 and Tempo MPP internally; agents
+should not look for separate `/x402` or `/mpp` paths.
+
+If paid confirmation needs passkey approval, the first confirm write may return
+permission denied after writing
+`/requests/pending/<id>/approval_challenge.json`. Read that file, check
+`action_id`, `expiry_ms`, merchant/payment details in `plan.md`, then open or
+forward `ceremony_url`. The foreground `bloom request confirm` command follows
+the same Sealed Approval ceremony and retry path.
+
+The ceremony mints a short-lived in-memory grant for the sealed request. x402
+and MPP then ask Bloom's host signer to sign the exact payment digest under that
+grant; one allowance is consumed atomically only when a signature is produced.
+Failed policy checks, bad attestations, failed credential preparation, or retry
+failures before signing do not consume the grant. Raw payment authorization
+headers, signed payloads, passkey material, and PRF output are not written to
+VFS artifacts; credential metadata is redacted.
+
+Request confirmation executes from the daemon's sealed paid-HTTP subject bytes
+and sealed policy snapshot. Files such as `request.toml`, `challenge.json`, and
+`policy_check.json` are views for agents. If a pending projection differs from
+the sealed subject, or `private/request_body` no longer matches the sealed body
+hash, confirmation fails before signing or minting credentials. Live policy may
+narrow or deny, but it cannot widen the already sealed payment terms.
 
 Example paid search:
 
@@ -103,18 +207,20 @@ blindly; inspect the wallet policy or ask the human to change it.
 
 ## Hyperliquid (session-first)
 
-Hyperliquid trading has two signing models:
+Hyperliquid trading uses Sealed Approval for owner authority:
 
-- **Agent sessions (RECOMMENDED):** one `approveAgent` ceremony creates an
-  ephemeral trading key. The agent trades inside policy bounds without further
-  human prompts. The session auto-expires and auto-flattens positions on breach.
-  Create at `/hyperliquid/mainnet/agent_sessions/<wallet>/new.json`.
-  Trade through the session at
-  `/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json`.
+- **Agent sessions (RECOMMENDED):** write an explicit session id to
+  `/hyperliquid/mainnet/agent_sessions/<wallet>/new.json`. If the write returns
+  permission denied, read that session directory's `approval_challenge.json`,
+  open or forward its `ceremony_url`, complete the grant ceremony, then retry
+  the same write. The resulting ephemeral API wallet trades inside policy
+  bounds at `/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json`
+  without additional owner prompts until the session expires or is stopped.
 
-- **Direct exchange writes (ADVANCED):** owner-signed one-off actions for
-  emergencies. Requires the wallet to be unlocked. Paths under
-  `/hyperliquid/<network>/exchange/<wallet>/...`.
+- **Owner actions:** `/hyperliquid/<network>/exchange/<wallet>/send_asset.json`
+  follows the same challenge/grant/retry flow and requires `transfer_cap_usd`.
+  Generic owner-signed order/cancel/update-leverage writes are disabled; use
+  agent sessions, or `raw_signed.json` for payloads signed outside Bloom.
 
 ## Polymarket
 
@@ -123,7 +229,8 @@ Prediction-market trading lives under `/polymarket` and is driven by the
 trades only after `[polymarket] enabled = true` is set in its `policy.toml`, and
 today every value-moving action opens a fresh passkey review ceremony. A
 Polymarket capability primitive (scoped approve, TTL, caps) is in active
-development — see `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
+development; until it lands, treat Polymarket value-moving actions as
+human-gated.
 
 Start at `/docs/examples.md` (the Polymarket section) and read
 `docs/polymarket-integration.md` in the repo for the full spec. Funds move only
