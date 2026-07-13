@@ -464,10 +464,13 @@ mod tests {
         assert_eq!(agents, expected);
         assert_eq!(claude, expected);
         let text = std::str::from_utf8(&agents).expect("guidance is utf-8");
-        assert!(text.contains("/docs"), "guidance should call out /docs");
         assert!(
-            text.contains("bloom vfs"),
-            "guidance should mention the bloom vfs CLI"
+            text.contains("cat docs/README.md"),
+            "guidance should use mounted filesystem examples"
+        );
+        assert!(
+            !text.contains("bloom vfs"),
+            "guidance should not mention the bloom vfs CLI"
         );
     }
 
