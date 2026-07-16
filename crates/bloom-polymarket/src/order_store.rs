@@ -25,10 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::onboard::validate_wallet_name;
 use crate::order::OrderType;
 use crate::types::Side;
-use crate::{PolymarketError, Result};
+use crate::{PolymarketError, Result, validate_wallet_name};
 
 const LOCK_STALE_MS: u128 = 5 * 60 * 1000;
 
@@ -547,7 +546,7 @@ pub fn render_plan_md(d: &OrderDraft) -> String {
         if d.signature_type == 3 {
             " — deposit wallet; owner EOA signs the wrapped POLY_1271 authorization"
         } else {
-            " — legacy EOA (the V2 CLOB rejects EOA makers at POST)"
+            " — legacy EOA (the CLOB rejects EOA makers at POST)"
         },
     ));
     s.push_str(&format!("Market:    {} ({})\n", d.question, d.slug));

@@ -38,6 +38,32 @@ fn fresh_home() -> TempDir {
     tempfile::tempdir().expect("create temp home")
 }
 
+fn write_file(root: &Path, rel: &str, body: &[u8]) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create fixture parent");
+    std::fs::write(path, body).expect("write fixture file");
+}
+
+fn write_demo_petal_package(root: &Path) {
+    write_file(
+        root,
+        "petal.toml",
+        br#"schema = "bloom.petal.package.v1"
+name = "demo"
+
+[consent]
+summary = "Demo app used by CLI tests."
+"#,
+    );
+    write_file(root, "README.md", b"# demo\n");
+    write_file(root, "AGENTS.md", b"# demo agents\n");
+    write_file(
+        root,
+        "petal/demo/hello.txt.wasm",
+        include_bytes!("../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"),
+    );
+}
+
 /// Write `passphrase` to a file under `home` and return its path string. Used
 /// to feed `--passphrase-file` for non-interactive passphrase-wallet creation
 /// (the only way to create a local wallet without a tty — passkey is default).
@@ -1165,175 +1191,108 @@ fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
     assert_eq!(writes[0].1, b"y");
 }
 
-/// End-to-end petals smoke test: install a WAT module from a file,
-/// confirm `petals ls` shows it under both its hash and its petname, then
-/// `petals run` it and check that WASI stdout reaches the parent process.
-/// The WAT writes a fixed string via `fd_write` and exits 0, so a success
-/// here proves the wasmtime engine, WASI shims, and the runner are wired
-/// through the daemon end to end.
 #[test]
-fn petals_install_then_ls_then_run() {
+fn petal_cli_build_install_list_and_vfs_read_happy_path() {
     let home = fresh_home();
-    let wat_path = home.path().join("hello.wat");
-    // Self-contained WASI petal: writes 21 bytes to fd 1 (stdout), exits 0.
-    // The iovec table at offset 32 points at the string at offset 0.
-    let wat = r#"
-        (module
-          (import "wasi_snapshot_preview1" "fd_write"
-            (func $fd_write (param i32 i32 i32 i32) (result i32)))
-          (import "wasi_snapshot_preview1" "proc_exit"
-            (func $exit (param i32)))
-          (memory (export "memory") 1)
-          (data (i32.const 0) "hello from cli petal\n")
-          (data (i32.const 32) "\00\00\00\00\15\00\00\00")
-          (func (export "_start")
-            (call $fd_write (i32.const 1) (i32.const 32) (i32.const 1) (i32.const 48))
-            drop
-            (call $exit (i32.const 0)))
-        )
-    "#;
-    std::fs::write(&wat_path, wat).unwrap();
+    let work = tempfile::tempdir().expect("create package workdir");
+    let package = work.path().join("demo-package");
+    let archive = work.path().join("demo.petal.tar");
+    write_demo_petal_package(&package);
 
-    let install = bloom_cmd(home.path())
-        .args([
-            "petals",
-            "install",
-            wat_path.to_str().unwrap(),
-            "--name",
-            "hello",
-        ])
+    let package_arg = package.to_str().unwrap();
+    let archive_arg = archive.to_str().unwrap();
+    bloom_cmd(home.path())
+        .args(["petals", "build", package_arg, "--out", archive_arg])
         .assert()
-        .success();
-    let install_out = String::from_utf8(install.get_output().stdout.clone()).unwrap();
-    let hash_line = install_out
-        .lines()
-        .find(|l| l.starts_with("hash: "))
-        .expect("install stdout must include a hash line");
-    let hash = hash_line.trim_start_matches("hash: ").trim();
-    assert_eq!(hash.len(), 64, "expected 64-char hex hash, got {hash:?}");
+        .success()
+        .stdout(predicate::str::contains("petal_mount: petals/demo/"))
+        .stdout(predicate::str::contains("routes: 1"))
+        .stdout(predicate::str::contains("archive: "));
+    assert!(
+        archive.is_file(),
+        "build should write {}",
+        archive.display()
+    );
 
-    let ls = bloom_cmd(home.path())
+    bloom_cmd(home.path())
+        .args(["petals", "install", archive_arg])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mode: petal"))
+        .stdout(predicate::str::contains("petal_mount: petals/demo/"))
+        .stdout(predicate::str::contains("routes: 1"));
+
+    bloom_cmd(home.path())
         .args(["petals", "ls"])
         .assert()
-        .success();
-    let ls_out = String::from_utf8(ls.get_output().stdout.clone()).unwrap();
-    // ls prints the first 12 chars of the hash plus the petname.
-    let short = &hash[..12];
-    assert!(
-        ls_out.contains(short),
-        "petals ls should mention installed hash {short}; got:\n{ls_out}"
-    );
-    assert!(
-        ls_out.contains("name=hello"),
-        "petals ls should show name=hello; got:\n{ls_out}"
-    );
+        .success()
+        .stdout(predicate::str::contains("app=petals/demo/"));
 
-    // Run via the petname.
-    let run_by_name = bloom_cmd(home.path())
-        .args(["petals", "run", "hello"])
-        .assert()
-        .success();
-    let stdout_name = String::from_utf8(run_by_name.get_output().stdout.clone()).unwrap();
-    assert_eq!(
-        stdout_name, "hello from cli petal\n",
-        "stdout from petal didn't match"
-    );
-
-    // Run via the bare hash.
-    let run_by_hash = bloom_cmd(home.path())
-        .args(["petals", "run", hash])
-        .assert()
-        .success();
-    let stdout_hash = String::from_utf8(run_by_hash.get_output().stdout.clone()).unwrap();
-    assert_eq!(stdout_hash, "hello from cli petal\n");
-}
-
-/// `bloom petals name <name> <hash>` binds a petname, and `name <name>`
-/// with no hash unbinds it. Verified by reading `public/<name>` via the
-/// VFS subcommand, which goes through the PetalsHandler we mounted in
-/// `bloom-daemon`.
-#[test]
-fn petals_name_bind_unbind_reflects_in_vfs() {
-    let home = fresh_home();
-    let wat_path = home.path().join("noop.wat");
-    // Minimal valid wasm module: `(module)` compiles to 8 bytes. We use
-    // a slightly fuller WAT just so it survives a wasmtime parse.
-    let wat = r#"(module (memory (export "memory") 1) (func (export "_start")))"#;
-    std::fs::write(&wat_path, wat).unwrap();
-
-    let install = bloom_cmd(home.path())
-        .args(["petals", "install", wat_path.to_str().unwrap()])
-        .assert()
-        .success();
-    let install_out = String::from_utf8(install.get_output().stdout.clone()).unwrap();
-    let hash = install_out
-        .lines()
-        .find(|l| l.starts_with("hash: "))
-        .unwrap()
-        .trim_start_matches("hash: ")
-        .trim()
-        .to_string();
-
-    // Bind a new petname.
     bloom_cmd(home.path())
-        .args(["petals", "name", "greet", &hash])
+        .args(["vfs", "cat", "/petals/demo/hello.txt"])
         .assert()
-        .success();
-
-    // `vfs ls /public` should expose the petname as a symlink. We just
-    // check the entry is listed; symlink targets aren't shown by the ls
-    // formatter, but the daemon-side handler emits the entry.
-    let ls = bloom_cmd(home.path())
-        .args(["vfs", "ls", "/public/local"])
-        .assert()
-        .success();
-    let ls_out = String::from_utf8(ls.get_output().stdout.clone()).unwrap();
-    assert!(
-        ls_out.lines().any(|l| l.starts_with("greet")),
-        "expected 'greet' entry under /public/local; got:\n{ls_out}"
-    );
-
-    // Unbind by omitting the hash.
-    bloom_cmd(home.path())
-        .args(["petals", "name", "greet"])
-        .assert()
-        .success();
-
-    let ls_after = bloom_cmd(home.path())
-        .args(["vfs", "ls", "/public/local"])
-        .assert()
-        .success();
-    let ls_after_out = String::from_utf8(ls_after.get_output().stdout.clone()).unwrap();
-    assert!(
-        !ls_after_out.lines().any(|l| l.starts_with("greet")),
-        "expected 'greet' entry removed; got:\n{ls_after_out}"
-    );
+        .success()
+        .stdout(predicate::eq("component"));
 }
 
 #[test]
-fn install_same_hash_same_mode_different_caps_returns_cap_mismatch() {
+#[ignore = "clones and builds the public Polymarket Petal source repo"]
+fn github_source_install_polymarket_dispatches_route_contract() {
+    let petal_ref = "f2d7adbd64f76fccf515e7f39f46af048047a4e3";
     let home = fresh_home();
-    let wat_path = home.path().join("hello.wat");
-    std::fs::write(&wat_path, "(module (func (export \"_start\")))").unwrap();
     bloom_cmd(home.path())
         .args([
             "petals",
             "install",
-            wat_path.to_str().unwrap(),
-            "--cap",
-            "vfs.read",
+            "https://github.com/bloom-directory/bloom-petal-polymarket",
+            "--ref",
+            petal_ref,
         ])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "source: bloom-directory/bloom-petal-polymarket@{petal_ref}"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "resolved_commit: {petal_ref}"
+        )))
+        .stdout(predicate::str::contains("routes: 94"));
+
+    bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "source=bloom-directory/bloom-petal-polymarket@{petal_ref}"
+        )));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/petals/polymarket/meta/route-contract.json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "bloom.polymarket.petal-route-contract.v1",
+        ));
+}
+
+#[test]
+fn petals_install_rejects_untrusted_owner_and_raw_remote_wasm() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["petals", "install", "https://github.com/not-bloom/petal"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsupported GitHub owner"));
+
     bloom_cmd(home.path())
         .args([
             "petals",
             "install",
-            wat_path.to_str().unwrap(),
-            "--cap",
-            "vfs.write",
+            "https://github.com/bloom-directory/petal/raw/main/route.wasm",
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("cap mismatch"));
+        .stderr(predicate::str::contains(
+            "raw remote .wasm installs are not supported",
+        ));
 }

@@ -188,8 +188,12 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
         run: rustup show
+      - name: Install wasm target
+        run: rustup target add wasm32-unknown-unknown
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+      - name: Install wasm-tools
+        uses: bytecodealliance/actions/wasm-tools/setup@v1
       - name: Download nextest archive
         uses: actions/download-artifact@v4
         with:
@@ -212,6 +216,10 @@ jobs:
             --no-fail-fast
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'kind(lib) and (package(bloom-defi) or package(bloom-etherscan) or package(bloom-polymarket) or package(bloom-prices))' \
+            --run-ignored ignored-only \
+            --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom) and test(github_source_install_polymarket_dispatches_route_contract)' \
             --run-ignored ignored-only \
             --no-fail-fast
 

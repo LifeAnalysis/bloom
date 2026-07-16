@@ -8,12 +8,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    /// May call `bloom_vfs_read`.
+    /// May call `vfs_read`.
     #[serde(rename = "vfs.read")]
     VfsRead,
-    /// May call `bloom_vfs_write`.
+    /// May call `vfs_write`.
     #[serde(rename = "vfs.write")]
     VfsWrite,
+    /// May call `http_fetch`.
+    #[serde(rename = "net.fetch")]
+    NetFetch,
+    /// May call `sign_hash`.
+    #[serde(rename = "sign")]
+    Sign,
+    /// May call `store_*`.
+    #[serde(rename = "store")]
+    Store,
+    /// May perform mediated chain reads.
+    #[serde(rename = "chain")]
+    Chain,
+    /// May stage and confirm generic EVM outbox entries.
+    #[serde(rename = "tx.outbox")]
+    TxOutbox,
 }
 
 impl Capability {
@@ -21,6 +36,11 @@ impl Capability {
         match self {
             Capability::VfsRead => "vfs.read",
             Capability::VfsWrite => "vfs.write",
+            Capability::NetFetch => "net.fetch",
+            Capability::Sign => "sign",
+            Capability::Store => "store",
+            Capability::Chain => "chain",
+            Capability::TxOutbox => "tx.outbox",
         }
     }
 
@@ -28,6 +48,11 @@ impl Capability {
         match s {
             "vfs.read" => Some(Capability::VfsRead),
             "vfs.write" => Some(Capability::VfsWrite),
+            "net.fetch" => Some(Capability::NetFetch),
+            "sign" => Some(Capability::Sign),
+            "store" => Some(Capability::Store),
+            "chain" => Some(Capability::Chain),
+            "tx.outbox" => Some(Capability::TxOutbox),
             _ => None,
         }
     }
@@ -67,6 +92,30 @@ pub struct PetalMeta {
     pub caps: BTreeSet<Capability>,
     #[serde(default)]
     pub mode: PetalMode,
+    #[serde(default)]
+    pub petal: Option<PetalPackageMeta>,
+    #[serde(default)]
+    pub source: Option<PetalSourceProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PetalPackageMeta {
+    pub name: String,
+    pub petal_root: String,
+    pub route_index_schema: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PetalSourceProvenance {
+    pub source_kind: String,
+    pub url: String,
+    pub owner: String,
+    pub repo: String,
+    pub requested_ref: String,
+    pub resolved_commit: String,
+    #[serde(default)]
+    pub selected_tag: Option<String>,
+    pub package_hash: String,
 }
 
 impl PetalMeta {
@@ -81,7 +130,7 @@ impl PetalMeta {
 
 /// Validate that a (mode, caps) pair is allowed at install time.
 ///
-/// - `Local` may declare `{vfs.read, vfs.write}`.
+/// - `Local` may declare `{vfs.read, vfs.write, net.fetch, sign, store, chain}`.
 ///
 /// Returns `Err` on the first offending capability; the remaining caps
 /// are not inspected.
@@ -92,7 +141,16 @@ pub fn validate_mode_caps(
     for cap in caps {
         let ok = matches!(
             (mode, *cap),
-            (PetalMode::Local, Capability::VfsRead | Capability::VfsWrite)
+            (
+                PetalMode::Local,
+                Capability::VfsRead
+                    | Capability::VfsWrite
+                    | Capability::NetFetch
+                    | Capability::Sign
+                    | Capability::Store
+                    | Capability::Chain
+                    | Capability::TxOutbox
+            )
         );
         if !ok {
             return Err(crate::error::PetalError::ModeCapMismatch {
@@ -112,8 +170,18 @@ mod tests {
     fn capability_string_roundtrip() {
         assert_eq!(Capability::VfsRead.as_str(), "vfs.read");
         assert_eq!(Capability::VfsWrite.as_str(), "vfs.write");
+        assert_eq!(Capability::NetFetch.as_str(), "net.fetch");
+        assert_eq!(Capability::Sign.as_str(), "sign");
+        assert_eq!(Capability::Store.as_str(), "store");
+        assert_eq!(Capability::Chain.as_str(), "chain");
+        assert_eq!(Capability::TxOutbox.as_str(), "tx.outbox");
         assert_eq!(Capability::parse("vfs.read"), Some(Capability::VfsRead));
         assert_eq!(Capability::parse("vfs.write"), Some(Capability::VfsWrite));
+        assert_eq!(Capability::parse("net.fetch"), Some(Capability::NetFetch));
+        assert_eq!(Capability::parse("sign"), Some(Capability::Sign));
+        assert_eq!(Capability::parse("store"), Some(Capability::Store));
+        assert_eq!(Capability::parse("chain"), Some(Capability::Chain));
+        assert_eq!(Capability::parse("tx.outbox"), Some(Capability::TxOutbox));
         assert_eq!(Capability::parse("nope"), None);
     }
 
@@ -128,6 +196,8 @@ mod tests {
             name: Some("hello".into()),
             caps,
             mode: PetalMode::default(),
+            petal: None,
+            source: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         let m2: PetalMeta = serde_json::from_str(&s).unwrap();
@@ -187,6 +257,20 @@ mod tests {
         assert!(
             validate_mode_caps(PetalMode::Local, &vfs_read).is_ok(),
             "Local + {{vfs.read}} should be ok"
+        );
+
+        let mut chain = BTreeSet::new();
+        chain.insert(Capability::Chain);
+        assert!(
+            validate_mode_caps(PetalMode::Local, &chain).is_ok(),
+            "Local + {{chain}} should be ok"
+        );
+
+        let mut tx_outbox = BTreeSet::new();
+        tx_outbox.insert(Capability::TxOutbox);
+        assert!(
+            validate_mode_caps(PetalMode::Local, &tx_outbox).is_ok(),
+            "Local + {{tx.outbox}} should be ok"
         );
     }
 }

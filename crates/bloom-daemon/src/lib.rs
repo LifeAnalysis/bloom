@@ -16,7 +16,22 @@ mod price_oracle;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alloy::network::TransactionBuilder;
+use alloy::primitives::{Address, Bytes, U256};
+use alloy::rpc::types::eth::TransactionRequest;
+#[cfg(feature = "unsafe-debug-signer")]
+use alloy::signers::SignerSync;
+#[cfg(feature = "unsafe-debug-signer")]
+use alloy::signers::local::PrivateKeySigner;
+use base64::Engine as _;
 use bloom_auth::{AuthStore, StoreApprovalVerifier};
+use bloom_auth_api::{
+    AssuranceLevel, CANONICAL_INTENT_HEADER_SCHEMA_V1, CanonicalEnvelope, CanonicalIntentHeader,
+    DaemonGrantTerms, ExecutorKind, PETAL_PETAL_ID_PREFIX,
+    PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1, PetalPolicySnapshot, PetalSigningAttestationFacts,
+    PolicyCheckClass, PolicyCheckResult, SealedAction, SealedSignBatchEntry, SignHashRequest,
+    signing_attestation_facts_digest,
+};
 use bloom_evm::{ChainClient, ChainRegistry};
 
 use bloom_defi::EnsoClient;
@@ -25,16 +40,28 @@ use bloom_etherscan::EtherscanClient;
 use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
 use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
 use bloom_paid_http::PaidHttpChainRpcResolver;
-use bloom_petals::{NameRegistry, PetalRunner, PetalStore, PetalVm, PetalsHandler};
+use bloom_petals::abi::{
+    ApprovalRequired, ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome,
+    EvmTransactionRequest, PetalRouteContext,
+};
+use bloom_petals::{
+    HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy,
+    PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignBatchOutcome, SignBatchRequest,
+    SignOutcome, SignRequest,
+};
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient};
 use bloom_prices::PricesClient;
-use bloom_proto::{AddressBook, AuditLog, ChainSpec, Config, HomeDir, HomeWritePermit};
+use bloom_proto::audit::AuditRecord;
+use bloom_proto::{
+    AddressBook, AuditLog, ChainSpec, Config, GasStrategy, HomeDir, HomeWritePermit, RawIntent,
+    RawIntentBody,
+};
 use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
 };
-use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox};
-use bloom_tx::tx_engine::TxEngine;
+use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxState};
+use bloom_tx::tx_engine::{Eip1559FeeOverrides, TxEngine};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
@@ -45,12 +72,78 @@ use bloom_vfs::handlers::{
 };
 use bloom_vfs::{AuthServices, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
+use futures::StreamExt;
+use rand::RngCore;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use std::sync::Mutex;
+
+const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
+const PETAL_ACTION_TTL_MS: u64 = 120_000;
+const MAX_ACTIVE_PETAL_ACTION_IDENTITIES: usize = 4_096;
+const PETAL_SIGNING_SUBJECT_KIND: &str = "petal_sign_hash";
+const PETAL_SIGNING_SUBJECT_SCHEMA_V1: &str = "bloom.petal.sign_hash_subject.v1";
+const PETAL_SIGNING_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash.action.v1";
+const PETAL_SIGNING_BATCH_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash_batch.action.v1";
+const MAX_PETAL_SIGN_BATCH: usize = 16;
+
+#[derive(Clone)]
+struct PetalActionIdentity {
+    action_id: String,
+    expires_ms: u64,
+}
+
+#[derive(Default)]
+struct PetalActionIdentityCache {
+    entries: std::collections::HashMap<[u8; 32], PetalActionIdentity>,
+}
+
+impl PetalActionIdentityCache {
+    /// Keep one request identity for the challenge's complete live interval.
+    /// Expiry remains part of the action id, so the same scoped request gets a
+    /// fresh identity in its next lifecycle and cannot revive an old grant.
+    /// The fixed capacity fails closed rather than evicting a live approval.
+    fn resolve(
+        &mut self,
+        domain: &[u8],
+        action_id_prefix: &str,
+        fingerprint: &[u8],
+        now_ms: u64,
+    ) -> Result<PetalActionIdentity, HostError> {
+        self.entries
+            .retain(|_, identity| identity.expires_ms > now_ms);
+
+        let mut request_hasher = blake3::Hasher::new();
+        request_hasher.update(domain);
+        request_hasher.update(fingerprint);
+        let request_key = *request_hasher.finalize().as_bytes();
+        if let Some(identity) = self.entries.get(&request_key) {
+            return Ok(identity.clone());
+        }
+        if self.entries.len() >= MAX_ACTIVE_PETAL_ACTION_IDENTITIES {
+            return Err(HostError::Backend(
+                "too many active petal signing approval identities".into(),
+            ));
+        }
+
+        let expires_ms = now_ms
+            .checked_add(PETAL_ACTION_TTL_MS)
+            .ok_or_else(|| HostError::Backend("petal action expiry overflow".into()))?;
+        let mut action_hasher = blake3::Hasher::new();
+        action_hasher.update(domain);
+        action_hasher.update(fingerprint);
+        action_hasher.update(&expires_ms.to_be_bytes());
+        let identity = PetalActionIdentity {
+            action_id: format!("{action_id_prefix}{}", action_hasher.finalize().to_hex()),
+            expires_ms,
+        };
+        self.entries.insert(request_key, identity.clone());
+        Ok(identity)
+    }
+}
 
 /// Concrete adapter that bridges [`CentralOutbox`] (filesystem) and
 /// [`AuthStore`] (action_id_map) to satisfy [`CentralOutboxProjection`]
@@ -155,6 +248,1450 @@ pub enum DaemonError {
     Io(#[from] std::io::Error),
     #[error("watch: {0}")]
     Watch(String),
+}
+
+struct DaemonPetalHost {
+    vfs: Arc<LateVfsHost>,
+    http: reqwest::Client,
+    audit: Arc<AuditLog>,
+    auth_services: AuthServices,
+    tx_outbox: Option<PetalTxOutbox>,
+    tx_stage_lock: tokio::sync::Mutex<()>,
+    sign_batch_lock: tokio::sync::Mutex<()>,
+    petal_action_identities: Mutex<PetalActionIdentityCache>,
+    #[cfg(feature = "unsafe-debug-signer")]
+    unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
+}
+
+#[derive(Clone)]
+struct PetalTxOutbox {
+    tx_engine: TxEngine,
+    chains: ChainRegistry,
+    keystore: Keystore,
+    address_book: Arc<AddressBook>,
+    write_permit: Option<Arc<HomeWritePermit>>,
+}
+
+impl DaemonPetalHost {
+    fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>, auth_services: AuthServices) -> Self {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("daemon petal http client must build");
+        Self {
+            vfs,
+            http,
+            audit,
+            auth_services,
+            tx_outbox: None,
+            tx_stage_lock: tokio::sync::Mutex::new(()),
+            sign_batch_lock: tokio::sync::Mutex::new(()),
+            petal_action_identities: Mutex::new(PetalActionIdentityCache::default()),
+            #[cfg(feature = "unsafe-debug-signer")]
+            unsafe_debug_signer: None,
+        }
+    }
+
+    fn with_tx_outbox(mut self, tx_outbox: PetalTxOutbox) -> Self {
+        self.tx_outbox = Some(tx_outbox);
+        self
+    }
+
+    #[cfg(feature = "unsafe-debug-signer")]
+    fn with_unsafe_debug_signer(mut self, wallet: String, signer: Arc<PrivateKeySigner>) -> Self {
+        self.unsafe_debug_signer = Some((wallet, signer));
+        self
+    }
+
+    #[cfg(feature = "unsafe-debug-signer")]
+    fn unsafe_debug_signer(&self, wallet: &str) -> Option<&Arc<PrivateKeySigner>> {
+        self.unsafe_debug_signer
+            .as_ref()
+            .filter(|(configured, _)| configured == wallet)
+            .map(|(_, signer)| signer)
+    }
+
+    fn petal_execution_origin(
+        context: &PetalRouteContext,
+    ) -> Result<bloom_proto::plan::ExecutionOrigin, HostError> {
+        if context.petal_root.trim().is_empty()
+            || context.route_id.trim().is_empty()
+            || !bloom_petals::store::is_valid_hex_hash(&context.package_hash)
+            || !matches!(context.op.as_str(), "lookup" | "list" | "read" | "write")
+        {
+            return Err(HostError::Invalid(
+                "trusted Petal route context is incomplete or has an invalid package hash".into(),
+            ));
+        }
+        Ok(bloom_proto::plan::ExecutionOrigin {
+            petal_id: format!("{PETAL_PETAL_ID_PREFIX}{}", context.petal_root),
+            petal_digest: context.package_hash.clone(),
+            petal_version: "v1-package".into(),
+        })
+    }
+
+    fn validate_petal_signing_scope(
+        req: &SignRequest,
+        context: &PetalRouteContext,
+    ) -> Result<std::collections::BTreeMap<String, String>, HostError> {
+        if req.wallet.trim().is_empty() || req.purpose.trim().is_empty() {
+            return Err(HostError::Invalid(
+                "sign-hash wallet and intent must be non-empty".into(),
+            ));
+        }
+        if context.petal_root.trim().is_empty()
+            || context.route_id.trim().is_empty()
+            || !bloom_petals::store::is_valid_hex_hash(&context.package_hash)
+        {
+            return Err(HostError::Invalid(
+                "trusted Petal route context is incomplete or has an invalid package hash".into(),
+            ));
+        }
+        if !matches!(context.op.as_str(), "lookup" | "list" | "read" | "write") {
+            return Err(HostError::Invalid(
+                "trusted Petal route context has an invalid operation".into(),
+            ));
+        }
+        let mut params = std::collections::BTreeMap::new();
+        for (key, value) in &context.params {
+            if params.insert(key.clone(), value.clone()).is_some() {
+                return Err(HostError::Invalid(
+                    "trusted Petal route context has duplicate parameter names".into(),
+                ));
+            }
+        }
+        Ok(params)
+    }
+
+    fn petal_action(
+        &self,
+        req: &SignRequest,
+        context: &PetalRouteContext,
+        now_ms: u64,
+    ) -> Result<(SealedAction, bloom_auth_api::SigningAttestation), HostError> {
+        self.petal_action_with_identity(req, context, now_ms, None)
+    }
+
+    fn petal_action_with_identity(
+        &self,
+        req: &SignRequest,
+        context: &PetalRouteContext,
+        now_ms: u64,
+        identity: Option<&PetalActionIdentity>,
+    ) -> Result<(SealedAction, bloom_auth_api::SigningAttestation), HostError> {
+        let params = Self::validate_petal_signing_scope(req, context)?;
+
+        let hash_hex = format!("0x{}", hex::encode(req.hash32));
+        let fingerprint = serde_json::to_vec(&serde_json::json!({
+            "wallet": req.wallet,
+            "hash_hex": hash_hex,
+            "intent": req.purpose,
+            "petal_root": context.petal_root,
+            "package_hash": context.package_hash,
+            "route_id": context.route_id,
+            "op": context.op,
+            "path": context.path,
+            "params": params,
+            "actor": context.actor,
+        }))
+        .map_err(|e| HostError::Backend(format!("encode petal action fingerprint: {e}")))?;
+        let identity = match identity {
+            Some(identity) => identity.clone(),
+            None => self
+                .petal_action_identities
+                .lock()
+                .map_err(|e| HostError::Backend(format!("lock petal action identities: {e}")))?
+                .resolve(
+                    PETAL_SIGNING_ACTION_DOMAIN,
+                    "appsign-",
+                    &fingerprint,
+                    now_ms,
+                )?,
+        };
+        let action_id = identity.action_id;
+        let expires_ms = identity.expires_ms;
+        let petal_id = format!("{PETAL_PETAL_ID_PREFIX}{}", context.petal_root);
+        let header = CanonicalIntentHeader {
+            schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
+            wallet: req.wallet.clone(),
+            surface: "petals".into(),
+            action_id: action_id.clone(),
+            petal_id: petal_id.clone(),
+            petal_digest: context.package_hash.clone(),
+            petal_version: "v1-package".into(),
+            executor_kind: ExecutorKind::Wasm,
+            network: "local".into(),
+            account: req.wallet.clone(),
+            action_kind: "petal.sign_hash".into(),
+            value_movement: true,
+            authority_change: true,
+            expires_ms,
+        };
+        let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Standard);
+        terms.max_ttl_secs = PETAL_ACTION_TTL_MS / 1_000;
+        terms.max_signatures = 1;
+        terms.allowed_sign_intents = vec![req.purpose.clone()];
+        terms.extra.insert(
+            "required.signing_hash".into(),
+            serde_json::Value::String(hash_hex.clone()),
+        );
+
+        let mut snapshot = PetalPolicySnapshot::minimal(&header);
+        snapshot.config.insert(
+            "petal_root".into(),
+            serde_json::Value::String(context.petal_root.clone()),
+        );
+        snapshot.config.insert(
+            "package_hash".into(),
+            serde_json::Value::String(context.package_hash.clone()),
+        );
+        snapshot.config.insert(
+            "route_id".into(),
+            serde_json::Value::String(context.route_id.clone()),
+        );
+        let policy_snapshot_digest = snapshot
+            .petal_policy_digest()
+            .map_err(|e| HostError::Backend(format!("digest petal policy snapshot: {e}")))?;
+        let facts = PetalSigningAttestationFacts {
+            facts_schema: PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+            action_id,
+            wallet: req.wallet.clone(),
+            surface: "petals".into(),
+            petal_id,
+            petal_digest: context.package_hash.clone(),
+            petal_version: "v1-package".into(),
+            petal_root: context.petal_root.clone(),
+            package_hash: context.package_hash.clone(),
+            route_id: context.route_id.clone(),
+            op: context.op.clone(),
+            path: context.path.clone(),
+            params,
+            actor: context.actor.clone(),
+            intent: req.purpose.clone(),
+            signing_hash: hash_hex,
+            policy_snapshot_digest,
+        };
+        let facts_map = facts
+            .to_facts_map()
+            .map_err(|e| HostError::Backend(format!("encode petal signing facts: {e}")))?;
+        let facts_digest = signing_attestation_facts_digest(&facts_map)
+            .map_err(|e| HostError::Backend(format!("digest petal signing facts: {e}")))?;
+        terms.extra.insert(
+            "required.attestation_facts_digest".into(),
+            serde_json::Value::String(facts_digest),
+        );
+        let attestation = facts
+            .signing_attestation()
+            .map_err(|e| HostError::Backend(format!("build petal signing attestation: {e}")))?;
+        let subject = serde_json::to_vec(&facts)
+            .map_err(|e| HostError::Backend(format!("encode petal signing subject: {e}")))?;
+        let envelope = CanonicalEnvelope::new(
+            header,
+            PETAL_SIGNING_SUBJECT_KIND,
+            PETAL_SIGNING_SUBJECT_SCHEMA_V1,
+            subject,
+        );
+        let plan = format!(
+            "# Approve Petal signature\n\nPetal: `{}`\nPackage: `{}`\nRoute: `{}` {} `{}`\nWallet: `{}`\nIntent: `{}`\nHash: `{}`\n",
+            context.petal_root,
+            context.package_hash,
+            context.route_id,
+            context.op,
+            context.path,
+            req.wallet,
+            req.purpose,
+            attestation
+                .facts
+                .get("signing_hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+        );
+        let action = SealedAction::new(
+            envelope,
+            plan,
+            vec![PolicyCheckResult {
+                rule_id: "petal.route_provenance".into(),
+                rule_class: PolicyCheckClass::Informational,
+                outcome: "pass".into(),
+                message: "signature request is bound to the resolved Petal package and route"
+                    .into(),
+                step_up_ceiling: None,
+            }],
+            terms,
+            snapshot,
+            now_ms,
+        )
+        .map_err(|e| HostError::Backend(format!("seal petal signing action: {e}")))?;
+        Ok((action, attestation))
+    }
+
+    fn petal_batch_action(
+        &self,
+        requests: &[SignRequest],
+        now_ms: u64,
+    ) -> Result<(SealedAction, Vec<bloom_auth_api::SigningAttestation>), HostError> {
+        if requests.is_empty() || requests.len() > MAX_PETAL_SIGN_BATCH {
+            return Err(HostError::Invalid(format!(
+                "petal signing batch requires 1..={MAX_PETAL_SIGN_BATCH} requests"
+            )));
+        }
+        let first_context = requests[0].context.as_ref().ok_or_else(|| {
+            HostError::Denied("signing batch requires trusted Petal route context".into())
+        })?;
+        let first_wallet = requests[0].wallet.as_str();
+        let mut seen = std::collections::BTreeSet::new();
+        for request in requests {
+            if request.wallet != first_wallet || request.context.as_ref() != Some(first_context) {
+                return Err(HostError::Invalid(
+                    "signing batch entries must share one wallet and trusted route context".into(),
+                ));
+            }
+            let tuple = (
+                request.wallet.clone(),
+                request.hash32,
+                request.purpose.clone(),
+            );
+            if !seen.insert(tuple) {
+                return Err(HostError::Invalid(
+                    "signing batch contains a duplicate wallet/hash/intent entry".into(),
+                ));
+            }
+            Self::validate_petal_signing_scope(request, first_context)?;
+        }
+
+        let params = Self::validate_petal_signing_scope(&requests[0], first_context)?;
+        let request_fingerprint: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                serde_json::json!({
+                    "wallet": request.wallet,
+                    "hash_hex": format!("0x{}", hex::encode(request.hash32)),
+                    "intent": request.purpose,
+                })
+            })
+            .collect();
+        let fingerprint = serde_json::to_vec(&serde_json::json!({
+            "requests": request_fingerprint,
+            "petal_root": first_context.petal_root,
+            "package_hash": first_context.package_hash,
+            "route_id": first_context.route_id,
+            "op": first_context.op,
+            "path": first_context.path,
+            "params": params,
+            "actor": first_context.actor,
+        }))
+        .map_err(|e| HostError::Backend(format!("encode petal batch fingerprint: {e}")))?;
+        let identity = self
+            .petal_action_identities
+            .lock()
+            .map_err(|e| HostError::Backend(format!("lock petal action identities: {e}")))?
+            .resolve(
+                PETAL_SIGNING_BATCH_ACTION_DOMAIN,
+                "appsign-batch-",
+                &fingerprint,
+                now_ms,
+            )?;
+        let action_id = identity.action_id.clone();
+        let expires_ms = identity.expires_ms;
+
+        let mut individual = Vec::with_capacity(requests.len());
+        for request in requests {
+            individual.push(self.petal_action_with_identity(
+                request,
+                first_context,
+                now_ms,
+                Some(&identity),
+            )?);
+        }
+
+        let mut attestations = Vec::with_capacity(individual.len());
+        let mut entries = Vec::with_capacity(individual.len());
+        for ((_, attestation), request) in individual.into_iter().zip(requests) {
+            let mut facts = PetalSigningAttestationFacts::from_attestation(&attestation)
+                .map_err(|e| HostError::Backend(format!("decode petal attestation: {e}")))?;
+            facts.action_id = action_id.clone();
+            let attestation = facts
+                .signing_attestation()
+                .map_err(|e| HostError::Backend(format!("build batch attestation: {e}")))?;
+            entries.push(SealedSignBatchEntry {
+                wallet: request.wallet.clone(),
+                intent: request.purpose.clone(),
+                hash_hex: format!("0x{}", hex::encode(request.hash32)),
+                attestation_facts_digest: signing_attestation_facts_digest(&attestation.facts)
+                    .map_err(|e| HostError::Backend(format!("digest batch attestation: {e}")))?,
+            });
+            attestations.push(attestation);
+        }
+
+        let petal_id = format!("{PETAL_PETAL_ID_PREFIX}{}", first_context.petal_root);
+        let header = CanonicalIntentHeader {
+            schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
+            wallet: first_wallet.into(),
+            surface: "petals".into(),
+            action_id: action_id.clone(),
+            petal_id,
+            petal_digest: first_context.package_hash.clone(),
+            petal_version: "v1-package".into(),
+            executor_kind: ExecutorKind::Wasm,
+            network: "local".into(),
+            account: first_wallet.into(),
+            action_kind: "petal.sign_hash_batch".into(),
+            value_movement: true,
+            authority_change: true,
+            expires_ms,
+        };
+        let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Hardened);
+        terms.max_ttl_secs = PETAL_ACTION_TTL_MS / 1_000;
+        terms.max_signatures = u32::try_from(entries.len())
+            .map_err(|_| HostError::Invalid("signing batch is too large".into()))?;
+        terms.allowed_sign_intents = requests
+            .iter()
+            .map(|request| request.purpose.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        terms.extra.insert(
+            "required.signing_requests".into(),
+            serde_json::to_value(&entries)
+                .map_err(|e| HostError::Backend(format!("encode sealed signing batch: {e}")))?,
+        );
+        let mut snapshot = PetalPolicySnapshot::minimal(&header);
+        snapshot.config.insert(
+            "petal_root".into(),
+            serde_json::Value::String(first_context.petal_root.clone()),
+        );
+        snapshot.config.insert(
+            "package_hash".into(),
+            serde_json::Value::String(first_context.package_hash.clone()),
+        );
+        snapshot.config.insert(
+            "route_id".into(),
+            serde_json::Value::String(first_context.route_id.clone()),
+        );
+        let subject = serde_json::to_vec(&serde_json::json!({
+            "action_id": action_id,
+            "requests": entries,
+        }))
+        .map_err(|e| HostError::Backend(format!("encode petal batch subject: {e}")))?;
+        let plan_entries = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                format!(
+                    "{}. intent `{}`; hash `0x{}`",
+                    index + 1,
+                    request.purpose,
+                    hex::encode(request.hash32)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let action = SealedAction::new(
+            CanonicalEnvelope::new(
+                header,
+                "petal_sign_hash_batch",
+                "bloom.petal.sign_hash_batch_subject.v1",
+                subject,
+            ),
+            format!(
+                "# Approve Petal signature batch\n\nPetal: `{}`\nPackage: `{}`\nRoute: `{}` {} `{}`\nWallet: `{}`\n\n{}\n",
+                first_context.petal_root,
+                first_context.package_hash,
+                first_context.route_id,
+                first_context.op,
+                first_context.path,
+                first_wallet,
+                plan_entries,
+            ),
+            vec![PolicyCheckResult {
+                rule_id: "petal.route_provenance".into(),
+                rule_class: PolicyCheckClass::Informational,
+                outcome: "pass".into(),
+                message: "ordered signature batch is bound to the resolved Petal package and route".into(),
+                step_up_ceiling: None,
+            }],
+            terms,
+            snapshot,
+            now_ms,
+        )
+        .map_err(|e| HostError::Backend(format!("seal petal signing batch: {e}")))?;
+        Ok((action, attestations))
+    }
+
+    fn audit_http_fetch(
+        &self,
+        method: &str,
+        url: &str,
+        outcome: &str,
+        status: Option<u16>,
+        body_len: Option<usize>,
+        error: Option<&str>,
+    ) {
+        let mut data = serde_json::json!({
+            "method": method,
+            "target": audit_http_target(url),
+            "outcome": outcome,
+        });
+        if let Some(status) = status {
+            data["status"] = serde_json::json!(status);
+        }
+        if let Some(body_len) = body_len {
+            data["body_len"] = serde_json::json!(body_len);
+        }
+        if let Some(error) = error {
+            data["error"] = serde_json::json!(error);
+        }
+        if let Err(e) = self.audit.append(AuditRecord {
+            ts_ms: 0,
+            kind: "petal.http_fetch".into(),
+            wallet: None,
+            chain: None,
+            data,
+            prev: String::new(),
+            digest: String::new(),
+        }) {
+            warn!(error = %e, "petal.http_fetch.audit_append_failed");
+        }
+    }
+
+    fn audit_sign_hash(&self, req: &SignRequest, outcome: &str, error: Option<&str>) {
+        let mut data = serde_json::json!({
+            "purpose": req.purpose.as_str(),
+            "hash32": hex::encode(req.hash32),
+            "outcome": outcome,
+        });
+        if let Some(error) = error {
+            data["error"] = serde_json::json!(error);
+        }
+        if let Err(e) = self.audit.append(AuditRecord {
+            ts_ms: 0,
+            kind: "petal.sign_hash".into(),
+            wallet: Some(req.wallet.clone()),
+            chain: None,
+            data,
+            prev: String::new(),
+            digest: String::new(),
+        }) {
+            warn!(wallet = %req.wallet, error = %e, "petal.sign_hash.audit_append_failed");
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PetalHost for DaemonPetalHost {
+    async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+        self.vfs.vfs_lookup(path).await
+    }
+
+    async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+        self.vfs.vfs_read(path).await
+    }
+
+    async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+        self.vfs.vfs_list(path).await
+    }
+
+    async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+        self.vfs.vfs_write(path, bytes).await
+    }
+
+    async fn http_fetch(
+        &self,
+        req: HttpRequest,
+        policy: NetPolicy,
+        max_response_bytes: usize,
+    ) -> Result<HttpResponse, HostError> {
+        let mut method = req.method;
+        let mut url = req.url;
+        let mut body = req.body;
+        let mut headers = req.headers;
+        for redirect_count in 0..=PETAL_HTTP_MAX_REDIRECTS {
+            if let Err(e) = policy.check(&method, &url) {
+                self.audit_http_fetch(&method, &url, "denied", None, None, Some(&e.to_string()));
+                return Err(e);
+            }
+            let reqwest_method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| {
+                let err = HostError::Invalid(format!("http method: {e}"));
+                self.audit_http_fetch(&method, &url, "error", None, None, Some(&err.to_string()));
+                err
+            })?;
+            let mut builder = self.http.request(reqwest_method, &url);
+            for (name, value) in &headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            let resp = builder.body(body.clone()).send().await.map_err(|e| {
+                let err = HostError::Backend(format!("http_fetch send: {e}"));
+                self.audit_http_fetch(&method, &url, "error", None, None, Some(&err.to_string()));
+                err
+            })?;
+            let status = resp.status().as_u16();
+            if resp.status().is_redirection() {
+                let location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let Some(location) = location else {
+                    let err = HostError::Backend("http redirect missing Location".into());
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "error",
+                        Some(status),
+                        None,
+                        Some(&err.to_string()),
+                    );
+                    return Err(err);
+                };
+                if redirect_count == PETAL_HTTP_MAX_REDIRECTS {
+                    let err = HostError::Backend("http redirect limit exceeded".into());
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "error",
+                        Some(status),
+                        None,
+                        Some(&err.to_string()),
+                    );
+                    return Err(err);
+                }
+                let next_url = match resolve_redirect_target(&url, &location) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        self.audit_http_fetch(
+                            &method,
+                            &url,
+                            "error",
+                            Some(status),
+                            None,
+                            Some(&e.to_string()),
+                        );
+                        return Err(e);
+                    }
+                };
+                let next_method = redirect_method(&method, status);
+                if let Err(e) = policy.check(&next_method, &next_url) {
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "denied_redirect",
+                        Some(status),
+                        None,
+                        Some(&e.to_string()),
+                    );
+                    return Err(e);
+                }
+                if let Err(e) =
+                    prepare_redirect_request(&url, &next_url, &next_method, &mut headers, &mut body)
+                {
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "denied_redirect",
+                        Some(status),
+                        None,
+                        Some(&e.to_string()),
+                    );
+                    return Err(e);
+                }
+                self.audit_http_fetch(&method, &url, "redirect", Some(status), None, None);
+                method = next_method;
+                url = next_url;
+                continue;
+            }
+            let headers = resp
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            if resp.content_length().is_some_and(|len| {
+                usize::try_from(len)
+                    .map(|len| len > max_response_bytes)
+                    .unwrap_or(true)
+            }) {
+                let err = HostError::Backend("http response too large".into());
+                self.audit_http_fetch(
+                    &method,
+                    &url,
+                    "error",
+                    Some(status),
+                    None,
+                    Some(&err.to_string()),
+                );
+                return Err(err);
+            }
+            let mut body = Vec::new();
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    let err = HostError::Backend(format!("http_fetch body: {e}"));
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "error",
+                        Some(status),
+                        Some(body.len()),
+                        Some(&err.to_string()),
+                    );
+                    err
+                })?;
+                if body.len().saturating_add(chunk.len()) > max_response_bytes {
+                    let err = HostError::Backend("http response too large".into());
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "error",
+                        Some(status),
+                        Some(body.len().saturating_add(chunk.len())),
+                        Some(&err.to_string()),
+                    );
+                    return Err(err);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            self.audit_http_fetch(&method, &url, "ok", Some(status), Some(body.len()), None);
+            return Ok(HttpResponse {
+                status,
+                headers,
+                body,
+            });
+        }
+        unreachable!("bounded redirect loop returns before exhausting iterator")
+    }
+
+    async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
+        match self.sign_hash_outcome(req).await? {
+            SignOutcome::Signature(signature) => Ok(signature),
+            SignOutcome::ApprovalRequired(approval) => Err(HostError::Denied(format!(
+                "Sealed Approval required for Petal sign_hash; action_id={}; ceremony_url={}",
+                approval.action_id, approval.ceremony_url
+            ))),
+        }
+    }
+
+    async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
+        let Some(context) = req.context.as_ref() else {
+            let err = HostError::Denied(
+                "Petal sign_hash requires trusted Petal route context and a Sealed Approval grant"
+                    .into(),
+            );
+            self.audit_sign_hash(&req, "denied", Some(&err.to_string()));
+            return Err(err);
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let (action, attestation) = match self.petal_action(&req, context, now_ms) {
+            Ok(value) => value,
+            Err(err) => {
+                self.audit_sign_hash(&req, "denied", Some(&err.to_string()));
+                return Err(err);
+            }
+        };
+        #[cfg(feature = "unsafe-debug-signer")]
+        if let Some(signer) = self.unsafe_debug_signer(&req.wallet) {
+            tracing::warn!(
+                wallet = %req.wallet,
+                action_id = %action.action_id(),
+                "petal.unsafe_debug_signing_bypass"
+            );
+            let signature = signer
+                .sign_hash_sync(&alloy::primitives::B256::from(req.hash32))
+                .map_err(|e| HostError::Backend(format!("debug sign hash: {e}")))?
+                .as_bytes()
+                .to_vec();
+            self.audit_sign_hash(&req, "unsafe_debug_ok", None);
+            return Ok(SignOutcome::Signature(signature));
+        }
+        let active_grant = self
+            .auth_services
+            .require_grant_store()
+            .map_err(|e| HostError::Backend(e.to_string()))?
+            .get_active(
+                &req.wallet,
+                action.action_id(),
+                action.petal_id(),
+                action.petal_digest(),
+                now_ms,
+            )
+            .await
+            .map_err(|e| HostError::Backend(format!("lookup petal sealed grant: {e}")))?;
+        if active_grant.is_none() {
+            let writer = self
+                .auth_services
+                .require_writer()
+                .map_err(|e| HostError::Backend(e.to_string()))?;
+            writer
+                .stage_action(action.clone(), now_ms)
+                .await
+                .map_err(|e| HostError::Backend(format!("stage petal sealed action: {e}")))?;
+            let mut nonce = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            let challenge = writer
+                .issue_challenge(
+                    action.surface(),
+                    action.action_id(),
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce),
+                    action.expires_ms,
+                    now_ms,
+                )
+                .await
+                .map_err(|e| HostError::Backend(format!("issue petal approval challenge: {e}")))?
+                .with_local_ceremony_url();
+            let ceremony_url = challenge
+                .ceremony_url
+                .unwrap_or_else(|| "unavailable".into());
+            let approval = SignOutcome::ApprovalRequired(ApprovalRequired {
+                action_id: action.action_id().to_string(),
+                ceremony_url,
+                expires_ms: action.expires_ms,
+            });
+            self.audit_sign_hash(&req, "approval_required", None);
+            return Ok(approval);
+        }
+
+        let signature = self
+            .auth_services
+            .require_petal_host()
+            .map_err(|e| HostError::Backend(e.to_string()))?
+            .sign_hash(
+                SignHashRequest {
+                    wallet: req.wallet.clone(),
+                    action_id: action.action_id().to_string(),
+                    intent: req.purpose.clone(),
+                    hash_hex: format!("0x{}", hex::encode(req.hash32)),
+                },
+                &attestation,
+                now_ms,
+            )
+            .await
+            .map_err(|e| HostError::Denied(format!("petal sealed signing denied: {e}")))?;
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(signature.signature_b64)
+            .map_err(|e| HostError::Backend(format!("decode petal signature: {e}")))?;
+        if signature.len() != 65 {
+            let err = HostError::Backend("petal signer returned a non-65-byte signature".into());
+            self.audit_sign_hash(&req, "error", Some(&err.to_string()));
+            return Err(err);
+        }
+        self.audit_sign_hash(&req, "ok", None);
+        Ok(SignOutcome::Signature(signature))
+    }
+
+    async fn sign_hashes_outcome(
+        &self,
+        req: SignBatchRequest,
+    ) -> Result<SignBatchOutcome, HostError> {
+        let _guard = self.sign_batch_lock.lock().await;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let (action, attestations) = self.petal_batch_action(&req.requests, now_ms)?;
+        #[cfg(feature = "unsafe-debug-signer")]
+        if let Some(signer) = self.unsafe_debug_signer(action.wallet()) {
+            tracing::warn!(
+                wallet = %action.wallet(),
+                action_id = %action.action_id(),
+                count = req.requests.len(),
+                "petal.unsafe_debug_batch_signing_bypass"
+            );
+            let mut signatures = Vec::with_capacity(req.requests.len());
+            for request in &req.requests {
+                signatures.push(
+                    signer
+                        .sign_hash_sync(&alloy::primitives::B256::from(request.hash32))
+                        .map_err(|e| HostError::Backend(format!("debug batch sign hash: {e}")))?
+                        .as_bytes()
+                        .to_vec(),
+                );
+            }
+            return Ok(SignBatchOutcome::Signatures(signatures));
+        }
+        let active_grant = self
+            .auth_services
+            .require_grant_store()
+            .map_err(|e| HostError::Backend(e.to_string()))?
+            .get_active(
+                action.wallet(),
+                action.action_id(),
+                action.petal_id(),
+                action.petal_digest(),
+                now_ms,
+            )
+            .await
+            .map_err(|e| HostError::Backend(format!("lookup petal batch grant: {e}")))?;
+        if active_grant.is_none() {
+            let writer = self
+                .auth_services
+                .require_writer()
+                .map_err(|e| HostError::Backend(e.to_string()))?;
+            writer
+                .stage_action(action.clone(), now_ms)
+                .await
+                .map_err(|e| HostError::Backend(format!("stage petal signing batch: {e}")))?;
+            let mut nonce = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            let challenge = writer
+                .issue_challenge(
+                    action.surface(),
+                    action.action_id(),
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce),
+                    action.expires_ms,
+                    now_ms,
+                )
+                .await
+                .map_err(|e| HostError::Backend(format!("issue batch challenge: {e}")))?
+                .with_local_ceremony_url();
+            return Ok(SignBatchOutcome::ApprovalRequired(ApprovalRequired {
+                action_id: action.action_id().into(),
+                ceremony_url: challenge
+                    .ceremony_url
+                    .unwrap_or_else(|| "unavailable".into()),
+                expires_ms: action.expires_ms,
+            }));
+        }
+
+        let requests = req
+            .requests
+            .iter()
+            .map(|request| SignHashRequest {
+                wallet: request.wallet.clone(),
+                action_id: action.action_id().into(),
+                intent: request.purpose.clone(),
+                hash_hex: format!("0x{}", hex::encode(request.hash32)),
+            })
+            .collect();
+        let sealed = self
+            .auth_services
+            .require_petal_host()
+            .map_err(|e| HostError::Backend(e.to_string()))?
+            .sign_hash_batch(requests, &attestations, now_ms)
+            .await
+            .map_err(|e| HostError::Denied(format!("petal sealed batch signing denied: {e}")))?;
+        let mut signatures = Vec::with_capacity(sealed.len());
+        for signature in sealed {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(signature.signature_b64)
+                .map_err(|e| HostError::Backend(format!("decode batch signature: {e}")))?;
+            if bytes.len() != 65 {
+                return Err(HostError::Backend(
+                    "petal batch signer returned a non-65-byte signature".into(),
+                ));
+            }
+            signatures.push(bytes);
+        }
+        Ok(SignBatchOutcome::Signatures(signatures))
+    }
+
+    async fn evm_tx_stage(
+        &self,
+        req: EvmTransactionRequest,
+    ) -> Result<EvmOutboxOutcome, HostError> {
+        let context = req.context.as_ref().ok_or_else(|| {
+            HostError::Denied("Petal EVM outbox requires trusted Petal route context".into())
+        })?;
+        let origin = Self::petal_execution_origin(context)?;
+        let service = self
+            .tx_outbox
+            .as_ref()
+            .ok_or_else(|| HostError::Denied("EVM outbox is unavailable".into()))?;
+        let permit = service
+            .write_permit
+            .as_deref()
+            .ok_or_else(|| HostError::Denied("EVM outbox requires daemon write permit".into()))?;
+        if req.value_wei.is_empty() || !req.value_wei.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(HostError::Invalid(
+                "value-wei must be an unsigned decimal integer".into(),
+            ));
+        }
+        if !req.data_hex.starts_with("0x")
+            || !req.data_hex.len().is_multiple_of(2)
+            || req.data_hex != req.data_hex.to_ascii_lowercase()
+            || hex::decode(&req.data_hex[2..]).is_err()
+        {
+            return Err(HostError::Invalid(
+                "data-hex must be canonical 0x-prefixed hex".into(),
+            ));
+        }
+        let wallet = service
+            .keystore
+            .info(&req.wallet)
+            .map_err(|e| HostError::Invalid(format!("wallet: {e}")))?;
+        let chain = service
+            .chains
+            .get(&req.chain)
+            .ok_or_else(|| HostError::NotFound(format!("chain {}", req.chain)))?;
+        let fee_overrides = Eip1559FeeOverrides::from_decimal_pair(
+            req.max_fee_per_gas.as_deref(),
+            req.max_priority_fee_per_gas.as_deref(),
+            chain.spec().legacy_tx,
+        )
+        .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let requested_to = req
+            .to
+            .parse::<Address>()
+            .map_err(|error| HostError::Invalid(format!("to address: {error}")))?;
+        let requested_value = req
+            .value_wei
+            .parse::<U256>()
+            .map_err(|error| HostError::Invalid(format!("value-wei: {error}")))?;
+        // Keep pending-action reuse and staging atomic within the daemon. Without
+        // this guard, concurrent retries can both miss the pending scan.
+        let _stage_guard = self.tx_stage_lock.lock().await;
+        for pending_id in service
+            .tx_engine
+            .outbox
+            .list(&req.wallet, &req.chain, OutboxState::Pending)
+            .map_err(|error| HostError::Backend(format!("list pending EVM outbox: {error}")))?
+        {
+            let entry = service
+                .tx_engine
+                .outbox
+                .read_in_state(&req.wallet, &req.chain, &pending_id, OutboxState::Pending)
+                .map_err(|error| HostError::Backend(format!("read pending EVM outbox: {error}")))?;
+            if petal_pending_request_matches(
+                &entry.staged,
+                &req,
+                &origin,
+                requested_to,
+                requested_value,
+            ) {
+                return petal_outbox_outcome(
+                    &service.tx_engine,
+                    &req.wallet,
+                    &req.chain,
+                    &pending_id,
+                    None,
+                );
+            }
+        }
+        let staged = service
+            .tx_engine
+            .stage_with_execution_origin_and_fee_overrides(
+                permit,
+                &req.wallet,
+                wallet.address,
+                RawIntent {
+                    body: RawIntentBody::Raw {
+                        to: req.to,
+                        value: format!("{} wei", req.value_wei),
+                        data: req.data_hex,
+                    },
+                    chain: Some(req.chain.clone()),
+                    gas: GasStrategy::Auto,
+                    nonce: req.nonce,
+                    gas_limit_hint: None,
+                    usd_value_hint: None,
+                },
+                &chain,
+                &wallet.policy,
+                Some(service.address_book.as_ref()),
+                Some(origin),
+                fee_overrides,
+            )
+            .await
+            .map_err(|e| HostError::Backend(format!("stage EVM outbox: {e}")))?;
+        petal_outbox_outcome(
+            &service.tx_engine,
+            &req.wallet,
+            &req.chain,
+            &staged.id,
+            None,
+        )
+    }
+
+    async fn evm_tx_confirm(
+        &self,
+        wallet: String,
+        chain_name: String,
+        outbox_id: String,
+        acknowledge_warnings: bool,
+        context: Option<PetalRouteContext>,
+    ) -> Result<EvmOutboxOutcome, HostError> {
+        let context = context.as_ref().ok_or_else(|| {
+            HostError::Denied("Petal EVM outbox requires trusted Petal route context".into())
+        })?;
+        let origin = Self::petal_execution_origin(context)?;
+        let service = self
+            .tx_outbox
+            .as_ref()
+            .ok_or_else(|| HostError::Denied("EVM outbox is unavailable".into()))?;
+        let permit = service
+            .write_permit
+            .as_deref()
+            .ok_or_else(|| HostError::Denied("EVM outbox requires daemon write permit".into()))?;
+        let entry = service
+            .tx_engine
+            .outbox
+            .read(&wallet, &chain_name, &outbox_id)
+            .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
+        if entry.staged.resolved_execution_origin() != origin {
+            return Err(HostError::Denied(
+                "outbox entry was not staged by this trusted Petal".into(),
+            ));
+        }
+        let wallet_info = service
+            .keystore
+            .info(&wallet)
+            .map_err(|e| HostError::Invalid(format!("wallet: {e}")))?;
+        let chain = service
+            .chains
+            .get(&chain_name)
+            .ok_or_else(|| HostError::NotFound(format!("chain {chain_name}")))?;
+        match service
+            .tx_engine
+            .confirm_with_warning_override(
+                permit,
+                &wallet,
+                &chain_name,
+                &outbox_id,
+                &chain,
+                &wallet_info.policy,
+                acknowledge_warnings,
+            )
+            .await
+        {
+            Ok(_) => {
+                petal_outbox_outcome(&service.tx_engine, &wallet, &chain_name, &outbox_id, None)
+            }
+            Err(bloom_tx::TxEngineError::ApprovalRequired(requirement)) => petal_outbox_outcome(
+                &service.tx_engine,
+                &wallet,
+                &chain_name,
+                &outbox_id,
+                Some(requirement),
+            ),
+            Err(error) => Err(HostError::Backend(format!("confirm EVM outbox: {error}"))),
+        }
+    }
+
+    async fn evm_tx_inspect(
+        &self,
+        wallet: String,
+        chain_name: String,
+        outbox_id: String,
+        context: Option<PetalRouteContext>,
+    ) -> Result<EvmOutboxInspection, HostError> {
+        let context = context.as_ref().ok_or_else(|| {
+            HostError::Denied("Petal EVM outbox requires trusted Petal route context".into())
+        })?;
+        let origin = Self::petal_execution_origin(context)?;
+        let service = self
+            .tx_outbox
+            .as_ref()
+            .ok_or_else(|| HostError::Denied("EVM outbox is unavailable".into()))?;
+        let entry = service
+            .tx_engine
+            .outbox
+            .read(&wallet, &chain_name, &outbox_id)
+            .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
+        if entry.staged.resolved_execution_origin() != origin {
+            return Err(HostError::Denied(
+                "outbox entry was not staged by this trusted Petal".into(),
+            ));
+        }
+        let receipt = service
+            .tx_engine
+            .outbox
+            .read_receipt(&wallet, &chain_name, &outbox_id)
+            .map_err(|e| HostError::Backend(format!("read EVM outbox receipt: {e}")))?;
+        let state = receipt
+            .as_ref()
+            .map(|receipt| receipt.outcome.clone())
+            .unwrap_or_else(|| entry.staged.status.to_string());
+        let receipt_json = receipt
+            .map(|receipt| serde_json::to_string(&receipt))
+            .transpose()
+            .map_err(|e| HostError::Backend(format!("encode EVM outbox receipt: {e}")))?;
+        Ok(EvmOutboxInspection {
+            outbox_id,
+            state,
+            tx_hash: entry.staged.tx_hash,
+            receipt_json,
+        })
+    }
+
+    async fn chain_read(&self, req: ChainRequest) -> Result<ChainResponse, HostError> {
+        let context = req.context.as_ref().ok_or_else(|| {
+            HostError::Denied("Petal chain read requires trusted Petal route context".into())
+        })?;
+        Self::petal_execution_origin(context)?;
+        let service = self
+            .tx_outbox
+            .as_ref()
+            .ok_or_else(|| HostError::Denied("chain reads are unavailable".into()))?;
+        let chain = service
+            .chains
+            .get(&req.chain)
+            .ok_or_else(|| HostError::NotFound(format!("chain {}", req.chain)))?;
+        let result_json = daemon_petal_chain_read(&chain, &req.method, &req.params_json).await?;
+        Ok(ChainResponse { result_json })
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PetalEthCall {
+    to: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    input: Option<String>,
+}
+
+async fn daemon_petal_chain_read(
+    chain: &ChainClient,
+    method: &str,
+    params_json: &str,
+) -> Result<String, HostError> {
+    let params: Vec<serde_json::Value> = serde_json::from_str(params_json)
+        .map_err(|e| HostError::Invalid(format!("chain params-json must be an array: {e}")))?;
+    let result = match method {
+        "eth_chainId" if params.is_empty() => format!(
+            "0x{:x}",
+            chain
+                .chain_id()
+                .await
+                .map_err(|e| HostError::Backend(format!("chain id: {e}")))?
+        ),
+        "eth_getBalance" if matches!(params.len(), 1 | 2) => {
+            require_latest_block_param(&params, 1)?;
+            let address = parse_petal_address(&params[0], "eth_getBalance address")?;
+            let balance = chain
+                .balance(address)
+                .await
+                .map_err(|e| HostError::Backend(format!("native balance: {e}")))?;
+            format!("{balance:#x}")
+        }
+        "eth_getCode" if matches!(params.len(), 1 | 2) => {
+            require_latest_block_param(&params, 1)?;
+            let address = parse_petal_address(&params[0], "eth_getCode address")?;
+            let code = chain
+                .code(address)
+                .await
+                .map_err(|e| HostError::Backend(format!("contract code: {e}")))?;
+            format!("0x{}", hex::encode(code))
+        }
+        "eth_call" if matches!(params.len(), 1 | 2) => {
+            require_latest_block_param(&params, 1)?;
+            let call: PetalEthCall = serde_json::from_value(params[0].clone())
+                .map_err(|e| HostError::Invalid(format!("invalid eth_call request: {e}")))?;
+            if call.data.is_some() && call.input.is_some() {
+                return Err(HostError::Invalid(
+                    "eth_call must not supply both data and input".into(),
+                ));
+            }
+            let to = call
+                .to
+                .parse::<Address>()
+                .map_err(|e| HostError::Invalid(format!("eth_call to address: {e}")))?;
+            let mut tx = TransactionRequest::default().with_to(to);
+            if let Some(from) = call.from {
+                tx = tx.with_from(
+                    from.parse::<Address>()
+                        .map_err(|e| HostError::Invalid(format!("eth_call from address: {e}")))?,
+                );
+            }
+            if let Some(value) = call.value {
+                tx = tx.with_value(parse_petal_hex_quantity(&value, "eth_call value")?);
+            }
+            let input = call.data.or(call.input).unwrap_or_else(|| "0x".into());
+            tx = tx.with_input(Bytes::from(parse_petal_hex_bytes(&input, "eth_call data")?));
+            let bytes = chain
+                .eth_call_at_block(tx, Some("latest"))
+                .await
+                .map_err(|e| HostError::Backend(format!("eth_call: {e}")))?;
+            format!("0x{}", hex::encode(bytes))
+        }
+        "eth_chainId" | "eth_getBalance" | "eth_getCode" | "eth_call" => {
+            return Err(HostError::Invalid(format!(
+                "invalid {method} parameters; only latest-block reads are allowed"
+            )));
+        }
+        _ => {
+            return Err(HostError::Denied(format!(
+                "chain method {method} is not in the read-only allowlist"
+            )));
+        }
+    };
+    serde_json::to_string(&result)
+        .map_err(|e| HostError::Backend(format!("encode chain response: {e}")))
+}
+
+fn require_latest_block_param(params: &[serde_json::Value], index: usize) -> Result<(), HostError> {
+    if let Some(block) = params.get(index)
+        && block.as_str() != Some("latest")
+    {
+        return Err(HostError::Denied(
+            "only latest-block chain reads are allowed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_petal_address(value: &serde_json::Value, field: &str) -> Result<Address, HostError> {
+    value
+        .as_str()
+        .ok_or_else(|| HostError::Invalid(format!("{field} must be a string")))?
+        .parse::<Address>()
+        .map_err(|e| HostError::Invalid(format!("{field}: {e}")))
+}
+
+fn parse_petal_hex_quantity(value: &str, field: &str) -> Result<U256, HostError> {
+    if !value.starts_with("0x") || value.len() < 3 {
+        return Err(HostError::Invalid(format!(
+            "{field} must be a 0x-prefixed hex quantity"
+        )));
+    }
+    value
+        .parse::<U256>()
+        .map_err(|e| HostError::Invalid(format!("{field}: {e}")))
+}
+
+fn parse_petal_hex_bytes(value: &str, field: &str) -> Result<Vec<u8>, HostError> {
+    let Some(value) = value.strip_prefix("0x") else {
+        return Err(HostError::Invalid(format!(
+            "{field} must be canonical 0x-prefixed hex"
+        )));
+    };
+    if !value.len().is_multiple_of(2) {
+        return Err(HostError::Invalid(format!(
+            "{field} must have an even number of hex digits"
+        )));
+    }
+    hex::decode(value).map_err(|e| HostError::Invalid(format!("{field}: {e}")))
+}
+
+fn petal_pending_request_matches(
+    staged: &bloom_proto::StagedTx,
+    request: &EvmTransactionRequest,
+    origin: &bloom_proto::plan::ExecutionOrigin,
+    requested_to: Address,
+    requested_value: U256,
+) -> bool {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(u128::MAX);
+    staged.expires_ms > now_ms
+        && staged.resolved_execution_origin() == *origin
+        && staged.to.parse::<Address>().ok() == Some(requested_to)
+        && staged.value_wei.parse::<U256>().ok() == Some(requested_value)
+        && staged.data_hex == request.data_hex
+        && request.nonce.is_none_or(|nonce| staged.nonce == nonce)
+        && request
+            .max_fee_per_gas
+            .as_ref()
+            .is_none_or(|fee| decimal_strings_equal(staged.max_fee_per_gas.as_deref(), fee))
+        && request.max_priority_fee_per_gas.as_ref().is_none_or(|fee| {
+            decimal_strings_equal(staged.max_priority_fee_per_gas.as_deref(), fee)
+        })
+}
+
+fn decimal_strings_equal(stored: Option<&str>, requested: &str) -> bool {
+    match (
+        stored.and_then(|value| value.parse::<U256>().ok()),
+        requested.parse::<U256>().ok(),
+    ) {
+        (Some(stored), Some(requested)) => stored == requested,
+        _ => false,
+    }
+}
+
+fn petal_outbox_outcome(
+    tx_engine: &TxEngine,
+    wallet: &str,
+    chain: &str,
+    outbox_id: &str,
+    approval_requirement: Option<bloom_tx::ApprovalRequirement>,
+) -> Result<EvmOutboxOutcome, HostError> {
+    let entry = tx_engine
+        .outbox
+        .read(wallet, chain, outbox_id)
+        .map_err(|e| HostError::Backend(format!("read staged EVM outbox: {e}")))?;
+    let plan_md = std::fs::read_to_string(entry.dir.join("plan.md"))
+        .map_err(|e| HostError::Backend(format!("read staged EVM plan: {e}")))?;
+    let approval_required = approval_requirement.map(|requirement| ApprovalRequired {
+        action_id: requirement.action_id,
+        ceremony_url: requirement.ceremony_url,
+        expires_ms: requirement.expires_ms,
+    });
+    Ok(EvmOutboxOutcome {
+        outbox_id: outbox_id.into(),
+        plan_md,
+        approval_required,
+    })
+}
+
+fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, HostError> {
+    let base = url::Url::parse(current_url).map_err(|e| HostError::Invalid(format!("url: {e}")))?;
+    base.join(location)
+        .map(|url| url.to_string())
+        .map_err(|e| HostError::Invalid(format!("redirect location: {e}")))
+}
+
+fn redirect_method(method: &str, status: u16) -> String {
+    let upper = method.to_ascii_uppercase();
+    if matches!(status, 301..=303) && upper != "GET" && upper != "HEAD" {
+        "GET".into()
+    } else {
+        upper
+    }
+}
+
+fn prepare_redirect_request(
+    current_url: &str,
+    next_url: &str,
+    next_method: &str,
+    headers: &mut Vec<(String, String)>,
+    body: &mut Vec<u8>,
+) -> Result<(), HostError> {
+    let same_origin = same_origin(current_url, next_url)?;
+    let bodyless = matches!(next_method, "GET" | "HEAD");
+    if !same_origin {
+        headers.clear();
+        if !bodyless && !body.is_empty() {
+            return Err(HostError::Denied(
+                "cross-origin redirect would replay request body".into(),
+            ));
+        }
+    }
+    if bodyless {
+        body.clear();
+    }
+    Ok(())
+}
+
+fn same_origin(a: &str, b: &str) -> Result<bool, HostError> {
+    let a = url::Url::parse(a).map_err(|e| HostError::Invalid(format!("url: {e}")))?;
+    let b = url::Url::parse(b).map_err(|e| HostError::Invalid(format!("url: {e}")))?;
+    Ok(a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default())
+}
+
+fn audit_http_target(raw: &str) -> serde_json::Value {
+    match url::Url::parse(raw) {
+        Ok(url) => serde_json::json!({
+            "scheme": url.scheme(),
+            "host": url.host_str(),
+            "port": url.port(),
+            "path": url.path(),
+        }),
+        Err(_) => serde_json::json!({ "invalid": true }),
+    }
 }
 
 /// All wired-up state the daemon owns. Cheap to clone (everything is
@@ -331,6 +1868,56 @@ impl Daemon {
         let keystore =
             Keystore::new(home.keystore_dir()).map_err(|e| DaemonError::Keystore(e.to_string()))?;
 
+        #[cfg(feature = "unsafe-debug-signer")]
+        let unsafe_debug_signer = match (
+            std::env::var("BLOOM_UNSAFE_DEBUG_SIGNER_WALLET").ok(),
+            std::env::var("BLOOM_UNSAFE_DEBUG_PRIVATE_KEY_FILE").ok(),
+        ) {
+            (Some(wallet), Some(path)) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+                    if mode != 0o600 {
+                        return Err(DaemonError::Keystore(format!(
+                            "unsafe debug private-key file must have mode 0600, got {mode:04o}"
+                        )));
+                    }
+                }
+                let key = std::fs::read_to_string(&path)?;
+                let signer: PrivateKeySigner = key.trim().parse().map_err(|e| {
+                    DaemonError::Keystore(format!("parse unsafe debug private key: {e}"))
+                })?;
+                let expected = keystore
+                    .info(&wallet)
+                    .map_err(|e| DaemonError::Keystore(e.to_string()))?
+                    .address;
+                if signer.address() != expected {
+                    return Err(DaemonError::Keystore(format!(
+                        "unsafe debug signer address {} does not match wallet {wallet} ({expected})",
+                        signer.address()
+                    )));
+                }
+                let signer = Arc::new(signer);
+                keystore
+                    .install_unsafe_debug_signer(&wallet, signer.clone())
+                    .map_err(|e| DaemonError::Keystore(e.to_string()))?;
+                warn!(
+                    wallet = %wallet,
+                    address = %expected,
+                    "UNSAFE DEBUG SIGNER ENABLED: interactive approval ceremonies are bypassed"
+                );
+                Some((wallet, signer))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(DaemonError::Keystore(
+                    "BLOOM_UNSAFE_DEBUG_SIGNER_WALLET and BLOOM_UNSAFE_DEBUG_PRIVATE_KEY_FILE must be set together"
+                        .into(),
+                ));
+            }
+        };
+
         // Open auth store early so we can also wire the EVM → central
         // outbox projection.  Two connections to the same SQLite file:
         // one for the verifier (owned), one for the projection (behind
@@ -348,6 +1935,10 @@ impl Daemon {
             config.stage_ttl.as_millis(),
             config.block_mainnet_broadcast,
         );
+        #[cfg(feature = "unsafe-debug-signer")]
+        if let Some((wallet, signer)) = &unsafe_debug_signer {
+            tx_engine = tx_engine.with_unsafe_debug_signer(wallet.clone(), signer.clone());
+        }
 
         // Wire ENS resolver into TxEngine when a mainnet-style chain is
         // configured. We pick the first chain with id 1 / 11155111 / 5 /
@@ -575,9 +2166,8 @@ impl Daemon {
 
         // Build the petals runtime: content-addressed store under
         // `~/.bloom/petals/store`, name registry under
-        // `~/.bloom/petals/registry`, and a wasmtime engine. The handler
-        // exposed at `public/` reads from both, while the runner glues
-        // them together for IPC-driven install/run.
+        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
+        // packages are exposed under `petals/`.
         let petals_root = home.root().join("petals");
         let petal_store = PetalStore::open(petals_root.join("store"))
             .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
@@ -587,12 +2177,39 @@ impl Daemon {
         );
         let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
+        let petal_vfs_host = Arc::new(LateVfsHost::new());
+        let petal_app_host = DaemonPetalHost::new(
+            petal_vfs_host.clone(),
+            audit_arc.clone(),
+            auth_services.clone(),
+        )
+        .with_tx_outbox(PetalTxOutbox {
+            tx_engine: tx_engine.clone(),
+            chains: chains.clone(),
+            keystore: keystore.clone(),
+            address_book: address_book_arc.clone(),
+            write_permit: home_write_permit.clone(),
+        });
+        #[cfg(feature = "unsafe-debug-signer")]
+        let petal_app_host = match &unsafe_debug_signer {
+            Some((wallet, signer)) => {
+                petal_app_host.with_unsafe_debug_signer(wallet.clone(), signer.clone())
+            }
+            None => petal_app_host,
+        };
+        let petal_app_host = Arc::new(petal_app_host);
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
 
         let mut vfs_builder = Vfs::builder()
             .mount(
-                "public",
-                Arc::new(PetalsHandler::new(petal_store, petal_registry)) as _,
+                "petals",
+                Arc::new(
+                    PetalRouter::new(petals.clone(), petal_app_host)
+                        .with_runtime_petals(config.petals.runtime.clone())
+                        .map_err(|e| {
+                            DaemonError::Audit(format!("petals runtime configuration: {e}"))
+                        })?,
+                ) as _,
             )
             .mount(
                 "chains",
@@ -978,6 +2595,7 @@ impl Daemon {
             .with_audit(audit_arc.clone())
             .with_cache(path_cache)
             .build();
+        petal_vfs_host.set(Arc::new(vfs.clone()));
 
         // Start the watch executor so any pre-existing specs on disk are
         // sampled and any new ones registered by the WatchHandler get
@@ -1371,6 +2989,28 @@ mod tests {
     use bloom_vfs::handler::Handler;
 
     #[test]
+    fn approval_error_display_text_cannot_trigger_ceremony_routing() {
+        let error = bloom_tx::TxEngineError::ApprovalServiceUnavailable(
+            "Sealed Approval is mentioned, but no ceremony can recover this".into(),
+        );
+        assert!(!matches!(
+            error,
+            bloom_tx::TxEngineError::ApprovalRequired(_)
+        ));
+
+        let requirement = bloom_tx::ApprovalRequirement {
+            action_id: "action-1".into(),
+            ceremony_url: "http://127.0.0.1/approve/action-1".into(),
+            expires_ms: 123,
+            reason: "wording is irrelevant".into(),
+        };
+        assert!(matches!(
+            bloom_tx::TxEngineError::ApprovalRequired(requirement),
+            bloom_tx::TxEngineError::ApprovalRequired(_)
+        ));
+    }
+
+    #[test]
     fn builds_from_tempdir() {
         let dir = tempfile::tempdir().unwrap();
         let home = HomeDir::at(dir.path());
@@ -1384,11 +3024,568 @@ mod tests {
         assert!(d.vfs.handler("prices").is_some());
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
-        assert!(d.vfs.handler("public").is_some());
+        assert!(d.vfs.handler("petals").is_some());
         assert!(
             d.vfs.handler("hyperliquid").is_some(),
             "fresh homes should mount Hyperliquid with public defaults"
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_host_sign_hash_rejects_calls_without_trusted_petal_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let host =
+            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let err = host
+            .sign_hash(SignRequest {
+                wallet: "alice".into(),
+                hash32: [7; 32],
+                purpose: "test.intent".into(),
+                context: None,
+            })
+            .await
+            .unwrap_err();
+        let HostError::Denied(msg) = err else {
+            panic!("expected denied error");
+        };
+        assert!(msg.contains("trusted Petal route context"), "{msg}");
+    }
+
+    #[test]
+    fn daemon_petal_host_seals_petal_signing_action_from_trusted_route_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let host =
+            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let req = SignRequest {
+            wallet: "alice".into(),
+            hash32: [7; 32],
+            purpose: "portfolio.position.sign".into(),
+            context: Some(PetalRouteContext {
+                petal_root: "portfolio".into(),
+                package_hash: "a".repeat(64),
+                route_id: "r000001".into(),
+                op: "read".into(),
+                path: "/positions".into(),
+                params: vec![("account".into(), "main".into())],
+                actor: Some("agent-1".into()),
+            }),
+        };
+        let (action, attestation) = host
+            .petal_action(&req, req.context.as_ref().unwrap(), 1)
+            .unwrap();
+
+        assert_eq!(action.surface(), "petals");
+        assert_eq!(action.petal_id(), "petal:portfolio");
+        assert_eq!(action.petal_digest(), "a".repeat(64));
+        assert_eq!(action.daemon_terms.max_signatures, 1);
+        assert_eq!(
+            action.daemon_terms.allowed_sign_intents,
+            vec![req.purpose.clone()]
+        );
+        assert!(
+            action
+                .daemon_terms
+                .extra
+                .contains_key("required.attestation_facts_digest")
+        );
+        assert_eq!(
+            attestation
+                .facts
+                .get("route_id")
+                .and_then(|value| value.as_str()),
+            Some("r000001")
+        );
+        let expected_hash = format!("0x{}", hex::encode([7; 32]));
+        assert_eq!(
+            attestation
+                .facts
+                .get("signing_hash")
+                .and_then(|value| value.as_str()),
+            Some(expected_hash.as_str())
+        );
+
+        let mut root_context = req.context.clone().unwrap();
+        root_context.path.clear();
+        host.petal_action(&req, &root_context, 1).unwrap();
+    }
+
+    #[test]
+    fn petal_signing_identity_is_stable_until_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let host =
+            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let req = SignRequest {
+            wallet: "alice".into(),
+            hash32: [7; 32],
+            purpose: "example.batch_sign".into(),
+            context: Some(PetalRouteContext {
+                petal_root: "example".into(),
+                package_hash: "a".repeat(64),
+                route_id: "r-sign".into(),
+                op: "write".into(),
+                path: "/sign/alice/begin".into(),
+                params: vec![("wallet".into(), "alice".into())],
+                actor: None,
+            }),
+        };
+
+        let (start, _) = host
+            .petal_action(&req, req.context.as_ref().unwrap(), 1)
+            .unwrap();
+        let (end_of_bucket, _) = host
+            .petal_action(&req, req.context.as_ref().unwrap(), 59_999)
+            .unwrap();
+        assert_eq!(start.action_id(), end_of_bucket.action_id());
+        assert_eq!(end_of_bucket.expires_ms, 120_001);
+
+        let (next_bucket, _) = host
+            .petal_action(&req, req.context.as_ref().unwrap(), 60_000)
+            .unwrap();
+        assert_eq!(start.action_id(), next_bucket.action_id());
+        assert_eq!(next_bucket.expires_ms, start.expires_ms);
+
+        let (last_live_retry, _) = host
+            .petal_action(&req, req.context.as_ref().unwrap(), 120_000)
+            .unwrap();
+        assert_eq!(start.action_id(), last_live_retry.action_id());
+
+        let (after_expiry, _) = host
+            .petal_action(&req, req.context.as_ref().unwrap(), 120_001)
+            .unwrap();
+        assert_ne!(start.action_id(), after_expiry.action_id());
+        assert_eq!(after_expiry.expires_ms, 240_001);
+    }
+
+    #[test]
+    fn petal_signing_identity_binds_the_complete_request_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let host =
+            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let req = SignRequest {
+            wallet: "alice".into(),
+            hash32: [7; 32],
+            purpose: "example.sign".into(),
+            context: Some(PetalRouteContext {
+                petal_root: "example".into(),
+                package_hash: "a".repeat(64),
+                route_id: "r-sign".into(),
+                op: "write".into(),
+                path: "/sign/alice".into(),
+                params: vec![("wallet".into(), "alice".into())],
+                actor: Some("agent-1".into()),
+            }),
+        };
+        let (original, _) = host
+            .petal_action(&req, req.context.as_ref().unwrap(), 1)
+            .unwrap();
+
+        let mut changed_hash = req.clone();
+        changed_hash.hash32 = [8; 32];
+        let (changed_hash, _) = host
+            .petal_action(&changed_hash, changed_hash.context.as_ref().unwrap(), 1)
+            .unwrap();
+        assert_ne!(original.action_id(), changed_hash.action_id());
+
+        let mut changed_context = req.clone();
+        changed_context.context.as_mut().unwrap().actor = Some("agent-2".into());
+        let (changed_context, _) = host
+            .petal_action(
+                &changed_context,
+                changed_context.context.as_ref().unwrap(),
+                1,
+            )
+            .unwrap();
+        assert_ne!(original.action_id(), changed_context.action_id());
+    }
+
+    #[test]
+    fn daemon_petal_host_seals_exact_ordered_hardened_signing_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let host =
+            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let context = PetalRouteContext {
+            petal_root: "polymarket".into(),
+            package_hash: "b".repeat(64),
+            route_id: "r-onboard".into(),
+            op: "write".into(),
+            path: "/onboard/alice/begin".into(),
+            params: vec![("wallet".into(), "alice".into())],
+            actor: None,
+        };
+        let requests = vec![
+            SignRequest {
+                wallet: "alice".into(),
+                hash32: [1; 32],
+                purpose: "polymarket.onboard".into(),
+                context: Some(context.clone()),
+            },
+            SignRequest {
+                wallet: "alice".into(),
+                hash32: [2; 32],
+                purpose: "polymarket.relayer_batch".into(),
+                context: Some(context),
+            },
+        ];
+        let (action, attestations) = host.petal_batch_action(&requests, 1).unwrap();
+        assert_eq!(action.daemon_terms.assurance, AssuranceLevel::Hardened);
+        assert_eq!(action.daemon_terms.max_signatures, 2);
+        assert_eq!(attestations.len(), 2);
+        let entries: Vec<SealedSignBatchEntry> =
+            serde_json::from_value(action.daemon_terms.extra["required.signing_requests"].clone())
+                .unwrap();
+        assert_eq!(entries[0].hash_hex, format!("0x{}", hex::encode([1; 32])));
+        assert_eq!(entries[1].hash_hex, format!("0x{}", hex::encode([2; 32])));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.attestation_facts_digest.is_empty())
+        );
+
+        let (across_retry_boundary, _) = host.petal_batch_action(&requests, 60_000).unwrap();
+        assert_eq!(action.action_id(), across_retry_boundary.action_id());
+        assert_eq!(action.expires_ms, across_retry_boundary.expires_ms);
+
+        let (after_expiry, _) = host
+            .petal_batch_action(&requests, action.expires_ms)
+            .unwrap();
+        assert_ne!(action.action_id(), after_expiry.action_id());
+
+        let mut reversed = requests.clone();
+        reversed.reverse();
+        let (reversed_action, _) = host.petal_batch_action(&reversed, 1).unwrap();
+        assert_ne!(action.action_id(), reversed_action.action_id());
+        assert!(
+            host.petal_batch_action(&[requests[0].clone(), requests[0].clone()], 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_signing_batches_cannot_consume_identity_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let host =
+            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let context = PetalRouteContext {
+            petal_root: "example".into(),
+            package_hash: "b".repeat(64),
+            route_id: "r-sign".into(),
+            op: "write".into(),
+            path: "/sign/alice".into(),
+            params: vec![("wallet".into(), "alice".into())],
+            actor: None,
+        };
+
+        for index in 0..MAX_ACTIVE_PETAL_ACTION_IDENTITIES {
+            let mut hash32 = [0; 32];
+            hash32[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let invalid = SignRequest {
+                wallet: "alice".into(),
+                hash32,
+                purpose: String::new(),
+                context: Some(context.clone()),
+            };
+            assert!(host.petal_batch_action(&[invalid], 1).is_err());
+        }
+        assert_eq!(
+            host.petal_action_identities.lock().unwrap().entries.len(),
+            0
+        );
+
+        let valid = SignRequest {
+            wallet: "alice".into(),
+            hash32: [7; 32],
+            purpose: "example.sign".into(),
+            context: Some(context),
+        };
+        host.petal_batch_action(&[valid], 1).unwrap();
+        assert_eq!(
+            host.petal_action_identities.lock().unwrap().entries.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn daemon_petal_host_derives_evm_origin_only_from_trusted_route_context() {
+        let context = PetalRouteContext {
+            petal_root: "polymarket".into(),
+            package_hash: "a".repeat(64),
+            route_id: "r000001".into(),
+            op: "write".into(),
+            path: "/fund/alice/one/confirm".into(),
+            params: vec![("id".into(), "one".into())],
+            actor: Some("agent-1".into()),
+        };
+        let origin = DaemonPetalHost::petal_execution_origin(&context).unwrap();
+        assert_eq!(origin.petal_id, "petal:polymarket");
+        assert_eq!(origin.petal_digest, "a".repeat(64));
+        assert_eq!(origin.petal_version, "v1-package");
+
+        for mutate in ["route", "operation", "path"] {
+            let mut changed = context.clone();
+            match mutate {
+                "route" => changed.route_id = "r000002".into(),
+                "operation" => changed.op = "read".into(),
+                "path" => changed.path = "/fund/alice/two/confirm".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                DaemonPetalHost::petal_execution_origin(&changed).unwrap(),
+                origin,
+                "{mutate} must remain within the package-scoped EVM execution origin"
+            );
+        }
+
+        let mut root = context.clone();
+        root.path.clear();
+        assert_eq!(
+            DaemonPetalHost::petal_execution_origin(&root).unwrap(),
+            origin
+        );
+
+        let mut invalid = context;
+        invalid.package_hash = "not-a-digest".into();
+        assert!(DaemonPetalHost::petal_execution_origin(&invalid).is_err());
+    }
+
+    fn test_petal_host(daemon: &Daemon) -> DaemonPetalHost {
+        DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            daemon.audit.clone(),
+            daemon.auth_services.clone(),
+        )
+        .with_tx_outbox(PetalTxOutbox {
+            tx_engine: daemon.tx_engine.clone(),
+            chains: daemon.chains.clone(),
+            keystore: daemon.keystore.clone(),
+            address_book: daemon.address_book.clone(),
+            write_permit: daemon.home_write_permit.clone(),
+        })
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_chain_read_requires_context_and_rejects_unsafe_rpc_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+        let host = test_petal_host(&daemon);
+        let context = PetalRouteContext {
+            petal_root: "reader".into(),
+            package_hash: "a".repeat(64),
+            route_id: "r000001".into(),
+            op: "read".into(),
+            path: "/balance.json".into(),
+            params: vec![],
+            actor: None,
+        };
+        let chain_name = daemon.chains.list_names().into_iter().next().unwrap();
+
+        let missing_context = host
+            .chain_read(ChainRequest {
+                chain: chain_name.clone(),
+                method: "eth_chainId".into(),
+                params_json: "[]".into(),
+                context: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(missing_context, HostError::Denied(_)));
+
+        for (method, params) in [
+            ("eth_sendRawTransaction", "[]"),
+            ("eth_chainId", "[1]"),
+            (
+                "eth_getBalance",
+                r#"["0x0000000000000000000000000000000000000001","pending"]"#,
+            ),
+            (
+                "eth_getCode",
+                r#"["0x0000000000000000000000000000000000000001","pending"]"#,
+            ),
+            (
+                "eth_call",
+                r#"[{"to":"0x0000000000000000000000000000000000000001","stateOverride":{}},"latest"]"#,
+            ),
+        ] {
+            let error = host
+                .chain_read(ChainRequest {
+                    chain: chain_name.clone(),
+                    method: method.into(),
+                    params_json: params.into(),
+                    context: Some(context.clone()),
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, HostError::Denied(_) | HostError::Invalid(_)),
+                "unexpected {method} result: {error}"
+            );
+        }
+
+        assert!(parse_petal_hex_bytes("0x70a08231", "data").is_ok());
+        assert!(parse_petal_hex_bytes("70a08231", "data").is_err());
+        assert!(parse_petal_hex_quantity("0x0", "value").is_ok());
+        assert!(parse_petal_hex_quantity("0", "value").is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_outbox_inspection_is_read_only_and_origin_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+        let host = test_petal_host(&daemon);
+        let context = PetalRouteContext {
+            petal_root: "funding".into(),
+            package_hash: "b".repeat(64),
+            route_id: "r000002".into(),
+            op: "read".into(),
+            path: "/fund/alice/one/status.json".into(),
+            params: vec![],
+            actor: Some("agent-1".into()),
+        };
+        let tx_hash = format!("0x{}", "ab".repeat(32));
+        let staged = bloom_proto::StagedTx {
+            id: "petal-inspect".into(),
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            chain_id: 31337,
+            from: "0x0000000000000000000000000000000000000001".into(),
+            to: "0x0000000000000000000000000000000000000002".into(),
+            value_wei: "0".into(),
+            data_hex: "0x".into(),
+            gas_limit: 21_000,
+            max_fee_per_gas: Some("100".into()),
+            max_priority_fee_per_gas: Some("10".into()),
+            gas_price: None,
+            nonce: 0,
+            policy_checks: vec![],
+            created_ms: 1,
+            expires_ms: u128::MAX,
+            status: bloom_proto::TxStatus::Pending,
+            tx_hash: Some(tx_hash.clone()),
+            token: None,
+            nft: None,
+            usd_value: None,
+            depends_on: None,
+            action_id: None,
+            execution_origin: Some(DaemonPetalHost::petal_execution_origin(&context).unwrap()),
+        };
+        let request = EvmTransactionRequest {
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            to: staged.to.clone(),
+            value_wei: staged.value_wei.clone(),
+            data_hex: staged.data_hex.clone(),
+            nonce: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            context: Some(context.clone()),
+        };
+        let origin = staged.resolved_execution_origin();
+        assert!(petal_pending_request_matches(
+            &staged,
+            &request,
+            &origin,
+            staged.to.parse().unwrap(),
+            staged.value_wei.parse().unwrap(),
+        ));
+        let mut equivalent_fee_request = request.clone();
+        equivalent_fee_request.max_fee_per_gas = Some("00100".into());
+        equivalent_fee_request.max_priority_fee_per_gas = Some("00010".into());
+        assert!(petal_pending_request_matches(
+            &staged,
+            &equivalent_fee_request,
+            &origin,
+            staged.to.parse().unwrap(),
+            staged.value_wei.parse().unwrap(),
+        ));
+        let mut changed_request = request;
+        changed_request.data_hex = "0x00".into();
+        assert!(!petal_pending_request_matches(
+            &staged,
+            &changed_request,
+            &origin,
+            staged.to.parse().unwrap(),
+            staged.value_wei.parse().unwrap(),
+        ));
+        let entry_dir = daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "# plan")
+            .unwrap();
+        let receipt = bloom_tx::outbox::MinedReceipt {
+            outcome: "success".into(),
+            tx_hash: tx_hash.clone(),
+            block_number: Some(42),
+            revert_reason: None,
+        };
+        daemon
+            .tx_engine
+            .outbox
+            .write_artefact(
+                &entry_dir,
+                bloom_tx::outbox::RECEIPT_FILE,
+                &serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+
+        let inspection = host
+            .evm_tx_inspect(
+                "alice".into(),
+                "anvil".into(),
+                staged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "success");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
+        assert!(
+            inspection
+                .receipt_json
+                .unwrap()
+                .contains("\"block_number\":42")
+        );
+
+        let mut other_route = context.clone();
+        other_route.path = "/fund/alice/two/confirm".into();
+        host.evm_tx_inspect(
+            "alice".into(),
+            "anvil".into(),
+            staged.id.clone(),
+            Some(other_route),
+        )
+        .await
+        .unwrap();
+
+        let mut other_app = context.clone();
+        other_app.petal_root = "other".into();
+        let denied = host
+            .evm_tx_inspect(
+                "alice".into(),
+                "anvil".into(),
+                staged.id.clone(),
+                Some(other_app),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(denied, HostError::Denied(_)));
+
+        let mut other_context = context;
+        other_context.package_hash = "c".repeat(64);
+        let denied = host
+            .evm_tx_inspect(
+                "alice".into(),
+                "anvil".into(),
+                staged.id,
+                Some(other_context),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(denied, HostError::Denied(_)));
     }
 
     #[test]
@@ -1593,6 +3790,7 @@ ws_url = "wss://example.invalid"
             usd_value: None,
             depends_on: None,
             action_id: None,
+            execution_origin: None,
         };
         d.tx_engine.outbox.write_pending(&staged, "p").unwrap();
         let n = d.tx_engine.outbox.sweep_expired(2).unwrap();

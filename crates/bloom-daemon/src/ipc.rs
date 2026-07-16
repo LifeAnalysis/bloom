@@ -29,12 +29,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_keystore::petal_host::SignerCache;
 use bloom_keystore::{Keystore, WalletKind};
-use bloom_petals::{Capability, PetalError, PetalRunner, RunOptions, VfsHost};
+use bloom_petals::{PetalError, PetalRunner};
 use bloom_proto::{CeremonyIntent, CeremonyIntentKind};
 use bloom_vfs::{AuthServices, Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -125,10 +124,6 @@ pub struct IpcServer {
     petals: Option<PetalRunner>,
     auth_services: AuthServices,
     signer_cache: Option<Arc<SignerCache>>,
-    /// Pre-wrapped `Arc<Vfs>` for building [`VfsHost`] per `petals.run`.
-    /// We keep it next to the bare `vfs` clone so the existing handler
-    /// surface stays untouched.
-    vfs_arc: Arc<Vfs>,
     shutdown: Arc<Notify>,
 }
 
@@ -146,7 +141,6 @@ fn reject_passkey_write_unlocked(kind: WalletKind) -> Result<(), HandlerError> {
 
 impl IpcServer {
     pub fn new(vfs: Vfs, version: impl Into<String>, chains: Vec<String>) -> Self {
-        let vfs_arc = Arc::new(vfs.clone());
         Self {
             vfs,
             version: version.into(),
@@ -155,7 +149,6 @@ impl IpcServer {
             petals: None,
             auth_services: AuthServices::default(),
             signer_cache: None,
-            vfs_arc,
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -553,69 +546,18 @@ impl IpcServer {
 
     /// `params`: `{ bytes_b64? | text?, name?, caps?: ["vfs.read","vfs.write"] }`.
     /// Either `bytes_b64` (raw wasm or WAT) or `text` (WAT only) must be set.
-    async fn do_petals_install(&self, params: &Value) -> Result<Value, PetalError> {
-        let runner = self.petals()?;
-        let bytes = if let Some(s) = params.get("bytes_b64").and_then(|v| v.as_str()) {
-            B64.decode(s)
-                .map_err(|e| PetalError::vm(format!("bytes_b64: {e}")))?
-        } else if let Some(s) = params.get("text").and_then(|v| v.as_str()) {
-            s.as_bytes().to_vec()
-        } else {
-            return Err(PetalError::vm("install needs bytes_b64 or text"));
-        };
-        let name = params.get("name").and_then(|v| v.as_str());
-        let caps = parse_caps(params.get("caps"))?;
-        let mode = match params.get("mode").and_then(|v| v.as_str()) {
-            None => bloom_petals::PetalMode::Local,
-            Some("local") => bloom_petals::PetalMode::Local,
-            Some(other) => {
-                return Err(PetalError::vm(format!("install: unknown mode {other:?}")));
-            }
-        };
-        let (result, meta) = runner.install(&bytes, name, &caps, mode)?;
-        Ok(json!({
-            "hash": result.hash,
-            "size": result.size,
-            "already_present": result.already_present,
-            "name": meta.name,
-            "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            "installed_at_ms": meta.installed_at_ms,
-            "mode": meta.mode_str(),
-        }))
+    async fn do_petals_install(&self, _params: &Value) -> Result<Value, PetalError> {
+        Err(PetalError::vm(
+            "raw petal IPC install is unsupported; use `bloom petals install <package-dir|.petal.tar|github-url>`",
+        ))
     }
 
     /// `params`: `{ name_or_hash, stdin_b64?, input?, cap_mask?: ["vfs.read",...] }`.
     /// `cap_mask` narrows the petal's declared caps; absent ⇒ use them as-is.
-    async fn do_petals_run(&self, params: &Value) -> Result<Value, PetalError> {
-        let runner = self.petals()?;
-        let target = params
-            .get("name_or_hash")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| PetalError::vm("missing 'name_or_hash'"))?;
-        let stdin = if let Some(s) = params.get("stdin_b64").and_then(|v| v.as_str()) {
-            B64.decode(s)
-                .map_err(|e| PetalError::vm(format!("stdin_b64: {e}")))?
-        } else if let Some(s) = params.get("input").and_then(|v| v.as_str()) {
-            s.as_bytes().to_vec()
-        } else {
-            Vec::new()
-        };
-        let cap_mask = match params.get("cap_mask") {
-            Some(v) if !v.is_null() => Some(parse_caps(Some(v))?),
-            _ => None,
-        };
-        let host = Arc::new(VfsHost::new(self.vfs_arc.clone()));
-        let out = runner
-            .run(target, stdin, host, cap_mask, RunOptions::default())
-            .await?;
-        let meta = runner.store().load_meta(&runner.resolve(target)?)?;
-        Ok(json!({
-            "exit_code": out.exit_code,
-            "stdout_b64": B64.encode(&out.stdout),
-            "stderr_b64": B64.encode(&out.stderr),
-            "fuel_consumed": out.fuel_consumed,
-            "mode": meta.mode_str(),
-        }))
+    async fn do_petals_run(&self, _params: &Value) -> Result<Value, PetalError> {
+        Err(PetalError::vm(
+            "raw petal IPC run is unsupported; Petal routes are dispatched through /petals",
+        ))
     }
 
     async fn do_petals_list(&self) -> Result<Value, PetalError> {
@@ -627,10 +569,14 @@ impl IpcServer {
         for (name, hash) in &names {
             name_for_hash.entry(hash.clone()).or_insert(name.clone());
         }
-        let hashes = runner.store().list_hashes()?;
+        let hashes = runner.store().list_package_hashes()?;
         let mut out = Vec::with_capacity(hashes.len());
         for hash in hashes {
             let meta = runner.store().load_meta(&hash)?;
+            let petal_mount = meta
+                .petal
+                .as_ref()
+                .map(|app| format!("petals/{}/", app.name));
             out.push(json!({
                 "hash": meta.hash,
                 "size": meta.size,
@@ -638,6 +584,9 @@ impl IpcServer {
                 "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                 "installed_at_ms": meta.installed_at_ms,
                 "mode": meta.mode_str(),
+                "petal_mount": petal_mount,
+                "petal": meta.petal,
+                "source": meta.source,
             }));
         }
         Ok(Value::Array(out))
@@ -714,12 +663,6 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // polymarket/onboard/<wallet>/begin signs CLOB auth and relayer/deposit-wallet operations.
-        [root, action, _wallet, begin]
-            if root == "polymarket" && action == "onboard" && begin == "begin" =>
-        {
-            true
-        }
         // Everything else reaches the VFS handler through the plain write lane.
         // In particular these first-party Sealed Approval actions are NOT raw
         // signer lanes and must forward through to `vfs.write` rather than be
@@ -734,6 +677,10 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         //     stages an approval challenge on the first write and signs the
         //     x402/Tempo MPP credential only under a grant-gated PetalHost
         //     signature.
+        //   * Polymarket onboarding (`/polymarket/onboard/<wallet>/begin`):
+        //     the handler stages approval and signs CLOB auth plus relayer/
+        //     deposit-wallet operations only under grant-gated PetalHost
+        //     signatures.
         //   * Hyperliquid owner approvals (`agent_sessions/<wallet>/new.json`
         //     and `exchange/<wallet>/send_asset.json`): the Hyperliquid
         //     handler stages approval and signs only under a grant-gated
@@ -1285,30 +1232,6 @@ fn find_defi_review_for_outbox(
     None
 }
 
-fn parse_caps(v: Option<&Value>) -> Result<BTreeSet<Capability>, PetalError> {
-    let Some(v) = v else {
-        return Ok(BTreeSet::new());
-    };
-    if v.is_null() {
-        return Ok(BTreeSet::new());
-    }
-    let arr = v
-        .as_array()
-        .ok_or_else(|| PetalError::vm("'caps' must be an array of strings"))?;
-    let mut out = BTreeSet::new();
-    for item in arr {
-        let s = item
-            .as_str()
-            .ok_or_else(|| PetalError::vm("'caps' entries must be strings"))?;
-        out.insert(Capability::parse(s).ok_or_else(|| {
-            PetalError::vm(format!(
-                "unknown capability {s:?}; expected 'vfs.read' or 'vfs.write'"
-            ))
-        })?);
-    }
-    Ok(out)
-}
-
 fn parse_path(params: &Value) -> Result<VfsPath, HandlerError> {
     let s = params
         .get("path")
@@ -1507,13 +1430,35 @@ mod tests {
             .build()
     }
 
+    fn write_demo_petal_package(root: &Path) {
+        let write = |rel: &str, body: &[u8]| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write(
+            "petal.toml",
+            br#"schema = "bloom.petal.package.v1"
+name = "demo"
+
+[consent]
+summary = "Demo app used by IPC tests."
+"#,
+        );
+        write("README.md", b"# demo\n");
+        write("AGENTS.md", b"# demo agents\n");
+        write(
+            "petal/demo/hello.txt.wasm",
+            include_bytes!("../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"),
+        );
+    }
+
     #[test]
     fn plain_ipc_write_rejects_signer_consuming_paths() {
         for path in [
             "/wallets/minnow/sign/message",
             "/wallets/minnow/sign/hash",
             "/wallets/minnow/sign/typed_data",
-            "/polymarket/onboard/minnow/begin",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(write_path_uses_wallet_signer(&p), "{path}");
@@ -1539,6 +1484,7 @@ mod tests {
             "/requests/pending/req_123/confirm",
             "/requests/new",
             "/requests/pending/req_123/cancel",
+            "/polymarket/onboard/minnow/begin",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
@@ -1581,13 +1527,36 @@ mod tests {
         reject_passkey_write_unlocked(WalletKind::Local).unwrap();
     }
 
+    #[tokio::test]
+    async fn petals_list_reports_petal_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("demo-package");
+        write_demo_petal_package(&package);
+
+        let store = bloom_petals::PetalStore::open(dir.path().join("store")).unwrap();
+        let registry =
+            Arc::new(bloom_petals::NameRegistry::open(dir.path().join("registry")).unwrap());
+        let vm = bloom_petals::PetalVm::new().unwrap();
+        let runner = PetalRunner::new(store.clone(), registry, vm);
+        let (installed, _, _) = store.install_petal_package_dir(&package).unwrap();
+
+        let server = IpcServer::new(vfs(), "0", vec![]).with_petals(runner);
+        let listed = server.do_petals_list().await.unwrap();
+        let entries = listed.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["hash"], installed.hash);
+        assert_eq!(entries[0]["mode"], "local");
+        assert_eq!(entries[0]["petal_mount"], "petals/demo/");
+        assert_eq!(entries[0]["petal"]["name"], "demo");
+    }
+
     #[test]
     fn onboard_begin_unlock_intent_lists_grants_not_just_the_path() {
         let p = VfsPath::parse("/polymarket/onboard/minnow/begin").unwrap();
         let intent = write_unlocked_intent("minnow", &p, b"y", None, None, None);
         // The reviewer must see the concrete onboarding effects, not a bare path.
         let text = intent.summary_lines.join("\n");
-        assert!(text.contains("approve(MAX) -> CTF Exchange V2"), "{text}");
+        assert!(text.contains("approve(MAX) -> CTF Exchange"), "{text}");
         assert!(text.contains("setApprovalForAll(true)"), "{text}");
         assert!(text.contains("builder API key"), "{text}");
         assert_eq!(

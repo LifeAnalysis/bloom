@@ -44,10 +44,16 @@ pub struct Config {
     pub etherscan: Option<EtherscanConfig>,
     #[serde(default)]
     pub enso: Option<EnsoConfig>,
-    /// Polymarket v2 read surface. Presence of `[polymarket]` opts the
+    /// Polymarket read surface. Presence of `[polymarket]` opts the
     /// `polymarket/` VFS subtree in (like `[enso]` opts in `defi/`).
     #[serde(default)]
     pub polymarket: Option<PolymarketConfig>,
+    /// Trusted, daemon-owned runtime settings for installed Petals.
+    /// Endpoint overrides are matched to named manifest bindings and may only
+    /// replace the HTTPS authority; the signed method/path policy remains the
+    /// upper bound.
+    #[serde(default)]
+    pub petals: PetalsConfig,
     /// Hyperliquid HyperCore read/write surface. Presence of `[hyperliquid]`
     /// opts the `hyperliquid/` VFS subtree in.
     #[serde(default)]
@@ -68,11 +74,26 @@ pub struct Config {
     pub backends: BackendsConfig,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PetalsConfig {
+    #[serde(default)]
+    pub runtime: BTreeMap<String, PetalRuntimeConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PetalRuntimeConfig {
+    #[serde(default)]
+    pub endpoints: BTreeMap<String, String>,
+    #[serde(default)]
+    pub values: BTreeMap<String, String>,
+}
+
 /// Where a given feature sources its data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Backend {
-    /// Etherscan v2 multichain API. Requires an `[etherscan]` block.
+    /// Etherscan multichain API. Requires an `[etherscan]` block.
     Etherscan,
     /// Raw JSON-RPC against the configured chain endpoints.
     Rpc,
@@ -156,7 +177,7 @@ impl BackendsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EtherscanConfig {
-    /// Etherscan v2 multi-chain API key.
+    /// Etherscan multi-chain API key.
     pub api_key: String,
     #[serde(default = "default_etherscan_url")]
     pub api_url: String,
@@ -169,7 +190,7 @@ pub struct EnsoConfig {
     pub api_url: String,
 }
 
-/// Polymarket v2 client configuration. Every field has a default so a bare
+/// Polymarket client configuration. Every field has a default so a bare
 /// `[polymarket]` TOML table parses to the public-endpoint defaults on Polygon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolymarketConfig {
@@ -212,7 +233,7 @@ pub struct PolymarketConfig {
     #[serde(default = "default_builder_key_mode")]
     pub builder_key_mode: String,
     /// Explicit opt-in to the legacy EOA onboarding mode (signatureType 0).
-    /// The V2 CLOB rejects EOA makers at order placement ("maker address not
+    /// The CLOB rejects EOA makers at order placement ("maker address not
     /// allowed"), so this mode cannot trade — it exists for read/creds-only
     /// setups and backward compatibility.
     #[serde(default)]
@@ -488,6 +509,7 @@ impl Config {
             etherscan: None,
             enso: None,
             polymarket: None,
+            petals: PetalsConfig::default(),
             hyperliquid: Some(HyperliquidConfig::default()),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
@@ -558,6 +580,42 @@ impl Config {
                 )));
             }
         }
+        for (app_name, app) in &self.petals.runtime {
+            validate_petal_runtime_name("app", app_name)?;
+            for (binding, origin) in &app.endpoints {
+                validate_petal_runtime_name("endpoint binding", binding)?;
+                validate_petal_endpoint_origin(origin)?;
+            }
+            for key in app.values.keys() {
+                validate_petal_runtime_name("runtime value", key)?;
+            }
+            match (app.values.get("chain"), app.values.get("chain_id")) {
+                (Some(chain), Some(chain_id)) => {
+                    let parsed = chain_id.parse::<u64>().map_err(|_| {
+                        ConfigError::Invalid(format!(
+                            "petals.runtime.{app_name}.values.chain_id must be a u64"
+                        ))
+                    })?;
+                    let spec = self.chains.get(chain).ok_or_else(|| {
+                        ConfigError::Invalid(format!(
+                            "petals.runtime.{app_name}.values.chain={chain:?} is not configured"
+                        ))
+                    })?;
+                    if spec.chain_id != parsed {
+                        return Err(ConfigError::Invalid(format!(
+                            "petals.runtime.{app_name} chain {chain:?} has id {}, not {parsed}",
+                            spec.chain_id
+                        )));
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(ConfigError::Invalid(format!(
+                        "petals.runtime.{app_name} must set values.chain and values.chain_id together"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -580,6 +638,39 @@ impl Config {
         }
         c.allow_broadcast
     }
+}
+
+fn validate_petal_runtime_name(kind: &str, name: &str) -> Result<(), ConfigError> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ConfigError::Invalid(format!(
+            "petal {kind} {name:?} must contain only ASCII letters, digits, '-' or '_'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_petal_endpoint_origin(origin: &str) -> Result<(), ConfigError> {
+    let url = url::Url::parse(origin).map_err(|err| {
+        ConfigError::Invalid(format!("invalid petal endpoint origin {origin:?}: {err}"))
+    })?;
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.port().is_some_and(|port| port != 443)
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_none()
+    {
+        return Err(ConfigError::Invalid(format!(
+            "petal endpoint {origin:?} must be an HTTPS origin using the default port"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -640,6 +731,61 @@ mod tests {
     #[test]
     fn local_default_validates() {
         Config::local_default().validate().unwrap();
+    }
+
+    #[test]
+    fn petal_runtime_endpoints_and_chain_are_operator_validated() {
+        let mut cfg = Config::local_default();
+        cfg.petals.runtime.insert(
+            "polymarket".into(),
+            PetalRuntimeConfig {
+                endpoints: BTreeMap::from([(
+                    "clob".into(),
+                    "https://clob.internal.example".into(),
+                )]),
+                values: BTreeMap::from([
+                    ("chain".into(), "polygon".into()),
+                    ("chain_id".into(), "137".into()),
+                ]),
+            },
+        );
+        cfg.validate().unwrap();
+
+        cfg.petals
+            .runtime
+            .get_mut("polymarket")
+            .expect("polymarket app was inserted above")
+            .endpoints
+            .insert(
+                "clob".into(),
+                "https://clob.internal.example/credential-sink".into(),
+            );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn petal_runtime_names_use_the_package_name_grammar() {
+        for valid in ["echo", "Echo2", "my-petal", "my_petal"] {
+            validate_petal_runtime_name("app", valid).unwrap();
+        }
+        for invalid in ["", "foo.bar", "foo/bar", "foo\\bar", "petal💮"] {
+            let err = validate_petal_runtime_name("app", invalid).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("must contain only ASCII letters, digits, '-' or '_'")
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_petals_apps_config_is_rejected() {
+        let err = toml::from_str::<PetalsConfig>(
+            r#"
+[apps.demo]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `apps`"), "{err}");
     }
 
     #[test]

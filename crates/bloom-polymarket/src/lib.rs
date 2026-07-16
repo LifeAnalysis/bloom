@@ -1,4 +1,4 @@
-//! Polymarket v2 client for bloom (hand-roll path).
+//! Polymarket client for bloom (hand-roll path).
 //!
 //! Pure library crate — no VFS coupling, no `bloom-keystore` dependency. It
 //! provides:
@@ -12,17 +12,17 @@
 //! - the deterministic deposit-wallet address derivation ([`eip712`]);
 //! - **onboarding**: the idempotent, resumable state machine ([`Onboarder`]:
 //!   deploy → fund → approve → creds → sync) over the hand-rolled relayer
-//!   client ([`RelayerClient`]), the V2 approval-call builders ([`wallet`]),
+//!   client ([`RelayerClient`]), the onboarding approval-call builders ([`wallet`]),
 //!   and the 0600 CLOB credential store ([`CredentialStore`]);
 //!
-//! - **orders** ([`order`]): V2 EIP-712 order building/signing for the
+//! - **orders** ([`order`]): EIP-712 order building/signing for the
 //!   deposit-wallet path (signatureType 3 / POLY_1271) with integer micro-unit
 //!   amount math, verified by known-answer tests against independent EIP-712
 //!   implementations and official SDK source shapes.
 //!
 //! The private key never leaves the supplied signer; no code path serializes
 //! it. The reference for every byte-exact signing detail is the official
-//! `Polymarket/rs-clob-client-v2` SDK (we hand-roll to avoid pulling its
+//! official Polymarket Rust SDK (we hand-roll to avoid pulling its
 //! `alloy 1.6` major alongside bloom's `alloy 2`).
 
 #![forbid(unsafe_code)]
@@ -63,7 +63,6 @@ pub use eip712::{deposit_wallet_implementation, derive_deposit_wallet_address};
 pub use gamma::GammaClient;
 pub use onboard::{
     ChainReader, OnboardEvent, OnboardMode, OnboardState, OnboardStore, Onboarder, Stage,
-    validate_wallet_name,
 };
 pub use order_store::{DraftStatus, OrderDraft, OrderLock, OrderReceipt, OrderStore};
 pub use relayer::{RelayerClient, RelayerTx};
@@ -74,6 +73,25 @@ pub use signing::{
     signature_string_from_raw, wallet_batch_action_and_hash,
 };
 pub use types::{BookLevel, Credentials, Market, OrderBook, Position, Side, TokenMarket, Trade};
+pub use wallet_name::validate_wallet_name;
+
+mod wallet_name {
+    use crate::{PolymarketError, Result};
+
+    pub fn validate_wallet_name(name: &str) -> Result<()> {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(PolymarketError::invalid(format!(
+                "invalid wallet name {name:?}: must be 1-64 chars of [A-Za-z0-9_-]"
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// Polygon mainnet chain id — where Polymarket settles.
 pub const POLYGON: u64 = 137;

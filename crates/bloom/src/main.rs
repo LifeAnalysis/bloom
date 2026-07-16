@@ -12,6 +12,7 @@ mod commands {
     pub mod polymarket;
     pub mod qr;
 }
+mod github_source;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -221,8 +222,8 @@ enum Cmd {
     /// Talk to a running `bloom serve` over its UDS JSON-RPC socket.
     #[command(subcommand)]
     Ipc(IpcCmd),
-    /// Manage wasm petals: install, run, list, name.
-    #[command(subcommand)]
+    /// Manage wasm petals: install, app, list, uninstall.
+    #[command(subcommand, visible_alias = "petal")]
     Petals(PetalsCmd),
     /// Polymarket venue workflows.
     #[command(subcommand)]
@@ -279,40 +280,30 @@ enum VfsCmd {
 
 #[derive(Subcommand, Debug)]
 enum PetalsCmd {
-    /// Install a wasm (or WAT) module at `<path>`. Accepts `-` for stdin.
+    /// Install a Petal package directory, `.petal.tar`, or trusted GitHub source repository.
     Install {
-        /// Path to a `.wasm` or `.wat` file, or `-` for stdin.
+        /// Path to a package directory, `.petal.tar`, or trusted GitHub source repository URL.
         path: String,
-        /// Petname to bind to the resulting hash.
-        #[arg(long)]
-        name: Option<String>,
-        /// Capabilities to grant. Repeat to grant multiple, e.g.
-        /// `--cap vfs.read --cap vfs.write`.
-        #[arg(long = "cap", value_name = "CAP")]
-        caps: Vec<String>,
+        /// Git tag, branch, or commit SHA to install from a GitHub source repository.
+        #[arg(long = "ref", value_name = "TAG_OR_SHA")]
+        ref_: Option<String>,
     },
-    /// Run a petal by petname or hash.
-    Run {
-        /// Petname or 64-char hex hash.
-        name_or_hash: String,
-        /// File to feed to the petal as stdin (default: empty). `-` means
-        /// read from this process's stdin.
-        #[arg(long)]
-        input: Option<String>,
-        /// Restrict capabilities for this run to the listed set
-        /// (intersected with the petal's declared caps). Without this
-        /// flag, the petal runs with all of its declared caps.
-        #[arg(long = "cap", value_name = "CAP")]
-        cap_mask: Vec<String>,
+    /// Validate a Petal package directory and optionally emit a deterministic `.petal.tar`.
+    Build {
+        /// Package directory containing petal.toml, README.md, AGENTS.md, and petal/<name>/.
+        package_dir: String,
+        /// Write a deterministic `.petal.tar` archive.
+        #[arg(long, value_name = "ARCHIVE")]
+        out: Option<String>,
     },
     /// List installed petals.
     Ls,
-    /// Bind `<name>` to `<hash>`. Omit `<hash>` to remove the binding.
-    Name { name: String, hash: Option<String> },
     /// Remove an installed petal (and any petname pointing at it).
     Uninstall {
-        /// 64-char hex content hash of the petal to remove.
-        hash: String,
+        /// Content hash of the petal to remove: full 64-char hex, a
+        /// unique prefix of at least 12 chars (as printed by `ls`),
+        /// a Petal name, or a petname.
+        target: String,
     },
 }
 
@@ -430,7 +421,7 @@ enum PolymarketCmd {
         #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
         passphrase: Option<String>,
     },
-    /// Revoke the pUSD/CTF spending approvals onboarding granted to the four V2
+    /// Revoke the pUSD/CTF spending approvals onboarding granted to the four
     /// contracts (the inverse of onboarding's approve stage). Withdraws the
     /// trading contracts' authority over the deposit wallet's collateral and
     /// positions; trading needs re-onboarding afterward.
@@ -1059,6 +1050,25 @@ async fn main() -> ExitCode {
     }
 }
 
+fn reject_archive_output_inside_package(package_dir: &str, out: &str) -> Result<()> {
+    let package_dir = std::fs::canonicalize(package_dir)
+        .with_context(|| format!("canonicalize package dir {package_dir}"))?;
+    let out_path = std::path::Path::new(out);
+    let out_parent = out_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let out_parent = std::fs::canonicalize(out_parent)
+        .with_context(|| format!("canonicalize archive parent {out}"))?;
+    let out_abs = out_parent.join(out_path.file_name().unwrap_or_default());
+    if out_abs.starts_with(&package_dir) {
+        bail!(
+            "--out must be outside the package directory so archives are not packaged into future builds"
+        );
+    }
+    Ok(())
+}
+
 /// Returns `None` when no daemon socket is present (daemon not started),
 /// propagating all other errors normally. A stale socket (file exists but
 /// connection refused) is removed and surfaced as an error rather than
@@ -1469,7 +1479,11 @@ async fn run(cli: Cli) -> Result<()> {
                             }
                             Err(e) => return Err(e).context("Polymarket onboarding"),
                         }
-                        poll_polymarket_onboard_until_stable(&d, &wallet).await?;
+                        if let Some(status_path) = polymarket_onboard_status_path(&p) {
+                            poll_polymarket_onboard_status_until_stable(&d, &status_path).await?;
+                        } else {
+                            poll_polymarket_onboard_until_stable(&d, &wallet).await?;
+                        }
                         return Ok(());
                     }
                 }
@@ -1510,14 +1524,8 @@ async fn run(cli: Cli) -> Result<()> {
                 // If this is a polymarket `begin` write, the handler spawned a background
                 // task. In in-process mode we must poll until the task reaches a stable
                 // stage, else the process exits and kills the task.
-                let segs = p.segments();
-                if segs.len() == 4
-                    && segs[0] == "polymarket"
-                    && segs[1] == "onboard"
-                    && segs[3] == "begin"
-                {
-                    let wallet_name = segs[2].clone();
-                    poll_polymarket_onboard_until_stable(&d, &wallet_name).await?;
+                if let Some(status_path) = polymarket_onboard_status_path(&p) {
+                    poll_polymarket_onboard_status_until_stable(&d, &status_path).await?;
                 }
                 return Ok(());
             }
@@ -2254,7 +2262,7 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let staged = match confirm_once().await {
                 Ok(staged) => staged,
-                Err(TxEngineError::BroadcastApprovalRequired(reason)) if passkey_wallet => {
+                Err(TxEngineError::ApprovalRequired(requirement)) if passkey_wallet => {
                     if sign_outbox_sealed_approval_if_challenged(
                         &d,
                         &wallet,
@@ -2266,7 +2274,7 @@ async fn run(cli: Cli) -> Result<()> {
                     {
                         confirm_once().await?
                     } else {
-                        return Err(TxEngineError::BroadcastApprovalRequired(reason).into());
+                        return Err(TxEngineError::ApprovalRequired(requirement).into());
                     }
                 }
                 Err(e) => return Err(e.into()),
@@ -2455,7 +2463,7 @@ async fn run(cli: Cli) -> Result<()> {
                 };
                 let staged = match confirm_once().await {
                     Ok(staged) => staged,
-                    Err(TxEngineError::BroadcastApprovalRequired(reason)) if passkey_wallet => {
+                    Err(TxEngineError::ApprovalRequired(requirement)) if passkey_wallet => {
                         if sign_outbox_sealed_approval_if_challenged(
                             &d,
                             &wallet,
@@ -2470,7 +2478,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 .await
                                 .with_context(|| format!("confirm {chain}:{id}"))?
                         } else {
-                            return Err(TxEngineError::BroadcastApprovalRequired(reason).into());
+                            return Err(TxEngineError::ApprovalRequired(requirement).into());
                         }
                     }
                     Err(e) => {
@@ -2778,157 +2786,263 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
-    use std::collections::BTreeSet;
-    use std::io::Read;
-
-    use bloom_petals::{Capability, RunOptions, VfsHost};
-
-    let d = Daemon::from_home(home).context("build daemon")?;
-    let vfs_arc = std::sync::Arc::new(d.vfs.clone());
-
-    match cmd {
-        PetalsCmd::Install { path, name, caps } => {
-            let bytes = if path == "-" {
-                let mut buf = Vec::new();
-                std::io::stdin()
-                    .read_to_end(&mut buf)
-                    .context("read stdin")?;
-                buf
-            } else {
-                std::fs::read(&path).with_context(|| format!("read {path}"))?
-            };
-            let mut cap_set: BTreeSet<Capability> = BTreeSet::new();
-            for c in &caps {
-                let cap = Capability::parse(c)
-                    .ok_or_else(|| anyhow::anyhow!("unknown capability: {c:?}"))?;
-                cap_set.insert(cap);
+    let cmd = match cmd {
+        PetalsCmd::Build { package_dir, out } => {
+            if let Some(out) = out.as_deref() {
+                reject_archive_output_inside_package(&package_dir, out)?;
             }
-            let (result, meta) = d
-                .petals
-                .install(
-                    &bytes,
-                    name.as_deref(),
-                    &cap_set,
-                    bloom_petals::PetalMode::Local,
-                )
-                .context("install petal")?;
+            let package = bloom_petals::package::build_petal_package_dir(&package_dir)
+                .with_context(|| format!("build Petal package {package_dir}"))?;
+            let consent = bloom_petals::package::petal_consent_summary(&package)
+                .context("build Petal consent summary")?;
+            println!("hash: {}", package.hash);
+            println!("contract: {}", bloom_petals::package::ROUTE_PACKAGE);
+            println!(
+                "wit_digest: {}",
+                bloom_petals::package::contract_wit_digest()
+            );
+            println!("petal_mount: petals/{}/", package.name);
+            println!("routes: {}", package.route_index.routes.len());
+            println!("artifacts: {package_dir}/artifacts");
+            print_petal_consent(&consent);
+            if let Some(out) = out {
+                let file =
+                    std::fs::File::create(&out).with_context(|| format!("create archive {out}"))?;
+                package
+                    .write_petal_tar(file)
+                    .with_context(|| format!("write archive {out}"))?;
+                println!("archive: {out}");
+            }
+            return Ok(());
+        }
+        other => other,
+    };
+
+    let d = Daemon::from_home(home.clone()).context("build daemon")?;
+    match cmd {
+        PetalsCmd::Install { path, ref_ } => {
+            if let Some(repo) = github_source::parse_github_install_url(&path)? {
+                let installed =
+                    github_source::install_github_source(&home, &d, &repo, ref_.as_deref())?;
+                println!();
+                println!("hash: {}", installed.result.hash);
+                println!("mode: petal");
+                println!("size: {} bytes", installed.result.size);
+                if installed.result.already_present {
+                    println!("note: already installed");
+                }
+                if let Some(app) = &installed.meta.petal {
+                    println!("petal_mount: petals/{}/", app.name);
+                }
+                println!("routes: {}", installed.index.routes.len());
+                println!(
+                    "source: {}/{}@{}",
+                    installed.provenance.owner,
+                    installed.provenance.repo,
+                    installed
+                        .provenance
+                        .selected_tag
+                        .as_deref()
+                        .unwrap_or(&installed.provenance.requested_ref)
+                );
+                println!("resolved_commit: {}", installed.provenance.resolved_commit);
+                print_petal_consent(&installed.consent);
+                return Ok(());
+            }
+
+            if ref_.is_some() {
+                bail!("--ref is only supported for trusted GitHub source installs");
+            }
+            let path_meta = std::fs::metadata(&path).with_context(|| format!("stat {path}"))?;
+            let is_petal_dir = path_meta.is_dir();
+            if !is_petal_dir && !path.ends_with(".petal.tar") {
+                bail!(
+                    "petals install only accepts Petal package directories, .petal.tar archives, or trusted GitHub source repositories"
+                );
+            }
+            let consent_package = if is_petal_dir {
+                bloom_petals::package::PreparedPetalPackage::from_dir(&path)
+                    .with_context(|| format!("read Petal package dir {path}"))?
+            } else {
+                bloom_petals::package::PreparedPetalPackage::from_petal_tar(&path)
+                    .with_context(|| format!("read Petal package archive {path}"))?
+            };
+            let mut consent = bloom_petals::package::petal_consent_summary(&consent_package)
+                .context("build app consent summary")?;
+            apply_configured_petal_endpoints(&d, &mut consent)?;
+            let (result, meta, index) = if is_petal_dir {
+                d.petals
+                    .store()
+                    .install_petal_package_dir(&path)
+                    .with_context(|| format!("install Petal package dir {path}"))?
+            } else {
+                d.petals
+                    .store()
+                    .install_petal_package_tar(&path)
+                    .with_context(|| format!("install Petal package archive {path}"))?
+            };
             println!("hash: {}", result.hash);
-            println!("mode: {}", meta.mode.as_str());
+            println!("mode: petal");
             println!("size: {} bytes", result.size);
             if result.already_present {
-                println!("note: already installed (caps unioned with existing)");
+                println!("note: already installed");
             }
-            if let Some(n) = &meta.name {
-                println!("name: {n}");
+            if let Some(app) = &meta.petal {
+                println!("petal_mount: petals/{}/", app.name);
             }
-            if !meta.caps.is_empty() {
-                let cs: Vec<&str> = meta.caps.iter().map(|c| c.as_str()).collect();
-                println!("caps: {}", cs.join(", "));
-            }
+            println!("routes: {}", index.routes.len());
+            print_petal_consent(&consent);
             Ok(())
         }
-        PetalsCmd::Run {
-            name_or_hash,
-            input,
-            cap_mask,
-        } => {
-            let stdin = match input.as_deref() {
-                Some("-") => {
-                    let mut buf = Vec::new();
-                    std::io::stdin()
-                        .read_to_end(&mut buf)
-                        .context("read stdin")?;
-                    buf
-                }
-                Some(p) => std::fs::read(p).with_context(|| format!("read {p}"))?,
-                None => Vec::new(),
-            };
-            let cap_mask = if cap_mask.is_empty() {
-                None
-            } else {
-                let mut s: BTreeSet<Capability> = BTreeSet::new();
-                for c in &cap_mask {
-                    let cap = Capability::parse(c)
-                        .ok_or_else(|| anyhow::anyhow!("unknown capability: {c:?}"))?;
-                    s.insert(cap);
-                }
-                Some(s)
-            };
-            let host = std::sync::Arc::new(VfsHost::new(vfs_arc.clone()));
-            let out = d
-                .petals
-                .run(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
-                .await
-                .context("run petal")?;
-            use std::io::Write;
-            // Stream stdout/stderr to the user verbatim so they can pipe
-            // a petal's output. Exit code goes to the parent process.
-            std::io::stdout().write_all(&out.stdout).ok();
-            std::io::stderr().write_all(&out.stderr).ok();
-            if out.exit_code != 0 {
-                anyhow::bail!("petal exited with code {}", out.exit_code);
-            }
-            Ok(())
+        PetalsCmd::Build { .. } => {
+            unreachable!("Petal build commands are handled before daemon startup")
         }
         PetalsCmd::Ls => {
-            let names = d.petals.registry().snapshot();
-            let mut name_for_hash: std::collections::BTreeMap<String, String> = Default::default();
-            for (n, h) in &names {
-                name_for_hash.entry(h.clone()).or_insert(n.clone());
-            }
-            let hashes = d.petals.store().list_hashes().context("list petals")?;
-            if hashes.is_empty() {
+            let package_hashes = d
+                .petals
+                .store()
+                .list_package_hashes()
+                .context("list Petal packages")?;
+            if package_hashes.is_empty() {
                 println!("(no petals installed)");
                 return Ok(());
             }
-            for h in hashes {
+            for h in package_hashes {
                 let meta = d.petals.store().load_meta(&h).context("load meta")?;
-                let n = name_for_hash.get(&h).map(String::as_str).unwrap_or("-");
-                let caps: Vec<&str> = meta.caps.iter().map(|c| c.as_str()).collect();
+                let app = meta
+                    .petal
+                    .as_ref()
+                    .map(|app| format!("  app=petals/{}/", app.name))
+                    .unwrap_or_default();
+                let source = meta.source.as_ref().map_or_else(String::new, |source| {
+                    let selected = source
+                        .selected_tag
+                        .as_deref()
+                        .unwrap_or(&source.requested_ref);
+                    format!("  source={}/{}@{}", source.owner, source.repo, selected)
+                });
                 println!(
-                    "{}  {:<7}  {:>7}  caps=[{}]  name={}",
-                    &meta.hash[..12],
-                    meta.mode.as_str(),
+                    "{}  {:<7}  {:>7}  caps=[]  name=-{}{}",
+                    &meta.hash[..bloom_petals::store::HASH_PREFIX_LEN],
+                    "app",
                     meta.size,
-                    caps.join(","),
-                    n
+                    app,
+                    source
                 );
             }
             Ok(())
         }
-        PetalsCmd::Name { name, hash } => match hash {
-            Some(h) => {
-                d.petals
-                    .registry()
-                    .set(&name, &h)
-                    .with_context(|| format!("bind name {name} -> {h}"))?;
-                println!("bound {name} -> {h}");
-                Ok(())
-            }
-            None => {
-                let removed = d
-                    .petals
-                    .registry()
-                    .unset(&name)
-                    .with_context(|| format!("unset name {name}"))?;
-                if removed {
-                    println!("removed name {name}");
-                } else {
-                    println!("name {name} was not bound");
-                }
-                Ok(())
-            }
-        },
-        PetalsCmd::Uninstall { hash } => {
-            let removed = d.petals.uninstall(&hash).context("uninstall petal")?;
+        PetalsCmd::Uninstall { target } => {
+            let removed = d.petals.uninstall(&target).context("uninstall petal")?;
             if removed {
-                println!("removed {hash}");
+                println!("removed {target}");
             } else {
-                println!("not installed: {hash}");
+                println!("not installed: {target}");
             }
             Ok(())
         }
     }
+}
+
+fn print_petal_consent(summary: &bloom_petals::package::PetalConsentSummary) {
+    println!("consent:");
+    if let Some(package_summary) = &summary.package_summary {
+        println!("  summary: {package_summary}");
+    }
+    println!("  docs: {}", summary.docs.join(", "));
+    if !summary.capabilities.is_empty() {
+        println!("  capabilities: {}", summary.capabilities.join(", "));
+    }
+    if !summary.network.is_empty() {
+        println!("  network:");
+        for rule in &summary.network {
+            println!("{}", format_petal_consent_net_rule(rule));
+        }
+    }
+    if !summary.sign_intents.is_empty() {
+        println!("  signing_intents: {}", summary.sign_intents.join(", "));
+    }
+    if !summary.store_namespaces.is_empty() {
+        println!("  private_store:");
+        for ns in &summary.store_namespaces {
+            let visibility = if ns.secret { "secret" } else { "private" };
+            println!("    - {} {}", ns.namespace, visibility);
+        }
+    }
+    if !summary.routes.is_empty() {
+        println!("  routes:");
+        for route in &summary.routes {
+            let ops = route
+                .ops
+                .iter()
+                .map(|op| format!("{op:?}").to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut flags = Vec::new();
+            if route.side_effecting_read {
+                flags.push("side_effecting_read".to_string());
+            }
+            if route.write_async {
+                flags.push("write_async".to_string());
+            }
+            if let Some(ttl) = route.cache_ttl_ms {
+                flags.push(format!("cache_ttl_ms={ttl}"));
+            }
+            let caps = if route.required_caps.is_empty() {
+                "-".to_string()
+            } else {
+                route.required_caps.join(",")
+            };
+            if flags.is_empty() {
+                println!("    - {} ops=[{}] caps=[{}]", route.path, ops, caps);
+            } else {
+                println!(
+                    "    - {} ops=[{}] caps=[{}] flags=[{}]",
+                    route.path,
+                    ops,
+                    caps,
+                    flags.join(",")
+                );
+            }
+        }
+    }
+}
+
+fn apply_configured_petal_endpoints(
+    daemon: &Daemon,
+    summary: &mut bloom_petals::package::PetalConsentSummary,
+) -> Result<()> {
+    let bindings = daemon
+        .config
+        .petals
+        .runtime
+        .get(&summary.name)
+        .map(|app| &app.endpoints)
+        .cloned()
+        .unwrap_or_default();
+    bloom_petals::package::apply_petal_consent_endpoint_bindings(summary, &bindings)
+        .context("apply configured Petal endpoint bindings")
+}
+
+fn format_petal_consent_net_rule(rule: &bloom_petals::package::PetalConsentNetRule) -> String {
+    let binding = rule
+        .binding
+        .as_deref()
+        .map(|binding| format!(" binding={binding}"))
+        .unwrap_or_default();
+    let effective = rule
+        .effective_origin
+        .as_deref()
+        .map(|origin| format!(" effective_origin={origin}"))
+        .unwrap_or_default();
+    format!(
+        "    - declared_host={}{}{} methods=[{}] paths=[{}]",
+        rule.host,
+        binding,
+        effective,
+        rule.methods.join(","),
+        rule.paths.join(",")
+    )
 }
 
 #[cfg(feature = "mount")]
@@ -3291,6 +3405,29 @@ fn polymarket_onboard_begin_write(path: &VfsPath) -> Option<String> {
     let segs = path.segments();
     if segs.len() == 4 && segs[0] == "polymarket" && segs[1] == "onboard" && segs[3] == "begin" {
         Some(segs[2].clone())
+    } else if segs.len() == 5
+        && segs[0] == "petals"
+        && segs[1] == "polymarket"
+        && segs[2] == "onboard"
+        && segs[4] == "begin"
+    {
+        Some(segs[3].clone())
+    } else {
+        None
+    }
+}
+
+fn polymarket_onboard_status_path(path: &VfsPath) -> Option<String> {
+    let segs = path.segments();
+    if segs.len() == 4 && segs[0] == "polymarket" && segs[1] == "onboard" && segs[3] == "begin" {
+        Some(format!("polymarket/onboard/{}/status.json", segs[2]))
+    } else if segs.len() == 5
+        && segs[0] == "petals"
+        && segs[1] == "polymarket"
+        && segs[2] == "onboard"
+        && segs[4] == "begin"
+    {
+        Some(format!("petals/polymarket/onboard/{}/status.json", segs[3]))
     } else {
         None
     }
@@ -3310,10 +3447,17 @@ fn polymarket_onboard_ceremony_intent(
 }
 
 async fn poll_polymarket_onboard_until_stable(d: &Daemon, wallet: &str) -> Result<()> {
+    poll_polymarket_onboard_status_until_stable(
+        d,
+        &format!("polymarket/onboard/{wallet}/status.json"),
+    )
+    .await
+}
+
+async fn poll_polymarket_onboard_status_until_stable(d: &Daemon, status_path: &str) -> Result<()> {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let status_path = VfsPath::parse(&format!("polymarket/onboard/{wallet}/status.json"))
-            .context("parse status path")?;
+        let status_path = VfsPath::parse(status_path).context("parse status path")?;
         if let Ok(bytes) = d.vfs.read(&status_path).await
             && let Ok(st) = serde_json::from_slice::<serde_json::Value>(&bytes)
         {
@@ -4695,11 +4839,27 @@ async fn unmount_bloom(handle: Option<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        polymarket_fund_confirm_write, polymarket_redeem_confirm_write,
-        polymarket_revoke_approvals_confirm_write, polymarket_trade_confirm_write,
-        polymarket_withdraw_pusd_confirm_write, request_body_with_wallet,
+        format_petal_consent_net_rule, polymarket_fund_confirm_write,
+        polymarket_redeem_confirm_write, polymarket_revoke_approvals_confirm_write,
+        polymarket_trade_confirm_write, polymarket_withdraw_pusd_confirm_write,
+        request_body_with_wallet,
     };
     use bloom_vfs::VfsPath;
+
+    #[test]
+    fn petal_consent_network_line_includes_named_binding() {
+        let line = format_petal_consent_net_rule(&bloom_petals::package::PetalConsentNetRule {
+            binding: Some("clob".into()),
+            host: "clob.polymarket.com".into(),
+            effective_origin: Some("https://clob.internal.example".into()),
+            methods: vec!["POST".into()],
+            paths: vec!["/order".into()],
+        });
+        assert_eq!(
+            line,
+            "    - declared_host=clob.polymarket.com binding=clob effective_origin=https://clob.internal.example methods=[POST] paths=[/order]"
+        );
+    }
 
     #[test]
     fn request_wallet_injection_preserves_http_message_body() {

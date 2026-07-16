@@ -28,6 +28,11 @@ pub const APPROVAL_CHALLENGE_SCHEMA_V1: &str = "bloom.approval_challenge.v1";
 pub const SEALED_ACTION_SCHEMA_V1: &str = "bloom.sealed_action.v1";
 /// Schema tag for [`SigningAttestation`] envelopes.
 pub const SIGNING_ATTESTATION_SCHEMA_V1: &str = "bloom.signing_attestation.v1";
+/// Typed facts schema embedded in [`SigningAttestation::facts`] for dynamically loaded
+/// Petal package signing.
+pub const PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1: &str = "bloom.petal.signing_facts.v1";
+/// Petal id prefix for dynamically loaded dynamically loaded Petals.
+pub const PETAL_PETAL_ID_PREFIX: &str = "petal:";
 /// Canonical subject schema for EVM wallet sealed actions.
 pub const EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1: &str = "bloom.evm.sealed_intent.v1";
 /// Canonical subject kind for EVM wallet sealed actions.
@@ -55,9 +60,9 @@ pub const PAID_HTTP_MPP_SIGN_INTENT: &str = "paid-http.mpp.sign";
 /// onboarding, redemption, withdrawal, revocation, builder_key, funding).
 pub const POLYMARKET_SIGNING_ATTESTATION_FACTS_SCHEMA_V1: &str =
     "bloom.polymarket.signing_facts.v1";
-/// Polymarket V2 order signing intent (POLY_1271 owner-side wrap).
-pub const POLYMARKET_ORDER_SIGN_INTENT: &str = "polymarket.order.v2";
-/// Polymarket onboarding signing intent (covers V2 approval batch, CLOB creds
+/// Polymarket order signing intent (POLY_1271 owner-side wrap).
+pub const POLYMARKET_ORDER_SIGN_INTENT: &str = "polymarket.order.v1";
+/// Polymarket onboarding signing intent (covers onboarding approval batch, CLOB creds
 /// mint, builder key create under one hardened grant).
 pub const POLYMARKET_ONBOARDING_SIGN_INTENT: &str = "polymarket.onboarding";
 /// Polymarket redemption signing intent (CTF.redeem batch from deposit wallet).
@@ -68,27 +73,22 @@ pub const POLYMARKET_WITHDRAWAL_SIGN_INTENT: &str = "polymarket.withdrawal";
 /// Polymarket builder-key creation / rotation signing intent (used as a
 /// sub-step of onboarding, but reachable on its own).
 pub const POLYMARKET_BUILDER_KEY_SIGN_INTENT: &str = "polymarket.builder_key";
-/// Polymarket V2-spender revoke signing intent (authority-changing: resets
-/// deposit-wallet approvals for every V2 spender to zero).
+/// Polymarket spender-revocation signing intent (authority-changing: resets
+/// every deposit-wallet approval granted during onboarding to zero).
 pub const POLYMARKET_REVOCATION_SIGN_INTENT: &str = "polymarket.revocation";
 /// Polymarket funding signing intent (EVM tx outbox path; mostly an alias for
 /// the tx-engine Sealed Approval flow used by `bloom polymarket fund`).
 pub const POLYMARKET_FUNDING_SIGN_INTENT: &str = "polymarket.funding";
 /// Schema tag for [`CanonicalEnvelope`].
-///
-/// v2: the canonical header gained Petal identity (`petal_id`, `petal_digest`,
-/// `petal_version`, `executor_kind`) and `expires_ms`, replacing `executor_id`.
-pub const CANONICAL_ENVELOPE_SCHEMA_V2: &str = "bloom.canonical_envelope.v2";
+pub const CANONICAL_ENVELOPE_SCHEMA_V1: &str = "bloom.canonical_envelope.v1";
 /// Schema tag callers should place in [`CanonicalIntentHeader::schema`].
-pub const CANONICAL_INTENT_HEADER_SCHEMA_V2: &str = "bloom.intent_header.v2";
+pub const CANONICAL_INTENT_HEADER_SCHEMA_V1: &str = "bloom.intent_header.v1";
 
 /// Domain tag for [`intent_hash_of`].
 ///
 /// Spec §5.2: this tag MUST be bumped whenever the canonical schema changes.
-/// v2 corresponds to [`CANONICAL_ENVELOPE_SCHEMA_V2`] (Petal identity +
-/// `expires_ms` on the header). Hashes produced under `bloom.intent.v1` refer
-/// to the retired v1 envelope schema and can no longer be recomputed.
-pub const INTENT_HASH_DOMAIN: &[u8] = b"bloom.intent.v2";
+/// The initial schema binds Petal identity and header expiry.
+pub const INTENT_HASH_DOMAIN: &[u8] = b"bloom.intent.v1";
 /// Domain tag for the WebAuthn approval challenge hash (§5.7).
 pub const APPROVAL_CHALLENGE_DOMAIN: &[u8] = b"bloom.approval.v1";
 /// Domain tag for [`DaemonGrantTerms::daemon_terms_digest`].
@@ -413,7 +413,7 @@ impl CanonicalEnvelope {
         subject_bytes: Vec<u8>,
     ) -> Self {
         Self {
-            schema: CANONICAL_ENVELOPE_SCHEMA_V2.to_string(),
+            schema: CANONICAL_ENVELOPE_SCHEMA_V1.to_string(),
             header,
             subject_kind: subject_kind.into(),
             subject_schema: subject_schema.into(),
@@ -432,7 +432,7 @@ impl CanonicalEnvelope {
 
 /// Compute the domain-separated `intent_hash` over raw canonical bytes.
 ///
-/// Uses BLAKE3 with the `bloom.intent.v2` domain tag, encoded as lowercase,
+/// Uses BLAKE3 with the `bloom.intent.v1` domain tag, encoded as lowercase,
 /// full-length, untruncated hex. This is the single hash function that must
 /// be used anywhere an `intent_hash` is produced — in
 /// [`CanonicalEnvelope::intent_hash`], in central outbox projections, and in
@@ -465,7 +465,7 @@ pub struct DaemonGrantTerms {
     /// Maximum wallet signatures allowed across the whole action.
     pub max_signatures: u32,
     /// Exact `intent` strings the Petal may pass to `sign-hash`
-    /// (e.g. `evm.tx.sign`, `polymarket.order.v2`, `wallet_policy.sign`).
+    /// (e.g. `evm.tx.sign`, `polymarket.order.v1`, `wallet_policy.sign`).
     pub allowed_sign_intents: Vec<String>,
     /// Required approval strength, copied into the challenge.
     pub assurance: AssuranceLevel,
@@ -669,7 +669,7 @@ pub trait PolicyEvaluator: Send + Sync {
 /// The sealed action record persisted in daemon-controlled storage (§6.1).
 ///
 /// The wrapped [`CanonicalEnvelope`] remains the sole intent-hash preimage
-/// (`intent_hash = BLAKE3("bloom.intent.v2" || envelope canonical bytes)`);
+/// (`intent_hash = BLAKE3("bloom.intent.v1" || envelope canonical bytes)`);
 /// the sealed action adds daemon-produced review and enforcement context.
 /// Once sealed it is immutable — re-stage instead of mutating (§5.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -760,14 +760,14 @@ impl SealedAction {
                 self.schema
             )));
         }
-        if self.envelope.schema != CANONICAL_ENVELOPE_SCHEMA_V2 {
+        if self.envelope.schema != CANONICAL_ENVELOPE_SCHEMA_V1 {
             return Err(AuthApiError::InvalidSubject(format!(
                 "unsupported canonical envelope schema {}",
                 self.envelope.schema
             )));
         }
         let header = &self.envelope.header;
-        if header.schema != CANONICAL_INTENT_HEADER_SCHEMA_V2 {
+        if header.schema != CANONICAL_INTENT_HEADER_SCHEMA_V1 {
             return Err(AuthApiError::InvalidSubject(format!(
                 "unsupported canonical intent header schema {}",
                 header.schema
@@ -1552,6 +1552,163 @@ impl SigningAttestation {
     }
 }
 
+/// Facts attested by the daemon-owned Petal signing bridge.
+///
+/// A component receives only `(wallet, hash32, intent)` through the WIT
+/// interface. The runner supplies the remaining provenance from the resolved
+/// package and route, so an app cannot select another app identity or route
+/// when requesting a signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PetalSigningAttestationFacts {
+    pub facts_schema: String,
+    pub action_id: String,
+    pub wallet: String,
+    pub surface: String,
+    pub petal_id: String,
+    pub petal_digest: String,
+    pub petal_version: String,
+    pub petal_root: String,
+    pub package_hash: String,
+    pub route_id: String,
+    pub op: String,
+    pub path: String,
+    #[serde(default)]
+    pub params: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    pub intent: String,
+    pub signing_hash: String,
+    pub policy_snapshot_digest: String,
+}
+
+/// Whether `petal_id` names a dynamically loaded dynamically loaded application.
+pub fn is_petal_petal_id(petal_id: &str) -> bool {
+    petal_id
+        .strip_prefix(PETAL_PETAL_ID_PREFIX)
+        .is_some_and(|petal_root| !petal_root.trim().is_empty())
+}
+
+impl PetalSigningAttestationFacts {
+    pub fn to_facts_map(&self) -> Result<BTreeMap<String, serde_json::Value>, AuthApiError> {
+        match serde_json::to_value(self).map_err(AuthApiError::Json)? {
+            serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
+            _ => Err(AuthApiError::InvalidSubject(
+                "petal attestation facts did not serialize as an object".into(),
+            )),
+        }
+    }
+
+    pub fn from_facts_map(
+        facts: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<Self, AuthApiError> {
+        let map: serde_json::Map<String, serde_json::Value> = facts.clone().into_iter().collect();
+        serde_json::from_value(serde_json::Value::Object(map)).map_err(AuthApiError::Json)
+    }
+
+    pub fn signing_attestation(&self) -> Result<SigningAttestation, AuthApiError> {
+        self.validate()?;
+        Ok(SigningAttestation {
+            schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: self.petal_id.clone(),
+            petal_digest: self.petal_digest.clone(),
+            intent: self.intent.clone(),
+            facts: self.to_facts_map()?,
+        })
+    }
+
+    pub fn from_attestation(attestation: &SigningAttestation) -> Result<Self, AuthApiError> {
+        if attestation.schema != SIGNING_ATTESTATION_SCHEMA_V1 {
+            return Err(AuthApiError::Denied(format!(
+                "unsupported attestation schema {}",
+                attestation.schema
+            )));
+        }
+        if !is_petal_petal_id(&attestation.petal_id) {
+            return Err(AuthApiError::Denied(
+                "petal attestation petal_id mismatch".into(),
+            ));
+        }
+        let typed = Self::from_facts_map(&attestation.facts)?;
+        typed.validate()?;
+        if typed.petal_id != attestation.petal_id
+            || typed.petal_digest != attestation.petal_digest
+            || typed.intent != attestation.intent
+        {
+            return Err(AuthApiError::Denied(
+                "petal attestation envelope does not match typed facts".into(),
+            ));
+        }
+        Ok(typed)
+    }
+
+    pub fn validate(&self) -> Result<(), AuthApiError> {
+        if self.facts_schema != PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1 {
+            return Err(AuthApiError::Denied(format!(
+                "unsupported petal attestation facts schema {}",
+                self.facts_schema
+            )));
+        }
+        for (name, value) in [
+            ("action_id", &self.action_id),
+            ("wallet", &self.wallet),
+            ("petal_id", &self.petal_id),
+            ("petal_digest", &self.petal_digest),
+            ("petal_version", &self.petal_version),
+            ("petal_root", &self.petal_root),
+            ("package_hash", &self.package_hash),
+            ("route_id", &self.route_id),
+            ("op", &self.op),
+            ("intent", &self.intent),
+            ("signing_hash", &self.signing_hash),
+            ("policy_snapshot_digest", &self.policy_snapshot_digest),
+        ] {
+            validate_required(name, value).map_err(denied_from_invalid)?;
+        }
+        if self.surface != "petals" {
+            return Err(AuthApiError::Denied(
+                "petal attestation surface must be apps".into(),
+            ));
+        }
+        if !is_petal_petal_id(&self.petal_id) {
+            return Err(AuthApiError::Denied(
+                "petal attestation petal_id must use petal: prefix".into(),
+            ));
+        }
+        if self.petal_id != format!("{PETAL_PETAL_ID_PREFIX}{}", self.petal_root)
+            || self.petal_digest != self.package_hash
+        {
+            return Err(AuthApiError::Denied(
+                "petal attestation identity does not match package provenance".into(),
+            ));
+        }
+        if self.package_hash.len() != 64
+            || !self
+                .package_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(AuthApiError::Denied(
+                "petal attestation package_hash must be a lowercase BLAKE3 digest".into(),
+            ));
+        }
+        if !matches!(self.op.as_str(), "lookup" | "list" | "read" | "write") {
+            return Err(AuthApiError::Denied(
+                "petal attestation operation is unsupported".into(),
+            ));
+        }
+        let hash = self
+            .signing_hash
+            .strip_prefix("0x")
+            .unwrap_or(&self.signing_hash);
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AuthApiError::Denied(
+                "petal attestation signing_hash must be a 32-byte hex value".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Collision-resistant, domain-tagged digest of a signing attestation facts
 /// map. The map is ordered so serde JSON output is deterministic.
 pub fn signing_attestation_facts_digest(
@@ -1724,9 +1881,11 @@ impl EvmSealedIntentSubject {
         validate_required("wallet", &self.wallet)?;
         validate_required("surface", &self.surface)?;
         validate_required("account", &self.account)?;
-        if self.petal_id != petal_identity::PETAL_ID_EVM_WALLET {
+        if self.petal_id != petal_identity::PETAL_ID_EVM_WALLET
+            && !is_petal_petal_id(&self.petal_id)
+        {
             return Err(AuthApiError::InvalidSubject(
-                "EVM sealed intent petal_id must be evm-wallet".into(),
+                "EVM sealed intent petal_id must be evm-wallet or a Petal".into(),
             ));
         }
         if self.petal_digest.trim().is_empty() || self.petal_version.trim().is_empty() {
@@ -1795,7 +1954,7 @@ impl EvmSealedIntentSubject {
 
     pub fn canonical_header(&self, expires_ms: u64) -> CanonicalIntentHeader {
         CanonicalIntentHeader {
-            schema: CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: self.wallet.clone(),
             surface: self.surface.clone(),
             action_id: self.action_id.clone(),
@@ -1939,9 +2098,11 @@ impl EvmSigningAttestationFacts {
                 "EVM attestation intent mismatch".into(),
             ));
         }
-        if attestation.petal_id != petal_identity::PETAL_ID_EVM_WALLET {
+        if attestation.petal_id != petal_identity::PETAL_ID_EVM_WALLET
+            && !is_petal_petal_id(&attestation.petal_id)
+        {
             return Err(AuthApiError::Denied(
-                "EVM attestation petal_id mismatch".into(),
+                "EVM attestation petal_id must be evm-wallet or a Petal".into(),
             ));
         }
         let typed = Self::from_facts_map(&attestation.facts)?;
@@ -1972,9 +2133,11 @@ impl EvmSigningAttestationFacts {
         validate_required("account", &self.account).map_err(denied_from_invalid)?;
         validate_required("to", &self.to).map_err(denied_from_invalid)?;
         validate_required("method", &self.method).map_err(denied_from_invalid)?;
-        if self.petal_id != petal_identity::PETAL_ID_EVM_WALLET {
+        if self.petal_id != petal_identity::PETAL_ID_EVM_WALLET
+            && !is_petal_petal_id(&self.petal_id)
+        {
             return Err(AuthApiError::Denied(
-                "EVM attestation petal_id must be evm-wallet".into(),
+                "EVM attestation petal_id must be evm-wallet or a Petal".into(),
             ));
         }
         validate_required("petal_digest", &self.petal_digest).map_err(denied_from_invalid)?;
@@ -2038,16 +2201,16 @@ impl EvmSigningAttestationFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolymarketSealedActionKind {
-    /// V2 POLY_1271 deposit-wallet order (signatureType 3).
+    /// POLY_1271 deposit-wallet order (signatureType 3).
     Order,
-    /// Onboarding: covers deploy (no owner sig), V2 approval batch,
+    /// Onboarding: covers deploy (no owner sig), onboarding approval batch,
     /// CLOB creds mint, builder-key create under one hardened grant.
     Onboarding,
     /// CTF.redeem batch from the deposit wallet.
     Redemption,
     /// pUSD/USDC transfer from the deposit wallet to the owner.
     Withdrawal,
-    /// V2-spender revoke batch (authority change; assurance = hardened).
+    /// spender revoke batch (authority change; assurance = hardened).
     Revocation,
     /// Builder-key create / rotate (own sealed action when not under onboarding).
     BuilderKey,
@@ -2423,7 +2586,7 @@ impl SigningAttestationSchemaRegistry for DefaultAttestationRegistry {
         if schema != SIGNING_ATTESTATION_SCHEMA_V1 {
             return false;
         }
-        Self::allowed_pair(petal_id, intent)
+        is_petal_petal_id(petal_id) || Self::allowed_pair(petal_id, intent)
     }
 
     fn validate_attestation(&self, attestation: &SigningAttestation) -> Result<(), AuthApiError> {
@@ -2434,16 +2597,21 @@ impl SigningAttestationSchemaRegistry for DefaultAttestationRegistry {
                 attestation.schema
             )));
         }
-        if !Self::allowed_pair(&attestation.petal_id, &attestation.intent) {
+        if !is_petal_petal_id(&attestation.petal_id)
+            && !Self::allowed_pair(&attestation.petal_id, &attestation.intent)
+        {
             return Err(AuthApiError::Denied(format!(
                 "unsupported attestation schema for ({}, {})",
                 attestation.petal_id, attestation.intent
             )));
         }
-        if attestation.petal_id == petal_identity::PETAL_ID_EVM_WALLET
-            && attestation.intent == EVM_TX_SIGN_INTENT
+        if attestation.intent == EVM_TX_SIGN_INTENT
+            && (attestation.petal_id == petal_identity::PETAL_ID_EVM_WALLET
+                || is_petal_petal_id(&attestation.petal_id))
         {
             EvmSigningAttestationFacts::from_attestation(attestation)?;
+        } else if is_petal_petal_id(&attestation.petal_id) {
+            PetalSigningAttestationFacts::from_attestation(attestation)?;
         } else if attestation.petal_id == petal_identity::PETAL_ID_POLYMARKET {
             PolymarketSigningAttestationFacts::from_attestation(attestation)?;
         }
@@ -2586,7 +2754,7 @@ pub struct SealedPetalContext {
     /// envelope bytes (the same bytes that produce `intent_hash`).
     pub canonical_intent_bytes_hash: String,
     /// Same as the canonical hash, but explicitly tagged with the
-    /// `bloom.intent.v2` domain (== `intent_hash_of(canonical_bytes)`).
+    /// `bloom.intent.v1` domain (== `intent_hash_of(canonical_bytes)`).
     pub intent_hash: String,
     pub daemon_terms_digest: String,
     pub petal_policy_digest: String,
@@ -2602,6 +2770,16 @@ pub struct SignHashRequest {
     pub intent: String,
     /// `0x` + 64 lowercase hex chars — the 32-byte hash the wallet key signs.
     pub hash_hex: String,
+}
+
+/// One entry in a daemon-sealed ordered signing batch. The optional facts
+/// digest binds the hash-specific attestation used for this exact entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedSignBatchEntry {
+    pub wallet: String,
+    pub intent: String,
+    pub hash_hex: String,
+    pub attestation_facts_digest: String,
 }
 
 /// Sealed signature returned by [`PetalHost::sign_hash`].
@@ -2656,6 +2834,23 @@ pub trait PetalHost: Send + Sync {
         attestation: &SigningAttestation,
         now_ms: u64,
     ) -> Result<SealedSignature, AuthApiError>;
+
+    /// Sign a daemon-sealed ordered batch. The default is deliberately
+    /// fail-closed; hosts opting in must validate every entry before exposing
+    /// any signature to the caller. Signature production is not transactional:
+    /// an unexpected signer or audit failure may consume a prefix internally,
+    /// but that prefix is never returned and the caller must obtain a fresh
+    /// approval rather than append or resume the sealed request set.
+    async fn sign_hash_batch(
+        &self,
+        _requests: Vec<SignHashRequest>,
+        _attestations: &[SigningAttestation],
+        _now_ms: u64,
+    ) -> Result<Vec<SealedSignature>, AuthApiError> {
+        Err(AuthApiError::Denied(
+            "batch signing is not supported by this host".into(),
+        ))
+    }
 
     /// Append a structured audit event to the host audit log.
     async fn audit(&self, event: AuditEvent) -> Result<(), AuthApiError>;
@@ -3443,7 +3638,7 @@ mod tests {
 
     fn header() -> CanonicalIntentHeader {
         CanonicalIntentHeader {
-            schema: CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
             wallet: "my-wallet".into(),
             surface: "requests".into(),
             action_id: "req_1".into(),
@@ -3489,32 +3684,27 @@ mod tests {
     }
 
     #[test]
-    fn intent_hash_of_uses_v2_domain_tag() {
+    fn intent_hash_of_uses_v1_domain_tag() {
         let bytes = br#"{"x":42}"#;
         let with_domain = intent_hash_of(bytes);
 
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"bloom.intent.v2");
+        hasher.update(b"bloom.intent.v1");
         hasher.update(bytes);
         let manual = hasher.finalize().to_hex().to_string();
 
         assert_eq!(with_domain, manual);
 
-        // Not the retired v1 domain, and not the untagged hash.
-        let mut v1 = blake3::Hasher::new();
-        v1.update(b"bloom.intent.v1");
-        v1.update(bytes);
-        assert_ne!(with_domain, v1.finalize().to_hex().to_string());
-
+        // Domain separation must differ from an untagged hash.
         let mut no_domain = blake3::Hasher::new();
         no_domain.update(bytes);
         assert_ne!(with_domain, no_domain.finalize().to_hex().to_string());
     }
 
     #[test]
-    fn envelope_schema_is_v2() {
+    fn envelope_schema_is_v1() {
         let env = CanonicalEnvelope::new(header(), "paid_http", "paid_http.v1", b"{}".to_vec());
-        assert_eq!(env.schema, "bloom.canonical_envelope.v2");
+        assert_eq!(env.schema, "bloom.canonical_envelope.v1");
     }
 
     // ------------------------------------------------------------------
@@ -3631,7 +3821,7 @@ mod tests {
         let modified = CanonicalEnvelope::new(
             header(),
             "paid_http",
-            "paid_http.v2",
+            "paid_http.unsupported",
             br#"{"a":1}"#.to_vec(),
         );
         assert_ne!(
@@ -3850,7 +4040,7 @@ mod tests {
     #[test]
     fn sealed_action_rejects_wrong_header_schema() {
         let mut action = sealed_action();
-        action.envelope.header.schema = "bloom.intent_header.v1".into();
+        action.envelope.header.schema = "bloom.intent_header.unsupported".into();
         let err = action.validate().unwrap_err();
         assert!(err.to_string().contains("intent header schema"), "{err}");
     }
@@ -3962,7 +4152,7 @@ mod tests {
 
     #[test]
     fn challenge_binds_schema() {
-        assert_challenge_changes(|c| c.schema = "bloom.approval_challenge.v2".into());
+        assert_challenge_changes(|c| c.schema = "bloom.approval_challenge.unsupported".into());
     }
 
     #[test]
@@ -4774,6 +4964,27 @@ mod tests {
     }
 
     #[test]
+    fn evm_typed_subject_and_attestation_allow_petal_provenance() {
+        let mut subject = evm_typed_subject();
+        subject.petal_id = "petal:polymarket".into();
+        subject.petal_digest = "a".repeat(64);
+        subject.petal_version = "v1-package".into();
+        subject.policy_snapshot.petal_id = subject.petal_id.clone();
+        subject.policy_snapshot.petal_digest = subject.petal_digest.clone();
+        subject.policy_snapshot_digest = subject.policy_snapshot.petal_policy_digest().unwrap();
+
+        subject.validate_evm().unwrap();
+        let attestation = subject
+            .signing_attestation_facts()
+            .signing_attestation()
+            .unwrap();
+        EvmSigningAttestationFacts::from_attestation(&attestation).unwrap();
+        DefaultAttestationRegistry::new()
+            .validate_attestation(&attestation)
+            .unwrap();
+    }
+
+    #[test]
     fn evm_typed_attestation_round_trips_and_registry_accepts() {
         let subject = evm_typed_subject();
         let facts = subject.signing_attestation_facts();
@@ -4785,6 +4996,38 @@ mod tests {
         DefaultAttestationRegistry::new()
             .validate_attestation(&attestation)
             .unwrap();
+    }
+
+    #[test]
+    fn petal_attestation_is_bound_to_package_and_route_provenance() {
+        let facts = PetalSigningAttestationFacts {
+            facts_schema: PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+            action_id: "appsign-test".into(),
+            wallet: "alice".into(),
+            surface: "petals".into(),
+            petal_id: "petal:portfolio".into(),
+            petal_digest: "a".repeat(64),
+            petal_version: "v1-package".into(),
+            petal_root: "portfolio".into(),
+            package_hash: "a".repeat(64),
+            route_id: "r000001".into(),
+            op: "read".into(),
+            path: "/positions".into(),
+            params: BTreeMap::from([("account".into(), "main".into())]),
+            actor: Some("agent-1".into()),
+            intent: "portfolio.position.sign".into(),
+            signing_hash: format!("0x{}", "b".repeat(64)),
+            policy_snapshot_digest: "c".repeat(64),
+        };
+        let attestation = facts.signing_attestation().unwrap();
+        DefaultAttestationRegistry::new()
+            .validate_attestation(&attestation)
+            .unwrap();
+
+        let mut mismatched = facts;
+        mismatched.package_hash = "e".repeat(64);
+        let err = mismatched.validate().unwrap_err();
+        assert!(err.to_string().contains("package provenance"), "{err}");
     }
 
     #[test]
@@ -5013,7 +5256,7 @@ mod tests {
             (PETAL_ID_EVM_WALLET, "evm.tx.sign"),
             (PETAL_ID_PAID_HTTP, "x402.sign"),
             (PETAL_ID_PAID_HTTP, "paid-http.mpp.sign"),
-            (PETAL_ID_POLYMARKET, "polymarket.order.v2"),
+            (PETAL_ID_POLYMARKET, "polymarket.order.v1"),
             (PETAL_ID_POLYMARKET, "polymarket.onboarding"),
             (PETAL_ID_POLYMARKET, "polymarket.funding"),
             (PETAL_ID_POLYMARKET, "polymarket.redemption"),

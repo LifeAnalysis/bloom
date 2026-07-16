@@ -16,6 +16,9 @@ mount = ["bloom-daemon/mount", "dep:bloom-mount"]
 # Pass-through for the heimdall-rs decompile decoder. Build with
 # `cargo build --features bytecode-decompile` to enable.
 bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
+# Development-only private-key loader and approval bypass. Never enable for a
+# production build.
+unsafe-debug-signer = ["bloom-daemon/unsafe-debug-signer"]
 
 [dependencies]
 bloom-proto.workspace = true
@@ -47,10 +50,10 @@ base64.workspace = true
 qrcode.workspace = true
 rand.workspace = true
 rpassword.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
-tempfile.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
