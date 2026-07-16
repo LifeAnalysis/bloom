@@ -19,7 +19,7 @@ use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -254,6 +254,15 @@ fn epoch_ts() -> Timestamp {
     }
 }
 
+/// Build a `Timestamp` from a system time, falling back to the Unix epoch.
+fn system_time_to_ts(time: SystemTime) -> Timestamp {
+    let dur = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    Timestamp {
+        seconds: dur.as_secs() as i64,
+        nanos: dur.subsec_nanos(),
+    }
+}
+
 fn stable_attrs(object_type: ObjectType, fileid: u64) -> Attrs {
     let mut attrs = Attrs::new(object_type, fileid);
     let ts = epoch_ts();
@@ -293,6 +302,10 @@ fn entry_to_attrs(path: &VfsPath, e: &Entry, size: u64) -> Attrs {
     a.size = size;
     a.space_used = size;
     a.mode = e.mode;
+    let ts = e.modified.map(system_time_to_ts).unwrap_or_else(epoch_ts);
+    a.mtime = ts;
+    a.atime = ts;
+    a.ctime = ts;
     if matches!(e.kind, EntryKind::File | EntryKind::Symlink) {
         a.change = file_change_now();
     }
@@ -772,6 +785,12 @@ pub struct BloomFs {
     directory_cache: Arc<MountDirectoryCache>,
     /// Cold list operations coalesce independently from file renders.
     directory_in_flight: Arc<Mutex<HashMap<VfsPath, InFlightDirectory>>>,
+    /// Wall-clock time this adapter was built; the root directory's
+    /// mtime. Stable across getattrs — a per-stat `SystemTime::now()`
+    /// would make the root look freshly modified to every freshness
+    /// check (`rsync`, `find -newer`) — but saner-looking than the
+    /// epoch fallback used for entries with no known artifact time.
+    mounted_at: SystemTime,
 }
 
 impl BloomFs {
@@ -783,6 +802,7 @@ impl BloomFs {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             directory_cache: Arc::new(MountDirectoryCache::new(DIRECTORY_CACHE_CAPACITY)),
             directory_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            mounted_at: SystemTime::now(),
         }
     }
 
@@ -1037,6 +1057,10 @@ impl FileSystem for BloomFs {
             BloomHandle::Root => {
                 let mut a = stable_attrs(ObjectType::Directory, fileid_for(&VfsPath::root()));
                 a.mode = 0o755;
+                let ts = system_time_to_ts(self.mounted_at);
+                a.mtime = ts;
+                a.atime = ts;
+                a.ctime = ts;
                 a.change = self.dir_change(&VfsPath::root()).await?;
                 Ok(a)
             }
@@ -2434,6 +2458,19 @@ mod tests {
         let run = fs.lookup(&ctx, &dir, "run").await.unwrap();
         let attrs = fs.getattr(&ctx, &run).await.unwrap();
         assert_eq!(attrs.mode & 0o777, 0o555);
+    }
+
+    #[test]
+    fn entry_to_attrs_uses_entry_modified_time() {
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let entry = Entry::file("artifact.json").with_modified(modified);
+        let path = VfsPath::parse("/requests/pending/req_1/artifact.json").unwrap();
+
+        let attrs = entry_to_attrs(&path, &entry, 0);
+
+        assert_eq!(attrs.mtime.seconds, 1_700_000_000);
+        assert_eq!(attrs.ctime.seconds, 1_700_000_000);
+        assert_eq!(attrs.atime.seconds, 1_700_000_000);
     }
 
     /// Bug #5: ACCESS strips MODIFY/EXTEND/DELETE for a read-only path
