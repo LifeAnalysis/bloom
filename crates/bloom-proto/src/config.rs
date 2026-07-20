@@ -44,9 +44,9 @@ pub struct Config {
     pub etherscan: Option<EtherscanConfig>,
     #[serde(default)]
     pub enso: Option<EnsoConfig>,
-    /// Polymarket read surface. Presence of `[polymarket]` opts the
-    /// `polymarket/` VFS subtree in (like `[enso]` opts in `defi/`).
-    #[serde(default)]
+    /// Polymarket read and trading surface. Enabled with public Polygon
+    /// endpoints by default; a `[polymarket]` table can override them.
+    #[serde(default = "default_polymarket_config")]
     pub polymarket: Option<PolymarketConfig>,
     /// Trusted, daemon-owned runtime settings for installed Petals.
     /// Endpoint overrides are matched to named manifest bindings and may only
@@ -62,14 +62,10 @@ pub struct Config {
     pub mempool: BTreeMap<String, MempoolChainConfig>,
     #[serde(default)]
     pub private_rpc: BTreeMap<String, PrivateRpcChainConfig>,
-    /// Kill-switch: never permit broadcast to mainnet chain ids regardless
-    /// of per-chain `allow_broadcast`.
-    #[serde(default = "default_mainnet_block")]
-    pub block_mainnet_broadcast: bool,
     /// Per-feature backend selection. Makes the data-source boundary
     /// between Etherscan, raw RPC, and a future embedded indexer
-    /// explicit. Defaults match the historical behaviour: Etherscan for
-    /// metadata + history, RPC for everything else.
+    /// explicit. Defaults use Etherscan for indexed data and RPC for live
+    /// reads.
     #[serde(default)]
     pub backends: BackendsConfig,
 }
@@ -240,6 +236,27 @@ pub struct PolymarketConfig {
     pub legacy_eoa_mode: bool,
 }
 
+impl Default for PolymarketConfig {
+    fn default() -> Self {
+        Self {
+            gamma_url: default_gamma_url(),
+            data_url: default_data_url(),
+            clob_url: default_clob_url(),
+            relayer_url: default_relayer_url(),
+            chain_id: default_polymarket_chain_id(),
+            builder_code: None,
+            relayer_api_key: None,
+            relayer_api_key_address: None,
+            builder_key_mode: default_builder_key_mode(),
+            legacy_eoa_mode: false,
+        }
+    }
+}
+
+fn default_polymarket_config() -> Option<PolymarketConfig> {
+    Some(PolymarketConfig::default())
+}
+
 fn default_builder_key_mode() -> String {
     "auto".into()
 }
@@ -335,9 +352,6 @@ fn default_hyperliquid_deposit_chain_id() -> u64 {
 fn default_polymarket_chain_id() -> u64 {
     137
 }
-fn default_mainnet_block() -> bool {
-    true
-}
 fn default_max_index_size() -> usize {
     50_000
 }
@@ -369,7 +383,7 @@ fn evm_chain(
         chain_id,
         rpc_urls: rpc_urls.iter().map(|u| (*u).to_string()).collect(),
         rpc_endpoints: Vec::new(),
-        allow_broadcast: false,
+        allow_broadcast: true,
         etherscan_api_url: None,
         display_name: Some(display_name.to_string()),
         native_symbol: native_symbol.to_string(),
@@ -493,13 +507,12 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 }
 
 impl Config {
-    /// A safe agentic-wallet default: read-ready public EVM networks, Anvil,
+    /// An agentic-wallet default: read-ready public EVM networks, Anvil,
     /// and the Hyperliquid HyperCore VFS using its official public endpoints.
     ///
-    /// Live networks default to read-only (`allow_broadcast = false`) and the
-    /// global mainnet broadcast kill-switch stays enabled. Users can inspect
-    /// balances, contracts, ENS, prices, and stage plans immediately with zero
-    /// config, then opt into live broadcasts deliberately.
+    /// Per-chain broadcast is enabled by default. Signing, policy,
+    /// confirmation, and Sealed Approval gates still apply to value-moving
+    /// actions.
     pub fn local_default() -> Self {
         let chains = default_chains();
         Config {
@@ -511,12 +524,11 @@ impl Config {
             chains,
             etherscan: None,
             enso: None,
-            polymarket: None,
+            polymarket: default_polymarket_config(),
             petals: PetalsConfig::default(),
             hyperliquid: Some(HyperliquidConfig::default()),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
-            block_mainnet_broadcast: true,
             backends: BackendsConfig::default(),
         }
     }
@@ -551,7 +563,7 @@ impl Config {
     /// Apply post-load migrations for backwards compatibility.
     ///
     /// Currently infers `op_stack` for well-known OP-stack chain IDs
-    /// (Optimism=10, Base=8453, â¦) that predate the `op_stack` field.
+    /// (Optimism=10, Base=8453, …) that predate the `op_stack` field.
     fn migrate(&mut self) {
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
@@ -637,19 +649,8 @@ impl Config {
         self.chains.get(name)
     }
 
-    /// Is this chain id one we *consider* mainnet for the kill-switch?
-    pub fn is_mainnet_id(chain_id: u64) -> bool {
-        matches!(
-            chain_id,
-            1 | 10 | 56 | 100 | 137 | 250 | 324 | 999 | 8453 | 42161 | 43114 | 59144 | 534352
-        )
-    }
-
-    /// Whether broadcast is ultimately allowed on this chain.
+    /// Whether broadcast is allowed on this chain.
     pub fn broadcast_permitted(&self, c: &ChainSpec) -> bool {
-        if self.block_mainnet_broadcast && Self::is_mainnet_id(c.chain_id) {
-            return false;
-        }
         c.allow_broadcast
     }
 }
@@ -707,9 +708,13 @@ mod tests {
         assert!(cfg.default_wallet.is_none());
         assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
-        assert!(cfg.block_mainnet_broadcast);
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
+        let polymarket = cfg
+            .polymarket
+            .as_ref()
+            .expect("Polymarket is enabled by default");
+        assert_eq!(polymarket.chain_id, 137);
         let hyperliquid = cfg
             .hyperliquid
             .as_ref()
@@ -722,7 +727,7 @@ mod tests {
         assert_eq!(cfg.chains.len(), 12);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
-        assert!(!ethereum.allow_broadcast);
+        assert!(ethereum.allow_broadcast);
         assert!(!ethereum.rpc_urls.is_empty());
         let base = cfg.chains.get("base").expect("base entry");
         assert_eq!(base.chain_id, 8453);
@@ -839,6 +844,16 @@ mod tests {
     }
 
     #[test]
+    fn missing_polymarket_block_enables_public_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let pm = cfg
+            .polymarket
+            .expect("Polymarket should be enabled when the block is omitted");
+        assert_eq!(pm.chain_id, 137);
+        assert_eq!(pm.gamma_url, "https://gamma-api.polymarket.com");
+    }
+
+    #[test]
     fn bare_hyperliquid_block_parses_to_public_defaults() {
         let hl: HyperliquidConfig = toml::from_str("").unwrap();
         assert_eq!(hl.mainnet_url, "https://api.hyperliquid.xyz");
@@ -898,6 +913,26 @@ mod tests {
     }
 
     #[test]
+    fn load_or_init_preserves_existing_broadcast_settings() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let existing = r#"
+default_chain = "anvil"
+
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+allow_broadcast = false
+"#;
+        std::fs::write(&path, existing).unwrap();
+
+        let cfg = Config::load_or_init(&path).unwrap();
+        assert!(!cfg.chains["anvil"].allow_broadcast);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+    }
+
+    #[test]
     fn validate_rejects_empty_chains() {
         let mut cfg = Config::local_default();
         cfg.chains.clear();
@@ -944,7 +979,6 @@ mount_path = "/bloom"
 nfs_listen_addr = "127.0.0.1:12049"
 default_chain = "anvil"
 stage_ttl = "30m"
-block_mainnet_broadcast = true
 
 [chains.anvil]
 name = "anvil"
@@ -1019,64 +1053,13 @@ allow_broadcast = true
     }
 
     #[test]
-    fn is_mainnet_id_matches_known_ids() {
-        for id in [
-            1, 10, 56, 100, 137, 250, 324, 999, 8453, 42161, 43114, 59144, 534352,
-        ] {
-            assert!(Config::is_mainnet_id(id), "{id} should be mainnet");
-        }
-        assert!(!Config::is_mainnet_id(31337));
-        assert!(!Config::is_mainnet_id(11155111)); // sepolia
-        assert!(!Config::is_mainnet_id(0));
-    }
-
-    #[test]
-    fn broadcast_permitted_blocked_on_mainnet_when_killswitch_on() {
-        let cfg = Config::local_default(); // block_mainnet_broadcast = true
-        let mainnet = ChainSpec {
-            name: "ethereum".to_string(),
-            chain_id: 1,
-            rpc_urls: vec!["https://x".into()],
-            rpc_endpoints: Vec::new(),
-            allow_broadcast: true,
-            etherscan_api_url: None,
-            display_name: None,
-            native_symbol: "ETH".into(),
-            native_decimals: 18,
-            legacy_tx: false,
-            op_stack: false,
-        };
-        assert!(!cfg.broadcast_permitted(&mainnet));
-    }
-
-    #[test]
-    fn broadcast_permitted_when_killswitch_off_and_chain_allows() {
-        let mut cfg = Config::local_default();
-        cfg.block_mainnet_broadcast = false;
-        let mainnet = ChainSpec {
-            name: "ethereum".to_string(),
-            chain_id: 1,
-            rpc_urls: vec!["https://x".into()],
-            rpc_endpoints: Vec::new(),
-            allow_broadcast: true,
-            etherscan_api_url: None,
-            display_name: None,
-            native_symbol: "ETH".into(),
-            native_decimals: 18,
-            legacy_tx: false,
-            op_stack: false,
-        };
-        assert!(cfg.broadcast_permitted(&mainnet));
-    }
-
-    #[test]
-    fn broadcast_permitted_respects_chain_allow_flag_on_testnet() {
+    fn broadcast_permitted_respects_mainnet_chain_allow_flag() {
         let cfg = Config::local_default();
-        let mut anvil = ChainSpec::anvil_default();
-        anvil.allow_broadcast = false;
-        assert!(!cfg.broadcast_permitted(&anvil));
-        anvil.allow_broadcast = true;
-        assert!(cfg.broadcast_permitted(&anvil));
+        let mut ethereum = cfg.chains["ethereum"].clone();
+        ethereum.allow_broadcast = false;
+        assert!(!cfg.broadcast_permitted(&ethereum));
+        ethereum.allow_broadcast = true;
+        assert!(cfg.broadcast_permitted(&ethereum));
     }
 
     #[test]
@@ -1234,7 +1217,6 @@ mount_path = "/eth"
 nfs_listen_addr = "127.0.0.1:12049"
 default_chain = "anvil"
 stage_ttl = "1h"
-block_mainnet_broadcast = true
 
 [chains.anvil]
 name = "anvil"

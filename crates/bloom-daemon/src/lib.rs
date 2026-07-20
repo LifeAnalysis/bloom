@@ -1930,11 +1930,7 @@ impl Daemon {
             Arc::new(EvmOutboxProjection::new(central, projection_auth));
         let outbox = Outbox::new_with_projection(home.outbox_dir(), projection)
             .map_err(|e| DaemonError::Outbox(e.to_string()))?;
-        let mut tx_engine = TxEngine::new(
-            outbox,
-            config.stage_ttl.as_millis(),
-            config.block_mainnet_broadcast,
-        );
+        let mut tx_engine = TxEngine::new(outbox, config.stage_ttl.as_millis());
         #[cfg(feature = "unsafe-debug-signer")]
         if let Some((wallet, signer)) = &unsafe_debug_signer {
             tx_engine = tx_engine.with_unsafe_debug_signer(wallet.clone(), signer.clone());
@@ -2377,8 +2373,8 @@ impl Daemon {
 
         // Polymarket: public read surface (Gamma/Data/CLOB) plus, when a
         // `[chains]` entry matches the Polymarket chain id (Polygon 137), the
-        // onboarding state machine and L2 account views. Mount whenever a
-        // `[polymarket]` block exists; a bare block uses the public defaults.
+        // onboarding state machine and L2 account views. Polymarket is enabled
+        // by default with public endpoints; a config block can override them.
         // Signing never leaves the daemon (Keystore::signer → KeystoreSigner).
         if let Some(pm_cfg) = &config.polymarket {
             let pm_url = |raw: &str| match url::Url::parse(raw) {
@@ -2445,7 +2441,7 @@ impl Daemon {
             debug!(chain_id = pm_cfg.chain_id, "daemon.polymarket_mounted");
             vfs_builder = vfs_builder.mount("polymarket", Arc::new(handler) as _);
         } else {
-            debug!("daemon.polymarket_skipped: no [polymarket] config");
+            debug!("daemon.polymarket_skipped: disabled programmatically");
         }
 
         // /next.md — brutally-scoped next-action aggregator for agents.
@@ -2761,7 +2757,6 @@ impl Daemon {
             enso = config.enso.is_some(),
             ens_resolver = ens_client.is_some(),
             heimdall = cfg!(feature = "bytecode-decompile"),
-            block_mainnet_broadcast = config.block_mainnet_broadcast,
             "daemon.built"
         );
 

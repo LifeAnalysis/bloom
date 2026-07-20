@@ -60,12 +60,12 @@ Bloom gives an agent a safe wallet workspace:
 - enforce policy: spend caps, allow/deny lists, contract-call gates,
   private orderflow settings, and hash-chained audit logging.
 
-Bloom ships read-ready RPC defaults for ten major EVM networks —
-Ethereum, Base, Arbitrum, Optimism, Polygon, BNB Smart Chain,
-Avalanche, Gnosis, Linea, and HyperEVM — plus local Anvil. Mainnet/L2
-broadcasts are disabled by default. Public reads, simulations, and
-planning work without adding API keys; local devnet sends require a
-running Anvil node.
+Bloom ships read-ready RPC defaults for major EVM networks — Ethereum,
+Base, Tempo, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche,
+Gnosis, Linea, and HyperEVM — plus local Anvil. Per-chain broadcasting is
+enabled by default; set `allow_broadcast = false` on a chain to disable it.
+Public reads, simulations, and planning work without adding API keys;
+local devnet sends require a running Anvil node.
 
 ## Try it
 
@@ -194,9 +194,9 @@ and example crates used by the broader Bloom runtime and examples.
 
 ## Security defaults
 
-- **Mainnet broadcasts disabled by default.** Set
-  `block_mainnet_broadcast = false` plus a per-chain `allow_broadcast =
-  true` in `~/.bloom/config.toml` to opt a chain into broadcasting.
+- **Broadcast routing enabled by default.** Per-chain `allow_broadcast`
+  defaults to `true`. Signing, policy, confirmation, and Sealed Approval
+  gates still apply.
 - **Private keys are never readable through the FS.** The keystore
   lives outside the mount; only `address` and `public_key` are
   exposed.
@@ -224,10 +224,9 @@ and example crates used by the broader Bloom runtime and examples.
 - **Single-user daemon.** No daemon-level auth or multi-tenant
   isolation; the mount inherits the OS user's permissions on
   `~/.bloom`.
-- **Mainnet broadcast requires two opt-ins.** A live tx requires both
-  the global `block_mainnet_broadcast = false` and a per-chain
-  `allow_broadcast = true`. Forgetting the second is the most common
-  cause of "stage works, confirm 403s".
+- **Broadcast config is not an approval boundary.** Set a chain's
+  `allow_broadcast = false` to disable broadcast on that chain. Value-moving
+  actions still pass Bloom's signing, policy, and confirmation controls.
 - **Embedded indexer deferred.** Address activity, ERC-20 / ERC-721
   history, and contract source / ABI are served via Etherscan; no
   local block-by-block index yet. The selected backend is visible under

@@ -309,10 +309,10 @@ fn polymarket_vfs_trade_confirm_reaches_cli_confirm_path_for_durable_drafts() {
 #[test]
 fn polymarket_vfs_redeem_confirm_shares_cli_redeem_core() {
     // Both the CLI command and the foreground VFS confirm path must dispatch
-    // into the same redeem core and fail at the same durable refusal (no
-    // [polymarket] config) before any network or signing work.
+    // into the same redeem core and fail at the same durable refusal (missing
+    // wallet) before any network or signing work.
     let home = fresh_home();
-    let expected = "no [polymarket] block in config.toml";
+    let expected = "wallet 'my-wallet' not found";
 
     bloom_cmd(home.path())
         .args(["polymarket", "redeem", "my-wallet", "some-slug"])
@@ -338,7 +338,7 @@ fn polymarket_vfs_redeem_confirm_shares_cli_redeem_core() {
 #[test]
 fn polymarket_vfs_revoke_approvals_confirm_shares_cli_core() {
     let home = fresh_home();
-    let expected = "no [polymarket] block in config.toml";
+    let expected = "wallet 'my-wallet' not found";
 
     bloom_cmd(home.path())
         .args(["polymarket", "revoke-approvals", "my-wallet"])
@@ -364,7 +364,7 @@ fn polymarket_vfs_revoke_approvals_confirm_shares_cli_core() {
 #[test]
 fn polymarket_vfs_withdraw_pusd_confirm_shares_cli_core() {
     let home = fresh_home();
-    let expected = "no [polymarket] block in config.toml";
+    let expected = "wallet 'my-wallet' not found";
 
     // CLI: amount is a positional; VFS: amount rides in the confirm body.
     bloom_cmd(home.path())
@@ -418,8 +418,7 @@ fn status_prints_version_and_chain_summary() {
         // Version line uses the package version; just assert the prefix.
         .stdout(predicate::str::contains("version: "))
         .stdout(predicate::str::contains("home: "))
-        .stdout(predicate::str::contains("chains: "))
-        .stdout(predicate::str::contains("block_mainnet_broadcast: "));
+        .stdout(predicate::str::contains("chains: "));
 }
 
 #[test]
