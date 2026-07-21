@@ -109,9 +109,9 @@ cat wallets/<wallet>/policy.toml
 printf '%s' "$edited_policy" > wallets/<wallet>/policy.toml
 
 # 3. Discover and read the challenge through the mount.
-ls wallets/<wallet>/policy-updates
-cat wallets/<wallet>/policy-updates/<action_id>/status.json
-cat wallets/<wallet>/policy-updates/<action_id>/approval_challenge.json
+ls wallets/<wallet>/policy-updates/pending
+cat wallets/<wallet>/policy-updates/latest/status.json
+cat wallets/<wallet>/policy-updates/latest/approval_challenge.json
 
 # 4. Open or forward ceremony_url, approve, then retry the identical write.
 printf '%s' "$edited_policy" > wallets/<wallet>/policy.toml
