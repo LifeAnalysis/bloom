@@ -1300,38 +1300,50 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
         .assert()
         .success()
         .stdout(predicate::eq("component"));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/petals/demo/README.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# demo"));
 }
 
 #[test]
 #[ignore = "clones and builds the public Polymarket Petal source repo"]
 fn github_source_install_polymarket_dispatches_route_contract() {
-    let petal_ref = "1ffb267a1e1d4acd137c184806c20cc98d20a3f4";
+    let petal_ref = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
     let home = fresh_home();
-    bloom_cmd(home.path())
-        .arg("init")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "preinstalled_petal: installing polymarket",
-        ))
-        .stdout(predicate::str::contains(format!(
-            "Resolved commit: {petal_ref}"
-        )))
-        .stdout(predicate::str::contains("\"routes\": 95"))
-        .stdout(predicate::str::contains(
-            "preinstalled_petals: [\"polymarket\"]",
-        ));
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    let mut config = bloom_proto::Config::local_default();
+    config.petals.preinstalled.clear();
+    config.save(&home_dir.config_path()).unwrap();
 
     bloom_cmd(home.path())
         .arg("init")
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "preinstalled_petal: polymarket (already installed at ",
-        ))
-        .stdout(predicate::str::contains(
-            "preinstalled_petals: [\"polymarket\"]",
-        ));
+        .stdout(predicate::str::contains("preinstalled_petals: []"));
+
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            "https://github.com/bloom-directory/bloom-petal-polymarket",
+            "--ref",
+            petal_ref,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "Resolved commit: {petal_ref}"
+        )))
+        .stdout(predicate::str::contains("\"routes\": 95"));
+
+    bloom_cmd(home.path())
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("preinstalled_petals: []"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
@@ -1348,6 +1360,12 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .stdout(predicate::str::contains(
             "bloom.polymarket.petal-route-contract.v1",
         ));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/petals/polymarket/README.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# Polymarket Petal"));
 }
 
 #[test]
