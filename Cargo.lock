@@ -2268,6 +2268,7 @@ dependencies = [
  "bloom-petals",
  "bloom-proto",
  "bloom-tx",
+ "bloom-update",
  "bloom-vfs",
  "clap",
  "clap_complete",
@@ -2342,6 +2343,7 @@ dependencies = [
  "bloom-proto",
  "bloom-revert",
  "bloom-tx",
+ "bloom-update",
  "bloom-vfs",
  "bloom-watch",
  "futures",
@@ -2742,6 +2744,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-update"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "reqwest 0.12.28",
+ "semver 1.0.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bloom-vfs"
 version = "0.1.0"
 dependencies = [
@@ -2767,6 +2784,7 @@ dependencies = [
  "bloom-rpc",
  "bloom-tools",
  "bloom-tx",
+ "bloom-update",
  "bloom-watch",
  "hex",
  "lru 0.12.5",

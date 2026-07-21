@@ -17,7 +17,10 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static UPDATE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -227,6 +230,10 @@ enum Cmd {
     /// Hyperliquid HyperCore reads and tightly scoped test actions.
     #[command(subcommand)]
     Hyperliquid(HyperliquidCmd),
+    /// Check for newer bloom releases on GitHub and inspect the
+    /// current update-checker state.
+    #[command(subcommand)]
+    Update(UpdateCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init,
 
@@ -354,6 +361,16 @@ enum RequestCmd {
     Body { id: String },
     /// Print receipt JSON for an id or `latest`.
     Receipt { id: String },
+}
+
+/// Subcommands for `bloom update`.
+#[derive(Subcommand, Debug)]
+enum UpdateCmd {
+    /// Force a refresh against GitHub and print the result as JSON.
+    /// Exits 0 if up to date, 1 if behind, 2 if unknown/error.
+    Check,
+    /// Print the cached snapshot without making a network call.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -863,7 +880,13 @@ async fn main() -> ExitCode {
         .try_init();
 
     match run(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            let code = UPDATE_EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst);
+            if code != 0 {
+                return ExitCode::from(code as u8);
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("error: {:#}", e);
             ExitCode::FAILURE
@@ -1144,6 +1167,24 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 println!("deposit: bloom wallet address <wallet> --qr");
                 println!("agent workflow: browse the mounted VFS or use bloom vfs cat/ls/write");
+            }
+            if let Some(snap) = d.update_checker.quick_check_cached() {
+                let latest = snap.latest.as_deref().unwrap_or("?");
+                let latest_display = latest.strip_prefix('v').unwrap_or(latest);
+                let available = match snap.available() {
+                    bloom_update::UpdateAvailable::OutOfDate => "out_of_date",
+                    bloom_update::UpdateAvailable::UpToDate => "up_to_date",
+                    bloom_update::UpdateAvailable::Unknown => "unknown",
+                };
+                println!("latest_release: {}", latest);
+                println!("update_available: {}", available);
+                if matches!(snap.available(), bloom_update::UpdateAvailable::OutOfDate) {
+                    eprintln!(
+                        "hint: bloom v{} is available (you have v{}); see /status/update",
+                        latest_display,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                }
             }
             Ok(())
         }
@@ -2307,6 +2348,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Hyperliquid(cmd) => handle_hyperliquid(home, &client_endpoint, cmd).await,
+        Cmd::Update(cmd) => handle_update(&home, cmd).await,
         Cmd::Petals(cmd) => {
             let _home_permit = HomeWritePermit::acquire(&home)?;
             run_petals(home, cmd).await
@@ -3348,6 +3390,37 @@ async fn handle_hyperliquid(
                 },
             )
             .await
+        }
+    }
+}
+
+async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
+    match cmd {
+        UpdateCmd::Status => {
+            let installed = env!("CARGO_PKG_VERSION");
+            let snap = bloom_update::read_cache_only(installed, &home.cache_dir());
+            let json = serde_json::to_string_pretty(&snap).context("serialise update snapshot")?;
+            println!("{json}");
+            Ok(())
+        }
+        UpdateCmd::Check => {
+            // An explicit check needs only a checker; avoid constructing
+            // the full daemon and its unrelated VFS/transaction services.
+            let checker =
+                bloom_update::UpdateChecker::new(env!("CARGO_PKG_VERSION"), home.cache_dir())
+                    .context("build update checker")?;
+            let snap = checker.refresh().await;
+            let json = serde_json::to_string_pretty(&snap).context("serialise update snapshot")?;
+            println!("{json}");
+            let code = match snap.available() {
+                bloom_update::UpdateAvailable::OutOfDate => 1,
+                bloom_update::UpdateAvailable::UpToDate => 0,
+                bloom_update::UpdateAvailable::Unknown => 2,
+            };
+            if code != 0 {
+                UPDATE_EXIT_CODE.store(code, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
         }
     }
 }
