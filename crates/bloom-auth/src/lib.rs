@@ -20,6 +20,7 @@ use bloom_auth_api::{
     GrantStore, NonceState, PriceOracle, ReservationRecord, ReservationState, ReviewSessionRecord,
     SealedAction, SealedApprovalGrant, SealedIntentRecord, SessionDenialReason, SignedApproval,
     SignerKind, StandingSessionRecord, UnsignedApproval, ValuationPolicy, ValuationQuote,
+    WalletRegistrationState, WalletRegistrationStatus, WalletRegistrationStore,
     WebAuthnAssertionRecord,
 };
 use bloom_prices::{CoinId, PricesClient};
@@ -113,6 +114,12 @@ impl<S> StoreApprovalVerifier<S> {
             store: Mutex::new(store),
             signature_verifier,
         }
+    }
+
+    fn lock_store(&self) -> Result<std::sync::MutexGuard<'_, AuthStore>, AuthApiError> {
+        self.store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))
     }
 }
 
@@ -309,6 +316,23 @@ impl AuthStore {
             );
             CREATE INDEX IF NOT EXISTS standing_sessions_wallet_kind_idx
                 ON standing_sessions(wallet, session_kind, expires_ms);
+
+            CREATE TABLE IF NOT EXISTS wallet_registration_sessions (
+                session_id TEXT PRIMARY KEY NOT NULL,
+                wallet TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER NOT NULL,
+                ceremony_url TEXT,
+                address TEXT,
+                error TEXT,
+                updated_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS wallet_registration_sessions_wallet_created_idx
+                ON wallet_registration_sessions(wallet, created_at_ms DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS wallet_registration_sessions_live_wallet_idx
+                ON wallet_registration_sessions(wallet)
+                WHERE state IN ('awaiting_user', 'awaiting_recovery_ack');
             "#,
         )?;
         // Upgrade pre-sealed-action databases in place. `CREATE TABLE IF NOT
@@ -1807,6 +1831,115 @@ impl AuthStore {
         Ok(())
     }
 
+    /// Insert or update the public status row for a wallet registration
+    /// session, keyed by `session_id` (the URL token).
+    pub fn upsert_wallet_registration_status(
+        &mut self,
+        session_id: &str,
+        status: &WalletRegistrationStatus,
+        now_ms: u64,
+    ) -> Result<(), AuthStoreError> {
+        self.conn.execute(
+            "INSERT INTO wallet_registration_sessions(
+                session_id, wallet, state, created_at_ms, expires_at_ms,
+                ceremony_url, address, error, updated_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(session_id) DO UPDATE SET
+                state = excluded.state,
+                expires_at_ms = excluded.expires_at_ms,
+                ceremony_url = excluded.ceremony_url,
+                address = excluded.address,
+                error = excluded.error,
+                updated_ms = excluded.updated_ms",
+            params![
+                session_id,
+                status.wallet,
+                status.state.as_str(),
+                status.created_at_ms as i64,
+                status.expires_at_ms as i64,
+                status.ceremony_url,
+                status.address,
+                status.error,
+                now_ms as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Most-recently-created registration session row for `wallet`.
+    pub fn wallet_registration_status(
+        &self,
+        wallet: &str,
+    ) -> Result<Option<WalletRegistrationStatus>, AuthStoreError> {
+        self.conn
+            .query_row(
+                "SELECT wallet, state, created_at_ms, expires_at_ms, ceremony_url, address, error
+                 FROM wallet_registration_sessions
+                 WHERE wallet = ?1
+                 ORDER BY created_at_ms DESC, rowid DESC
+                 LIMIT 1",
+                params![wallet],
+                registration_status_row,
+            )
+            .optional()?
+            .map(registration_status_from_row)
+            .transpose()
+    }
+
+    pub fn wallet_registration_status_by_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<WalletRegistrationStatus>, AuthStoreError> {
+        self.conn
+            .query_row(
+                "SELECT wallet, state, created_at_ms, expires_at_ms, ceremony_url, address, error
+                 FROM wallet_registration_sessions WHERE session_id = ?1",
+                params![session_id],
+                registration_status_row,
+            )
+            .optional()?
+            .map(registration_status_from_row)
+            .transpose()
+    }
+
+    /// All wallet names with a known registration session (live or recent).
+    pub fn wallet_registration_wallets(&self) -> Result<Vec<String>, AuthStoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT wallet FROM wallet_registration_sessions ORDER BY wallet")?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
+    }
+
+    /// `(session_id, status)` for every wallet-registration session whose
+    /// persisted state is not yet terminal. For restart reconciliation: the
+    /// caller checks each wallet against on-disk keystore state itself,
+    /// since a bulk `UPDATE` can't tell "actually installed before the
+    /// daemon died" apart from "truly abandoned."
+    pub fn non_terminal_wallet_registration_sessions(
+        &self,
+    ) -> Result<Vec<(String, WalletRegistrationStatus)>, AuthStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, wallet, state, created_at_ms, expires_at_ms, ceremony_url, address, error
+             FROM wallet_registration_sessions
+             WHERE state IN ('awaiting_user', 'awaiting_recovery_ack')",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let session_id: String = row.get(0)?;
+            out.push((
+                session_id,
+                registration_status_from_row(registration_status_row_at(row, 1)?)?,
+            ));
+        }
+        Ok(out)
+    }
+
     pub fn orphan_standing_sessions(
         &mut self,
         wallet: &str,
@@ -1954,6 +2087,52 @@ impl AuthStore {
         let sql = format!("PRAGMA {name}");
         Ok(self.conn.query_row(&sql, [], |row| row.get(0))?)
     }
+}
+
+type RegistrationStatusRow = (
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn registration_status_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegistrationStatusRow> {
+    registration_status_row_at(row, 0)
+}
+
+fn registration_status_row_at(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<RegistrationStatusRow> {
+    Ok((
+        row.get(offset)?,
+        row.get(offset + 1)?,
+        row.get(offset + 2)?,
+        row.get(offset + 3)?,
+        row.get(offset + 4)?,
+        row.get(offset + 5)?,
+        row.get(offset + 6)?,
+    ))
+}
+
+fn registration_status_from_row(
+    (wallet, state, created_at_ms, expires_at_ms, ceremony_url, address, error): RegistrationStatusRow,
+) -> Result<WalletRegistrationStatus, AuthStoreError> {
+    let state = WalletRegistrationState::parse(&state)
+        .ok_or_else(|| AuthStoreError::InvalidState(state))?;
+    Ok(WalletRegistrationStatus {
+        schema: bloom_auth_api::WALLET_REGISTRATION_STATUS_SCHEMA_V1.into(),
+        wallet,
+        state,
+        created_at_ms: created_at_ms as u64,
+        expires_at_ms: expires_at_ms as u64,
+        ceremony_url,
+        address,
+        error,
+    })
 }
 
 #[async_trait]
@@ -2246,6 +2425,46 @@ where
             .lock()
             .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
         Ok(store.release_evm_owner_session_use(session_id, reservation_id, now_ms)?)
+    }
+}
+
+#[async_trait]
+impl<S: Send + Sync> WalletRegistrationStore for StoreApprovalVerifier<S> {
+    async fn status_for_wallet(
+        &self,
+        wallet: &str,
+    ) -> Result<Option<WalletRegistrationStatus>, AuthApiError> {
+        Ok(self.lock_store()?.wallet_registration_status(wallet)?)
+    }
+
+    async fn status_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<WalletRegistrationStatus>, AuthApiError> {
+        Ok(self
+            .lock_store()?
+            .wallet_registration_status_by_session(session_id)?)
+    }
+
+    async fn wallets(&self) -> Result<Vec<String>, AuthApiError> {
+        Ok(self.lock_store()?.wallet_registration_wallets()?)
+    }
+
+    async fn non_terminal(&self) -> Result<Vec<(String, WalletRegistrationStatus)>, AuthApiError> {
+        Ok(self
+            .lock_store()?
+            .non_terminal_wallet_registration_sessions()?)
+    }
+
+    async fn upsert(
+        &self,
+        session_id: &str,
+        status: &WalletRegistrationStatus,
+        now_ms: u64,
+    ) -> Result<(), AuthApiError> {
+        Ok(self
+            .lock_store()?
+            .upsert_wallet_registration_status(session_id, status, now_ms)?)
     }
 }
 
@@ -4826,5 +5045,115 @@ mod tests {
             .unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].session_id, "sess_live");
+    }
+
+    #[test]
+    fn wallet_registration_status_crud_lifecycle() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+
+        assert!(store.wallet_registration_status("main").unwrap().is_none());
+        assert!(store.wallet_registration_wallets().unwrap().is_empty());
+
+        let status = WalletRegistrationStatus::awaiting_user(
+            "main",
+            1_000,
+            1_000 + 300_000,
+            "http://localhost:18734/wallet-registration/tok-1",
+        );
+        store
+            .upsert_wallet_registration_status("tok-1", &status, 1_000)
+            .unwrap();
+
+        let got = store.wallet_registration_status("main").unwrap().unwrap();
+        assert_eq!(got.wallet, "main");
+        assert_eq!(got.state, WalletRegistrationState::AwaitingUser);
+        assert_eq!(
+            got.ceremony_url.as_deref(),
+            Some("http://localhost:18734/wallet-registration/tok-1")
+        );
+        assert_eq!(store.wallet_registration_wallets().unwrap(), vec!["main"]);
+
+        // Re-staging the same live session (same token) updates in place, not
+        // a new row — idempotent repeat writes must not rotate anything.
+        let mut same = status.clone();
+        same.expires_at_ms = 1_000 + 600_000;
+        store
+            .upsert_wallet_registration_status("tok-1", &same, 1_050)
+            .unwrap();
+        assert_eq!(store.wallet_registration_wallets().unwrap(), vec!["main"]);
+
+        // A second *live* session for the same wallet under a different
+        // token must be rejected by the partial unique index — defense in
+        // depth alongside the coordinator's own in-memory check.
+        let dup = WalletRegistrationStatus::awaiting_user(
+            "main",
+            2_000,
+            2_000 + 300_000,
+            "http://localhost:18734/wallet-registration/tok-2",
+        );
+        assert!(
+            store
+                .upsert_wallet_registration_status("tok-2", &dup, 2_000)
+                .is_err()
+        );
+
+        // Completing the session frees the wallet for a fresh live session
+        // under a new token.
+        let mut completed = same.clone();
+        completed.state = WalletRegistrationState::Completed;
+        completed.ceremony_url = None;
+        completed.address = Some("0xabc".into());
+        store
+            .upsert_wallet_registration_status("tok-1", &completed, 1_100)
+            .unwrap();
+        let fresh = WalletRegistrationStatus::awaiting_user(
+            "main",
+            1_000,
+            1_000 + 300_000,
+            "http://localhost:18734/wallet-registration/tok-3",
+        );
+        store
+            .upsert_wallet_registration_status("tok-3", &fresh, 3_000)
+            .unwrap();
+        let got = store.wallet_registration_status("main").unwrap().unwrap();
+        assert_eq!(got.state, WalletRegistrationState::AwaitingUser);
+        assert_eq!(
+            got.ceremony_url.as_deref(),
+            Some("http://localhost:18734/wallet-registration/tok-3")
+        );
+    }
+
+    #[test]
+    fn non_terminal_wallet_registration_sessions_excludes_terminal_rows() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let live = WalletRegistrationStatus::awaiting_user(
+            "main",
+            1_000,
+            1_000 + 300_000,
+            "http://localhost:18734/wallet-registration/tok-1",
+        );
+        store
+            .upsert_wallet_registration_status("tok-1", &live, 1_000)
+            .unwrap();
+
+        let mut other = WalletRegistrationStatus::awaiting_user(
+            "second",
+            1_000,
+            1_000 + 300_000,
+            "http://localhost:18734/wallet-registration/tok-2",
+        );
+        other.state = WalletRegistrationState::Completed;
+        other.ceremony_url = None;
+        other.address = Some("0xdef".into());
+        store
+            .upsert_wallet_registration_status("tok-2", &other, 1_000)
+            .unwrap();
+
+        let rows = store.non_terminal_wallet_registration_sessions().unwrap();
+        assert_eq!(rows.len(), 1, "only the non-terminal row must be returned");
+        let (token, status) = &rows[0];
+        assert_eq!(token, "tok-1");
+        assert_eq!(status.wallet, "main");
+        assert_eq!(status.state, WalletRegistrationState::AwaitingUser);
     }
 }

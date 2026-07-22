@@ -20,6 +20,9 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod wallet_registration;
+pub use wallet_registration::*;
+
 /// Schema tag for [`SignedApproval`] (`approval.json`).
 pub const APPROVAL_SCHEMA_V1: &str = "bloom.approval.v1";
 /// Schema tag for [`ApprovalChallenge`] (`challenge.json` / the signed preimage).

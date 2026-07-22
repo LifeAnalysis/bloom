@@ -41,6 +41,8 @@ use tokio::task::JoinHandle;
 
 use crate::Daemon;
 
+mod wallet_registration;
+
 const CEREMONY_HTML: &str = include_str!("sealed_ceremony.html");
 
 fn now_ms() -> u64 {
@@ -74,11 +76,15 @@ struct CeremonyState {
 pub struct CeremonyServer {
     shutdown: Arc<Notify>,
     handle: Option<JoinHandle<()>>,
+    registration: Option<Arc<dyn bloom_auth_api::WalletRegistrationCoordinator>>,
 }
 
 impl CeremonyServer {
     /// Signal graceful shutdown and wait for the server task to exit.
     pub async fn shutdown(mut self) {
+        if let Some(coordinator) = self.registration.take() {
+            coordinator.mark_listener_unbound();
+        }
         self.shutdown.notify_waiters();
         if let Some(h) = self.handle.take() {
             let _ = h.await;
@@ -88,6 +94,9 @@ impl CeremonyServer {
 
 impl Drop for CeremonyServer {
     fn drop(&mut self) {
+        if let Some(coordinator) = self.registration.take() {
+            coordinator.mark_listener_unbound();
+        }
         self.shutdown.notify_waiters();
         if let Some(h) = self.handle.take() {
             h.abort();
@@ -105,15 +114,47 @@ pub async fn spawn(daemon: &Daemon) -> std::io::Result<CeremonyServer> {
     let addr = format!("127.0.0.1:{LOCAL_CEREMONY_PORT}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(addr = %addr, "ceremony.server.listening");
+    // Arm the wallet-registration coordinator now that this process owns
+    // the one loopback ceremony listener — `stage()` fails closed until
+    // this is called, which is the fix for the historical port-18734
+    // double-bind: no VFS/IPC registration path can reach a second bind.
+    //
+    // Restart reconciliation runs here, not in `Daemon::from_home_inner`:
+    // the successful bind above is the actual proof that no other process
+    // (a live `bloom serve`, or another command-scoped fallback ceremony)
+    // currently owns registration state, so any persisted non-terminal
+    // session really is orphaned. A one-shot CLI command that never reaches
+    // this point never reconciles anything.
+    let registration = daemon.auth_services.registration_coordinator().cloned();
+    if let Some(coordinator) = &registration {
+        if let Err(e) = coordinator
+            .reconcile_after_restart(
+                "daemon restarted before this registration finished",
+                crate::registration::now_ms(),
+            )
+            .await
+        {
+            tracing::warn!(err = %e, "daemon.wallet_registration_restart_reconciliation_failed");
+        }
+        coordinator.mark_listener_bound(&format!("http://localhost:{LOCAL_CEREMONY_PORT}"));
+    }
     let shutdown_signal = shutdown.clone();
+    let task_registration = registration.clone();
     let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
+        if let Err(error) = axum::serve(listener, app)
             .with_graceful_shutdown(async move { shutdown_signal.notified().await })
-            .await;
+            .await
+        {
+            tracing::error!(%error, "ceremony.server.failed");
+        }
+        if let Some(coordinator) = task_registration {
+            coordinator.mark_listener_unbound();
+        }
     });
     Ok(CeremonyServer {
         shutdown,
         handle: Some(handle),
+        registration,
     })
 }
 
@@ -123,6 +164,7 @@ fn router(state: CeremonyState) -> Router {
         .route("/ceremony/{token}/plan.json", get(plan_json))
         .route("/ceremony/{token}/challenge", get(challenge_json))
         .route("/ceremony/{token}/complete", post(complete))
+        .merge(wallet_registration::router())
         .layer(axum::middleware::from_fn(require_local_origin))
         .with_state(state)
 }
