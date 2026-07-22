@@ -3685,10 +3685,12 @@ mod tests {
             // Far in the future so expiry never trips during tests.
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::Unknown,
             tx_hash: None,
             token: None,
             nft: None,
             usd_value: None,
+            valuation: None,
             depends_on: None,
             action_id: None,
             execution_origin: None,
@@ -4037,7 +4039,18 @@ mod tests {
             f.handler
                 .tx_engine
                 .session_store()
-                .authorize_and_debit("alice", 42161, "0001-a", Some(1_000_000), true, now_ms())
+                .authorize_and_debit(
+                    "alice",
+                    42161,
+                    "0001-a",
+                    Some(1_000_000),
+                    bloom_tx::session::SessionActionFacts {
+                        value_moving: true,
+                        calldata_verified: true,
+                        authority_change: false,
+                    },
+                    now_ms(),
+                )
                 .is_some()
         );
 
