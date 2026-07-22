@@ -34,12 +34,14 @@ bloom gatekeeps every value-moving action through capabilities:
   owner key after session creation.
 
 To see what a wallet can do without a human, check its per-chain state and
-outbox, or its Hyperliquid sessions under `hyperliquid/<net>/agent_sessions/`.
-A read-only `wallets/<wallet>/capabilities/` roll-up and a VFS-root `next.md`
-aggregator expose the current capability and next-action view when the daemon
-has the relevant handlers mounted.
+outbox. A read-only `wallets/<wallet>/capabilities/` roll-up and a VFS-root
+`next.md` aggregator expose Bloom-native capability and next-action state.
+Installed Petals expose their own durable session and status files.
 
-Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
+If the external Hyperliquid Petal is installed, start with
+`cat petals/hyperliquid/README.md` and list its route tree before trading.
+Read `docs/petals.md` for every installed Petal's mount directory, consent
+summary, and declared capabilities.
 
 ## Wallets
 
@@ -268,14 +270,14 @@ blindly; inspect the wallet policy or ask the human to change it.
 Hyperliquid trading uses Sealed Approval for owner authority:
 
 - **Agent sessions (RECOMMENDED):** write an explicit session id to
-  `hyperliquid/mainnet/agent_sessions/<wallet>/new.json`. If the write returns
+  `petals/hyperliquid/mainnet/agent_sessions/<wallet>/new.json`. If the write returns
   permission denied, read that session directory's `approval_challenge.json`,
   open or forward its `ceremony_url`, complete the grant ceremony, then retry
   the same write. The resulting ephemeral API wallet trades inside policy
-  bounds at `hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json`
+  bounds at `petals/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json`
   without additional owner prompts until the session expires or is stopped.
 
-- **Owner actions:** `hyperliquid/<network>/exchange/<wallet>/send_asset.json`
+- **Owner actions:** `petals/hyperliquid/<network>/exchange/<wallet>/send_asset.json`
   follows the same challenge/grant/retry flow and requires `transfer_cap_usd`.
   Generic owner-signed order/cancel/update-leverage writes are disabled; use
   agent sessions.

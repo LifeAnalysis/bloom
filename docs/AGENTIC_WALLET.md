@@ -29,7 +29,7 @@ An agent using Bloom can:
 - inspect live balances, nonces, blocks, gas, contracts, storage, events, NFTs, ENS, prices, and address history through file reads;
 - create or import encrypted local wallets without exposing private keys through the filesystem;
 - stage native ETH, ERC-20, NFT, contract-call, signing, and DeFi intents by writing plain-language or structured files;
-- query Hyperliquid market and account state, and submit bounded signed Hyperliquid exchange and agent-session actions through `/hyperliquid/...`;
+- query Hyperliquid market and account state, and submit bounded signed exchange and agent-session actions through the installed `/petals/hyperliquid/...` application;
 - read a generated `plan.md` before any transaction is signed;
 - confirm a staged transaction only after user approval;
 - make free or paid HTTP requests through `/requests`, with paid HTTP 402
@@ -194,7 +194,10 @@ Each wallet has one `policy.toml`. Different sections cover different surfaces:
 - `[approval]` decides whether Bloom must ask before each money-moving action or may act later inside signed rules.
 - `[limits]` provides cross-surface USD budgets for autonomous execution.
 - `[caps]` applies broad EVM transaction caps.
-- `[defi]`, `[polymarket]`, `[payments]`, and `[hyperliquid]` add surface-specific limits.
+- `[defi]`, `[polymarket]`, and `[payments]` add surface-specific limits.
+
+Installed Petals define their own bounded signing facts and approval terms;
+the Hyperliquid Petal does not add a native wallet-policy section.
 
 For passkey wallets, editing `policy.toml` is not enough. The policy must be
 signed:

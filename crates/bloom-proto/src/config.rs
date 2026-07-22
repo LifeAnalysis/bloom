@@ -50,8 +50,9 @@ pub struct Config {
     /// upper bound.
     #[serde(default)]
     pub petals: PetalsConfig,
-    /// Hyperliquid HyperCore read/write surface. Presence of `[hyperliquid]`
-    /// opts the `hyperliquid/` VFS subtree in.
+    /// Optional overrides for the DeFi route that deposits USDC into
+    /// Hyperliquid. Trading and HyperCore access are provided by the external
+    /// Hyperliquid Petal.
     #[serde(default)]
     pub hyperliquid: Option<HyperliquidConfig>,
     #[serde(default)]
@@ -203,14 +204,10 @@ pub struct EnsoConfig {
     pub api_url: String,
 }
 
-/// Hyperliquid HyperCore API configuration. Every field has a default so a
-/// bare `[hyperliquid]` TOML table uses the official public endpoints.
+/// Hyperliquid deposit-target configuration used by the built-in DeFi route.
+/// Every field has a mainnet default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HyperliquidConfig {
-    #[serde(default = "default_hyperliquid_mainnet_url")]
-    pub mainnet_url: String,
-    #[serde(default = "default_hyperliquid_testnet_url")]
-    pub testnet_url: String,
     /// Bridge2 contract that credits deposits (native USDC on Arbitrum).
     /// Defaults to the mainnet bridge; not a magic literal in the route code.
     #[serde(default = "default_hyperliquid_bridge")]
@@ -223,8 +220,6 @@ pub struct HyperliquidConfig {
 impl Default for HyperliquidConfig {
     fn default() -> Self {
         Self {
-            mainnet_url: default_hyperliquid_mainnet_url(),
-            testnet_url: default_hyperliquid_testnet_url(),
             bridge_address: default_hyperliquid_bridge(),
             deposit_chain_id: default_hyperliquid_deposit_chain_id(),
         }
@@ -266,12 +261,6 @@ fn default_etherscan_url() -> String {
 }
 fn default_enso_url() -> String {
     "https://api.enso.finance".to_string()
-}
-fn default_hyperliquid_mainnet_url() -> String {
-    "https://api.hyperliquid.xyz".to_string()
-}
-fn default_hyperliquid_testnet_url() -> String {
-    "https://api.hyperliquid-testnet.xyz".to_string()
 }
 fn default_hyperliquid_bridge() -> String {
     crate::hyperliquid::MAINNET_BRIDGE.to_string()
@@ -434,8 +423,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 }
 
 impl Config {
-    /// An agentic-wallet default: read-ready public EVM networks, Anvil,
-    /// and the Hyperliquid HyperCore VFS using its official public endpoints.
+    /// An agentic-wallet default: read-ready public EVM networks and Anvil.
     ///
     /// Per-chain broadcast is enabled by default. Signing, policy,
     /// confirmation, and Sealed Approval gates still apply to value-moving
@@ -670,16 +658,19 @@ mod tests {
         assert!(cfg.enso.is_none());
         assert_eq!(
             cfg.petals.preinstalled,
-            ["polymarket", "near-intents", "enso"]
+            ["polymarket", "near-intents", "enso", "hyperliquid"]
         );
-        let hyperliquid = cfg
+        let hyperliquid_deposit = cfg
             .hyperliquid
             .as_ref()
-            .expect("Hyperliquid is enabled by default");
-        assert_eq!(hyperliquid.mainnet_url, "https://api.hyperliquid.xyz");
+            .expect("Hyperliquid deposit routing is configured by default");
         assert_eq!(
-            hyperliquid.testnet_url,
-            "https://api.hyperliquid-testnet.xyz"
+            hyperliquid_deposit.bridge_address,
+            crate::hyperliquid::MAINNET_BRIDGE
+        );
+        assert_eq!(
+            hyperliquid_deposit.deposit_chain_id,
+            crate::hyperliquid::DEPOSIT_CHAIN_ID
         );
         assert_eq!(cfg.chains.len(), 12);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
@@ -802,15 +793,25 @@ mod tests {
     }
 
     #[test]
-    fn bare_hyperliquid_block_parses_to_public_defaults() {
+    fn bare_hyperliquid_deposit_block_parses_to_mainnet_defaults() {
         let hl: HyperliquidConfig = toml::from_str("").unwrap();
-        assert_eq!(hl.mainnet_url, "https://api.hyperliquid.xyz");
-        assert_eq!(hl.testnet_url, "https://api.hyperliquid-testnet.xyz");
+        assert_eq!(hl.bridge_address, crate::hyperliquid::MAINNET_BRIDGE);
+        assert_eq!(hl.deposit_chain_id, crate::hyperliquid::DEPOSIT_CHAIN_ID);
+    }
 
-        let hl: HyperliquidConfig =
-            toml::from_str("mainnet_url = \"http://localhost:3001\"\n").unwrap();
-        assert_eq!(hl.mainnet_url, "http://localhost:3001");
-        assert_eq!(hl.testnet_url, "https://api.hyperliquid-testnet.xyz");
+    #[test]
+    fn legacy_hyperliquid_endpoint_keys_are_ignored() {
+        let hl: HyperliquidConfig = toml::from_str(
+            "mainnet_url = \"http://localhost:3001\"\n\
+             testnet_url = \"http://localhost:3002\"\n",
+        )
+        .unwrap();
+        assert_eq!(hl.bridge_address, crate::hyperliquid::MAINNET_BRIDGE);
+        assert_eq!(hl.deposit_chain_id, crate::hyperliquid::DEPOSIT_CHAIN_ID);
+
+        let serialized = toml::to_string_pretty(&hl).unwrap();
+        assert!(!serialized.contains("mainnet_url"));
+        assert!(!serialized.contains("testnet_url"));
     }
 
     #[test]

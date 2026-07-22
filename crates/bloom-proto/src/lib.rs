@@ -16,9 +16,6 @@ pub mod config;
 pub mod defi_policy;
 pub mod home;
 pub mod hyperliquid;
-pub mod hyperliquid_policy;
-pub mod hyperliquid_review;
-pub mod hyperliquid_session;
 pub mod intent;
 pub mod plan;
 pub mod policy;
@@ -39,14 +36,6 @@ pub use config::{
 };
 pub use defi_policy::{DefiPolicy, DefiRouteCtx, ReceiverClass, evaluate_defi_route};
 pub use home::{HomeDir, HomeError, HomeWritePermit};
-pub use hyperliquid_policy::{
-    HyperliquidActionCtx, HyperliquidPolicy, evaluate_hyperliquid_action,
-};
-pub use hyperliquid_review::{
-    DEFAULT_HYPERLIQUID_AGENT_SESSION_NAME, hyperliquid_write_unlock_intent,
-    resolve_hyperliquid_agent_session_name,
-};
-pub use hyperliquid_session::{BreachAction, HyperliquidSession, SessionStatus};
 pub use intent::{
     EnsoIntent, GasStrategy, RawIntent, RawIntentBody, ShellIntent, TxIntent, ValueOrToken,
 };

@@ -33,7 +33,6 @@ bloom-tx.workspace = true
 url.workspace = true
 bloom-vfs.workspace = true
 bloom-update.workspace = true
-bloom-hyperliquid.workspace = true
 bloom-petals.workspace = true
 anyhow.workspace = true
 clap.workspace = true

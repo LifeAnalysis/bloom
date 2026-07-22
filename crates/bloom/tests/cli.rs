@@ -240,6 +240,7 @@ fn help_lists_all_subcommands() {
         .stdout(predicate::str::contains("ipc"))
         .stdout(predicate::str::contains("petals"))
         .stdout(predicate::str::contains("init"))
+        .stdout(predicate::str::contains("hyperliquid").not())
         .stdout(predicate::str::contains("polymarket").not());
 }
 
@@ -332,6 +333,10 @@ fn vfs_ls_root_lists_top_level_handlers() {
     assert!(
         !out.lines().any(|line| line.starts_with("polymarket\t")),
         "native polymarket handler must not be mounted:\n{out}"
+    );
+    assert!(
+        !out.lines().any(|line| line.starts_with("hyperliquid\t")),
+        "native Hyperliquid handler must not be mounted:\n{out}"
     );
 }
 

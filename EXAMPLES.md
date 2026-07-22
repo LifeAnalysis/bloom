@@ -1408,41 +1408,44 @@ just by `cat`ing them again.
 
 ## 16. Hyperliquid trading
 
-Hyperliquid perp and spot trading surface. Mounted when the `[hyperliquid]`
-block is present in `config.toml`. Reads are always safe; writes require either
-an agent session (RECOMMENDED) or an unlocked wallet for direct exchange
-writes (ADVANCED). Read `/hyperliquid/README.md` for the full safety
-model and agent guidance.
+Hyperliquid perp and spot trading are provided by the standalone Petal. Install
+it from a local checkout, then read its mounted documentation before using
+signed routes:
+
+```sh
+bloom petals install ../bloom-petal-hyperliquid
+bloom vfs cat /petals/hyperliquid/README.md
+```
 
 ### Discovery
 
 ```sh
-ls /bloom/hyperliquid/mainnet/
+ls /bloom/petals/hyperliquid/mainnet/
 # mids.json  perp_meta.json  spot_meta.json  books/  candles/
 # exchange/  agent_sessions/  users/  README.md  ASSET_IDS.md
-cat /bloom/hyperliquid/mainnet/README.md
+cat /bloom/petals/hyperliquid/README.md
 ```
 
 ### Market data (reads, no wallet)
 
 ```sh
 # All prices
-cat /bloom/hyperliquid/mainnet/mids.json | jq '.[0:3]'
+cat /bloom/petals/hyperliquid/mainnet/mids.json | jq '.[0:3]'
 
 # Order book
-cat /bloom/hyperliquid/mainnet/books/BTC.json
+cat /bloom/petals/hyperliquid/mainnet/books/BTC.json
 
 # Perp metadata
-cat /bloom/hyperliquid/mainnet/perp_meta.json
+cat /bloom/petals/hyperliquid/mainnet/perp_meta.json
 
 # Candles (coin, interval in ["15m","1h","4h","1d"])
-cat /bloom/hyperliquid/mainnet/candles/ETH.json
+cat /bloom/petals/hyperliquid/mainnet/candles/ETH.json
 # {"interval":"1h","candles":[{"t":...,"o":"...","h":"...","l":"...","c":"..."}]}
 
 # User account state
-cat /bloom/hyperliquid/mainnet/users/0xYourAddress/clearinghouse.json
-cat /bloom/hyperliquid/mainnet/users/0xYourAddress/open_orders.json
-cat /bloom/hyperliquid/mainnet/users/0xYourAddress/fills.json
+cat /bloom/petals/hyperliquid/mainnet/users/0xYourAddress/clearinghouse.json
+cat /bloom/petals/hyperliquid/mainnet/users/0xYourAddress/open_orders.json
+cat /bloom/petals/hyperliquid/mainnet/users/0xYourAddress/fills.json
 ```
 
 ### Automated trading via agent session (RECOMMENDED)
@@ -1456,17 +1459,18 @@ and auto-flatten on risk breach.
 bloom wallet unlock <wallet>
 
 # 2) Create the session (one approveAgent signature)
-echo '{}' > /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/new.json
+echo '{"id":"bounded-session"}' \
+  > /bloom/petals/hyperliquid/mainnet/agent_sessions/<wallet>/new.json
 # 3) Trade through the session
 echo '{"asset":"ETH","is_buy":true,"order_type":"Limit",
   "price":"3000","sz":"0.01","reduce_only":false}' \
-  > /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json
+  > /bloom/petals/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json
 
 # 4) Inspect session status
-cat /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/status.json
+cat /bloom/petals/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/status.json
 
 # 5) Stop the session early
-echo stop > /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/stop
+echo stop > /bloom/petals/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/stop
 ```
 
 ### Direct exchange writes (ADVANCED)
@@ -1476,10 +1480,10 @@ Owner-signed one-off actions. Requires the wallet to stay unlocked.
 ```sh
 echo '{"asset":"ETH","is_buy":true,"order_type":"Limit",
   "price":"3000","sz":"0.01","reduce_only":false}' \
-  > /bloom/hyperliquid/mainnet/exchange/<wallet>/order.json
+  > /bloom/petals/hyperliquid/mainnet/exchange/<wallet>/order.json
 
 echo '{"asset":"ETH","is_cross":false,"leverage":5}' \
-  > /bloom/hyperliquid/mainnet/exchange/<wallet>/update_leverage.json
+  > /bloom/petals/hyperliquid/mainnet/exchange/<wallet>/update_leverage.json
 ```
 
 ---

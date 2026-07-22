@@ -1,6 +1,5 @@
 //! Capability model: the unified read-only shape for bounded trading
-//! authority across built-in venues (Hyperliquid agent sessions and EVM
-//! policy-sessions).
+//! authority across built-in venues.
 //!
 //! [`CapabilityViewEntry`] is the serialisable snapshot each venue handler
 //! projects into, rendered at `/wallets/<w>/capabilities/active.json`.
@@ -17,8 +16,6 @@ use serde::Serialize;
 pub enum Venue {
     /// EVM outbox confirm batches via policy-session.
     EvmOutbox,
-    /// Hyperliquid perp/spot trading via agent sessions.
-    Hyperliquid,
     /// DeFi intent routes via Enso shortcuts.
     Defi,
 }
@@ -31,10 +28,6 @@ pub enum Venue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SigningModel {
-    /// The capability holds an ephemeral key the venue accepts as a delegated
-    /// signer. The owner key is needed only at capability-creation time
-    /// (e.g. Hyperliquid `approveAgent`).
-    HoldsDelegatedKey,
     /// The capability authorises actions but every action is still signed by
     /// the owner key (which must be resident in daemon RAM for the window).
     /// This is the EVM `policy-session` model.
