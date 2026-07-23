@@ -1408,15 +1408,19 @@ just by `cat`ing them again.
 
 ## 16. Hyperliquid trading
 
-Hyperliquid perp and spot trading are provided by the standalone Petal. Install
-it from a local checkout, then read its mounted documentation before using
-signed routes. Paths below use `/bloom/` as the mount root; replace with the
-VFS root (`/petals/...`) when running under `bloom vfs`.
+Hyperliquid perp and spot trading are provided by the default-installed
+standalone Petal. Initialize Bloom, then read its mounted documentation before
+using signed routes. Paths below use `/bloom/` as the mount root; replace with
+the VFS root (`/petals/...`) when running under `bloom vfs`.
 
 ```sh
-bloom petals install ../bloom-petal-hyperliquid
+bloom init
 bloom vfs cat /petals/hyperliquid/README.md
 ```
+
+Petal developers can replace the pinned package through the explicit
+uninstall/install workflow documented by `bloom petals --help`; initialization
+never overwrites a differently sourced installation.
 
 ### Discovery
 
@@ -1492,8 +1496,8 @@ echo '{"asset":"ETH","is_cross":false,"leverage":5}' \
 ## 17. Polymarket (external Petal)
 
 Bloom no longer includes a native `bloom polymarket` command or `/polymarket/`
-VFS handler. `bloom init` provisions the pinned default Polymarket Petal, which
-is available at `/petals/polymarket/`:
+VFS handler. `bloom init` provisions the pinned default Polymarket Petal
+alongside Hyperliquid. Polymarket is available at `/petals/polymarket/`:
 
 ```sh
 bloom init

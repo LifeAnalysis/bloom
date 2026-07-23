@@ -228,9 +228,10 @@ These are examples of the same interaction contract, not separate systems:
   withdrawal, or approval-revocation actions under `/petals/polymarket`; run the
   ceremony for owner signing or authority changes and execute only from sealed
   action bytes.
-- Hyperliquid: installed as the standalone `bloom-petal-hyperliquid` Petal;
-  stage owner-signed `approveAgent`, `usdSend`, or recovery actions through
-  the generic Petal signing host; bloom no longer mounts a native
+- Hyperliquid: provisioned as the default standalone
+  `bloom-petal-hyperliquid` Petal; stage owner-signed `approveAgent`,
+  `usdSend`, or recovery actions through the generic Petal signing host;
+  Bloom no longer mounts a native
   `/hyperliquid` VFS subtree or exposes a `bloom hyperliquid` CLI.
 - DeFi: stage routes and required approvals as ordered actions; run approval
   for the sealed route; execute the ordered plan without substituting steps.

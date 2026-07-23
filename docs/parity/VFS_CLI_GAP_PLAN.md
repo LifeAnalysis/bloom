@@ -308,6 +308,9 @@ namespace:
 /petals/hyperliquid/<network>/...
 ```
 
+Fresh default homes provision the pinned external release during `bloom init`;
+an explicit `[petals] preinstalled = []` remains the persistent opt-out.
+
 Parity classification: `petal`, not tracked in this ledger. The external
 Petal repository owns its own CLI, VFS, and test parity matrix. Bloom's
 built-in DeFi handler retains only the Hyperliquid deposit-route bridge

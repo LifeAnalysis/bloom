@@ -21,16 +21,16 @@ bloom gatekeeps every value-moving action through capabilities:
 
 - **Reads are always safe.** No signing, no ceremony, no wallet needed for chain
   state, balances, prices, books, candles, account state.
-- **Direct writes require owner approval.** The outbox stage-confirm flow,
-  one-off Hyperliquid exchange orders, and Polymarket trades each cross an
-  owner gate (passkey ceremony or local passphrase unlock).
+- **Direct writes require owner approval.** The outbox stage-confirm flow and
+  one-off actions through the default Hyperliquid and Polymarket Petals each
+  cross an owner gate (passkey ceremony or local passphrase unlock).
 - **Automated action uses a capability.** Create a bounded session/capability
   first — the human approves the bounds once, then the agent operates inside
   them without re-prompting until expiry, breach, or revocation.
 - **The owner key is never handed off.** For capabilities that depend on owner
   signing (EVM and installed Petals), the key will
   reside in daemon RAM for a bounded window and auto-lock on expiry.
-  Hyperliquid already uses an ephemeral agent key that does not need the
+  The Hyperliquid Petal uses an ephemeral agent key that does not need the
   owner key after session creation.
 
 To see what a wallet can do without a human, check its per-chain state and
@@ -38,10 +38,14 @@ outbox. A read-only `wallets/<wallet>/capabilities/` roll-up and a VFS-root
 `next.md` aggregator expose Bloom-native capability and next-action state.
 Installed Petals expose their own durable session and status files.
 
-If the external Hyperliquid Petal is installed, start with
+For the default-installed Hyperliquid Petal, start with
 `cat petals/hyperliquid/README.md` and list its route tree before trading.
 Read `docs/petals.md` for every installed Petal's mount directory, consent
 summary, and declared capabilities.
+For the default-installed Polymarket Petal, start with
+`cat petals/polymarket/README.md`, read `petals/polymarket/AGENTS.md`, then
+inspect `petals/polymarket/meta/route-contract.json` and list its route tree
+before using its prediction-market routes.
 
 ## Wallets
 

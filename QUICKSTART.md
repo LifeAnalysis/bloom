@@ -215,10 +215,10 @@ it expire after the configured TTL) cancels the stage.
   Petal confirmation stages anything into the wallet outbox.
 - **Prices** — keyless DefiLlama at `prices/spot/<coin>(.usd)` and
   `prices/change_24h/<coin>`.
-- **Hyperliquid** — install the standalone `bloom-petal-hyperliquid` package
-  with `bloom petals install ../bloom-petal-hyperliquid`. Perp/spot reads and
-  bounded signed actions then appear at `/petals/hyperliquid/<network>/...`.
-  Read `/petals/hyperliquid/README.md` for the installed workflow.
+- **Hyperliquid** — `bloom init` provisions the pinned default
+  `bloom-petal-hyperliquid` package. Perp/spot reads and bounded signed actions
+  appear at `/petals/hyperliquid/<network>/...`. Read
+  `/petals/hyperliquid/README.md` for the installed workflow.
 - **Polymarket** — `bloom init` provisions the pinned default
   `bloom-petal-polymarket` package. It appears at `/petals/polymarket/`; inspect
   `meta/route-contract.json` and list the route tree for the exact installed

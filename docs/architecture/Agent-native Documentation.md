@@ -61,8 +61,8 @@ hint file and no per-directory README duplication of global contracts.
 
 Built-in handlers embed read-only, handler-local documentation, while external
 Petals expose package-defined route documentation under `/petals/<name>/`.
-For example, an installed Hyperliquid Petal exposes
-`/petals/hyperliquid/README.md`, and the default installed Polymarket Petal
+For example, the default-installed Hyperliquid Petal exposes
+`/petals/hyperliquid/README.md`, and the default-installed Polymarket Petal
 exposes `/petals/polymarket/README.md`,
 `/petals/polymarket/AGENTS.md`, and
 `/petals/polymarket/meta/route-contract.json`. Per-request `plan.md` files under
