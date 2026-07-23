@@ -96,8 +96,8 @@ Two mechanisms keep the served documentation truthful:
 byte-identical to the vendored source file, and that the content passes
 sanity checks. Petal router tests assert that package `README.md` and
 `AGENTS.md` files are listed, readable, and immutable. Built-in handlers carry
-similar tests for their READMEs (for example, that the Hyperliquid README
-documents safe reads and API-wallet risk).
+similar tests for their READMEs (for example, that the installed Hyperliquid
+Petal's README documents safe reads and API-wallet risk).
 
 **The PR checklist enforces updates.** The repository's pull request
 template includes a mandatory "Agent Documentation updated" item, enforced

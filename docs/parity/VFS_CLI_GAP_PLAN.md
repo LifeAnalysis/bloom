@@ -296,151 +296,22 @@ Rollback/non-goals:
   entry; the explicit `cancel` file/command submits a same-nonce network
   cancellation.
 
-## 4. Audited: Hyperliquid exact CLI/VFS matrix
+## 4. Audited: Hyperliquid native surface removed (moved to Petal)
 
-Goal: replace the old broad Hyperliquid parity row with exact current-state
-classifications.
-
-### 4.0.1 Read surfaces — parity
-
-CLI:
-
-```bash
-bloom hyperliquid account <user> [--network <network>]
-bloom hyperliquid spot-state <user> [--network <network>]
-bloom hyperliquid open-orders <user> [--network <network>]
-bloom hyperliquid fills <user> [--network <network>]
-bloom hyperliquid funding <user> <coin> [--start-time <ms>] [--end-time <ms>] [--network <network>]
-bloom hyperliquid book <coin> [--network <network>]
-bloom hyperliquid candles <coin> <interval> <start-ms> <end-ms> [--network <network>]
-bloom hyperliquid metadata --kind <perp|perp-contexts|spot|spot-contexts|mids> [--network <network>]
-bloom hyperliquid test-reads <user> [--coin <coin>] [--network <network>]
-```
-
-VFS:
+Bloom no longer ships a native Hyperliquid handler, CLI subcommand, or
+`bloom-hyperliquid` crate. All Hyperliquid reads, exchange writes, agent
+sessions, and USD transfers moved to the standalone `bloom-petal-hyperliquid`
+package. After install, the surface appears under the canonical Petal
+namespace:
 
 ```text
-/hyperliquid/<network>/{mids,perp_meta,perp_contexts,predicted_fundings,spot_meta,spot_contexts}.json
-/hyperliquid/<network>/users/<account>/{clearinghouse,spot_state,open_orders,frontend_open_orders,fills,portfolio,rate_limit,extra_agents}.json
-/hyperliquid/<network>/users/<account>/funding/<coin>.json
-/hyperliquid/<network>/books/<coin>.json
-/hyperliquid/<network>/candles/<coin>/<interval>.json
-/hyperliquid/<network>/recent_trades/<coin>.json
-/hyperliquid/<network>/asset_contexts/<coin>.json
-/hyperliquid/<network>/funding_history/<coin>.json
+/petals/hyperliquid/<network>/...
 ```
 
-Classification: `parity` / `track_a` under mocked Info endpoints. The CLI reads
-call `bloom_hyperliquid::HyperliquidClient` directly; the VFS handler exposes
-the same Info API families as files.
-
-### 4.0.2 Owner exchange writes — VFS-only generic surface
-
-VFS:
-
-```text
-/hyperliquid/<network>/exchange/<wallet>/order.json
-/hyperliquid/<network>/exchange/<wallet>/cancel.json
-/hyperliquid/<network>/exchange/<wallet>/schedule_cancel.json
-/hyperliquid/<network>/exchange/<wallet>/update_leverage.json
-/hyperliquid/<network>/exchange/<wallet>/raw_signed.json
-```
-
-Classification: `vfs_only` / `track_b`, intentionally. These are advanced
-generic signed exchange writes. The CLI does not expose broad owner-signed
-order/cancel/update commands because the recommended product path is bounded
-agent sessions with policy/TTL/cap enforcement. Add dedicated CLI commands only
-if product direction changes; do not infer this as an unresolved parity defect.
-
-### 4.0.3 Agent sessions — parity
-
-CLI:
-
-```bash
-bloom hyperliquid session create <wallet> [--id <id>] [--agent-name <name>] [--vault-address <addr>] [--network <network>]
-bloom hyperliquid session status <wallet> <id> [--network <network>]
-bloom hyperliquid session audit <wallet> <id> [--network <network>]
-bloom hyperliquid session stop <wallet> <id> [--network <network>]
-bloom hyperliquid session cancel-all <wallet> <id> [--network <network>]
-bloom hyperliquid session close-all <wallet> <id> [--network <network>]
-```
-
-VFS:
-
-```text
-/hyperliquid/<network>/agent_sessions/<wallet>/new.json
-/hyperliquid/<network>/agent_sessions/<wallet>/<id>/status.json
-/hyperliquid/<network>/agent_sessions/<wallet>/<id>/session.json
-/hyperliquid/<network>/agent_sessions/<wallet>/<id>/audit.jsonl
-/hyperliquid/<network>/agent_sessions/<wallet>/<id>/last_response.json
-/hyperliquid/<network>/agent_sessions/<wallet>/<id>/order.json
-/hyperliquid/<network>/agent_sessions/<wallet>/<id>/cancel.json
-/hyperliquid/<network>/agent_sessions/<wallet>/<id>/schedule_cancel.json
-/hyperliquid/<network>/agent_sessions/<wallet>/<id>/stop
-/hyperliquid/<network>/agent_sessions/<wallet>/<id>/cancel_all
-/hyperliquid/<network>/agent_sessions/<wallet>/<id>/close_all
-```
-
-Classification: `parity` for the CLI-exposed lifecycle commands under a running
-daemon, because the CLI dispatches through the same VFS IPC paths. Session
-`order.json` / `cancel.json` / `schedule_cancel.json` remain VFS-native action
-sinks for agents inside the bounded session.
-
-### 4.0.4 Live post-only smoke — excluded
-
-CLI:
-
-```bash
-bloom hyperliquid test-post-only-cancel ... --danger-accept-live-orders
-```
-
-Classification: `cli_only` / `exclude`. This is an operator smoke test with a
-danger flag and live-order cleanup logic, not a product workflow to mirror in
-VFS.
-
-Rollback/non-goals:
-
-- do not broaden Hyperliquid trading semantics during the audit;
-- do not add generic owner-signed CLI exchange commands unless product direction
-  changes;
-- keep owner recovery paths disabled unless they are routed through Sealed
-  Approval host signing, and keep session actions scoped to the approved
-  ephemeral API wallet.
-
-## 4.1. Audited: Hyperliquid USD send parity already wired
-
-Finding: the ledger's previous `cli_only` / `gap` classification for
-Hyperliquid USD send was stale.
-
-Exact CLI behavior:
-
-```bash
-bloom hyperliquid send-asset <wallet> <destination> <amount> --network <network>
-```
-
-Exact VFS path and body:
-
-```text
-/hyperliquid/<network>/exchange/<wallet>/send_asset.json
-```
-
-The CLI dispatches through plain IPC to the same VFS path with a JSON body
-containing `destination` and `amount`. If the first write returns permission
-denied, the daemon has written `approval_challenge.json`; the CLI opens its
-`ceremony_url`, waits for grant-mode approval, then retries the same write. The
-VFS handler runs `HyperliquidHandler::submit_usd_send`, which:
-
-- requires configured wallet `[hyperliquid]` policy with `transfer_cap_usd`;
-- parses the amount exactly to micro-USDC for cap evaluation;
-- stages a sealed `usdSend` action and signs the Hyperliquid hash through
-  PetalHost only while the grant is active;
-- submits through the Hyperliquid exchange endpoint;
-- persists the response to `last_response.json`.
-
-Classification: `parity` / `track_a` under mocked exchange endpoints. This is
-owner-authority by design; agent-session keys cannot authorize Hyperliquid
-`usdSend`, so Bloom uses Sealed Approval host signing rather than wallet
-unlocking.
+Parity classification: `petal`, not tracked in this ledger. The external
+Petal repository owns its own CLI, VFS, and test parity matrix. Bloom's
+built-in DeFi handler retains only the Hyperliquid deposit-route bridge
+address and deposit chain id (Arbitrum) from `[hyperliquid]` config.
 
 ## 4.2. Implemented: Polymarket builder-key list/revoke VFS parity
 
