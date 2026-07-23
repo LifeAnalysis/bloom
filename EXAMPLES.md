@@ -1410,7 +1410,8 @@ just by `cat`ing them again.
 
 Hyperliquid perp and spot trading are provided by the standalone Petal. Install
 it from a local checkout, then read its mounted documentation before using
-signed routes:
+signed routes. Paths below use `/bloom/` as the mount root; replace with the
+VFS root (`/petals/...`) when running under `bloom vfs`.
 
 ```sh
 bloom petals install ../bloom-petal-hyperliquid
