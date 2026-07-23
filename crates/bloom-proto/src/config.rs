@@ -207,6 +207,7 @@ pub struct EnsoConfig {
 /// Hyperliquid deposit-target configuration used by the built-in DeFi route.
 /// Every field has a mainnet default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HyperliquidConfig {
     /// Bridge2 contract that credits deposits (native USDC on Arbitrum).
     /// Defaults to the mainnet bridge; not a magic literal in the route code.
@@ -800,15 +801,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_hyperliquid_endpoint_keys_are_ignored() {
-        let hl: HyperliquidConfig = toml::from_str(
+    fn legacy_hyperliquid_endpoint_keys_are_rejected() {
+        let err = toml::from_str::<HyperliquidConfig>(
             "mainnet_url = \"http://localhost:3001\"\n\
              testnet_url = \"http://localhost:3002\"\n",
         )
-        .unwrap();
-        assert_eq!(hl.bridge_address, crate::hyperliquid::MAINNET_BRIDGE);
-        assert_eq!(hl.deposit_chain_id, crate::hyperliquid::DEPOSIT_CHAIN_ID);
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") && msg.contains("mainnet_url"),
+            "expected unknown-field rejection, got: {msg}"
+        );
 
+        let hl: HyperliquidConfig = toml::from_str("").unwrap();
         let serialized = toml::to_string_pretty(&hl).unwrap();
         assert!(!serialized.contains("mainnet_url"));
         assert!(!serialized.contains("testnet_url"));

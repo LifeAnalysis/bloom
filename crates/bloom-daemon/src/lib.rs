@@ -1758,6 +1758,17 @@ impl Daemon {
             debug!(path = %config_path.display(), "config.initialised_default");
         }
 
+        let legacy_hl_secrets = home.root().join("hyperliquid").join(".agent_key_kek");
+        if legacy_hl_secrets.exists() {
+            warn!(
+                path = %legacy_hl_secrets.parent().unwrap().display(),
+                "bloom no longer manages native Hyperliquid agent sessions. \
+                 Sealed agent keys remain on disk under this directory. \
+                 Verify that any active sessions have been stopped or revoked \
+                 at the venue, then remove this directory."
+            );
+        }
+
         let mut clients: Vec<ChainClient> = Vec::new();
         for spec in config.chains.values() {
             match ChainClient::new(spec.clone()) {
@@ -3545,7 +3556,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = HomeDir::at(dir.path());
         home.ensure().unwrap();
-        let config = Config::local_default();
+        let mut config = Config::local_default();
+        config.enso = Some(bloom_proto::EnsoConfig {
+            api_key: String::new(),
+            api_url: "https://api.enso.finance".to_string(),
+        });
         config.save(&home.config_path()).unwrap();
 
         let daemon = Daemon::from_home(home).unwrap();
