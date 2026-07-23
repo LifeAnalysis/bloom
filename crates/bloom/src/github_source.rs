@@ -15,7 +15,7 @@ use url::Url;
 
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
-const HYPERLIQUID_INITIAL_RELEASE_COMMIT: &str = "42392bde650a6b8c7587c093b17575e3b4714bd6";
+const HYPERLIQUID_RELEASE_COMMIT: &str = "fa722a986c2a0a23977e9e00df54ebd291a686db";
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
 
@@ -41,10 +41,10 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
 const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
     name: "hyperliquid",
     repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
-    commit: HYPERLIQUID_INITIAL_RELEASE_COMMIT,
-    release_tag: "v0.1.3",
-    archive: "hyperliquid-v0.1.3.petal.tar.gz",
-    expected_hash: Some("a9cae7f5795b8a3e33c7e68e6c4bbafa4c1e46268f0410e60a175c62fde751b4"),
+    commit: HYPERLIQUID_RELEASE_COMMIT,
+    release_tag: "v0.1.4",
+    archive: "hyperliquid-v0.1.4.petal.tar.gz",
+    expected_hash: Some("1de2eb50b7ce0f0da03d3ef1ae6554c6f1b89393096d50183fe4f2dbca6b2af7"),
 };
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
