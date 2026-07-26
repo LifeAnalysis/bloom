@@ -2093,7 +2093,7 @@ summary = "Demo app used by source install tests."
             BuildScript::Failure => "#!/usr/bin/env bash\nset -euo pipefail\nexit 42\n".to_string(),
         };
         let script_path = work.path().join("scripts/build.sh");
-        std::fs::write(&script_path, script)?;
+        write_and_sync(&script_path, script.as_bytes())?;
         make_executable(&script_path)?;
         Ok(())
     }
@@ -2109,6 +2109,17 @@ summary = "Demo app used by source install tests."
 
     #[cfg(not(unix))]
     fn make_executable(_path: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    fn write_and_sync(path: &Path, contents: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)
+            .with_context(|| format!("create {}", path.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", path.display()))?;
         Ok(())
     }
 
