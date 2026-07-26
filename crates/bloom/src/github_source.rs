@@ -2114,8 +2114,8 @@ summary = "Demo app used by source install tests."
 
     fn write_and_sync(path: &Path, contents: &[u8]) -> Result<()> {
         use std::io::Write;
-        let mut file = std::fs::File::create(path)
-            .with_context(|| format!("create {}", path.display()))?;
+        let mut file =
+            std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
         file.write_all(contents)
             .with_context(|| format!("write {}", path.display()))?;
         file.sync_all()
