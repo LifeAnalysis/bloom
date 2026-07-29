@@ -13,13 +13,15 @@ use std::{
 
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use bloom_triad_protocol::{
-    ApprovalLifecycleState, ApprovalPrepareRequest, ApprovalPublicStatus, Base64UrlBytes,
-    CeremonyPublicStatus, CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest,
-    CustodyPrepareResponse, CustodyResult, DecimalU64, Digest32, IdRequest, KeyPublic, KeyRef,
-    KeyRequest, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
-    MachineSignRequest, OperationId, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
+    ActivationMode, ApprovalLifecycleState, ApprovalLimits, ApprovalPrepareRequest,
+    ApprovalPublicStatus, ApprovalSelector, ApprovalSubject, Base64UrlBytes, CeremonyPublicStatus,
+    CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse,
+    CustodyResult, DecimalU64, Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest,
+    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
+    OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
     PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
-    ProtocolErrorCode, ProvenanceSubject, SealedApprovalPrepareResponse, SignOperationIdentity,
+    ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce,
+    SealedApprovalPrepareResponse, SealedApprovalTerms, SignOperationIdentity,
     SignedPolicySnapshot, SigningPayloads, SigningResult, Token, WalletPublic, WalletRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -231,6 +233,101 @@ impl MachineBrokerClient {
         .await
     }
 
+    /// Prepare or execute one exact payload-bearing Machine/CLI operation.
+    ///
+    /// The caller persists the returned approval ID and reuses the exact
+    /// immutable request identities after the ceremony. No hash-only fallback
+    /// exists: both the payload bytes and the suite-derived hash are bound into
+    /// the approval and sign operation.
+    pub async fn sign_exact_payload(
+        &self,
+        request: ExactPayloadSignRequest,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        request.validate()?;
+        let wallet = self.wallet(request.wallet_id.clone()).await?;
+        let key_ref = unique_key_for_suite(&wallet.key_refs, request.crypto_suite)?;
+        let activation_mode = request
+            .activation_mode
+            .clone()
+            .unwrap_or_else(|| default_activation_mode(&key_ref));
+        let payload_digest = Digest32::from_bytes(Sha256::digest(&request.preimage).into());
+        let ordered_hash = suite_hash(request.crypto_suite, &request.preimage);
+        if request.claimed_hash != ordered_hash {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::SelectorMismatch,
+                "exact payload hash does not match the selected CryptoSuite",
+            ));
+        }
+
+        if let Some(approval_id) = request.approval_id {
+            let operation_digest = SignOperationIdentity {
+                operation_id: request.signing_operation_id.clone(),
+                approval_id: approval_id.clone(),
+                key_ref: key_ref.clone(),
+                crypto_suite: request.crypto_suite,
+                ordered_payload_digests: vec![payload_digest],
+                ordered_hashes: vec![ordered_hash],
+                petal_use_claim_digest: None,
+                claim_assurance_digest: None,
+                policy_version: wallet.policy_version,
+                policy_digest: wallet.policy_digest,
+            }
+            .digest()?;
+            return self
+                .sign(MachineSignRequest {
+                    operation_id: request.signing_operation_id,
+                    operation_digest,
+                    approval_id,
+                    key_ref,
+                    crypto_suite: request.crypto_suite,
+                    payloads: SigningPayloads::Single {
+                        payload: Base64UrlBytes::from_bytes(&request.preimage),
+                    },
+                    petal_use_claim: None,
+                    claim_assurance_evidence: None,
+                    provenance: request.provenance,
+                })
+                .await
+                .map(ExactPayloadSignOutcome::Signed);
+        }
+
+        let terms = SealedApprovalTerms {
+            subject: approval_subject(&request.provenance),
+            wallet_id: request.wallet_id,
+            key_ref,
+            allowed_crypto_suites: vec![request.crypto_suite],
+            selector: ApprovalSelector::Exact {
+                ordered_payload_digests: vec![payload_digest],
+                ordered_hashes: vec![ordered_hash],
+            },
+            limits: ApprovalLimits {
+                max_operations: DecimalU64::new(1),
+                max_signatures: DecimalU64::new(1),
+                operation_rate_limits: Vec::new(),
+                signature_rate_limits: Vec::new(),
+                value_limits: Vec::new(),
+            },
+            activation_mode,
+            wallet_revocation_epoch: wallet.wallet_revocation_epoch,
+            policy_version: wallet.policy_version,
+            policy_digest: wallet.policy_digest,
+            provenance_digest: request.provenance_digest,
+            request_nonce: request.request_nonce,
+            issued_at_ms: request.issued_at_ms.clone(),
+            not_before_ms: request.issued_at_ms,
+            expires_at_ms: request.expires_at_ms,
+            renewal_of: None,
+        };
+        terms.validate()?;
+        self.prepare_approval(ApprovalPrepareRequest {
+            operation_id: request.approval_operation_id,
+            terms,
+            canonical_plan_facts_digest: request.canonical_plan_facts_digest,
+        })
+        .await
+        .map(ExactPayloadSignOutcome::ApprovalRequired)
+    }
+
     pub async fn prepare_approval(
         &self,
         request: ApprovalPrepareRequest,
@@ -256,6 +353,21 @@ impl MachineBrokerClient {
         {
             MachineBrokerResponse::SealedApprovalStatus(status) => Ok(status),
             _ => Err(response_mismatch("sealed_approval.status")),
+        }
+    }
+
+    pub async fn operation_status(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<OperationPublicStatus, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::OperationStatus(OperationRequest {
+                operation_id,
+            }))
+            .await?
+        {
+            MachineBrokerResponse::OperationStatus(status) => Ok(status),
+            _ => Err(response_mismatch("operation.status")),
         }
     }
 
@@ -539,6 +651,47 @@ pub struct TrustedPetalSignRequest {
     pub trusted_provenance: ProvenanceSubject,
     pub frozen_action: Option<Vec<u8>>,
     pub frozen_advisory: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExactPayloadSignRequest {
+    pub wallet_id: Token,
+    pub preimage: Vec<u8>,
+    pub claimed_hash: Digest32,
+    pub crypto_suite: CryptoSuite,
+    pub provenance: ProvenanceSubject,
+    pub provenance_digest: Digest32,
+    /// `None` selects the fail-closed v1 default: boot-bound for local keys and
+    /// backend-managed for non-local enrolled backends.
+    pub activation_mode: Option<ActivationMode>,
+    pub approval_operation_id: OperationId,
+    pub signing_operation_id: OperationId,
+    pub request_nonce: RequestNonce,
+    pub issued_at_ms: DecimalU64,
+    pub expires_at_ms: DecimalU64,
+    pub canonical_plan_facts_digest: Digest32,
+    pub approval_id: Option<Digest32>,
+}
+
+impl ExactPayloadSignRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.expires_at_ms.get() <= self.issued_at_ms.get() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "exact approval validity interval is invalid",
+            ));
+        }
+        SigningPayloads::Single {
+            payload: Base64UrlBytes::from_bytes(&self.preimage),
+        }
+        .validate()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExactPayloadSignOutcome {
+    ApprovalRequired(SealedApprovalPrepareResponse),
+    Signed(SigningResult),
 }
 
 /// Durable Machine projection of a Broker-owned ceremony. Launch secrets are
@@ -874,6 +1027,90 @@ fn projection_mismatch(message: &str) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::MalformedFrame, message)
 }
 
+fn approval_subject(provenance: &ProvenanceSubject) -> ApprovalSubject {
+    match provenance {
+        ProvenanceSubject::Petal {
+            package_hash,
+            route,
+        } => ApprovalSubject::Petal {
+            package_hash: package_hash.clone(),
+            route: route.clone(),
+            agent_id: None,
+        },
+        ProvenanceSubject::Cli {
+            client_id,
+            command_class,
+        } => ApprovalSubject::Cli {
+            client_id: client_id.clone(),
+            command_class: command_class.clone(),
+        },
+        ProvenanceSubject::System {
+            component_id,
+            operation_class,
+        } => ApprovalSubject::System {
+            component_id: component_id.clone(),
+            operation_class: operation_class.clone(),
+        },
+    }
+}
+
+fn default_activation_mode(key_ref: &KeyRef) -> ActivationMode {
+    if key_ref.backend.as_str() == "local" {
+        ActivationMode::BootBound
+    } else {
+        ActivationMode::BackendManaged
+    }
+}
+
+/// Load the installer-owned public provenance catalog used to bind approval
+/// terms. Broker independently verifies every record signature before use.
+#[cfg(unix)]
+pub fn load_provenance_catalog(path: impl AsRef<Path>) -> Result<ProvenanceCatalog, ProtocolError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path = path.as_ref();
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            format!("inspect {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "provenance catalog must be a root-owned, non-symlink regular file not writable by group or other",
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            format!("read {}: {error}", path.display()),
+        )
+    })?;
+    decode_provenance_catalog(&bytes)
+}
+
+fn decode_provenance_catalog(bytes: &[u8]) -> Result<ProvenanceCatalog, ProtocolError> {
+    if bytes.len() > 1024 * 1024 {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::LimitExceededFrame,
+            "provenance catalog exceeds 1 MiB",
+        ));
+    }
+    let catalog: ProvenanceCatalog = serde_json::from_slice(bytes).map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::MalformedFrame,
+            format!("parse provenance catalog: {error}"),
+        )
+    })?;
+    catalog.validate_shape()?;
+    Ok(catalog)
+}
+
 impl TrustedPetalSignRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
         if self.preimage.is_empty()
@@ -1075,6 +1312,18 @@ mod tests {
                             broker_receipt_digest: digest(91),
                         }))
                     }
+                    MachineBrokerRequest::SealedApprovalPrepare(request) => {
+                        Ok(MachineBrokerResponse::SealedApprovalPrepare(
+                            SealedApprovalPrepareResponse {
+                                approval_id: request.terms.approval_id()?,
+                                state: ApprovalPrepareState::AwaitingCeremony,
+                                ceremony_url: "http://localhost:18734/ceremony/exact-owner-secret"
+                                    .into(),
+                                ceremony_expires_at_ms: request.terms.expires_at_ms,
+                                review_manifest_digest: digest(92),
+                            },
+                        ))
+                    }
                     MachineBrokerRequest::CeremonyStatus(request) => {
                         let operation_id =
                             OperationId::new(request.id.as_str().to_owned()).unwrap();
@@ -1180,6 +1429,117 @@ mod tests {
                 payload: Base64UrlBytes::from_bytes(&payload)
             }
         );
+    }
+
+    fn exact_request(payload: Vec<u8>, approval_id: Option<Digest32>) -> ExactPayloadSignRequest {
+        ExactPayloadSignRequest {
+            wallet_id: token("wallet"),
+            claimed_hash: Digest32::from_bytes(Keccak256::digest(&payload).into()),
+            preimage: payload,
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            provenance: ProvenanceSubject::Cli {
+                client_id: token("bloom-cli"),
+                command_class: token("transaction.confirm"),
+            },
+            provenance_digest: digest(60),
+            activation_mode: Some(ActivationMode::BootBound),
+            approval_operation_id: OperationId::from_bytes([61; 32]),
+            signing_operation_id: OperationId::from_bytes([62; 32]),
+            request_nonce: RequestNonce::from_bytes([63; 16]),
+            issued_at_ms: DecimalU64::new(1_000),
+            expires_at_ms: DecimalU64::new(601_000),
+            canonical_plan_facts_digest: digest(64),
+            approval_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_payload_prepares_then_signs_without_a_hash_only_path() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        let payload = b"canonical unsigned EVM envelope".to_vec();
+        let prepared = client
+            .sign_exact_payload(exact_request(payload.clone(), None))
+            .await
+            .unwrap();
+        let ExactPayloadSignOutcome::ApprovalRequired(prepared) = prepared else {
+            panic!("first call must prepare an exact approval");
+        };
+
+        {
+            let requests = broker.requests.lock().unwrap();
+            let MachineBrokerRequest::SealedApprovalPrepare(request) = &requests[1] else {
+                panic!("second call must be sealed_approval.prepare");
+            };
+            assert_eq!(
+                request.terms.selector,
+                ApprovalSelector::Exact {
+                    ordered_payload_digests: vec![Digest32::from_bytes(
+                        Sha256::digest(&payload).into()
+                    )],
+                    ordered_hashes: vec![Digest32::from_bytes(Keccak256::digest(&payload).into())],
+                }
+            );
+            assert_eq!(request.terms.provenance_digest, digest(60));
+            assert_eq!(request.terms.limits.max_operations.get(), 1);
+            assert_eq!(request.terms.limits.max_signatures.get(), 1);
+        }
+
+        let signed = client
+            .sign_exact_payload(exact_request(payload.clone(), Some(prepared.approval_id)))
+            .await
+            .unwrap();
+        let ExactPayloadSignOutcome::Signed(signed) = signed else {
+            panic!("approved retry must call signing.sign");
+        };
+        assert_eq!(signed.signatures[0].bytes.decode(), vec![7; 65]);
+        let requests = broker.requests.lock().unwrap();
+        let MachineBrokerRequest::SigningSign(request) = &requests[3] else {
+            panic!("fourth call must be signing.sign");
+        };
+        assert_eq!(
+            request.payloads,
+            SigningPayloads::Single {
+                payload: Base64UrlBytes::from_bytes(&payload)
+            }
+        );
+        assert!(request.petal_use_claim.is_none());
+        assert!(request.claim_assurance_evidence.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_payload_rejects_changed_hash_before_prepare_or_sign() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(1),
+                policy_digest: digest(1),
+                wallet_revocation_epoch: DecimalU64::new(0),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let mut request = exact_request(b"payload".to_vec(), None);
+        request.claimed_hash = digest(99);
+        let error = MachineBrokerClient::new(broker.clone())
+            .sign_exact_payload(request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
+        assert_eq!(broker.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

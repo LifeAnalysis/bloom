@@ -38,6 +38,7 @@ use bloom_auth_api::{
     EvmOwnerSigningSessionScope, SignHashRequest, SigningAttestation,
 };
 use bloom_evm::{ChainClient, ChainError, IERC20, NftKind};
+use bloom_machine_client::{ExactPayloadSignOutcome, ExactPayloadSignRequest, MachineBrokerClient};
 
 // Local NFT-write interfaces. `bloom-evm` declares the read shapes for
 // ERC-721/1155; we add the write functions here so calldata encoding stays
@@ -67,7 +68,13 @@ use bloom_proto::{
     AddressBook, ChainSpec, HomeWritePermit, NftAction, NftRef, Policy, RawIntent, RawIntentBody,
     StagedTx, TokenRef, TxActionKind, TxStatus, format_units, parse_amount, parse_eth, parse_units,
 };
+use bloom_triad_protocol::{
+    ApprovalLifecycleState, CryptoSuite, DecimalU64, Digest32, OperationId, OperationState,
+    ProtocolErrorCode, ProvenanceCatalog, ProvenanceRecord, ProvenanceSubject, RequestNonce,
+    SignOperationIdentity, SigningResult, Token,
+};
 use parking_lot::RwLock;
+use sha2::Digest as _;
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -435,6 +442,38 @@ type NonceLocks =
 const OUTBOX_APPROVAL_FILE: &str = "approval.json";
 const OUTBOX_APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const OUTBOX_APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
+const TRIAD_SIGNING_STATE_FILE: &str = "ceremony.json";
+const TRIAD_EXACT_APPROVAL_TTL_MS: u64 = 10 * 60 * 1_000;
+
+#[derive(Clone)]
+struct TriadSigningService {
+    broker: MachineBrokerClient,
+    provenance_catalog: ProvenanceCatalog,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct TriadEvmSigningState {
+    schema: String,
+    action_id: String,
+    payload_digest: Digest32,
+    claimed_hash: Digest32,
+    provenance_digest: Digest32,
+    approval_operation_id: OperationId,
+    signing_operation_id: OperationId,
+    request_nonce: RequestNonce,
+    issued_at_ms: DecimalU64,
+    expires_at_ms: DecimalU64,
+    canonical_plan_facts_digest: Digest32,
+    approval_id: Option<Digest32>,
+    ceremony_url: Option<String>,
+    ceremony_expires_at_ms: Option<DecimalU64>,
+    review_manifest_digest: Option<Digest32>,
+    #[serde(default)]
+    sign_dispatched: bool,
+    #[serde(default)]
+    expected_operation_digest: Option<Digest32>,
+}
 
 /// Stage / confirm the lifecycle.
 #[derive(Clone)]
@@ -468,6 +507,7 @@ pub struct TxEngine {
     auth_writer: Option<Arc<dyn AuthStoreWriter>>,
     grant_store: Option<Arc<dyn GrantStore>>,
     petal_host: Option<Arc<dyn PetalHost>>,
+    triad_signing: Option<Arc<TriadSigningService>>,
     #[cfg(feature = "unsafe-debug-signer")]
     unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
 }
@@ -488,6 +528,7 @@ impl TxEngine {
             auth_writer: None,
             grant_store: None,
             petal_host: None,
+            triad_signing: None,
             #[cfg(feature = "unsafe-debug-signer")]
             unsafe_debug_signer: None,
         }
@@ -511,6 +552,33 @@ impl TxEngine {
         self.grant_store = Some(grant_store);
         self.petal_host = Some(petal_host);
         self
+    }
+
+    /// Install the production Machine→Broker exact-signing route. The
+    /// provenance record is public installer metadata; Broker independently
+    /// verifies its signature and current catalog membership.
+    pub fn with_triad_signing(
+        mut self,
+        broker: MachineBrokerClient,
+        provenance_catalog: ProvenanceCatalog,
+    ) -> Result<Self, TxEngineError> {
+        provenance_catalog
+            .validate_shape()
+            .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?;
+        if !provenance_catalog
+            .records
+            .iter()
+            .any(|record| provenance_action_class(&record.subject) == Some("transaction.confirm"))
+        {
+            return Err(TxEngineError::ApprovalConstruction(
+                "Machine provenance catalog does not authorize transaction.confirm".into(),
+            ));
+        }
+        self.triad_signing = Some(Arc::new(TriadSigningService {
+            broker,
+            provenance_catalog,
+        }));
+        Ok(self)
     }
 
     /// Install an explicit local-only debug signer for one wallet. Policy
@@ -2458,6 +2526,15 @@ impl TxEngine {
         }
     }
 
+    fn unsigned_signing_preimage(unsigned: &UnsignedEvmTx) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        match unsigned {
+            UnsignedEvmTx::Legacy(tx) => tx.encode_for_signing(&mut encoded),
+            UnsignedEvmTx::Eip1559(tx) => tx.encode_for_signing(&mut encoded),
+        }
+        encoded
+    }
+
     fn assemble_signed_raw_tx(
         &self,
         staged: &StagedTx,
@@ -2597,8 +2674,14 @@ impl TxEngine {
             }
             return Err(e);
         }
+        let signing_preimage = Self::unsigned_signing_preimage(&prepared.unsigned);
         let signature = self
-            .host_sign_evm_hash(staged, action_kind, prepared.signing_hash)
+            .host_sign_evm_hash(
+                staged,
+                action_kind,
+                &signing_preimage,
+                prepared.signing_hash,
+            )
             .await?;
         let signed = self.assemble_signed_raw_tx(staged, prepared.unsigned, signature)?;
         self.outbox
@@ -3272,6 +3355,255 @@ impl TxEngine {
         Ok(())
     }
 
+    async fn triad_sign_evm_payload(
+        &self,
+        staged: &StagedTx,
+        action_kind: EvmOutboxActionKind,
+        signing_preimage: &[u8],
+        signing_hash: B256,
+    ) -> Result<Signature, TxEngineError> {
+        let service = self.triad_signing.as_ref().ok_or_else(|| {
+            TxEngineError::ApprovalServiceUnavailable(
+                "payload-bearing Machine-to-Broker signing is not configured".into(),
+            )
+        })?;
+        let operation_class = triad_operation_class(action_kind);
+        let provenance = service
+            .provenance_catalog
+            .records
+            .iter()
+            .find(|record| provenance_action_class(&record.subject) == Some(operation_class))
+            .ok_or_else(|| {
+                TxEngineError::ApprovalDenied(format!(
+                    "installer provenance does not authorize {operation_class}"
+                ))
+            })?;
+        let entry = self.outbox.read_in_state(
+            &staged.wallet,
+            &staged.chain,
+            &staged.id,
+            OutboxState::Pending,
+        )?;
+        let action_id = outbox_action_id(staged, action_kind);
+        let payload_digest = Digest32::from_bytes(sha2::Sha256::digest(signing_preimage).into());
+        let claimed_hash = Digest32::from_bytes(signing_hash.0);
+        let provenance_digest = provenance
+            .digest()
+            .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?;
+        let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let mut state = match read_triad_signing_state(&state_path)? {
+            Some(state) => {
+                if state.schema != "bloom.machine-evm-signing.1"
+                    || state.action_id != action_id
+                    || state.payload_digest != payload_digest
+                    || state.claimed_hash != claimed_hash
+                    || state.provenance_digest != provenance_digest
+                {
+                    return Err(TxEngineError::ApprovalState(
+                        "durable Broker signing projection conflicts with exact transaction bytes"
+                            .into(),
+                    ));
+                }
+                state
+            }
+            None => {
+                let now = now_ms() as u64;
+                let expires = now.saturating_add(TRIAD_EXACT_APPROVAL_TTL_MS);
+                let expires = if staged.expires_ms == 0 {
+                    expires
+                } else {
+                    expires.min(staged.expires_ms.min(u128::from(u64::MAX)) as u64)
+                };
+                if expires <= now {
+                    return Err(TxEngineError::ApprovalDenied(
+                        "staged transaction expired before approval prepare".into(),
+                    ));
+                }
+                let state = TriadEvmSigningState {
+                    schema: "bloom.machine-evm-signing.1".into(),
+                    action_id: action_id.clone(),
+                    payload_digest,
+                    claimed_hash,
+                    provenance_digest,
+                    approval_operation_id: random_operation_id(),
+                    signing_operation_id: random_operation_id(),
+                    request_nonce: random_request_nonce(),
+                    issued_at_ms: DecimalU64::new(now),
+                    expires_at_ms: DecimalU64::new(expires),
+                    canonical_plan_facts_digest: Digest32::from_bytes(
+                        sha2::Sha256::digest(serde_jcs::to_vec(staged).map_err(|error| {
+                            TxEngineError::ApprovalConstruction(format!(
+                                "canonicalize staged transaction plan: {error}"
+                            ))
+                        })?)
+                        .into(),
+                    ),
+                    approval_id: None,
+                    ceremony_url: None,
+                    ceremony_expires_at_ms: None,
+                    review_manifest_digest: None,
+                    sign_dispatched: false,
+                    expected_operation_digest: None,
+                };
+                write_triad_signing_state(&state_path, &state)?;
+                state
+            }
+        };
+
+        if state.sign_dispatched {
+            match service
+                .broker
+                .operation_status(state.signing_operation_id.clone())
+                .await
+            {
+                Ok(status) => {
+                    let expected_digest =
+                        state.expected_operation_digest.as_ref().ok_or_else(|| {
+                            TxEngineError::ApprovalState(
+                                "dispatched Broker signing projection omitted its operation digest"
+                                    .into(),
+                            )
+                        })?;
+                    if status.operation_id != state.signing_operation_id
+                        || &status.operation_digest != expected_digest
+                    {
+                        return Err(TxEngineError::ApprovalState(
+                            "Broker operation status conflicts with persisted signing identity"
+                                .into(),
+                        ));
+                    }
+                    match status.state {
+                        OperationState::Succeeded => {
+                            let result = status.result.ok_or_else(|| {
+                                TxEngineError::ApprovalState(
+                                    "succeeded Broker operation omitted its signing result".into(),
+                                )
+                            })?;
+                            return complete_triad_signing_result(&state_path, &mut state, result);
+                        }
+                        OperationState::Received
+                        | OperationState::Validated
+                        | OperationState::Reserved
+                        | OperationState::Dispatched
+                        | OperationState::DownstreamAccepted
+                        | OperationState::Committed => {
+                            return Err(TxEngineError::ApprovalServiceUnavailable(format!(
+                                "Broker signing operation is still {:?}; reconcile the same operation ID",
+                                status.state
+                            )));
+                        }
+                        OperationState::Denied
+                        | OperationState::Cancelled
+                        | OperationState::Failed
+                        | OperationState::Quarantined => {
+                            state.ceremony_url = None;
+                            state.ceremony_expires_at_ms = None;
+                            write_triad_signing_state(&state_path, &state)?;
+                            return Err(TxEngineError::ApprovalDenied(format!(
+                                "Broker signing operation is terminal: {:?}",
+                                status.state
+                            )));
+                        }
+                    }
+                }
+                Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => {
+                    // The durable marker is intentionally written before dispatch. Broker
+                    // proving that the operation does not exist closes that crash window and
+                    // permits the exact same operation ID to be sent for the first time.
+                    state.sign_dispatched = false;
+                    state.expected_operation_digest = None;
+                    write_triad_signing_state(&state_path, &state)?;
+                }
+                Err(error) => return Err(protocol_signing_error(error)),
+            }
+        }
+
+        if let Some(approval_id) = state.approval_id.clone() {
+            let status = service
+                .broker
+                .approval_status(approval_id.clone())
+                .await
+                .map_err(protocol_signing_error)?;
+            if status.approval_id != approval_id {
+                return Err(TxEngineError::ApprovalState(
+                    "Broker approval status changed approval identity".into(),
+                ));
+            }
+            match status.state {
+                ApprovalLifecycleState::Active => {
+                    state.ceremony_url = None;
+                    state.ceremony_expires_at_ms = None;
+                    write_triad_signing_state(&state_path, &state)?;
+                }
+                ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony => {
+                    state.ceremony_url = status.ceremony_url;
+                    state.ceremony_expires_at_ms = status.ceremony_expires_at_ms;
+                    write_triad_signing_state(&state_path, &state)?;
+                    return Err(TxEngineError::ApprovalRequired(approval_requirement(
+                        &state,
+                        "Broker ceremony is not complete",
+                    )?));
+                }
+                terminal => {
+                    state.ceremony_url = None;
+                    state.ceremony_expires_at_ms = None;
+                    write_triad_signing_state(&state_path, &state)?;
+                    return Err(TxEngineError::ApprovalDenied(format!(
+                        "Broker approval is terminal: {terminal:?}"
+                    )));
+                }
+            }
+        }
+
+        let request =
+            exact_evm_sign_request(staged, signing_preimage, signing_hash, provenance, &state)?;
+        if state.approval_id.is_some() {
+            let expected_operation_digest = expected_evm_sign_operation_digest(
+                &service.broker,
+                staged,
+                &state,
+                state.payload_digest.clone(),
+                state.claimed_hash.clone(),
+            )
+            .await?;
+            state.sign_dispatched = true;
+            state.expected_operation_digest = Some(expected_operation_digest);
+            write_triad_signing_state(&state_path, &state)?;
+        }
+        match service
+            .broker
+            .sign_exact_payload(request)
+            .await
+            .map_err(protocol_signing_error)?
+        {
+            ExactPayloadSignOutcome::ApprovalRequired(prepared) => {
+                if state
+                    .approval_id
+                    .as_ref()
+                    .is_some_and(|id| id != &prepared.approval_id)
+                {
+                    return Err(TxEngineError::ApprovalState(
+                        "Broker changed the prepared approval identity".into(),
+                    ));
+                }
+                state.approval_id = Some(prepared.approval_id);
+                state.ceremony_url = Some(prepared.ceremony_url);
+                state.ceremony_expires_at_ms = Some(prepared.ceremony_expires_at_ms);
+                state.review_manifest_digest = Some(prepared.review_manifest_digest);
+                state.sign_dispatched = false;
+                state.expected_operation_digest = None;
+                write_triad_signing_state(&state_path, &state)?;
+                Err(TxEngineError::ApprovalRequired(approval_requirement(
+                    &state,
+                    "exact Broker approval ceremony required",
+                )?))
+            }
+            ExactPayloadSignOutcome::Signed(result) => {
+                complete_triad_signing_result(&state_path, &mut state, result)
+            }
+        }
+    }
+
     #[cfg(not(test))]
     async fn host_sign_evm_sealed_subject_hash(
         &self,
@@ -3335,14 +3667,11 @@ impl TxEngine {
         &self,
         staged: &StagedTx,
         action_kind: EvmOutboxActionKind,
+        signing_preimage: &[u8],
         signing_hash: B256,
     ) -> Result<Signature, TxEngineError> {
-        let _ = (self, staged, action_kind, signing_hash);
-        Err(TxEngineError::ApprovalServiceUnavailable(
-            "UNSUPPORTED_VERSION: legacy hash-only EVM signing is disabled; use the \
-             payload-bearing Machine-to-Broker signing protocol"
-                .into(),
-        ))
+        self.triad_sign_evm_payload(staged, action_kind, signing_preimage, signing_hash)
+            .await
     }
 
     #[cfg(test)]
@@ -3350,8 +3679,14 @@ impl TxEngine {
         &self,
         staged: &StagedTx,
         action_kind: EvmOutboxActionKind,
+        signing_preimage: &[u8],
         signing_hash: B256,
     ) -> Result<Signature, TxEngineError> {
+        if self.triad_signing.is_some() {
+            return self
+                .triad_sign_evm_payload(staged, action_kind, signing_preimage, signing_hash)
+                .await;
+        }
         #[cfg(feature = "unsafe-debug-signer")]
         if let Some(signer) = self.unsafe_debug_signer(&staged.wallet) {
             return signer
@@ -3597,6 +3932,14 @@ impl TxEngine {
                 action = action_kind.action_kind(),
                 "tx.unsafe_debug_approval_bypass"
             );
+            return Ok(());
+        }
+
+        // In a triad Machine, authorization is durably reserved by Broker at
+        // the payload-bearing signing call. Reaching this branch does not
+        // authorize a signature; it only permits execution to advance to that
+        // exact Broker boundary after local policy and simulation pass.
+        if self.triad_signing.is_some() {
             return Ok(());
         }
 
@@ -4202,6 +4545,237 @@ fn bump_fees_in_place(staged: &mut StagedTx, pct: u32) {
     }
     if let Some(b) = bump_one(&staged.gas_price, pct) {
         staged.gas_price = Some(b);
+    }
+}
+
+fn triad_operation_class(action_kind: EvmOutboxActionKind) -> &'static str {
+    match action_kind {
+        EvmOutboxActionKind::Confirm => "transaction.confirm",
+        EvmOutboxActionKind::Replace => "transaction.replace",
+        EvmOutboxActionKind::Cancel => "transaction.cancel",
+    }
+}
+
+fn provenance_action_class(subject: &ProvenanceSubject) -> Option<&str> {
+    match subject {
+        ProvenanceSubject::Cli { command_class, .. } => Some(command_class.as_str()),
+        ProvenanceSubject::System {
+            operation_class, ..
+        } => Some(operation_class.as_str()),
+        ProvenanceSubject::Petal { .. } => None,
+    }
+}
+
+fn random_operation_id() -> OperationId {
+    let mut bytes = [0_u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    OperationId::from_bytes(bytes)
+}
+
+fn random_request_nonce() -> RequestNonce {
+    let mut bytes = [0_u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    RequestNonce::from_bytes(bytes)
+}
+
+fn exact_evm_sign_request(
+    staged: &StagedTx,
+    signing_preimage: &[u8],
+    signing_hash: B256,
+    provenance: &ProvenanceRecord,
+    state: &TriadEvmSigningState,
+) -> Result<ExactPayloadSignRequest, TxEngineError> {
+    Ok(ExactPayloadSignRequest {
+        wallet_id: Token::new(staged.wallet.clone())
+            .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
+        preimage: signing_preimage.to_vec(),
+        claimed_hash: Digest32::from_bytes(signing_hash.0),
+        crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+        provenance: provenance.subject.clone(),
+        provenance_digest: state.provenance_digest.clone(),
+        activation_mode: None,
+        approval_operation_id: state.approval_operation_id.clone(),
+        signing_operation_id: state.signing_operation_id.clone(),
+        request_nonce: state.request_nonce.clone(),
+        issued_at_ms: state.issued_at_ms.clone(),
+        expires_at_ms: state.expires_at_ms.clone(),
+        canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
+        approval_id: state.approval_id.clone(),
+    })
+}
+
+async fn expected_evm_sign_operation_digest(
+    broker: &MachineBrokerClient,
+    staged: &StagedTx,
+    state: &TriadEvmSigningState,
+    payload_digest: Digest32,
+    claimed_hash: Digest32,
+) -> Result<Digest32, TxEngineError> {
+    let approval_id = state.approval_id.clone().ok_or_else(|| {
+        TxEngineError::ApprovalState("active exact signing is missing its approval ID".into())
+    })?;
+    let wallet_id = Token::new(staged.wallet.clone())
+        .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?;
+    let wallet = broker
+        .wallet(wallet_id)
+        .await
+        .map_err(protocol_signing_error)?;
+    let suite = CryptoSuite::Secp256k1Keccak256Recoverable;
+    let mut matching = wallet
+        .key_refs
+        .into_iter()
+        .filter(|key| key.key_spec == suite.key_spec());
+    let key_ref = matching.next().ok_or_else(|| {
+        TxEngineError::ApprovalDenied("wallet has no key compatible with exact EVM signing".into())
+    })?;
+    if matching.next().is_some() {
+        return Err(TxEngineError::ApprovalDenied(
+            "wallet has multiple compatible keys; exact EVM signing is ambiguous".into(),
+        ));
+    }
+    SignOperationIdentity {
+        operation_id: state.signing_operation_id.clone(),
+        approval_id,
+        key_ref,
+        crypto_suite: suite,
+        ordered_payload_digests: vec![payload_digest],
+        ordered_hashes: vec![claimed_hash],
+        petal_use_claim_digest: None,
+        claim_assurance_digest: None,
+        policy_version: wallet.policy_version,
+        policy_digest: wallet.policy_digest,
+    }
+    .digest()
+    .map_err(protocol_signing_error)
+}
+
+fn complete_triad_signing_result(
+    state_path: &std::path::Path,
+    state: &mut TriadEvmSigningState,
+    result: SigningResult,
+) -> Result<Signature, TxEngineError> {
+    let expected_digest = state.expected_operation_digest.as_ref().ok_or_else(|| {
+        TxEngineError::ApprovalState(
+            "Broker signing result arrived without a persisted operation digest".into(),
+        )
+    })?;
+    if result.operation_id != state.signing_operation_id
+        || &result.operation_digest != expected_digest
+    {
+        return Err(TxEngineError::ApprovalState(
+            "Broker signing result conflicts with persisted operation identity".into(),
+        ));
+    }
+    let [normalized] = result.signatures.as_slice() else {
+        return Err(TxEngineError::Signer(
+            "Broker returned an invalid signature count".into(),
+        ));
+    };
+    if normalized.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable
+        || normalized.bytes.decode().len() != 65
+    {
+        return Err(TxEngineError::Signer(
+            "Broker returned an invalid exact EVM signature suite or encoding".into(),
+        ));
+    }
+    let signature = Signature::from_raw(&normalized.bytes.decode())
+        .map_err(|error| TxEngineError::Signer(error.to_string()))?;
+    state.ceremony_url = None;
+    state.ceremony_expires_at_ms = None;
+    write_triad_signing_state(state_path, state)?;
+    Ok(signature)
+}
+
+fn approval_requirement(
+    state: &TriadEvmSigningState,
+    reason: &str,
+) -> Result<ApprovalRequirement, TxEngineError> {
+    let ceremony_url = state.ceremony_url.clone().ok_or_else(|| {
+        TxEngineError::ApprovalState(
+            "Broker awaiting state omitted the owner-visible ceremony URL".into(),
+        )
+    })?;
+    let expires_ms = state
+        .ceremony_expires_at_ms
+        .as_ref()
+        .map(DecimalU64::get)
+        .ok_or_else(|| {
+            TxEngineError::ApprovalState("Broker awaiting state omitted the ceremony expiry".into())
+        })?;
+    Ok(ApprovalRequirement {
+        action_id: state.action_id.clone(),
+        ceremony_url,
+        expires_ms,
+        reason: reason.into(),
+    })
+}
+
+fn read_triad_signing_state(
+    path: &std::path::Path,
+) -> Result<Option<TriadEvmSigningState>, TxEngineError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(TxEngineError::Outbox(error.into())),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(TxEngineError::ApprovalState(
+            "durable Broker signing projection is not a regular file".into(),
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(OutboxError::from)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| TxEngineError::ApprovalState(format!("decode ceremony.json: {error}")))
+}
+
+fn write_triad_signing_state(
+    path: &std::path::Path,
+    state: &TriadEvmSigningState,
+) -> Result<(), TxEngineError> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| TxEngineError::ApprovalState(error.to_string()))?;
+    let parent = path.parent().ok_or_else(|| {
+        TxEngineError::ApprovalState("ceremony projection has no parent directory".into())
+    })?;
+    let mut random = [0_u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
+    let temporary = parent.join(format!(
+        ".{TRIAD_SIGNING_STATE_FILE}.{}.tmp",
+        hex::encode(random)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let result = (|| -> Result<(), std::io::Error> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|error| TxEngineError::Outbox(error.into()))
+}
+
+fn protocol_signing_error(error: bloom_triad_protocol::ProtocolError) -> TxEngineError {
+    match error.code {
+        bloom_triad_protocol::ProtocolErrorCode::ServiceUnavailable => {
+            TxEngineError::ApprovalServiceUnavailable(format!(
+                "{}: {}",
+                error.code.as_str(),
+                error.message
+            ))
+        }
+        _ => TxEngineError::ApprovalDenied(format!("{}: {}", error.code.as_str(), error.message)),
     }
 }
 
@@ -4868,7 +5442,10 @@ const _PARSE_UNITS: fn(&str, u8) -> Result<U256, bloom_proto::units::UnitError> 
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
 
     use super::*;
     use bloom_auth_api::{
@@ -4878,6 +5455,12 @@ mod tests {
         WebAuthnAssertionRecord,
     };
     use bloom_proto::TxStatus;
+    use bloom_triad_protocol::{
+        ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes, KeyRef, KeySpec,
+        MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, NormalizedSignature,
+        OperationPublicStatus, ProvenanceCatalog, ProvenanceFeeAsset, ProvenanceOperationClass,
+        ServiceFuture, SigningPayloads, SigningResult, WalletPublic,
+    };
 
     const TEST_SIGNER_PK: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -4887,6 +5470,145 @@ mod tests {
         TEST_SIGNER_PK
             .parse()
             .expect("valid deterministic test key")
+    }
+
+    struct TriadBrokerFixture {
+        active: AtomicBool,
+        lose_sign_response_once: AtomicBool,
+        completed_result: parking_lot::Mutex<Option<SigningResult>>,
+        requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
+        key_ref: KeyRef,
+    }
+
+    impl MachineBrokerService for TriadBrokerFixture {
+        fn dispatch<'a>(
+            &'a self,
+            request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async move {
+                self.requests.lock().push(request.clone());
+                match request {
+                    MachineBrokerRequest::WalletGetPublic(request) => {
+                        Ok(MachineBrokerResponse::WalletGetPublic(WalletPublic {
+                            wallet_id: request.wallet_id,
+                            wallet_kind: Token::new("local").unwrap(),
+                            key_refs: vec![self.key_ref.clone()],
+                            policy_version: DecimalU64::new(1),
+                            policy_digest: Digest32::from_bytes([7; 32]),
+                            wallet_revocation_epoch: DecimalU64::new(0),
+                        }))
+                    }
+                    MachineBrokerRequest::SealedApprovalPrepare(request) => {
+                        Ok(MachineBrokerResponse::SealedApprovalPrepare(
+                            bloom_triad_protocol::SealedApprovalPrepareResponse {
+                                approval_id: request.terms.approval_id()?,
+                                state: ApprovalPrepareState::AwaitingCeremony,
+                                ceremony_url: "http://localhost:18734/ceremony/triad-test-secret"
+                                    .into(),
+                                ceremony_expires_at_ms: request.terms.expires_at_ms,
+                                review_manifest_digest: Digest32::from_bytes([8; 32]),
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::SealedApprovalStatus(request) => Ok(
+                        MachineBrokerResponse::SealedApprovalStatus(ApprovalPublicStatus {
+                            approval_id: request.id,
+                            wallet_id: Token::new("alice").unwrap(),
+                            state: if self.completed_result.lock().is_some() {
+                                ApprovalLifecycleState::Exhausted
+                            } else if self.active.load(Ordering::SeqCst) {
+                                ApprovalLifecycleState::Active
+                            } else {
+                                ApprovalLifecycleState::AwaitingCeremony
+                            },
+                            effective_claim_assurance: None,
+                            ceremony_url: (!self.active.load(Ordering::SeqCst)).then(|| {
+                                "http://localhost:18734/ceremony/triad-test-secret".into()
+                            }),
+                            ceremony_expires_at_ms: (!self.active.load(Ordering::SeqCst))
+                                .then(|| DecimalU64::new((now_ms() as u64) + 60_000)),
+                        }),
+                    ),
+                    MachineBrokerRequest::OperationStatus(request) => {
+                        let result = self.completed_result.lock().clone().ok_or_else(|| {
+                            bloom_triad_protocol::ProtocolError::new(
+                                ProtocolErrorCode::ApprovalNotFound,
+                                "operation not found",
+                            )
+                        })?;
+                        Ok(MachineBrokerResponse::OperationStatus(
+                            OperationPublicStatus {
+                                operation_id: request.operation_id,
+                                operation_digest: result.operation_digest.clone(),
+                                state: OperationState::Succeeded,
+                                result: Some(result),
+                                error: None,
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::SigningSign(request) => {
+                        let SigningPayloads::Single { payload } = &request.payloads else {
+                            panic!("fixture expects one exact payload");
+                        };
+                        let hash = alloy::primitives::keccak256(payload.decode());
+                        use alloy::signers::SignerSync as _;
+                        let signature = test_signer().sign_hash_sync(&hash).unwrap();
+                        let result = SigningResult {
+                            operation_id: request.operation_id,
+                            operation_digest: request.operation_digest,
+                            signatures: vec![NormalizedSignature {
+                                crypto_suite: request.crypto_suite,
+                                bytes: Base64UrlBytes::from_bytes(&signature.as_bytes()),
+                            }],
+                            signer_receipt_digest: Digest32::from_bytes([9; 32]),
+                            broker_receipt_digest: Digest32::from_bytes([10; 32]),
+                        };
+                        *self.completed_result.lock() = Some(result.clone());
+                        if self.lose_sign_response_once.swap(false, Ordering::SeqCst) {
+                            return Err(bloom_triad_protocol::ProtocolError::new(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                "simulated local response loss after Broker commit",
+                            ));
+                        }
+                        Ok(MachineBrokerResponse::SigningSign(result))
+                    }
+                    other => panic!("unexpected triad fixture request: {other:?}"),
+                }
+            })
+        }
+    }
+
+    fn triad_catalog() -> ProvenanceCatalog {
+        ProvenanceCatalog {
+            schema: bloom_triad_protocol::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![ProvenanceRecord {
+                subject: ProvenanceSubject::System {
+                    component_id: Token::new("bloom-machine").unwrap(),
+                    operation_class: Token::new("transaction.confirm").unwrap(),
+                },
+                publisher: Token::new("bloom-installer").unwrap(),
+                operation_classes: vec![ProvenanceOperationClass {
+                    operation_class: Token::new("transaction.confirm").unwrap(),
+                    fee_asset: Some(ProvenanceFeeAsset {
+                        chain: Token::new("ethereum").unwrap(),
+                        asset: "native".into(),
+                    }),
+                }],
+                installer_key_id: Token::new("installer-key").unwrap(),
+                installer_signature: Base64UrlBytes::from_bytes(&[11; 64]),
+            }],
+        }
+    }
+
+    fn triad_key_ref() -> KeyRef {
+        KeyRef {
+            backend: Token::new("local").unwrap(),
+            backend_instance: Token::new("local-default").unwrap(),
+            locator: "fixture-key".into(),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: Digest32::from_bytes([12; 32]),
+            derivation: None,
+        }
     }
 
     #[derive(Clone)]
@@ -5922,6 +6644,225 @@ mod tests {
             action_id: None,
             execution_origin: None,
         }
+    }
+
+    #[tokio::test]
+    async fn triad_confirm_persists_prepare_identity_then_signs_exact_preimage_after_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("triad-confirm");
+        staged.wallet = "alice".into();
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let fixture = Arc::new(TriadBrokerFixture {
+            active: AtomicBool::new(false),
+            lose_sign_response_once: AtomicBool::new(false),
+            completed_result: parking_lot::Mutex::new(None),
+            requests: parking_lot::Mutex::new(Vec::new()),
+            key_ref: triad_key_ref(),
+        });
+        let service: Arc<dyn MachineBrokerService> = fixture.clone();
+        let broker = MachineBrokerClient::new(service);
+        let engine = TxEngine::new(outbox.clone(), 60_000)
+            .with_triad_signing(broker.clone(), triad_catalog())
+            .unwrap();
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+
+        let required = engine
+            .triad_sign_evm_payload(
+                &staged,
+                EvmOutboxActionKind::Confirm,
+                &preimage,
+                signing_hash,
+            )
+            .await
+            .unwrap_err();
+        let TxEngineError::ApprovalRequired(required) = required else {
+            panic!("first exact sign must return the Broker ceremony");
+        };
+        assert_eq!(
+            required.ceremony_url,
+            "http://localhost:18734/ceremony/triad-test-secret"
+        );
+        let entry = outbox
+            .read_in_state("alice", "anvil", "triad-confirm", OutboxState::Pending)
+            .unwrap();
+        let first: TriadEvmSigningState =
+            serde_json::from_slice(&std::fs::read(entry.dir.join("ceremony.json")).unwrap())
+                .unwrap();
+        assert!(first.approval_id.is_some());
+        assert!(first.ceremony_url.is_some());
+
+        fixture.active.store(true, Ordering::SeqCst);
+        let restarted = TxEngine::new(outbox, 60_000)
+            .with_triad_signing(broker, triad_catalog())
+            .unwrap();
+        let signature = restarted
+            .triad_sign_evm_payload(
+                &staged,
+                EvmOutboxActionKind::Confirm,
+                &preimage,
+                signing_hash,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            signature
+                .recover_address_from_prehash(&signing_hash)
+                .unwrap(),
+            staged.from.parse::<Address>().unwrap()
+        );
+        let terminal: TriadEvmSigningState =
+            serde_json::from_slice(&std::fs::read(entry.dir.join("ceremony.json")).unwrap())
+                .unwrap();
+        assert_eq!(terminal.approval_operation_id, first.approval_operation_id);
+        assert_eq!(terminal.signing_operation_id, first.signing_operation_id);
+        assert!(terminal.ceremony_url.is_none());
+        assert!(terminal.ceremony_expires_at_ms.is_none());
+        assert!(terminal.sign_dispatched);
+        assert!(terminal.expected_operation_digest.is_some());
+
+        let requests = fixture.requests.lock();
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                MachineBrokerRequest::WalletGetPublic(_),
+                MachineBrokerRequest::SealedApprovalPrepare(_),
+                MachineBrokerRequest::SealedApprovalStatus(_),
+                MachineBrokerRequest::WalletGetPublic(_),
+                MachineBrokerRequest::WalletGetPublic(_),
+                MachineBrokerRequest::SigningSign(_)
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn triad_confirm_recovers_committed_sign_after_local_response_loss_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("triad-response-loss");
+        staged.wallet = "alice".into();
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let fixture = Arc::new(TriadBrokerFixture {
+            active: AtomicBool::new(false),
+            lose_sign_response_once: AtomicBool::new(true),
+            completed_result: parking_lot::Mutex::new(None),
+            requests: parking_lot::Mutex::new(Vec::new()),
+            key_ref: triad_key_ref(),
+        });
+        let service: Arc<dyn MachineBrokerService> = fixture.clone();
+        let broker = MachineBrokerClient::new(service);
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+        let engine = TxEngine::new(outbox.clone(), 60_000)
+            .with_triad_signing(broker.clone(), triad_catalog())
+            .unwrap();
+
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        let lost = engine
+            .triad_sign_evm_payload(
+                &staged,
+                EvmOutboxActionKind::Confirm,
+                &preimage,
+                signing_hash,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(lost, TxEngineError::ApprovalServiceUnavailable(_)));
+
+        let entry = outbox
+            .read_in_state(
+                "alice",
+                "anvil",
+                "triad-response-loss",
+                OutboxState::Pending,
+            )
+            .unwrap();
+        let dispatched: TriadEvmSigningState =
+            serde_json::from_slice(&std::fs::read(entry.dir.join("ceremony.json")).unwrap())
+                .unwrap();
+        assert!(dispatched.sign_dispatched);
+        assert!(dispatched.expected_operation_digest.is_some());
+
+        let restarted = TxEngine::new(outbox, 60_000)
+            .with_triad_signing(broker, triad_catalog())
+            .unwrap();
+        let recovered = restarted
+            .triad_sign_evm_payload(
+                &staged,
+                EvmOutboxActionKind::Confirm,
+                &preimage,
+                signing_hash,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered
+                .recover_address_from_prehash(&signing_hash)
+                .unwrap(),
+            staged.from.parse::<Address>().unwrap()
+        );
+        let recovered_state: TriadEvmSigningState =
+            serde_json::from_slice(&std::fs::read(entry.dir.join("ceremony.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            recovered_state.signing_operation_id,
+            dispatched.signing_operation_id
+        );
+        assert_eq!(
+            recovered_state.expected_operation_digest,
+            dispatched.expected_operation_digest
+        );
+        assert!(recovered_state.ceremony_url.is_none());
+
+        let requests = fixture.requests.lock();
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                MachineBrokerRequest::WalletGetPublic(_),
+                MachineBrokerRequest::SealedApprovalPrepare(_),
+                MachineBrokerRequest::SealedApprovalStatus(_),
+                MachineBrokerRequest::WalletGetPublic(_),
+                MachineBrokerRequest::WalletGetPublic(_),
+                MachineBrokerRequest::SigningSign(_),
+                MachineBrokerRequest::OperationStatus(_)
+            ]
+        ));
     }
 
     fn outbox_intent_hash_for(staged: &StagedTx) -> String {

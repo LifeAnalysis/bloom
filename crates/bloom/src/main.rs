@@ -142,10 +142,25 @@ fn configured_broker_client() -> Result<bloom_machine_client::MachineBrokerClien
     .context("load authenticated Machine-to-Broker edge")
 }
 
+fn configured_broker_connection() -> Result<(
+    bloom_machine_client::MachineBrokerClient,
+    bloom_triad_protocol::ProvenanceCatalog,
+)> {
+    let broker = configured_broker_client()?;
+    let provenance_catalog = std::env::var_os("BLOOM_PROVENANCE_CATALOG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/etc/bloom/provenance-catalog.json"));
+    let catalog = bloom_machine_client::load_provenance_catalog(provenance_catalog)
+        .context("load installer-owned provenance catalog")?;
+    Ok((broker, catalog))
+}
+
 fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {
     let permit = Arc::new(HomeWritePermit::acquire(&home)?);
-    let daemon = match configured_broker_client() {
-        Ok(broker) => Daemon::from_home_with_permit_and_broker(home, permit.clone(), broker),
+    let daemon = match configured_broker_connection() {
+        Ok((broker, catalog)) => {
+            Daemon::from_home_with_permit_and_broker(home, permit.clone(), broker, catalog)
+        }
         Err(error) => {
             tracing::warn!(
                 error = %error,

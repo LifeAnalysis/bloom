@@ -1858,7 +1858,7 @@ impl Daemon {
     /// Build a fully-wired daemon from the home directory, materialising
     /// any missing subdirs as needed.
     pub fn from_home(home: HomeDir) -> Result<Self, DaemonError> {
-        Self::from_home_inner(home, None, None)
+        Self::from_home_inner(home, None, None, None)
     }
 
     /// Build a daemon with a held home write permit. VFS write surfaces use
@@ -1868,7 +1868,7 @@ impl Daemon {
         home: HomeDir,
         permit: Arc<HomeWritePermit>,
     ) -> Result<Self, DaemonError> {
-        Self::from_home_inner(home, Some(permit), None)
+        Self::from_home_inner(home, Some(permit), None, None)
     }
 
     /// Build a Machine daemon whose signing and custody authority is provided
@@ -1876,22 +1876,25 @@ impl Daemon {
     pub fn from_home_with_broker(
         home: HomeDir,
         broker: MachineBrokerClient,
+        provenance_catalog: bloom_triad_protocol::ProvenanceCatalog,
     ) -> Result<Self, DaemonError> {
-        Self::from_home_inner(home, None, Some(broker))
+        Self::from_home_inner(home, None, Some(broker), Some(provenance_catalog))
     }
 
     pub fn from_home_with_permit_and_broker(
         home: HomeDir,
         permit: Arc<HomeWritePermit>,
         broker: MachineBrokerClient,
+        provenance_catalog: bloom_triad_protocol::ProvenanceCatalog,
     ) -> Result<Self, DaemonError> {
-        Self::from_home_inner(home, Some(permit), Some(broker))
+        Self::from_home_inner(home, Some(permit), Some(broker), Some(provenance_catalog))
     }
 
     fn from_home_inner(
         home: HomeDir,
         home_write_permit: Option<Arc<HomeWritePermit>>,
         broker: Option<MachineBrokerClient>,
+        provenance_catalog: Option<bloom_triad_protocol::ProvenanceCatalog>,
     ) -> Result<Self, DaemonError> {
         home.ensure()?;
         let config_path = home.config_path();
@@ -2082,6 +2085,20 @@ impl Daemon {
         let outbox = Outbox::new_with_projection(home.outbox_dir(), projection)
             .map_err(|e| DaemonError::Outbox(e.to_string()))?;
         let mut tx_engine = TxEngine::new(outbox, config.stage_ttl.as_millis());
+        match (&broker, provenance_catalog) {
+            (Some(broker), Some(catalog)) => {
+                tx_engine = tx_engine
+                    .with_triad_signing(broker.clone(), catalog)
+                    .map_err(|error| DaemonError::Audit(error.to_string()))?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(DaemonError::Audit(
+                    "Broker client and installer provenance catalog must be configured together"
+                        .into(),
+                ));
+            }
+        }
         #[cfg(feature = "unsafe-debug-signer")]
         if let Some((wallet, signer)) = &unsafe_debug_signer {
             tx_engine = tx_engine.with_unsafe_debug_signer(wallet.clone(), signer.clone());
