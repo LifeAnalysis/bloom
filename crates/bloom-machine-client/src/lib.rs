@@ -17,11 +17,12 @@ use bloom_triad_protocol::{
     CeremonyPublicStatus, CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest,
     CustodyPrepareResponse, CustodyResult, DecimalU64, Digest32, IdRequest, KeyPublic, KeyRef,
     KeyRequest, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
-    MachineSignRequest, OperationId, OperationRequest, PetalUseClaim, ProtocolError,
+    MachineSignRequest, OperationId, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
+    PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
     ProtocolErrorCode, ProvenanceSubject, SealedApprovalPrepareResponse, SignOperationIdentity,
-    SigningPayloads, SigningResult, Token, WalletPublic, WalletRequest,
+    SignedPolicySnapshot, SigningPayloads, SigningResult, Token, WalletPublic, WalletRequest,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
 
@@ -258,6 +259,72 @@ impl MachineBrokerClient {
         }
     }
 
+    pub async fn policy(&self, wallet_id: Token) -> Result<SignedPolicySnapshot, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::PolicyRead(WalletRequest {
+                wallet_id,
+            }))
+            .await?
+        {
+            MachineBrokerResponse::PolicyRead(policy) => Ok(policy),
+            _ => Err(response_mismatch("policy.read")),
+        }
+    }
+
+    pub async fn validate_policy_update(
+        &self,
+        request: PolicyUpdateRequest,
+    ) -> Result<PolicyUpdatePrepareResponse, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::PolicyValidateUpdate(request))
+            .await?
+        {
+            MachineBrokerResponse::PolicyValidateUpdate(response) => Ok(response),
+            _ => Err(response_mismatch("policy.validate_update")),
+        }
+    }
+
+    pub async fn commit_policy_update(
+        &self,
+        request: PolicyCommitUpdateRequest,
+    ) -> Result<PolicyCommitReceipt, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::PolicyCommitUpdate(request))
+            .await?
+        {
+            MachineBrokerResponse::PolicyCommitUpdate(receipt) => Ok(receipt),
+            _ => Err(response_mismatch("policy.commit_update")),
+        }
+    }
+
+    pub async fn ceremony_status(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<CeremonyPublicStatus, ProtocolError> {
+        let id = Digest32::new(operation_id.as_str().to_owned())?;
+        match self
+            .request(MachineBrokerRequest::CeremonyStatus(IdRequest { id }))
+            .await?
+        {
+            MachineBrokerResponse::CeremonyStatus(status) => Ok(status),
+            _ => Err(response_mismatch("ceremony.status")),
+        }
+    }
+
+    pub async fn cancel_ceremony(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<CeremonyPublicStatus, ProtocolError> {
+        let id = Digest32::new(operation_id.as_str().to_owned())?;
+        match self
+            .request(MachineBrokerRequest::CeremonyCancel(IdRequest { id }))
+            .await?
+        {
+            MachineBrokerResponse::CeremonyCancel(status) => Ok(status),
+            _ => Err(response_mismatch("ceremony.cancel")),
+        }
+    }
+
     pub async fn wallets(&self) -> Result<Vec<WalletPublic>, ProtocolError> {
         match self
             .request(MachineBrokerRequest::WalletListPublic(
@@ -474,22 +541,37 @@ pub struct TrustedPetalSignRequest {
     pub frozen_advisory: Option<Vec<u8>>,
 }
 
-/// Machine/VFS projection of a Broker-owned ceremony. The URL is present only
-/// while the Broker reports an actionable awaiting state and before expiry.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Durable Machine projection of a Broker-owned ceremony. Launch secrets are
+/// retained only while Broker reports an actionable awaiting state.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CeremonyProjection {
     identity: Option<CeremonyProjectionIdentity>,
+    ceremony_state: Option<CeremonyProjectionState>,
     ceremony_url: Option<String>,
-    expires_at_ms: Option<DecimalU64>,
+    ceremony_expires_at_ms: Option<DecimalU64>,
+    review_manifest_digest: Option<Digest32>,
+    receipt_digest: Option<Digest32>,
+    last_error: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum CeremonyProjectionIdentity {
-    Approval(Digest32),
+    Approval {
+        approval_id: Digest32,
+    },
     Custody {
         operation_id: OperationId,
         ceremony_kind: bloom_triad_protocol::CeremonyKind,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "state", rename_all = "snake_case")]
+pub enum CeremonyProjectionState {
+    Approval(ApprovalLifecycleState),
+    Custody(CeremonyState),
 }
 
 impl CeremonyProjection {
@@ -503,9 +585,13 @@ impl CeremonyProjection {
             ));
         }
         Self::awaiting(
-            CeremonyProjectionIdentity::Approval(response.approval_id.clone()),
+            CeremonyProjectionIdentity::Approval {
+                approval_id: response.approval_id.clone(),
+            },
+            CeremonyProjectionState::Approval(ApprovalLifecycleState::AwaitingCeremony),
             response.ceremony_url.clone(),
             response.ceremony_expires_at_ms.clone(),
+            Some(response.review_manifest_digest.clone()),
             now_ms,
         )
     }
@@ -522,8 +608,66 @@ impl CeremonyProjection {
                 operation_id: response.custody_operation_id.clone(),
                 ceremony_kind: response.ceremony_kind,
             },
+            CeremonyProjectionState::Custody(CeremonyState::AwaitingUser),
             response.ceremony_url.clone(),
             response.ceremony_expires_at_ms.clone(),
+            None,
+            now_ms,
+        )
+    }
+
+    pub fn from_policy_prepare(
+        response: &PolicyUpdatePrepareResponse,
+        now_ms: u64,
+    ) -> Result<Self, ProtocolError> {
+        if response.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate {
+            return Err(projection_mismatch(
+                "policy prepare did not return policy_update ceremony kind",
+            ));
+        }
+        Self::awaiting(
+            CeremonyProjectionIdentity::Custody {
+                operation_id: response.operation_id.clone(),
+                ceremony_kind: response.ceremony_kind,
+            },
+            CeremonyProjectionState::Custody(CeremonyState::AwaitingUser),
+            response.ceremony_url.clone(),
+            response.ceremony_expires_at_ms.clone(),
+            Some(response.review_manifest_digest.clone()),
+            now_ms,
+        )
+    }
+
+    pub fn from_custody_status(
+        status: &CeremonyPublicStatus,
+        now_ms: u64,
+    ) -> Result<Self, ProtocolError> {
+        if status.state != CeremonyState::AwaitingUser {
+            return Ok(Self {
+                identity: Some(CeremonyProjectionIdentity::Custody {
+                    operation_id: status.operation_id.clone(),
+                    ceremony_kind: status.ceremony_kind,
+                }),
+                ceremony_state: Some(CeremonyProjectionState::Custody(status.state)),
+                ceremony_url: None,
+                ceremony_expires_at_ms: None,
+                review_manifest_digest: None,
+                receipt_digest: status.receipt_digest.clone(),
+                last_error: None,
+            });
+        }
+        let url = status.ceremony_url.clone().ok_or_else(|| {
+            projection_mismatch("awaiting custody status is missing ceremony URL")
+        })?;
+        Self::awaiting(
+            CeremonyProjectionIdentity::Custody {
+                operation_id: status.operation_id.clone(),
+                ceremony_kind: status.ceremony_kind,
+            },
+            CeremonyProjectionState::Custody(status.state),
+            url,
+            status.expires_at_ms.clone(),
+            None,
             now_ms,
         )
     }
@@ -534,31 +678,35 @@ impl CeremonyProjection {
         now_ms: u64,
     ) -> Result<(), ProtocolError> {
         if self.identity
-            != Some(CeremonyProjectionIdentity::Approval(
-                status.approval_id.clone(),
-            ))
+            != Some(CeremonyProjectionIdentity::Approval {
+                approval_id: status.approval_id.clone(),
+            })
         {
-            self.clear();
+            self.fail_closed("approval status does not match originating projection");
             return Err(projection_mismatch(
                 "approval status does not match originating projection",
             ));
         }
+        self.ceremony_state = Some(CeremonyProjectionState::Approval(status.state));
         if status.state == ApprovalLifecycleState::AwaitingCeremony {
             match (&status.ceremony_url, &status.ceremony_expires_at_ms) {
                 (Some(url), Some(expiry))
                     if self.ceremony_url.as_ref() == Some(url)
-                        && self.expires_at_ms.as_ref() == Some(expiry)
-                        && expiry.get() > now_ms => {}
+                        && self.ceremony_expires_at_ms.as_ref() == Some(expiry)
+                        && expiry.get() > now_ms =>
+                {
+                    self.last_error = None;
+                }
                 (Some(_), Some(_)) => {
-                    self.clear();
+                    self.fail_closed("approval ceremony URL or expiry changed");
                     return Err(projection_mismatch(
                         "approval ceremony URL or expiry changed",
                     ));
                 }
-                _ => self.clear(),
+                _ => self.clear_launch_secret(),
             }
         } else {
-            self.clear();
+            self.clear_launch_secret();
         }
         Ok(())
     }
@@ -574,20 +722,35 @@ impl CeremonyProjection {
                 ceremony_kind: status.ceremony_kind,
             })
         {
-            self.clear();
+            self.fail_closed("custody status does not match originating projection");
             return Err(projection_mismatch(
                 "custody status does not match originating projection",
             ));
         }
+        self.ceremony_state = Some(CeremonyProjectionState::Custody(status.state));
+        self.receipt_digest = status.receipt_digest.clone();
         if status.state == CeremonyState::AwaitingUser
             && self.ceremony_url.is_some()
-            && self.expires_at_ms.as_ref() == Some(&status.expires_at_ms)
+            && self.ceremony_expires_at_ms.as_ref() == Some(&status.expires_at_ms)
+            && status.ceremony_url.as_deref() == self.ceremony_url.as_deref()
             && status.expires_at_ms.get() > now_ms
         {
+            self.last_error = None;
             return Ok(());
         }
-        self.clear();
+        self.clear_launch_secret();
         Ok(())
+    }
+
+    pub fn expire_launch_secret(&mut self, now_ms: u64) {
+        if self
+            .ceremony_expires_at_ms
+            .as_ref()
+            .is_some_and(|expiry| expiry.get() <= now_ms)
+        {
+            self.clear_launch_secret();
+            self.last_error = Some("ceremony launch URL expired".into());
+        }
     }
 
     pub fn ceremony_url(&self) -> Option<&str> {
@@ -595,19 +758,62 @@ impl CeremonyProjection {
     }
 
     pub fn expires_at_ms(&self) -> Option<u64> {
-        self.expires_at_ms.as_ref().map(DecimalU64::get)
+        self.ceremony_expires_at_ms.as_ref().map(DecimalU64::get)
     }
 
-    pub fn clear(&mut self) {
-        self.identity = None;
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        match self.identity.as_ref() {
+            Some(CeremonyProjectionIdentity::Custody { operation_id, .. }) => Some(operation_id),
+            _ => None,
+        }
+    }
+
+    pub fn approval_id(&self) -> Option<&Digest32> {
+        match self.identity.as_ref() {
+            Some(CeremonyProjectionIdentity::Approval { approval_id }) => Some(approval_id),
+            _ => None,
+        }
+    }
+
+    pub fn ceremony_kind(&self) -> Option<bloom_triad_protocol::CeremonyKind> {
+        match self.identity.as_ref() {
+            Some(CeremonyProjectionIdentity::Custody { ceremony_kind, .. }) => Some(*ceremony_kind),
+            _ => None,
+        }
+    }
+
+    pub fn state(&self) -> Option<CeremonyProjectionState> {
+        self.ceremony_state
+    }
+
+    pub fn receipt_digest(&self) -> Option<&Digest32> {
+        self.receipt_digest.as_ref()
+    }
+
+    pub fn review_manifest_digest(&self) -> Option<&Digest32> {
+        self.review_manifest_digest.as_ref()
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    fn fail_closed(&mut self, message: &str) {
+        self.clear_launch_secret();
+        self.last_error = Some(message.into());
+    }
+
+    fn clear_launch_secret(&mut self) {
         self.ceremony_url = None;
-        self.expires_at_ms = None;
+        self.ceremony_expires_at_ms = None;
     }
 
     fn awaiting(
         identity: CeremonyProjectionIdentity,
+        state: CeremonyProjectionState,
         url: String,
         expiry: DecimalU64,
+        review_manifest_digest: Option<Digest32>,
         now_ms: u64,
     ) -> Result<Self, ProtocolError> {
         if url.is_empty() || expiry.get() <= now_ms {
@@ -617,8 +823,12 @@ impl CeremonyProjection {
         } else {
             Ok(Self {
                 identity: Some(identity),
+                ceremony_state: Some(state),
                 ceremony_url: Some(url),
-                expires_at_ms: Some(expiry),
+                ceremony_expires_at_ms: Some(expiry),
+                review_manifest_digest,
+                receipt_digest: None,
+                last_error: None,
             })
         }
     }
@@ -829,6 +1039,38 @@ mod tests {
                             broker_receipt_digest: digest(91),
                         }))
                     }
+                    MachineBrokerRequest::CeremonyStatus(request) => {
+                        let operation_id =
+                            OperationId::new(request.id.as_str().to_owned()).unwrap();
+                        Ok(MachineBrokerResponse::CeremonyStatus(
+                            CeremonyPublicStatus {
+                                ceremony_id: digest(81),
+                                ceremony_kind: CeremonyKind::WalletImport,
+                                operation_id,
+                                state: CeremonyState::AwaitingUser,
+                                expires_at_ms: DecimalU64::new(9_000),
+                                ceremony_url: Some(
+                                    "http://localhost:18734/ceremony/owner-secret".into(),
+                                ),
+                                receipt_digest: None,
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::CeremonyCancel(request) => {
+                        let operation_id =
+                            OperationId::new(request.id.as_str().to_owned()).unwrap();
+                        Ok(MachineBrokerResponse::CeremonyCancel(
+                            CeremonyPublicStatus {
+                                ceremony_id: digest(81),
+                                ceremony_kind: CeremonyKind::WalletImport,
+                                operation_id,
+                                state: CeremonyState::Cancelled,
+                                expires_at_ms: DecimalU64::new(9_000),
+                                ceremony_url: None,
+                                receipt_digest: None,
+                            },
+                        ))
+                    }
                     _ => Err(ProtocolError::new(
                         ProtocolErrorCode::UnknownMethod,
                         "unexpected mock request",
@@ -985,6 +1227,7 @@ mod tests {
                     operation_id: OperationId::from_bytes([4; 32]),
                     state: CeremonyState::AwaitingUser,
                     expires_at_ms: DecimalU64::new(2_000),
+                    ceremony_url: Some("http://127.0.0.1:18734/c/opaque".into()),
                     receipt_digest: None,
                 },
                 1_999,
@@ -999,12 +1242,27 @@ mod tests {
                     operation_id: OperationId::from_bytes([4; 32]),
                     state: CeremonyState::Succeeded,
                     expires_at_ms: DecimalU64::new(2_000),
+                    ceremony_url: None,
                     receipt_digest: Some(digest(9)),
                 },
                 1_999,
             )
             .unwrap();
-        assert_eq!(projection, CeremonyProjection::default());
+        assert_eq!(projection.ceremony_url(), None);
+        assert_eq!(
+            projection.operation_id(),
+            Some(&OperationId::from_bytes([4; 32]))
+        );
+        assert_eq!(
+            projection.state(),
+            Some(CeremonyProjectionState::Custody(CeremonyState::Succeeded))
+        );
+        assert_eq!(projection.receipt_digest(), Some(&digest(9)));
+        let encoded = serde_json::to_vec(&projection).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<CeremonyProjection>(&encoded).unwrap(),
+            projection
+        );
 
         let approval = SealedApprovalPrepareResponse {
             approval_id: digest(10),
@@ -1027,7 +1285,52 @@ mod tests {
                 2_500,
             )
             .unwrap();
-        assert_eq!(projection, CeremonyProjection::default());
+        assert_eq!(projection.ceremony_url(), None);
+        assert_eq!(projection.approval_id(), Some(&digest(10)));
+        assert_eq!(
+            projection.state(),
+            Some(CeremonyProjectionState::Approval(
+                ApprovalLifecycleState::Expired
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn ceremony_status_and_cancel_use_shared_operation_surface() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(1),
+                policy_digest: digest(1),
+                wallet_revocation_epoch: DecimalU64::new(0),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let operation_id = OperationId::from_bytes([82; 32]);
+        let client = MachineBrokerClient::new(broker.clone());
+        let status = client.ceremony_status(operation_id.clone()).await.unwrap();
+        assert_eq!(status.operation_id, operation_id);
+        assert!(status.ceremony_url.is_some());
+        let rebuilt = CeremonyProjection::from_custody_status(&status, 8_000).unwrap();
+        assert_eq!(rebuilt.ceremony_url(), status.ceremony_url.as_deref());
+
+        let cancelled = client.cancel_ceremony(operation_id.clone()).await.unwrap();
+        assert_eq!(cancelled.operation_id, operation_id);
+        assert_eq!(cancelled.state, CeremonyState::Cancelled);
+        assert!(cancelled.ceremony_url.is_none());
+
+        let requests = broker.requests.lock().unwrap();
+        assert!(matches!(
+            &requests[0],
+            MachineBrokerRequest::CeremonyStatus(_)
+        ));
+        assert!(matches!(
+            &requests[1],
+            MachineBrokerRequest::CeremonyCancel(_)
+        ));
     }
 
     #[tokio::test]

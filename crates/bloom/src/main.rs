@@ -159,6 +159,7 @@ fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {
 }
 
 async fn launch_custody_ceremony(
+    home: &HomeDir,
     requested_name: &str,
     method: bloom_machine_client::CustodyPrepareMethod,
     ceremony_kind: bloom_triad_protocol::CeremonyKind,
@@ -202,6 +203,13 @@ async fn launch_custody_ceremony(
         .await
         .map_err(anyhow::Error::new)
         .context("prepare Broker custody ceremony")?;
+    let projection = bloom_machine_client::CeremonyProjection::from_custody_prepare(
+        &response,
+        current_unix_ms(),
+    )
+    .map_err(anyhow::Error::new)
+    .context("construct Machine custody projection")?;
+    let projection_path = persist_ceremony_projection(home, &projection)?;
     println!("operation_id: {}", response.custody_operation_id);
     println!("ceremony_kind: {:?}", response.ceremony_kind);
     println!("ceremony_url: {}", response.ceremony_url);
@@ -209,6 +217,336 @@ async fn launch_custody_ceremony(
         "ceremony_expires_at_ms: {}",
         response.ceremony_expires_at_ms.get()
     );
+    println!("projection: {}", projection_path.display());
+    Ok(())
+}
+
+const MAX_POLICY_DOCUMENT_BYTES: u64 = 1024 * 1024;
+
+async fn prepare_policy_update(
+    home: &HomeDir,
+    requested_name: &str,
+    policy_file: &Path,
+    assurance_level: &str,
+) -> Result<()> {
+    use rand::RngCore as _;
+    use sha2::Digest as _;
+
+    bloom_keystore::Keystore::validate_name(requested_name)
+        .context("wallet name must be a safe single path segment")?;
+    let wallet_id = bloom_triad_protocol::Token::new(requested_name.to_owned())
+        .context("wallet name must be a protocol token")?;
+    let assurance_level = bloom_triad_protocol::Token::new(assurance_level.to_owned())
+        .context("assurance level must be a protocol token")?;
+    let metadata = std::fs::metadata(policy_file)
+        .with_context(|| format!("inspect proposed policy {}", policy_file.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_POLICY_DOCUMENT_BYTES,
+        "proposed policy must be a regular file no larger than {MAX_POLICY_DOCUMENT_BYTES} bytes"
+    );
+    let input = std::fs::read(policy_file)
+        .with_context(|| format!("read proposed policy {}", policy_file.display()))?;
+    let proposed: bloom_triad_protocol::CanonicalWalletPolicy = serde_json::from_slice(&input)
+        .with_context(|| {
+            format!(
+                "parse proposed policy {} as canonical policy JSON",
+                policy_file.display()
+            )
+        })?;
+    anyhow::ensure!(
+        proposed.wallet_id == wallet_id,
+        "proposed policy wallet_id does not match requested wallet"
+    );
+    let proposed_bytes =
+        serde_jcs::to_vec(&proposed).context("canonicalize proposed policy document")?;
+
+    let client = configured_broker_client()
+        .context("policy update requires the authenticated Machine-to-Broker edge")?;
+    let baseline = client
+        .policy(wallet_id.clone())
+        .await
+        .map_err(anyhow::Error::new)
+        .context("read Signer-authenticated policy baseline from Broker")?;
+    let baseline_bytes = baseline.canonical_policy.decode();
+    anyhow::ensure!(
+        bloom_triad_protocol::Digest32::from_bytes(sha2::Sha256::digest(&baseline_bytes).into())
+            == baseline.policy_digest,
+        "Broker policy baseline digest does not match its canonical bytes"
+    );
+    let baseline_policy: bloom_triad_protocol::CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline_bytes).context("parse Broker policy baseline")?;
+    anyhow::ensure!(
+        serde_jcs::to_vec(&baseline_policy).context("canonicalize Broker policy baseline")?
+            == baseline_bytes,
+        "Broker policy baseline is not canonical"
+    );
+    anyhow::ensure!(
+        baseline_policy.wallet_id == wallet_id,
+        "Broker policy baseline names another wallet"
+    );
+
+    let authority_diff =
+        bloom_triad_protocol::canonical_policy_authority_diff(&baseline_policy, &proposed);
+    let mut operation_bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut operation_bytes);
+    let operation_id = bloom_triad_protocol::OperationId::from_bytes(operation_bytes);
+    let request = bloom_triad_protocol::PolicyUpdateRequest {
+        operation_id,
+        wallet_id,
+        baseline_version: baseline.version,
+        baseline_digest: baseline.policy_digest,
+        proposed_canonical_policy: bloom_triad_protocol::Base64UrlBytes::from_bytes(
+            &proposed_bytes,
+        ),
+        proposed_policy_digest: bloom_triad_protocol::Digest32::from_bytes(
+            sha2::Sha256::digest(&proposed_bytes).into(),
+        ),
+        authority_diff_digest: authority_diff
+            .digest()
+            .map_err(anyhow::Error::new)
+            .context("digest canonical policy authority diff")?,
+        assurance_level,
+    };
+    let response = client
+        .validate_policy_update(request)
+        .await
+        .map_err(anyhow::Error::new)
+        .context("validate policy update and prepare Broker-originated custody ceremony")?;
+    let projection =
+        bloom_machine_client::CeremonyProjection::from_policy_prepare(&response, current_unix_ms())
+            .map_err(anyhow::Error::new)
+            .context("construct Machine policy-update projection")?;
+    let projection_path = persist_ceremony_projection(home, &projection)?;
+    println!("operation_id: {}", response.operation_id);
+    println!("ceremony_kind: {:?}", response.ceremony_kind);
+    println!(
+        "review_manifest_digest: {}",
+        response.review_manifest_digest
+    );
+    println!("ceremony_url: {}", response.ceremony_url);
+    println!(
+        "ceremony_expires_at_ms: {}",
+        response.ceremony_expires_at_ms.get()
+    );
+    println!("projection: {}", projection_path.display());
+    Ok(())
+}
+
+async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<()> {
+    let operation_id = bloom_triad_protocol::OperationId::new(operation_id)
+        .context("operation ID must be 64 lowercase hexadecimal characters")?;
+    let client = configured_broker_client()
+        .context("policy commit requires the authenticated Machine-to-Broker edge")?;
+    let ceremony_receipt = client
+        .custody_result(bloom_triad_protocol::OperationRequest {
+            operation_id: operation_id.clone(),
+        })
+        .await
+        .map_err(anyhow::Error::new)
+        .context("retrieve completed policy-update ceremony receipt")?;
+    anyhow::ensure!(
+        is_completed_policy_update_receipt(&ceremony_receipt, &operation_id),
+        "policy commit requires the matching completed policy_update ceremony receipt"
+    );
+
+    let receipt = client
+        .commit_policy_update(bloom_triad_protocol::PolicyCommitUpdateRequest {
+            operation_id: operation_id.clone(),
+            ceremony_receipt,
+        })
+        .await
+        .map_err(anyhow::Error::new)
+        .context("commit policy update through Broker and Signer compare-and-swap")?;
+    anyhow::ensure!(
+        receipt.operation_id == operation_id,
+        "Broker policy commit receipt operation identity mismatch"
+    );
+
+    if let Ok(status) = client.ceremony_status(operation_id.clone()).await {
+        let now_ms = current_unix_ms();
+        let mut projection = match load_ceremony_projection(home, &operation_id)? {
+            Some(mut projection) => {
+                projection
+                    .reconcile_custody(&status, now_ms)
+                    .map_err(anyhow::Error::new)
+                    .context("reconcile committed policy-update projection")?;
+                projection
+            }
+            None => bloom_machine_client::CeremonyProjection::from_custody_status(&status, now_ms)
+                .map_err(anyhow::Error::new)
+                .context("rebuild committed policy-update projection")?,
+        };
+        projection.expire_launch_secret(now_ms);
+        persist_ceremony_projection(home, &projection)?;
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&receipt).context("encode policy commit receipt")?
+    );
+    Ok(())
+}
+
+fn is_completed_policy_update_receipt(
+    receipt: &bloom_triad_protocol::CustodyResult,
+    operation_id: &bloom_triad_protocol::OperationId,
+) -> bool {
+    receipt.custody_operation_id == *operation_id
+        && receipt.ceremony_kind == bloom_triad_protocol::CeremonyKind::PolicyUpdate
+        && receipt.public_status == bloom_triad_protocol::CeremonyState::Completed
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn ceremony_projection_path(home: &HomeDir, operation_id: &str) -> PathBuf {
+    home.root()
+        .join("triad")
+        .join("ceremonies")
+        .join(format!("{operation_id}.json"))
+}
+
+fn persist_ceremony_projection(
+    home: &HomeDir,
+    projection: &bloom_machine_client::CeremonyProjection,
+) -> Result<PathBuf> {
+    use std::io::Write as _;
+
+    let operation_id = projection
+        .operation_id()
+        .context("custody projection is missing operation identity")?;
+    let path = ceremony_projection_path(home, operation_id.as_str());
+    let parent = path.parent().context("ceremony projection parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("protect {}", parent.display()))?;
+    }
+    let mut suffix = [0_u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut suffix);
+    let temp_path = parent.join(format!(
+        ".{}.{}.tmp",
+        operation_id.as_str(),
+        hex::encode(suffix)
+    ));
+    let bytes = serde_json::to_vec_pretty(projection).context("encode ceremony projection")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temp_path)
+        .with_context(|| format!("create {}", temp_path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("write {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, &path).with_context(|| format!("publish {}", path.display()))?;
+    Ok(path)
+}
+
+fn load_ceremony_projection(
+    home: &HomeDir,
+    operation_id: &bloom_triad_protocol::OperationId,
+) -> Result<Option<bloom_machine_client::CeremonyProjection>> {
+    let path = ceremony_projection_path(home, operation_id.as_str());
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let projection = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", path.display()))?;
+            Ok(Some(projection))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<()> {
+    let (operation_id, action) = match command {
+        CeremonyCmd::Status { operation_id } => (operation_id, "status"),
+        CeremonyCmd::Cancel { operation_id } => (operation_id, "cancel"),
+        CeremonyCmd::Result { operation_id } => (operation_id, "result"),
+    };
+    let operation_id = bloom_triad_protocol::OperationId::new(operation_id)
+        .context("operation ID must be 64 lowercase hexadecimal characters")?;
+    let client = configured_broker_client()
+        .context("ceremony operations require the authenticated Machine-to-Broker edge")?;
+    if action == "result" {
+        let result = client
+            .custody_result(bloom_triad_protocol::OperationRequest {
+                operation_id: operation_id.clone(),
+            })
+            .await
+            .map_err(anyhow::Error::new)
+            .context("retrieve Broker custody result")?;
+        anyhow::ensure!(
+            result.custody_operation_id == operation_id,
+            "Broker custody result operation identity mismatch"
+        );
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ceremony_kind": result.ceremony_kind,
+                "operation_id": result.custody_operation_id,
+                "state": result.public_status,
+                "wallet_id": result.wallet_id,
+                "public_key_refs": result.public_key_refs,
+                "credential_summaries": result.credential_summaries,
+                "receipt_digest": result.receipt_digest,
+                "has_encrypted_browser_result": result.encrypted_browser_result.is_some(),
+            }))
+            .context("encode public custody result")?
+        );
+        return Ok(());
+    }
+
+    let status = if action == "cancel" {
+        client
+            .cancel_ceremony(operation_id.clone())
+            .await
+            .map_err(anyhow::Error::new)
+            .context("cancel Broker ceremony")?
+    } else {
+        client
+            .ceremony_status(operation_id.clone())
+            .await
+            .map_err(anyhow::Error::new)
+            .context("read Broker ceremony status")?
+    };
+    anyhow::ensure!(
+        status.operation_id == operation_id,
+        "Broker ceremony status operation identity mismatch"
+    );
+    let now_ms = current_unix_ms();
+    let mut projection = match load_ceremony_projection(home, &operation_id)? {
+        Some(mut projection) => {
+            projection
+                .reconcile_custody(&status, now_ms)
+                .map_err(anyhow::Error::new)
+                .context("reconcile durable Machine ceremony projection")?;
+            projection
+        }
+        None => bloom_machine_client::CeremonyProjection::from_custody_status(&status, now_ms)
+            .map_err(anyhow::Error::new)
+            .context("rebuild Machine ceremony projection from Broker")?,
+    };
+    projection.expire_launch_secret(now_ms);
+    let path = persist_ceremony_projection(home, &projection)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&projection).context("encode ceremony projection")?
+    );
+    println!("projection: {}", path.display());
     Ok(())
 }
 
@@ -255,6 +593,9 @@ enum Cmd {
     /// Wallet management.
     #[command(subcommand)]
     Wallet(WalletCmd),
+    /// Inspect or cancel a Broker-owned custody ceremony by operation ID.
+    #[command(subcommand)]
+    Ceremony(CeremonyCmd),
     /// Paid/free HTTP requests via the `/requests` VFS surface.
     #[command(subcommand)]
     Request(RequestCmd),
@@ -307,6 +648,17 @@ enum IpcCmd {
         #[arg(long)]
         params: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum CeremonyCmd {
+    /// Refresh and print the durable Machine projection from Broker status.
+    Status { operation_id: String },
+    /// Cancel a ceremony before its atomic commit marker.
+    Cancel { operation_id: String },
+    /// Retrieve the signed public custody result. Encrypted Browser output is
+    /// never printed by Machine.
+    Result { operation_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -648,9 +1000,18 @@ enum WalletCmd {
         #[arg(long, default_value = "override")]
         text: String,
     },
-    /// Sign the current policy.toml for a passkey-gated wallet.
-    /// The wallet must already be unlocked (run `unlock` first).
-    SignPolicy { name: String },
+    /// Validate a proposed policy and prepare its Broker-originated review
+    /// ceremony. The input is JSON and is canonicalized before submission.
+    UpdatePolicy {
+        name: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, default_value = "user_verified")]
+        assurance_level: String,
+    },
+    /// Commit a policy update using its completed policy_update ceremony
+    /// receipt. This never provides a direct commit path.
+    CommitPolicy { operation_id: String },
     /// Re-bind an existing PRF-based passkey wallet to a new passkey
     /// credential. Unlocks with the current credential first to prove
     /// ownership, then runs a fresh WebAuthn registration ceremony and
@@ -1236,6 +1597,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Wallet(WalletCmd::New { name }) => {
             launch_custody_ceremony(
+                &home,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::WalletRegistration,
                 bloom_triad_protocol::CeremonyKind::WalletRegistration,
@@ -1246,6 +1608,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Wallet(WalletCmd::Import { name }) => {
             launch_custody_ceremony(
+                &home,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::WalletImport,
                 bloom_triad_protocol::CeremonyKind::WalletImport,
@@ -1361,15 +1724,19 @@ async fn run(cli: Cli) -> Result<()> {
                  wallet.unlock_prepare but §13.1 has no wallet_unlock ceremony_kind"
             )
         }
-        Cmd::Wallet(WalletCmd::SignPolicy { name }) => {
-            bail!(
-                "direct policy signing for '{name}' is removed; policy changes require                  Broker policy.validate_update, a completed policy_update ceremony receipt,                  and policy.commit_update"
-            )
+        Cmd::Wallet(WalletCmd::UpdatePolicy {
+            name,
+            file,
+            assurance_level,
+        }) => prepare_policy_update(&home, &name, &file, &assurance_level).await,
+        Cmd::Wallet(WalletCmd::CommitPolicy { operation_id }) => {
+            commit_policy_update(&home, operation_id).await
         }
         Cmd::Wallet(WalletCmd::RebindPasskey { name }) => {
             let wallet_id = bloom_triad_protocol::Token::new(name.clone())
                 .context("wallet ID must be a protocol token")?;
             launch_custody_ceremony(
+                &home,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::CredentialReplace,
                 bloom_triad_protocol::CeremonyKind::CredentialReplace,
@@ -1382,6 +1749,7 @@ async fn run(cli: Cli) -> Result<()> {
             let wallet_id = bloom_triad_protocol::Token::new(name.clone())
                 .context("wallet ID must be a protocol token")?;
             launch_custody_ceremony(
+                &home,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::WalletDelete,
                 bloom_triad_protocol::CeremonyKind::WalletDelete,
@@ -1532,6 +1900,7 @@ async fn run(cli: Cli) -> Result<()> {
                  {text:?})"
             )
         }
+        Cmd::Ceremony(command) => handle_ceremony(&home, command).await,
         Cmd::Serve { endpoint, mount } => {
             eprintln!("{ALPHA_DISCLOSURE}");
             let (_home_permit, d) = build_write_daemon(home.clone())?;
@@ -2527,7 +2896,13 @@ async fn unmount_bloom(handle: Option<()>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_petal_consent_net_rule, request_body_with_wallet};
+    use clap::Parser as _;
+
+    use super::{
+        Cli, Cmd, WalletCmd, ceremony_projection_path, format_petal_consent_net_rule,
+        is_completed_policy_update_receipt, load_ceremony_projection, persist_ceremony_projection,
+        request_body_with_wallet,
+    };
 
     #[test]
     fn petal_consent_network_line_includes_named_binding() {
@@ -2556,6 +2931,112 @@ mod tests {
         let output = request_body_with_wallet(input, Some("gavin"));
         assert!(output.starts_with("POST https://api.example.com/data wallet=gavin\n"));
         assert!(output.ends_with("\n\n{\"ok\":true}"));
+    }
+
+    #[test]
+    fn custody_projection_persists_atomically_and_without_secret_world_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = bloom_proto::HomeDir::at(temp.path());
+        let operation_id = bloom_triad_protocol::OperationId::from_bytes([61; 32]);
+        let status = bloom_triad_protocol::CeremonyPublicStatus {
+            ceremony_id: bloom_triad_protocol::Digest32::from_bytes([62; 32]),
+            ceremony_kind: bloom_triad_protocol::CeremonyKind::WalletImport,
+            operation_id: operation_id.clone(),
+            state: bloom_triad_protocol::CeremonyState::AwaitingUser,
+            expires_at_ms: bloom_triad_protocol::DecimalU64::new(u64::MAX),
+            ceremony_url: Some("http://localhost:18734/ceremony/owner-readable-secret".into()),
+            receipt_digest: None,
+        };
+        let projection =
+            bloom_machine_client::CeremonyProjection::from_custody_status(&status, 1).unwrap();
+        let path = persist_ceremony_projection(&home, &projection).unwrap();
+        assert_eq!(path, ceremony_projection_path(&home, operation_id.as_str()));
+        assert_eq!(
+            load_ceremony_projection(&home, &operation_id)
+                .unwrap()
+                .unwrap(),
+            projection
+        );
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp"))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn policy_cli_exposes_prepare_and_receipt_only_commit() {
+        let prepared = Cli::try_parse_from([
+            "bloom",
+            "wallet",
+            "update-policy",
+            "wallet",
+            "--file",
+            "proposed.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            prepared.cmd,
+            Cmd::Wallet(WalletCmd::UpdatePolicy {
+                name,
+                file,
+                assurance_level,
+            }) if name == "wallet"
+                && file.as_os_str() == "proposed.json"
+                && assurance_level == "user_verified"
+        ));
+
+        let committed =
+            Cli::try_parse_from(["bloom", "wallet", "commit-policy", &"ab".repeat(32)]).unwrap();
+        assert!(matches!(
+            committed.cmd,
+            Cmd::Wallet(WalletCmd::CommitPolicy { .. })
+        ));
+        assert!(
+            Cli::try_parse_from(["bloom", "wallet", "update-policy", "wallet"]).is_err(),
+            "prepare must require explicit proposed bytes"
+        );
+        assert!(
+            Cli::try_parse_from(["bloom", "wallet", "sign-policy", "wallet"]).is_err(),
+            "the legacy direct policy-signing path must stay removed"
+        );
+    }
+
+    #[test]
+    fn policy_commit_accepts_only_matching_completed_generic_custody_receipt() {
+        let operation_id = bloom_triad_protocol::OperationId::from_bytes([71; 32]);
+        let mut receipt = bloom_triad_protocol::CustodyResult {
+            ceremony_kind: bloom_triad_protocol::CeremonyKind::PolicyUpdate,
+            custody_operation_id: operation_id.clone(),
+            public_status: bloom_triad_protocol::CeremonyState::Completed,
+            wallet_id: Some(bloom_triad_protocol::Token::new("wallet").unwrap()),
+            public_key_refs: Vec::new(),
+            credential_summaries: Vec::new(),
+            initial_policy: None,
+            receipt_digest: bloom_triad_protocol::Digest32::from_bytes([72; 32]),
+            encrypted_browser_result: None,
+            signer_key_id: bloom_triad_protocol::Token::new("signer-ceremony-key").unwrap(),
+            signer_signature: bloom_triad_protocol::Base64UrlBytes::from_bytes(&[73; 64]),
+        };
+        assert!(is_completed_policy_update_receipt(&receipt, &operation_id));
+
+        receipt.public_status = bloom_triad_protocol::CeremonyState::Succeeded;
+        assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
+        receipt.public_status = bloom_triad_protocol::CeremonyState::Completed;
+        receipt.ceremony_kind = bloom_triad_protocol::CeremonyKind::WalletDelete;
+        assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
     }
 }
 

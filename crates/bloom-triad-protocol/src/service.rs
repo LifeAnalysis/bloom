@@ -295,6 +295,11 @@ pub struct CeremonyPublicStatus {
     pub operation_id: OperationId,
     pub state: CeremonyState,
     pub expires_at_ms: DecimalU64,
+    /// Owner-readable launch secret returned only by Broker to the
+    /// authenticated originating Machine while the ceremony is awaiting user
+    /// action. Signer-originated statuses and terminal Broker statuses omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceremony_url: Option<String>,
     pub receipt_digest: Option<Digest32>,
 }
 

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeSet;
 
 use crate::{
     Base64UrlBytes, CeremonyKind, CustodyCompleteRequest, CustodyPrepareRequest, CustodyResult,
@@ -35,6 +36,74 @@ pub struct PolicyDestination {
 pub struct RequiredVerifier {
     pub verifier_id: Token,
     pub verifier_digest: Digest32,
+}
+
+/// Compute the canonical, human-reviewable authority delta between two policy
+/// documents. Machine uses this only to populate its proposed request; Broker
+/// independently recomputes and verifies the result before preparing review.
+pub fn canonical_policy_authority_diff(
+    current: &CanonicalWalletPolicy,
+    proposed: &CanonicalWalletPolicy,
+) -> PolicyAuthorityDiff {
+    fn set_diff<T: Ord + Clone>(
+        before: impl IntoIterator<Item = T>,
+        after: impl IntoIterator<Item = T>,
+    ) -> (Vec<T>, Vec<T>) {
+        let before = before.into_iter().collect::<BTreeSet<_>>();
+        let after = after.into_iter().collect::<BTreeSet<_>>();
+        (
+            after.difference(&before).cloned().collect(),
+            before.difference(&after).cloned().collect(),
+        )
+    }
+
+    let (added_petal_packages, removed_petal_packages) = set_diff(
+        current.allowed_petal_packages.iter().cloned(),
+        proposed.allowed_petal_packages.iter().cloned(),
+    );
+    let (added_destinations, removed_destinations) = set_diff(
+        current
+            .allowed_destinations
+            .iter()
+            .map(|value| PolicyAuthorityDestination {
+                chain: value.chain.clone(),
+                destination: value.destination.clone(),
+            }),
+        proposed
+            .allowed_destinations
+            .iter()
+            .map(|value| PolicyAuthorityDestination {
+                chain: value.chain.clone(),
+                destination: value.destination.clone(),
+            }),
+    );
+    let (added_required_verifiers, removed_required_verifiers) = set_diff(
+        current
+            .required_verifiers
+            .iter()
+            .map(|value| PolicyAuthorityVerifier {
+                verifier_id: value.verifier_id.clone(),
+                verifier_digest: value.verifier_digest.clone(),
+            }),
+        proposed
+            .required_verifiers
+            .iter()
+            .map(|value| PolicyAuthorityVerifier {
+                verifier_id: value.verifier_id.clone(),
+                verifier_digest: value.verifier_digest.clone(),
+            }),
+    );
+
+    PolicyAuthorityDiff {
+        maximum_approval_lifetime_ms_before: DecimalU64::new(current.maximum_approval_lifetime_ms),
+        maximum_approval_lifetime_ms_after: DecimalU64::new(proposed.maximum_approval_lifetime_ms),
+        added_petal_packages,
+        removed_petal_packages,
+        added_destinations,
+        removed_destinations,
+        added_required_verifiers,
+        removed_required_verifiers,
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -259,4 +328,60 @@ fn canonical_error(error: impl std::fmt::Display) -> ProtocolError {
         ProtocolErrorCode::MalformedFrame,
         format!("policy canonicalization failed: {error}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(value: &str) -> Token {
+        Token::new(value).unwrap()
+    }
+
+    fn digest(value: u8) -> Digest32 {
+        Digest32::from_bytes([value; 32])
+    }
+
+    #[test]
+    fn authority_diff_is_sorted_deduplicated_and_complete() {
+        let current = CanonicalWalletPolicy {
+            wallet_id: token("wallet"),
+            maximum_approval_lifetime_ms: 10,
+            allowed_petal_packages: vec![digest(2), digest(1), digest(2)],
+            allowed_destinations: vec![PolicyDestination {
+                chain: token("ethereum"),
+                destination: "old".into(),
+            }],
+            required_verifiers: vec![RequiredVerifier {
+                verifier_id: token("human"),
+                verifier_digest: digest(3),
+            }],
+        };
+        let proposed = CanonicalWalletPolicy {
+            wallet_id: token("wallet"),
+            maximum_approval_lifetime_ms: 20,
+            allowed_petal_packages: vec![digest(4), digest(2), digest(4)],
+            allowed_destinations: vec![PolicyDestination {
+                chain: token("ethereum"),
+                destination: "new".into(),
+            }],
+            required_verifiers: Vec::new(),
+        };
+
+        let diff = canonical_policy_authority_diff(&current, &proposed);
+        assert_eq!(diff.maximum_approval_lifetime_ms_before.get(), 10);
+        assert_eq!(diff.maximum_approval_lifetime_ms_after.get(), 20);
+        assert_eq!(diff.added_petal_packages, vec![digest(4)]);
+        assert_eq!(diff.removed_petal_packages, vec![digest(1)]);
+        assert_eq!(diff.added_destinations[0].destination, "new");
+        assert_eq!(diff.removed_destinations[0].destination, "old");
+        assert!(diff.added_required_verifiers.is_empty());
+        assert_eq!(diff.removed_required_verifiers.len(), 1);
+        assert_eq!(
+            diff.digest().unwrap(),
+            canonical_policy_authority_diff(&current, &proposed)
+                .digest()
+                .unwrap()
+        );
+    }
 }
