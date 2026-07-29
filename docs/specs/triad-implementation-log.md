@@ -124,3 +124,29 @@ This log records fail-closed implementation choices where
 - W0 remains the release gate for OS-enforced egress and installed IAM policy,
   CloudTrail, principal, and sandbox configuration. W6 validates and binds the
   declarations but does not claim those host controls have been provisioned.
+
+## W7 Machine integration
+
+- Machine commit `b2e4f6a` adds the keyless typed Broker client and the
+  payload-bearing Petal signing ABI. Trusted runtime provenance, final
+  preimage bytes, claim assurance evidence, frozen action/advisory bindings,
+  operation identity, and response identity are preserved end to end.
+- Petal signing v0.1 hash-only single and batch calls fail closed with
+  `UNSUPPORTED_VERSION`. Production-reachable legacy VFS and transaction
+  hash-signing adapters also fail closed; their direct keystore-backed
+  implementations are test-only.
+- The production CLI write composition root constructs Machine with a bounded,
+  canonical Unix Broker connector. Broker ceremony projections retain URL and
+  expiry only for the exact originating approval/custody operation while it is
+  awaiting the user, and clear them on mismatch, expiry, or terminal state.
+- Broker commit `d55c3c1` moves current package/route provenance into an
+  installer-owned catalog. Approval preparation no longer accepts provenance
+  records from Machine, and every authorization compares the current verified
+  catalog entry with the approval-frozen record.
+- Catalog rotation, policy/revocation mutation, and signing authorization use
+  one serialization barrier through reservation. The concurrency regression
+  proves rotation cannot race between current-provenance validation and the
+  durable reservation boundary.
+- The W7 review gate passed after four read-only review rounds. The focused
+  protocol, Machine client, Petal, daemon, CLI compile, full Broker workspace,
+  and Signer workspace checks pass.
