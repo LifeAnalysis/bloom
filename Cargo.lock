@@ -2530,7 +2530,12 @@ dependencies = [
  "bloom-machine-client",
  "bloom-triad-protocol",
  "clap",
+ "hex",
+ "rand 0.8.6",
+ "serde_jcs",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
 ]
 

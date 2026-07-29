@@ -672,6 +672,21 @@ impl CeremonyProjection {
         )
     }
 
+    pub fn from_custody_result(result: &CustodyResult) -> Self {
+        Self {
+            identity: Some(CeremonyProjectionIdentity::Custody {
+                operation_id: result.custody_operation_id.clone(),
+                ceremony_kind: result.ceremony_kind,
+            }),
+            ceremony_state: Some(CeremonyProjectionState::Custody(result.public_status)),
+            ceremony_url: None,
+            ceremony_expires_at_ms: None,
+            receipt_digest: Some(result.receipt_digest.clone()),
+            review_manifest_digest: None,
+            last_error: None,
+        }
+    }
+
     pub fn reconcile_approval(
         &mut self,
         status: &ApprovalPublicStatus,
@@ -738,6 +753,27 @@ impl CeremonyProjection {
             self.last_error = None;
             return Ok(());
         }
+        self.clear_launch_secret();
+        Ok(())
+    }
+
+    pub fn reconcile_custody_result(
+        &mut self,
+        result: &CustodyResult,
+    ) -> Result<(), ProtocolError> {
+        if self.identity
+            != Some(CeremonyProjectionIdentity::Custody {
+                operation_id: result.custody_operation_id.clone(),
+                ceremony_kind: result.ceremony_kind,
+            })
+        {
+            self.fail_closed("custody result does not match originating projection");
+            return Err(projection_mismatch(
+                "custody result does not match originating projection",
+            ));
+        }
+        self.ceremony_state = Some(CeremonyProjectionState::Custody(result.public_status));
+        self.receipt_digest = Some(result.receipt_digest.clone());
         self.clear_launch_secret();
         Ok(())
     }
