@@ -34,6 +34,20 @@ wire detail. It does not amend that specification.
   the Signer root is unreadable by Machine and Broker. This does not claim
   protection from root. Runtime append uses exclusive file creation, rejects
   symlinks and non-owned roots, and refuses sequence rollback or replacement.
+- Section 25 leaves the exact adjacent-version window open. v1 ships a closed
+  current/current matrix only: Machine 0.1.1 with Broker 0.1.0 and Signer
+  0.1.0 over protocol 1.0. No adjacent combination is advertised, so the
+  requirement to test every supported adjacent combination is vacuous rather
+  than silently downgraded. Bundle assembly rejects any version outside that
+  matrix and records all three source revisions.
+- Section 26's W9 bundle rerun uses two complementary artifacts. Fault and
+  crash injection remains in separately linked test executables, because
+  shipping those hooks in a production service would violate AC-20. After
+  verifying and extracting the signed bundle, the gate binds the complete
+  AC-01--AC-35 workspace rerun to the exact three clean source revisions in
+  `SOURCE_REVISIONS`; it separately executes, scans, installs, and uninstalls
+  the extracted production artifacts. A source-suite pass from a different
+  revision or a version-only bundle smoke is not accepted.
 - Section 10.3 permits authenticated NTP, NTS, or a platform-managed time
   daemon. The edge manifest pins one reviewed source ID per platform:
   `linux-chrony-nts` or `macos-managed-timed`. Linux packaging requires two
