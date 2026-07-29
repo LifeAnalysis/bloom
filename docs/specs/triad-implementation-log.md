@@ -42,3 +42,15 @@ This log records fail-closed implementation choices where
 - **W1 cross-repository baseline:** Machine protocol commit `d01e82f` is
   consumed by Signer commit `5c09a6a` and Broker commit `6e3985b`. The sibling
   repositories intentionally have no remotes during extraction.
+
+## W2–W3 implementation commits
+
+- Broker durable journals and reservation ledgers are frozen at `ac7ef23`.
+- The Signer security seam is frozen at `2fe667a` and consumes the protocol
+  validity correction at Machine commit `bb09c32`. It includes compiled
+  backend-instance routing, encrypted local custody, signed derivation grants,
+  self-contained monotonic backup/restore, exact structural SignRequest
+  validation, per-wallet policy signing, and signed/idempotent revocation
+  reconciliation.
+- W0 packaging remains an explicit parallel release gate; no W2/W3 service
+  code claims that host-level isolation has already passed.
