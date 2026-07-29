@@ -3,7 +3,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     Base64UrlBytes, BootEpoch, ClaimAssurance, CryptoSuite, DecimalU64, Digest32, KeyRef,
-    OperationId, PetalUseClaim, ProtocolError, ProtocolErrorCode, SigningPayloads, Token,
+    OperationId, PetalUseClaim, ProtocolError, ProtocolErrorCode, ProvenanceSubject,
+    SigningPayloads, Token,
 };
 
 const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
@@ -11,12 +12,15 @@ const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineSignRequest {
+    pub operation_id: OperationId,
     pub operation_digest: Digest32,
     pub approval_id: Digest32,
     pub key_ref: KeyRef,
     pub crypto_suite: CryptoSuite,
     pub payloads: SigningPayloads,
     pub petal_use_claim: Option<PetalUseClaim>,
+    pub claim_assurance_evidence: Option<Base64UrlBytes>,
+    pub provenance: ProvenanceSubject,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

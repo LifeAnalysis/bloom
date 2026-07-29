@@ -25,6 +25,7 @@ unsafe-debug-signer = ["bloom-daemon/unsafe-debug-signer"]
 bloom-proto.workspace = true
 bloom-auth-api.workspace = true
 bloom-daemon.workspace = true
+bloom-machine-client.workspace = true
 blake3.workspace = true
 bloom-mount = { workspace = true, optional = true }
 bloom-keystore.workspace = true

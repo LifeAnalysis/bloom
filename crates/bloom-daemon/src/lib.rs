@@ -9,6 +9,7 @@ pub mod ceremony_server;
 pub mod ipc;
 pub mod registration;
 pub mod sealed_ceremony;
+#[cfg(test)]
 pub mod sign_hash;
 
 mod ens_resolver;
@@ -24,14 +25,16 @@ use alloy::rpc::types::eth::TransactionRequest;
 use alloy::signers::SignerSync;
 #[cfg(feature = "unsafe-debug-signer")]
 use alloy::signers::local::PrivateKeySigner;
+#[cfg(test)]
 use base64::Engine as _;
 use bloom_auth::{AuthStore, StoreApprovalVerifier};
+use bloom_auth_api::PETAL_PETAL_ID_PREFIX;
+#[cfg(test)]
 use bloom_auth_api::{
     AssuranceLevel, CANONICAL_INTENT_HEADER_SCHEMA_V1, CanonicalEnvelope, CanonicalIntentHeader,
-    DaemonGrantTerms, ExecutorKind, PETAL_PETAL_ID_PREFIX,
-    PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1, PetalPolicySnapshot, PetalSigningAttestationFacts,
-    PolicyCheckClass, PolicyCheckResult, SealedAction, SealedSignBatchEntry, SignHashRequest,
-    signing_attestation_facts_digest,
+    DaemonGrantTerms, ExecutorKind, PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1, PetalPolicySnapshot,
+    PetalSigningAttestationFacts, PolicyCheckClass, PolicyCheckResult, SealedAction,
+    SealedSignBatchEntry, SignHashRequest, signing_attestation_facts_digest,
 };
 use bloom_evm::{ChainClient, ChainRegistry};
 
@@ -40,6 +43,7 @@ use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
 use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
+use bloom_machine_client::{MachineBrokerClient, TrustedPetalSignRequest};
 use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::abi::{
     ApprovalRequired, ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome,
@@ -47,9 +51,10 @@ use bloom_petals::abi::{
 };
 use bloom_petals::{
     HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy,
-    PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignBatchOutcome, SignBatchRequest,
-    SignOutcome, SignRequest,
+    PayloadSignRequest, PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignOutcome,
 };
+#[cfg(test)]
+use bloom_petals::{SignBatchOutcome, SignBatchRequest, SignRequest};
 use bloom_prices::PricesClient;
 use bloom_proto::audit::AuditRecord;
 use bloom_proto::{
@@ -73,6 +78,7 @@ use bloom_vfs::handlers::{
 use bloom_vfs::{AuthServices, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
 use futures::StreamExt;
+#[cfg(test)]
 use rand::RngCore;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -82,25 +88,35 @@ use tracing::{debug, info, warn};
 use std::sync::Mutex;
 
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
+#[cfg(test)]
 const PETAL_ACTION_TTL_MS: u64 = 120_000;
+#[cfg(test)]
 const MAX_ACTIVE_PETAL_ACTION_IDENTITIES: usize = 4_096;
+#[cfg(test)]
 const PETAL_SIGNING_SUBJECT_KIND: &str = "petal_sign_hash";
+#[cfg(test)]
 const PETAL_SIGNING_SUBJECT_SCHEMA_V1: &str = "bloom.petal.sign_hash_subject.v1";
+#[cfg(test)]
 const PETAL_SIGNING_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash.action.v1";
+#[cfg(test)]
 const PETAL_SIGNING_BATCH_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash_batch.action.v1";
+#[cfg(test)]
 const MAX_PETAL_SIGN_BATCH: usize = 16;
 
+#[cfg(test)]
 #[derive(Clone)]
 struct PetalActionIdentity {
     action_id: String,
     expires_ms: u64,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct PetalActionIdentityCache {
     entries: std::collections::HashMap<[u8; 32], PetalActionIdentity>,
 }
 
+#[cfg(test)]
 impl PetalActionIdentityCache {
     /// Keep one request identity for the challenge's complete live interval.
     /// Expiry remains part of the action id, so the same scoped request gets a
@@ -254,11 +270,15 @@ struct DaemonPetalHost {
     vfs: Arc<LateVfsHost>,
     http: reqwest::Client,
     audit: Arc<AuditLog>,
+    #[cfg(test)]
     auth_services: AuthServices,
     tx_outbox: Option<PetalTxOutbox>,
     tx_stage_lock: tokio::sync::Mutex<()>,
+    #[cfg(test)]
     sign_batch_lock: tokio::sync::Mutex<()>,
+    #[cfg(test)]
     petal_action_identities: Mutex<PetalActionIdentityCache>,
+    broker: Option<MachineBrokerClient>,
     #[cfg(feature = "unsafe-debug-signer")]
     unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
 }
@@ -274,6 +294,8 @@ struct PetalTxOutbox {
 
 impl DaemonPetalHost {
     fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>, auth_services: AuthServices) -> Self {
+        #[cfg(not(test))]
+        let _ = &auth_services;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(20))
@@ -283,11 +305,15 @@ impl DaemonPetalHost {
             vfs,
             http,
             audit,
+            #[cfg(test)]
             auth_services,
             tx_outbox: None,
             tx_stage_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
             sign_batch_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
             petal_action_identities: Mutex::new(PetalActionIdentityCache::default()),
+            broker: None,
             #[cfg(feature = "unsafe-debug-signer")]
             unsafe_debug_signer: None,
         }
@@ -295,6 +321,11 @@ impl DaemonPetalHost {
 
     fn with_tx_outbox(mut self, tx_outbox: PetalTxOutbox) -> Self {
         self.tx_outbox = Some(tx_outbox);
+        self
+    }
+
+    fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
+        self.broker = broker;
         self
     }
 
@@ -331,6 +362,7 @@ impl DaemonPetalHost {
         })
     }
 
+    #[cfg(test)]
     fn validate_petal_signing_scope(
         req: &SignRequest,
         context: &PetalRouteContext,
@@ -364,6 +396,7 @@ impl DaemonPetalHost {
         Ok(params)
     }
 
+    #[cfg(test)]
     fn petal_action(
         &self,
         req: &SignRequest,
@@ -373,6 +406,7 @@ impl DaemonPetalHost {
         self.petal_action_with_identity(req, context, now_ms, None)
     }
 
+    #[cfg(test)]
     fn petal_action_with_identity(
         &self,
         req: &SignRequest,
@@ -526,6 +560,7 @@ impl DaemonPetalHost {
         Ok((action, attestation))
     }
 
+    #[cfg(test)]
     fn petal_batch_action(
         &self,
         requests: &[SignRequest],
@@ -755,6 +790,7 @@ impl DaemonPetalHost {
         }
     }
 
+    #[cfg(test)]
     fn audit_sign_hash(&self, req: &SignRequest, outcome: &str, error: Option<&str>) {
         let mut data = serde_json::json!({
             "purpose": req.purpose.as_str(),
@@ -965,6 +1001,7 @@ impl PetalHost for DaemonPetalHost {
         unreachable!("bounded redirect loop returns before exhausting iterator")
     }
 
+    #[cfg(test)]
     async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
         match self.sign_hash_outcome(req).await? {
             SignOutcome::Signature(signature) => Ok(signature),
@@ -975,6 +1012,7 @@ impl PetalHost for DaemonPetalHost {
         }
     }
 
+    #[cfg(test)]
     async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
         let Some(context) = req.context.as_ref() else {
             let err = HostError::Denied(
@@ -1085,6 +1123,7 @@ impl PetalHost for DaemonPetalHost {
         Ok(SignOutcome::Signature(signature))
     }
 
+    #[cfg(test)]
     async fn sign_hashes_outcome(
         &self,
         req: SignBatchRequest,
@@ -1189,6 +1228,91 @@ impl PetalHost for DaemonPetalHost {
             signatures.push(bytes);
         }
         Ok(SignBatchOutcome::Signatures(signatures))
+    }
+
+    async fn sign_payload_outcome(
+        &self,
+        req: PayloadSignRequest,
+    ) -> Result<SignOutcome, HostError> {
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            HostError::Backend("SERVICE_UNAVAILABLE: Broker client is not configured".into())
+        })?;
+        let context = req.context.as_ref().ok_or_else(|| {
+            HostError::Denied("payload signing requires trusted Petal route provenance".into())
+        })?;
+        let crypto_suite = match req.signature_algorithm.as_str() {
+            "secp256k1-keccak256-recoverable" => {
+                bloom_triad_protocol::CryptoSuite::Secp256k1Keccak256Recoverable
+            }
+            "secp256k1-sha256-recoverable" => {
+                bloom_triad_protocol::CryptoSuite::Secp256k1Sha256Recoverable
+            }
+            "ed25519-message" => bloom_triad_protocol::CryptoSuite::Ed25519Message,
+            _ => {
+                return Err(HostError::Invalid(format!(
+                    "unsupported signature algorithm {:?}",
+                    req.signature_algorithm
+                )));
+            }
+        };
+        let claim: bloom_triad_protocol::PetalUseClaim =
+            serde_json::from_slice(&req.petal_use_claim_jcs)
+                .map_err(|error| HostError::Invalid(format!("decode PetalUseClaim: {error}")))?;
+        let canonical_claim = serde_jcs::to_vec(&claim)
+            .map_err(|error| HostError::Invalid(format!("canonicalize PetalUseClaim: {error}")))?;
+        if canonical_claim != req.petal_use_claim_jcs {
+            return Err(HostError::Invalid(
+                "PetalUseClaim must use exact RFC 8785 canonical JSON".into(),
+            ));
+        }
+        let approval_id = req
+            .approval_hint
+            .map(bloom_triad_protocol::Digest32::new)
+            .transpose()
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let trusted_package_hash =
+            bloom_triad_protocol::Digest32::new(context.package_hash.clone())
+                .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let result = broker
+            .sign_petal_payload(TrustedPetalSignRequest {
+                wallet_id: bloom_triad_protocol::Token::new(req.wallet)
+                    .map_err(|error| HostError::Invalid(error.to_string()))?,
+                preimage: req.preimage,
+                claimed_hash: bloom_triad_protocol::Digest32::from_bytes(req.claimed_hash),
+                crypto_suite,
+                operation_class: bloom_triad_protocol::Token::new(req.operation_class)
+                    .map_err(|error| HostError::Invalid(error.to_string()))?,
+                claim,
+                claim_assurance_evidence: req.claim_assurance_evidence,
+                approval_id,
+                trusted_provenance: bloom_triad_protocol::ProvenanceSubject::Petal {
+                    package_hash: trusted_package_hash,
+                    route: context.route_id.clone(),
+                },
+                frozen_action: req.action,
+                frozen_advisory: req.advisory,
+            })
+            .await
+            .map_err(|error| {
+                HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+            })?;
+        let [signature] = result.signatures.as_slice() else {
+            return Err(HostError::Backend(
+                "Broker returned an invalid signature count".into(),
+            ));
+        };
+        let bytes = signature.bytes.decode();
+        match signature.crypto_suite.signature_encoding() {
+            bloom_triad_protocol::SignatureEncoding::Secp256k1Recoverable65
+                if bytes.len() == 65 => {}
+            bloom_triad_protocol::SignatureEncoding::Ed25519Raw64 if bytes.len() == 64 => {}
+            _ => {
+                return Err(HostError::Backend(
+                    "Broker returned an invalid normalized signature".into(),
+                ));
+            }
+        }
+        Ok(SignOutcome::Signature(bytes))
     }
 
     async fn evm_tx_stage(
@@ -1733,7 +1857,7 @@ impl Daemon {
     /// Build a fully-wired daemon from the home directory, materialising
     /// any missing subdirs as needed.
     pub fn from_home(home: HomeDir) -> Result<Self, DaemonError> {
-        Self::from_home_inner(home, None)
+        Self::from_home_inner(home, None, None)
     }
 
     /// Build a daemon with a held home write permit. VFS write surfaces use
@@ -1743,12 +1867,30 @@ impl Daemon {
         home: HomeDir,
         permit: Arc<HomeWritePermit>,
     ) -> Result<Self, DaemonError> {
-        Self::from_home_inner(home, Some(permit))
+        Self::from_home_inner(home, Some(permit), None)
+    }
+
+    /// Build a Machine daemon whose signing and custody authority is provided
+    /// exclusively by the Broker service boundary.
+    pub fn from_home_with_broker(
+        home: HomeDir,
+        broker: MachineBrokerClient,
+    ) -> Result<Self, DaemonError> {
+        Self::from_home_inner(home, None, Some(broker))
+    }
+
+    pub fn from_home_with_permit_and_broker(
+        home: HomeDir,
+        permit: Arc<HomeWritePermit>,
+        broker: MachineBrokerClient,
+    ) -> Result<Self, DaemonError> {
+        Self::from_home_inner(home, Some(permit), Some(broker))
     }
 
     fn from_home_inner(
         home: HomeDir,
         home_write_permit: Option<Arc<HomeWritePermit>>,
+        broker: Option<MachineBrokerClient>,
     ) -> Result<Self, DaemonError> {
         home.ensure()?;
         let config_path = home.config_path();
@@ -1983,18 +2125,16 @@ impl Daemon {
             Some(auth_verifier.clone()),
             Some(auth_verifier.clone()),
         );
-        // WS-1 wiring: in-memory grant store + first-party attestation
-        // registry + keystore-backed PetalHost. All three live behind the
-        // existing `AuthServices` so VFS handlers and the new `sign_hash`
-        // IPC method can call them without going through the old
-        // verifier/nfc paths. The concrete store / registry / host impls
-        // can be swapped (test doubles, post-MVP venues) by replacing
-        // the `Arc<dyn ...>` references.
+        // Legacy grant state remains available while the old ceremony
+        // projections are removed. A triad production build must never wire
+        // the keystore-backed, hash-only PetalHost into Machine: payload
+        // signing is exclusively dispatched through `MachineBrokerClient`.
         let grant_store: Arc<dyn bloom_auth_api::GrantStore> =
             Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
         let attestation_registry: Arc<dyn bloom_auth_api::SigningAttestationSchemaRegistry> =
             Arc::new(bloom_auth_api::DefaultAttestationRegistry::new());
         let signer_cache = Arc::new(bloom_keystore::petal_host::SignerCache::new());
+        #[cfg(test)]
         let petal_host: Arc<dyn bloom_auth_api::PetalHost> = Arc::new(
             bloom_keystore::petal_host::KeystorePetalHost::new(
                 Arc::new(keystore.clone()),
@@ -2004,7 +2144,11 @@ impl Daemon {
             )
             .with_signer_cache(signer_cache.clone()),
         );
-        tx_engine = tx_engine.with_host_signing_services(grant_store.clone(), petal_host.clone());
+        #[cfg(test)]
+        {
+            tx_engine =
+                tx_engine.with_host_signing_services(grant_store.clone(), petal_host.clone());
+        }
 
         // Wallet registration coordinator: always constructed (so every
         // VFS/IPC caller sees the same instance), but stays unarmed until
@@ -2019,17 +2163,21 @@ impl Daemon {
         // `ceremony_server::spawn` runs it instead, gated on this process
         // having just proven exclusive listener ownership via a successful
         // bind.
-        let registration_coordinator: Arc<dyn bloom_auth_api::WalletRegistrationCoordinator> =
-            Arc::new(registration::RegistrationCoordinator::new(
-                keystore.clone(),
-                auth_verifier.clone(),
-                audit_arc.clone(),
-                home.keystore_dir(),
-            ));
+        #[cfg(test)]
+        let registration_coordinator: Arc<
+            dyn bloom_auth_api::WalletRegistrationCoordinator,
+        > = Arc::new(registration::RegistrationCoordinator::new(
+            keystore.clone(),
+            auth_verifier.clone(),
+            audit_arc.clone(),
+            home.keystore_dir(),
+        ));
 
         let auth_services = auth_services
             .with_grant_store(grant_store)
-            .with_attestation_registry(attestation_registry)
+            .with_attestation_registry(attestation_registry);
+        #[cfg(test)]
+        let auth_services = auth_services
             .with_petal_host(petal_host)
             .with_registration_coordinator(registration_coordinator);
         let path_cache = Arc::new(PathCache::new());
@@ -2255,6 +2403,7 @@ impl Daemon {
             audit_arc.clone(),
             auth_services.clone(),
         )
+        .with_broker(broker)
         .with_tx_outbox(PetalTxOutbox {
             tx_engine: tx_engine.clone(),
             chains: chains.clone(),

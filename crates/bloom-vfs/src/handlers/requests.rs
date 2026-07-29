@@ -13,9 +13,12 @@ use base64::engine::general_purpose::STANDARD as B64_STD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bloom_auth_api::{
     ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms,
-    ExecutorKind, PetalHost, PolicyCheckClass, PolicyCheckResult, SIGNING_ATTESTATION_SCHEMA_V1,
-    SealedAction, SealedApprovalGrant, SignHashRequest, SignedApproval, SigningAttestation,
-    petal_identity,
+    ExecutorKind, PolicyCheckClass, PolicyCheckResult, SealedAction, SealedApprovalGrant,
+    SignedApproval, petal_identity,
+};
+#[cfg(test)]
+use bloom_auth_api::{
+    PetalHost, SIGNING_ATTESTATION_SCHEMA_V1, SignHashRequest, SigningAttestation,
 };
 use bloom_keystore::Keystore;
 use bloom_paid_http::{
@@ -641,6 +644,12 @@ impl RequestsHandler {
     /// requested, so misconfiguration surfaces at signing time rather than
     /// silently signing outside a grant.
     fn paid_http_host_signer(&self, wallet: &str, action_id: &str) -> Arc<dyn PaidHttpHostSigner> {
+        #[cfg(not(test))]
+        {
+            let _ = (wallet, action_id);
+            return Arc::new(UnwiredPaidHttpHostSigner);
+        }
+        #[cfg(test)]
         match self.auth_services.petal_host() {
             Some(host) => Arc::new(PaidHttpPetalHostSigner {
                 petal_host: host.clone(),
@@ -927,6 +936,7 @@ impl RequestsHandler {
 /// protocol adapter's signing request into a grant-gated, attestation-recorded
 /// [`PetalHost::sign_hash`] call. Key custody and grant enforcement stay in the
 /// runtime; the adapters only ever see the returned signature bytes.
+#[cfg(test)]
 struct PaidHttpPetalHostSigner {
     petal_host: Arc<dyn PetalHost>,
     wallet: String,
@@ -934,6 +944,7 @@ struct PaidHttpPetalHostSigner {
 }
 
 #[async_trait]
+#[cfg(test)]
 impl PaidHttpHostSigner for PaidHttpPetalHostSigner {
     async fn sign_paid_http_hash(
         &self,
@@ -979,13 +990,15 @@ impl PaidHttpHostSigner for UnwiredPaidHttpHostSigner {
         _facts: &PaidHttpSigningFacts,
     ) -> Result<[u8; 65], String> {
         Err(
-            "paid-http host signing requires a wired PetalHost under a live Sealed Approval grant"
+            "UNSUPPORTED_VERSION: legacy hash-only paid-http signing is disabled; use the \
+             payload-bearing Machine-to-Broker signing protocol"
                 .to_string(),
         )
     }
 }
 
 /// Lowercase hex for a 32-byte hash without pulling an extra dep.
+#[cfg(test)]
 fn hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -997,6 +1010,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// Build the structured [`SigningAttestation`] recorded for every paid-HTTP
 /// host signature. Carries only public request/payment facts and digests — no
 /// credential material, PRF output, or raw signatures.
+#[cfg(test)]
 fn paid_http_signing_attestation(
     intent: &str,
     signing_hash_hex: &str,

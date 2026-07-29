@@ -1,0 +1,18 @@
+[package]
+name = "bloom-machine-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bloom-triad-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_jcs.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

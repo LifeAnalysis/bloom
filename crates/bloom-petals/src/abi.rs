@@ -32,6 +32,26 @@ pub struct SignRequest {
     pub context: Option<PetalRouteContext>,
 }
 
+/// Payload-bearing signing request used by `bloom:sign/signing@0.2.0`.
+///
+/// The guest supplies the final bytes and its complete canonical use claim.
+/// The runner injects `context`; a guest can never select package or route
+/// provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadSignRequest {
+    pub wallet: String,
+    pub preimage: Vec<u8>,
+    pub claimed_hash: [u8; 32],
+    pub signature_algorithm: String,
+    pub operation_class: String,
+    pub petal_use_claim_jcs: Vec<u8>,
+    pub claim_assurance_evidence: Option<Vec<u8>>,
+    pub approval_hint: Option<String>,
+    pub action: Option<Vec<u8>>,
+    pub advisory: Option<Vec<u8>>,
+    pub context: Option<PetalRouteContext>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignBatchRequest {
     pub requests: Vec<SignRequest>,

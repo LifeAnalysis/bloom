@@ -309,10 +309,11 @@ impl IpcServer {
                 Ok(()) => Response::ok(id, Value::Null),
                 Err(e) => map_handler_err(id, e),
             },
-            "sign_hash" => match self.do_sign_hash(&req.params).await {
-                Ok(v) => Response::ok(id, v),
-                Err(e) => map_handler_err(id, e),
-            },
+            "sign_hash" => Response::err(
+                id,
+                -32601,
+                "UNSUPPORTED_VERSION: hash-only signing is disabled; use bloom:sign/signing@0.2.0",
+            ),
             "wallet.sign_policy" => match self.do_wallet_sign_policy(&req.params).await {
                 Ok(()) => Response::ok(id, Value::Null),
                 Err(e) => map_handler_err(id, e),
@@ -432,14 +433,6 @@ impl IpcServer {
             Ok(()) => Ok(()),
             Err(e) => Err(e),
         }
-    }
-
-    /// WS-1 IPC delegate for `sign_hash`. Thin wrapper that hands off
-    /// to [`crate::sign_hash::handle_sign_hash`] after looking up the
-    /// wired [`AuthServices`]. All validation, grant gating, audit
-    /// emission, and error mapping happens in that module.
-    async fn do_sign_hash(&self, params: &Value) -> Result<Value, HandlerError> {
-        crate::sign_hash::handle_sign_hash(&self.auth_services, params).await
     }
 
     async fn do_wallet_sign_policy(&self, params: &Value) -> Result<(), HandlerError> {

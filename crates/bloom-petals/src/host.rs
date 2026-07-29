@@ -10,8 +10,8 @@ use async_trait::async_trait;
 
 use crate::abi::{
     ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest,
-    HttpRequest, HttpResponse, PetalRouteContext, SignBatchOutcome, SignBatchRequest, SignOutcome,
-    SignRequest,
+    HttpRequest, HttpResponse, PayloadSignRequest, PetalRouteContext, SignBatchOutcome,
+    SignBatchRequest, SignOutcome, SignRequest,
 };
 use crate::policy::NetPolicy;
 
@@ -41,6 +41,8 @@ pub enum HostError {
     Invalid(String),
     #[error("backend: {0}")]
     Backend(String),
+    #[error("UNSUPPORTED_VERSION: {0}")]
+    UnsupportedVersion(String),
 }
 
 impl HostError {
@@ -51,6 +53,7 @@ impl HostError {
             HostError::Denied(_) => -2,
             HostError::Invalid(_) => -3,
             HostError::Backend(_) => -4,
+            HostError::UnsupportedVersion(_) => -5,
         }
     }
 }
@@ -81,16 +84,24 @@ pub trait PetalHost: Send + Sync {
         Err(HostError::Denied("http_fetch".into()))
     }
 
-    /// Sign a precomputed 32-byte hash with a daemon-held wallet key.
-    /// Default-deny; keys never cross into the petal.
+    /// Legacy v0.1 hash-only signing entry point.
+    ///
+    /// Triad hosts must fail this closed. Keeping the method in the host trait
+    /// lets old components instantiate and receive the stable protocol error
+    /// instead of falling through to an implementation-specific trap.
     async fn sign_hash(&self, _req: SignRequest) -> Result<Vec<u8>, HostError> {
-        Err(HostError::Denied("sign_hash".into()))
+        Err(HostError::UnsupportedVersion(
+            "bloom:sign/signing@0.1.0 is hash-only; use @0.2.0".into(),
+        ))
     }
 
     /// Structured component signing result for `bloom:sign/signing@0.1.0`.
     /// Hosts that have not opted into staged approval retain the v0.1 behavior.
     async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
-        self.sign_hash(req).await.map(SignOutcome::Signature)
+        let _ = req;
+        Err(HostError::UnsupportedVersion(
+            "bloom:sign/signing@0.1.0 is hash-only; use @0.2.0".into(),
+        ))
     }
 
     /// Sign an exact ordered set of hashes under one staged approval. Hosts
@@ -99,7 +110,17 @@ pub trait PetalHost: Send + Sync {
         &self,
         _req: SignBatchRequest,
     ) -> Result<SignBatchOutcome, HostError> {
-        Err(HostError::Denied("sign_hashes".into()))
+        Err(HostError::UnsupportedVersion(
+            "bloom:sign/signing@0.1.0 is hash-only; use @0.2.0".into(),
+        ))
+    }
+
+    /// Sign a final payload through the Machine-to-Broker authority boundary.
+    async fn sign_payload_outcome(
+        &self,
+        _req: PayloadSignRequest,
+    ) -> Result<SignOutcome, HostError> {
+        Err(HostError::Denied("sign_payload".into()))
     }
 
     /// Stage a generic EVM transaction in the daemon outbox. Hosts default to
@@ -174,6 +195,7 @@ mod tests {
             HostError::Denied("x".into()).as_wasm_code(),
             HostError::Invalid("x".into()).as_wasm_code(),
             HostError::Backend("x".into()).as_wasm_code(),
+            HostError::UnsupportedVersion("x".into()).as_wasm_code(),
         ];
         let mut sorted = codes.clone();
         sorted.sort();
@@ -192,6 +214,7 @@ mod tests {
         assert_eq!(HostError::Denied("x".into()).as_wasm_code(), -2);
         assert_eq!(HostError::Invalid("x".into()).as_wasm_code(), -3);
         assert_eq!(HostError::Backend("x".into()).as_wasm_code(), -4);
+        assert_eq!(HostError::UnsupportedVersion("x".into()).as_wasm_code(), -5);
     }
 
     #[tokio::test]
@@ -225,7 +248,7 @@ mod tests {
                 context: None,
             })
             .await,
-            Err(HostError::Denied(_))
+            Err(HostError::UnsupportedVersion(_))
         ));
         assert!(matches!(
             h.chain_read(ChainRequest {

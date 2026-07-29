@@ -38,9 +38,11 @@ use bloom_auth_api::{
     EVM_ERC20_TRANSFER_METHOD, EVM_OWNER_SESSION_MINT_ACTION_KIND,
     EVM_OWNER_SESSION_USE_ACTION_KIND, EVM_OWNER_SIGNING_SESSION_KIND, EVM_TX_SIGN_INTENT,
     EvmFeePolicy, EvmOwnerSigningSessionCounters, EvmOwnerSigningSessionScope,
-    EvmOwnerSigningSessionUse, ExecutorKind, PetalPolicySnapshot, SIGNING_ATTESTATION_SCHEMA_V1,
-    SealedAction, SignHashRequest, SignedApproval, SigningAttestation, petal_identity,
+    EvmOwnerSigningSessionUse, ExecutorKind, PetalPolicySnapshot, SealedAction, SignedApproval,
+    petal_identity,
 };
+#[cfg(test)]
+use bloom_auth_api::{SIGNING_ATTESTATION_SCHEMA_V1, SignHashRequest, SigningAttestation};
 use bloom_evm::ChainRegistry;
 use bloom_keystore::Keystore;
 use bloom_proto::{
@@ -55,7 +57,6 @@ use bloom_tx::{
 use qrcode::QrCode;
 use qrcode::render::svg;
 use qrcode::types::Color as QrColor;
-use serde::Deserialize;
 
 use crate::auth::AuthServices;
 use crate::handler::{Entry, Handler, HandlerError};
@@ -753,6 +754,23 @@ impl WalletsHandler {
             .map_err(|e| HandlerError::backend(format!("issue wallet-policy challenge: {e}")))
     }
 
+    #[cfg(not(test))]
+    async fn execute_wallet_policy_update(
+        &self,
+        wallet: &str,
+        action_id: &str,
+        old_policy_toml: &str,
+        proposed_policy: &[u8],
+    ) -> Result<(), HandlerError> {
+        let _ = (self, wallet, action_id, old_policy_toml, proposed_policy);
+        Err(HandlerError::Unsupported(
+            "UNSUPPORTED_VERSION: legacy hash-only wallet-policy signing is disabled; use the \
+             typed Broker policy-update ceremony"
+                .into(),
+        ))
+    }
+
+    #[cfg(test)]
     async fn execute_wallet_policy_update(
         &self,
         wallet: &str,
@@ -896,6 +914,7 @@ impl WalletsHandler {
     /// `confirmed` once the approved policy is installed). Best-effort: a
     /// failure is logged but never overrides an already-decided install/error
     /// outcome, because the policy bytes on disk are the source of truth.
+    #[cfg(test)]
     fn policy_update_transition(
         &self,
         wallet: &str,
@@ -1073,6 +1092,7 @@ impl WalletsHandler {
     /// a newer baseline has been approved and installed. Their sealed subjects
     /// are the authority for the proposed-policy hash; the VFS challenge is
     /// only used to locate that sealed record.
+    #[cfg(test)]
     async fn fail_superseded_pending_policy_updates(
         &self,
         wallet: &str,
@@ -1394,6 +1414,7 @@ fn write_json(path: impl AsRef<Path>, v: &impl serde::Serialize) -> Result<(), H
     Ok(())
 }
 
+#[cfg(test)]
 fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), HandlerError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1514,7 +1535,8 @@ fn wallet_policy_assurance(before: &Policy, after: &Policy) -> AssuranceLevel {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, serde::Deserialize)]
+#[cfg(test)]
 struct WalletPolicySealedSubject {
     proposed_policy_blake3: String,
 }

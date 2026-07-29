@@ -8,19 +8,24 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+#[cfg(test)]
+use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bloom_auth_api::{
     ApprovalChallenge, AssuranceLevel, AuthApiError, CanonicalEnvelope, CanonicalIntentHeader,
     CeremonyTokenResolution, DaemonGrantTerms, ExecutorKind, HYPERLIQUID_APPROVE_AGENT_SIGN_INTENT,
-    HYPERLIQUID_USD_SEND_SIGN_INTENT, PetalPolicySnapshot, SIGNING_ATTESTATION_SCHEMA_V1,
-    SealedAction, SignHashRequest, SigningAttestation, petal_identity,
+    HYPERLIQUID_USD_SEND_SIGN_INTENT, PetalPolicySnapshot, SealedAction, petal_identity,
     signing_attestation_facts_digest,
 };
+#[cfg(test)]
+use bloom_auth_api::{SIGNING_ATTESTATION_SCHEMA_V1, SignHashRequest, SigningAttestation};
+#[cfg(test)]
+use bloom_hyperliquid::signature_json_from_raw;
 use bloom_hyperliquid::{
     CancelWire, ExchangeAction, Grouping, HyperliquidClient, HyperliquidNetwork, HyperliquidSigner,
     LimitOrderType, OrderTypeWire, OrderWire, SignSubmit, SignedSubmit, TimeInForce,
     UsdSendRequest, approve_agent_action_and_hash, parse_address, pretty_json, sign_submit_payload,
-    signature_json_from_raw, signed_payload, usd_send_action_and_hash, user_signed_payload,
+    signed_payload, usd_send_action_and_hash, user_signed_payload,
 };
 use bloom_keystore::{Keystore, ephemeral::EphemeralAgentKey};
 use bloom_proto::hyperliquid_policy::HyperliquidPolicy;
@@ -2050,6 +2055,24 @@ impl HyperliquidHandler {
         }
     }
 
+    #[cfg(not(test))]
+    async fn host_sign_hyperliquid_hash(
+        &self,
+        wallet: &str,
+        action_id: &str,
+        intent: &str,
+        hash_hex: &str,
+        facts: Value,
+    ) -> Result<bloom_hyperliquid::SignatureJson, HandlerError> {
+        let _ = (self, wallet, action_id, intent, hash_hex, facts);
+        Err(HandlerError::Unsupported(
+            "UNSUPPORTED_VERSION: legacy hash-only Hyperliquid signing is disabled; use the \
+             payload-bearing Machine-to-Broker signing protocol"
+                .into(),
+        ))
+    }
+
+    #[cfg(test)]
     async fn host_sign_hyperliquid_hash(
         &self,
         wallet: &str,

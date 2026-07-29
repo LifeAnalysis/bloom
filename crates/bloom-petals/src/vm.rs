@@ -43,8 +43,8 @@ use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
     ChainRequest, ChainResponse, DispatchOp, DispatchRequest, DispatchResponse,
-    EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest, PetalRouteContext,
-    SignBatchOutcome, SignBatchRequest, SignOutcome, SignRequest,
+    EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest, PayloadSignRequest,
+    PetalRouteContext, SignOutcome,
 };
 use crate::error::PetalError;
 use crate::host::{HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
@@ -56,7 +56,6 @@ const DEFAULT_FUEL: u64 = 100_000_000;
 const DEFAULT_MEMORY_PAGES: u32 = 256; // 16 MiB (64 KiB pages).
 const STDOUT_CAP: usize = 1 << 20; // 1 MiB.
 const DEFAULT_HTTP_RESPONSE_CAP: usize = 8 * 1024 * 1024;
-const MAX_SIGN_BATCH_REQUESTS: usize = 16;
 const DEFAULT_RANDOM_BYTES_CAP: u32 = 1024 * 1024;
 pub(crate) const COMPONENT_NOT_A_DIR_CODE: i32 = -101;
 pub(crate) const COMPONENT_UNSUPPORTED_CODE: i32 = -102;
@@ -801,6 +800,12 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
         })?;
     }
     {
+        let mut sign = linker.instance("bloom:sign/signing@0.2.0")?;
+        sign.func_new_async("sign-payload", |store, params, results| {
+            Box::new(async move { component_sign_payload(store, params, results).await })
+        })?;
+    }
+    {
         let mut tx = linker.instance("bloom:tx/outbox@0.1.0")?;
         tx.func_new_async("stage", |store, params, results| {
             Box::new(async move { component_evm_tx_stage(store, params, results).await })
@@ -1197,23 +1202,34 @@ async fn component_store_delete_if_value(
 }
 
 async fn component_sign_hash(
+    _store: StoreContextMut<'_, StoreData>,
+    _params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    set_component_result(results, component_host_err(legacy_signing_unsupported()))
+}
+
+async fn component_sign_payload(
     store: StoreContextMut<'_, StoreData>,
     params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
-    let req = match component_sign_request(store.data(), params) {
+    let req = match component_payload_sign_request(store.data(), params) {
         Ok(req) => req,
         Err(err) => return set_component_result(results, component_host_err(err)),
     };
+    let expected_signature_len = payload_signature_len(&req.signature_algorithm);
     let host = store.data().host.clone();
-    match host.sign_hash_outcome(req).await {
-        Ok(SignOutcome::Signature(signature)) if signature.len() == 65 => {
+    match host.sign_payload_outcome(req).await {
+        Ok(SignOutcome::Signature(signature))
+            if expected_signature_len.is_some_and(|length| signature.len() == length) =>
+        {
             set_component_result(results, component_sign_signature(signature))
         }
         Ok(SignOutcome::Signature(_)) => set_component_result(
             results,
             component_host_err(HostError::Backend(
-                "sign_hash returned non-65-byte signature".into(),
+                "sign-payload returned a signature with the wrong normalized encoding".into(),
             )),
         ),
         Ok(SignOutcome::ApprovalRequired(approval)) => set_component_result(
@@ -1229,155 +1245,88 @@ async fn component_sign_hash(
 }
 
 async fn component_sign_hashes(
-    store: StoreContextMut<'_, StoreData>,
-    params: &[ComponentVal],
+    _store: StoreContextMut<'_, StoreData>,
+    _params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
-    let req = match component_sign_batch_request(store.data(), params) {
-        Ok(req) => req,
-        Err(err) => return set_component_result(results, component_host_err(err)),
+    set_component_result(results, component_host_err(legacy_signing_unsupported()))
+}
+
+fn legacy_signing_unsupported() -> HostError {
+    HostError::UnsupportedVersion(
+        "bloom:sign/signing@0.1.0 hash-only signing is disabled; use @0.2.0".into(),
+    )
+}
+
+fn component_payload_sign_request(
+    data: &StoreData,
+    params: &[ComponentVal],
+) -> Result<PayloadSignRequest, HostError> {
+    if !data.caps.contains(&Capability::Sign) {
+        log_denied(data, "component_sign_payload");
+        return Err(HostError::Denied("sign".into()));
+    }
+    let [ComponentVal::Record(fields)] = params else {
+        return Err(HostError::Invalid(
+            "invalid bloom:sign.sign-payload params".into(),
+        ));
     };
-    let expected_signatures = req.requests.len();
-    let host = store.data().host.clone();
-    match host.sign_hashes_outcome(req).await {
-        Ok(SignBatchOutcome::Signatures(signatures))
-            if signatures.len() == expected_signatures
-                && signatures.iter().all(|signature| signature.len() == 65) =>
-        {
-            set_component_result(
-                results,
-                ComponentVal::Result(Ok(Some(Box::new(ComponentVal::Variant(
-                    "signatures".into(),
-                    Some(Box::new(ComponentVal::List(
-                        signatures.into_iter().map(component_bytes).collect(),
-                    ))),
-                ))))),
-            )
-        }
-        Ok(SignBatchOutcome::Signatures(signatures)) if signatures.len() != expected_signatures => {
-            set_component_result(
-                results,
-                component_host_err(HostError::Backend(format!(
-                    "sign_hashes returned {} signatures for {expected_signatures} requests",
-                    signatures.len()
-                ))),
-            )
-        }
-        Ok(SignBatchOutcome::Signatures(_)) => set_component_result(
-            results,
-            component_host_err(HostError::Backend(
-                "sign_hashes returned a non-65-byte signature".into(),
-            )),
-        ),
-        Ok(SignBatchOutcome::ApprovalRequired(approval)) => set_component_result(
-            results,
-            component_sign_approval_required(
-                approval.action_id,
-                approval.ceremony_url,
-                approval.expires_ms,
-            ),
-        ),
-        Err(err) => set_component_result(results, component_host_err(err)),
+    component_payload_sign_record(data, fields)
+}
+
+fn payload_signature_len(algorithm: &str) -> Option<usize> {
+    match algorithm {
+        "secp256k1-keccak256-recoverable" | "secp256k1-sha256-recoverable" => Some(65),
+        "ed25519-message" => Some(64),
+        _ => None,
     }
 }
 
-fn component_sign_batch_request(
+fn component_payload_sign_record(
     data: &StoreData,
-    params: &[ComponentVal],
-) -> Result<SignBatchRequest, HostError> {
-    if !data.caps.contains(&Capability::Sign) {
-        log_denied(data, "component_sign_hashes");
-        return Err(HostError::Denied("sign".into()));
-    }
-    let [ComponentVal::List(values)] = params else {
+    fields: &[(String, ComponentVal)],
+) -> Result<PayloadSignRequest, HostError> {
+    let wallet = component_record_string(fields, "wallet")?;
+    let preimage = component_record_bytes(fields, "preimage")?;
+    let claimed_hash = component_record_bytes(fields, "claimed-hash")?;
+    if claimed_hash.len() != 32 {
         return Err(HostError::Invalid(
-            "invalid bloom:sign.sign-hashes params".into(),
+            "sign-payload requires a 32-byte claimed-hash".into(),
         ));
-    };
-    if values.is_empty() || values.len() > MAX_SIGN_BATCH_REQUESTS {
-        return Err(HostError::Invalid(format!(
-            "sign-hashes requires 1..={MAX_SIGN_BATCH_REQUESTS} requests"
+    }
+    let signature_algorithm = component_record_string(fields, "signature-algorithm")?;
+    let operation_class = component_record_string(fields, "operation-class")?;
+    let petal_use_claim_jcs = component_record_bytes(fields, "petal-use-claim-jcs")?;
+    if wallet.trim().is_empty()
+        || signature_algorithm.trim().is_empty()
+        || operation_class.trim().is_empty()
+        || petal_use_claim_jcs.is_empty()
+    {
+        return Err(HostError::Invalid(
+            "payload signing identity and claim fields must be non-empty".into(),
+        ));
+    }
+    if !sign_intent_allowed(data, &operation_class) {
+        return Err(HostError::Denied(format!(
+            "sign operation class {operation_class:?} is not allowed"
         )));
-    }
-    let mut requests = Vec::with_capacity(values.len());
-    for value in values {
-        let ComponentVal::Record(fields) = value else {
-            return Err(HostError::Invalid(
-                "sign-hashes request must be a record".into(),
-            ));
-        };
-        let wallet = component_string(
-            component_field(fields, "wallet").map_err(|e| HostError::Invalid(e.to_string()))?,
-            "wallet",
-        )?;
-        let hash = component_byte_list(
-            component_field(fields, "hash32").map_err(|e| HostError::Invalid(e.to_string()))?,
-            "hash32",
-        )?;
-        if hash.len() != 32 {
-            return Err(HostError::Invalid(
-                "sign-hashes requires 32-byte hashes".into(),
-            ));
-        }
-        let purpose = component_string(
-            component_field(fields, "intent").map_err(|e| HostError::Invalid(e.to_string()))?,
-            "intent",
-        )?;
-        if !sign_intent_allowed(data, &purpose) {
-            return Err(HostError::Denied(format!(
-                "sign intent {purpose:?} is not allowed"
-            )));
-        }
-        let mut hash32 = [0u8; 32];
-        hash32.copy_from_slice(&hash);
-        requests.push(SignRequest {
-            wallet,
-            hash32,
-            purpose,
-            context: data.sign_context.clone(),
-        });
-    }
-    Ok(SignBatchRequest { requests })
-}
-
-fn component_sign_request(
-    data: &StoreData,
-    params: &[ComponentVal],
-) -> Result<SignRequest, HostError> {
-    if !data.caps.contains(&Capability::Sign) {
-        log_denied(data, "component_sign_hash");
-        return Err(HostError::Denied("sign".into()));
-    }
-    let [wallet, hash, intent] = params else {
-        return Err(HostError::Invalid(
-            "invalid bloom:sign.sign-hash params".into(),
-        ));
-    };
-    let wallet = component_string(wallet, "wallet")?;
-    let hash = component_byte_list(hash, "hash32")?;
-    if hash.len() != 32 {
-        return Err(HostError::Invalid(
-            "sign-hash requires a 32-byte hash".into(),
-        ));
     }
     let mut hash32 = [0u8; 32];
-    hash32.copy_from_slice(&hash);
-    let purpose = component_string(intent, "intent")?;
-    if !sign_intent_allowed(data, &purpose) {
-        tracing::info!(
-            target: "bloom_petals::vm",
-            petal = %data.petal_hash,
-            intent = %purpose,
-            "component sign_hash denied by sign intent policy"
-        );
-        return Err(HostError::Denied(format!(
-            "sign intent {purpose:?} is not allowed"
-        )));
-    }
-    Ok(SignRequest {
+    hash32.copy_from_slice(&claimed_hash);
+    Ok(PayloadSignRequest {
         wallet,
-        hash32,
-        purpose,
+        preimage,
+        claimed_hash: hash32,
+        signature_algorithm,
+        operation_class,
+        petal_use_claim_jcs,
+        claim_assurance_evidence: component_record_optional_bytes(
+            fields,
+            "claim-assurance-evidence",
+        )?,
+        approval_hint: component_record_optional_string(fields, "approval-hint")?,
+        action: component_record_optional_bytes(fields, "action")?,
+        advisory: component_record_optional_bytes(fields, "advisory")?,
         context: data.sign_context.clone(),
     })
 }
@@ -2001,6 +1950,32 @@ fn component_record_bytes(
     component_byte_list(component_record_field(fields, name)?, name)
 }
 
+fn component_record_optional_bytes(
+    fields: &[(String, ComponentVal)],
+    name: &str,
+) -> Result<Option<Vec<u8>>, HostError> {
+    match component_record_field(fields, name)? {
+        ComponentVal::Option(None) => Ok(None),
+        ComponentVal::Option(Some(value)) => component_byte_list(value, name).map(Some),
+        other => Err(HostError::Invalid(format!(
+            "component {name} expected option<list<u8>>, got {other:?}"
+        ))),
+    }
+}
+
+fn component_record_optional_string(
+    fields: &[(String, ComponentVal)],
+    name: &str,
+) -> Result<Option<String>, HostError> {
+    match component_record_field(fields, name)? {
+        ComponentVal::Option(None) => Ok(None),
+        ComponentVal::Option(Some(value)) => component_string(value, name).map(Some),
+        other => Err(HostError::Invalid(format!(
+            "component {name} expected option<string>, got {other:?}"
+        ))),
+    }
+}
+
 fn component_record_headers(
     fields: &[(String, ComponentVal)],
     name: &str,
@@ -2374,7 +2349,8 @@ impl Default for PetalVm {
 mod tests {
     use super::*;
     use crate::abi::{
-        DispatchOp, DispatchRequest, DispatchResponse, HttpRequest, HttpResponse, SignRequest,
+        DispatchOp, DispatchRequest, DispatchResponse, HttpRequest, HttpResponse,
+        PayloadSignRequest,
     };
     use crate::host::DenyHost;
     use crate::meta::PetalMode;
@@ -2385,6 +2361,33 @@ mod tests {
     use wasmtime::AsContextMut;
 
     const VALID_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn component_payload_request(wallet: &str, byte: u8, operation_class: &str) -> ComponentVal {
+        ComponentVal::Record(vec![
+            ("wallet".into(), ComponentVal::String(wallet.into())),
+            ("preimage".into(), component_bytes(vec![byte; 48])),
+            ("claimed-hash".into(), component_bytes(vec![byte; 32])),
+            (
+                "signature-algorithm".into(),
+                ComponentVal::String("secp256k1-keccak256-recoverable".into()),
+            ),
+            (
+                "operation-class".into(),
+                ComponentVal::String(operation_class.into()),
+            ),
+            (
+                "petal-use-claim-jcs".into(),
+                component_bytes(br#"{"claim":"complete"}"#.to_vec()),
+            ),
+            (
+                "claim-assurance-evidence".into(),
+                ComponentVal::Option(None),
+            ),
+            ("approval-hint".into(), ComponentVal::Option(None)),
+            ("action".into(), ComponentVal::Option(None)),
+            ("advisory".into(), ComponentVal::Option(None)),
+        ])
+    }
 
     /// Compile a WAT snippet to wasm bytes.
     fn wat(src: &str) -> Vec<u8> {
@@ -2532,10 +2535,8 @@ mod tests {
         lists: Mutex<HashMap<String, Vec<HostVfsEntry>>>,
         vfs_reads: Mutex<Vec<String>>,
         http_calls: Mutex<Vec<HttpRequest>>,
-        sign_calls: Mutex<Vec<SignRequest>>,
+        sign_calls: Mutex<Vec<PayloadSignRequest>>,
         sign_outcome: Mutex<Option<SignOutcome>>,
-        sign_batch_calls: Mutex<Vec<SignBatchRequest>>,
-        sign_batch_outcome: Mutex<Option<SignBatchOutcome>>,
         tx_stage_calls: Mutex<Vec<EvmTransactionRequest>>,
         tx_confirm_calls: Mutex<Vec<TxConfirmCall>>,
         tx_inspect_calls: Mutex<Vec<TxInspectCall>>,
@@ -2606,30 +2607,16 @@ mod tests {
             Ok(resp)
         }
 
-        async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
-            self.sign_calls.lock().push(req);
-            Ok(vec![7u8; 65])
-        }
-
-        async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
+        async fn sign_payload_outcome(
+            &self,
+            req: PayloadSignRequest,
+        ) -> Result<SignOutcome, HostError> {
             self.sign_calls.lock().push(req);
             Ok(self
                 .sign_outcome
                 .lock()
                 .clone()
                 .unwrap_or_else(|| SignOutcome::Signature(vec![7u8; 65])))
-        }
-
-        async fn sign_hashes_outcome(
-            &self,
-            req: SignBatchRequest,
-        ) -> Result<SignBatchOutcome, HostError> {
-            self.sign_batch_calls.lock().push(req);
-            Ok(self
-                .sign_batch_outcome
-                .lock()
-                .clone()
-                .unwrap_or_else(|| SignBatchOutcome::Signatures(vec![vec![7u8; 65]])))
         }
 
         async fn evm_tx_stage(
@@ -3192,18 +3179,25 @@ paths = ["/status"]
         )
         .await
         .unwrap();
-        assert_component_ok_signature(&sign[0], &[7u8; 65]);
+        assert_component_err_contains(&sign[0], "UNSUPPORTED_VERSION");
+        assert!(host.sign_calls.lock().is_empty());
+
+        let mut payload_sign = vec![ComponentVal::Bool(false)];
+        component_sign_payload(
+            store.as_context_mut(),
+            &[component_payload_request("alice", 3, "test.intent")],
+            &mut payload_sign,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_signature(&payload_sign[0], &[7u8; 65]);
         assert_eq!(host.sign_calls.lock().len(), 1);
 
         store.data_mut().sign_intents = Some(BTreeSet::from(["test.allowed".to_string()]));
         let mut denied_sign = vec![ComponentVal::Bool(false)];
-        component_sign_hash(
+        component_sign_payload(
             store.as_context_mut(),
-            &[
-                ComponentVal::String("alice".into()),
-                component_bytes(vec![3u8; 32]),
-                ComponentVal::String("test.denied".into()),
-            ],
+            &[component_payload_request("alice", 3, "test.denied")],
             &mut denied_sign,
         )
         .await
@@ -3279,13 +3273,9 @@ paths = ["/status"]
         let mut store = component_test_store(caps, None, host.clone());
         let mut result = vec![ComponentVal::Bool(false)];
 
-        component_sign_hash(
+        component_sign_payload(
             store.as_context_mut(),
-            &[
-                ComponentVal::String("alice".into()),
-                component_bytes(vec![3u8; 32]),
-                ComponentVal::String("orders.place".into()),
-            ],
+            &[component_payload_request("alice", 3, "orders.place")],
             &mut result,
         )
         .await
@@ -3327,13 +3317,9 @@ paths = ["/status"]
         let mut caps = BTreeSet::new();
         caps.insert(Capability::Sign);
         let mut store = component_test_store(caps, None, host.clone());
-        let params = [
-            ComponentVal::String("alice".into()),
-            component_bytes(vec![3u8; 32]),
-            ComponentVal::String("orders.place".into()),
-        ];
+        let params = [component_payload_request("alice", 3, "orders.place")];
         let mut result = vec![ComponentVal::Bool(false)];
-        component_sign_hash(store.as_context_mut(), &params, &mut result)
+        component_sign_payload(store.as_context_mut(), &params, &mut result)
             .await
             .unwrap();
         let ComponentVal::Result(Ok(Some(value))) = &result[0] else {
@@ -3353,7 +3339,7 @@ paths = ["/status"]
 
         store.data_mut().sign_intents = Some(BTreeSet::from(["orders.cancel".to_string()]));
         let mut denied = vec![ComponentVal::Bool(false)];
-        component_sign_hash(store.as_context_mut(), &params, &mut denied)
+        component_sign_payload(store.as_context_mut(), &params, &mut denied)
             .await
             .unwrap();
         assert_component_err_contains(&denied[0], "not allowed");
@@ -3361,11 +3347,34 @@ paths = ["/status"]
     }
 
     #[tokio::test]
-    async fn component_sign_batch_requires_exactly_one_valid_signature_per_request() {
+    async fn component_payload_sign_accepts_normalized_ed25519_signature() {
+        let host = Arc::new(MockHost::default());
+        *host.sign_outcome.lock() = Some(SignOutcome::Signature(vec![9; 64]));
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Sign);
+        let mut store = component_test_store(caps, None, host);
+        let mut request = component_payload_request("alice", 3, "message.sign");
+        let ComponentVal::Record(fields) = &mut request else {
+            unreachable!();
+        };
+        let algorithm = fields
+            .iter_mut()
+            .find(|(name, _)| name == "signature-algorithm")
+            .unwrap();
+        algorithm.1 = ComponentVal::String("ed25519-message".into());
+        let mut result = vec![ComponentVal::Bool(false)];
+        component_sign_payload(store.as_context_mut(), &[request], &mut result)
+            .await
+            .unwrap();
+        assert_component_ok_signature(&result[0], &[9; 64]);
+    }
+
+    #[tokio::test]
+    async fn legacy_component_sign_batch_is_always_unsupported() {
         let host = Arc::new(MockHost::default());
         let mut caps = BTreeSet::new();
         caps.insert(Capability::Sign);
-        let mut store = component_test_store(caps, None, host.clone());
+        let mut store = component_test_store(caps, None, host);
         let request = |wallet: &str, byte: u8| {
             ComponentVal::Record(vec![
                 ("wallet".into(), ComponentVal::String(wallet.into())),
@@ -3377,54 +3386,11 @@ paths = ["/status"]
             request("alice", 1),
             request("bob", 2),
         ])];
-
-        *host.sign_batch_outcome.lock() = Some(SignBatchOutcome::Signatures(vec![
-            vec![1u8; 65],
-            vec![2u8; 65],
-        ]));
-        let mut exact = vec![ComponentVal::Bool(false)];
-        component_sign_hashes(store.as_context_mut(), &params, &mut exact)
+        let mut result = vec![ComponentVal::Bool(false)];
+        component_sign_hashes(store.as_context_mut(), &params, &mut result)
             .await
             .unwrap();
-        let ComponentVal::Result(Ok(Some(value))) = &exact[0] else {
-            panic!("expected successful batch result: {:?}", exact[0]);
-        };
-        let ComponentVal::Variant(name, Some(signatures)) = value.as_ref() else {
-            panic!("expected signatures variant: {value:?}");
-        };
-        assert_eq!(name, "signatures");
-        let ComponentVal::List(signatures) = signatures.as_ref() else {
-            panic!("expected signature list: {signatures:?}");
-        };
-        assert_eq!(
-            signatures
-                .iter()
-                .map(|signature| component_byte_list(signature, "signature").unwrap()[0])
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-
-        for (signatures, expected_error) in [
-            (vec![], "returned 0 signatures for 2 requests"),
-            (vec![vec![1u8; 65]], "returned 1 signatures for 2 requests"),
-            (
-                vec![vec![1u8; 65], vec![2u8; 65], vec![3u8; 65]],
-                "returned 3 signatures for 2 requests",
-            ),
-            (vec![vec![1u8; 65], vec![2u8; 64]], "non-65-byte signature"),
-        ] {
-            *host.sign_batch_outcome.lock() = Some(SignBatchOutcome::Signatures(signatures));
-            let mut result = vec![ComponentVal::Bool(false)];
-            component_sign_hashes(store.as_context_mut(), &params, &mut result)
-                .await
-                .unwrap();
-            assert_component_err_contains(&result[0], expected_error);
-        }
-
-        let calls = host.sign_batch_calls.lock();
-        assert_eq!(calls.len(), 5);
-        assert_eq!(calls[0].requests[0].wallet, "alice");
-        assert_eq!(calls[0].requests[1].wallet, "bob");
+        assert_component_err_contains(&result[0], "UNSUPPORTED_VERSION");
     }
 
     #[tokio::test]

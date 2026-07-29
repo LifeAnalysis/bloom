@@ -133,7 +133,12 @@ fn resolve_server_endpoint(home: &HomeDir, endpoint: Option<&str>) -> Result<Res
 
 fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {
     let permit = Arc::new(HomeWritePermit::acquire(&home)?);
-    let daemon = Daemon::from_home_with_permit(home, permit.clone()).context("build daemon")?;
+    let broker_socket = std::env::var_os("BLOOM_BROKER_SOCKET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/run/bloom/broker.sock"));
+    let broker = bloom_machine_client::MachineBrokerClient::connect_unix(broker_socket);
+    let daemon = Daemon::from_home_with_permit_and_broker(home, permit.clone(), broker)
+        .context("build daemon")?;
     Ok((permit, daemon))
 }
 

@@ -2270,6 +2270,7 @@ dependencies = [
  "bloom-evm",
  "bloom-hyperliquid",
  "bloom-keystore",
+ "bloom-machine-client",
  "bloom-mount",
  "bloom-petals",
  "bloom-proto",
@@ -2345,6 +2346,7 @@ dependencies = [
  "bloom-evm",
  "bloom-hyperliquid",
  "bloom-keystore",
+ "bloom-machine-client",
  "bloom-mempool",
  "bloom-mount",
  "bloom-paid-http",
@@ -2352,6 +2354,7 @@ dependencies = [
  "bloom-prices",
  "bloom-proto",
  "bloom-revert",
+ "bloom-triad-protocol",
  "bloom-tx",
  "bloom-update",
  "bloom-vfs",
@@ -2362,6 +2365,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",
+ "serde_jcs",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -2516,6 +2520,20 @@ dependencies = [
  "url",
  "webauthn-rs",
  "zeroize",
+]
+
+[[package]]
+name = "bloom-machine-client"
+version = "0.1.1"
+dependencies = [
+ "bloom-triad-protocol",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha3 0.10.9",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

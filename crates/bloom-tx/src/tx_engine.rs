@@ -20,18 +20,22 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+#[cfg(test)]
 use bloom_auth_api::petal_identity::{
     FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET,
 };
 use bloom_auth_api::{
     ApprovalVerifier, AssuranceLevel, AuthEntryState, AuthStoreWriter, CanonicalEnvelope,
-    DaemonGrantTerms, EVM_ERC20_TRANSFER_METHOD, EVM_OWNER_SESSION_USE_ACTION_KIND,
-    EVM_SEALED_INTENT_SUBJECT_KIND, EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1, EVM_TX_SIGN_INTENT,
-    EvmCallFact, EvmFeeFacts, EvmNonceIntent, EvmOriginalTxFact, EvmOwnerSessionUseFact,
-    EvmOwnerSigningSessionScope, EvmOwnerSigningSessionUse, EvmSealedActionKind,
-    EvmSealedIntentSubject, EvmTokenFact, EvmUnsignedEnvelopeFacts, EvmValueFact, GrantStore,
-    NonceState, PetalHost, PetalPolicySnapshot, SealedAction, SignHashRequest, SignedApproval,
-    SigningAttestation, StandingSessionRecord, ValuationPolicy,
+    DaemonGrantTerms, EVM_ERC20_TRANSFER_METHOD, EVM_SEALED_INTENT_SUBJECT_KIND,
+    EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1, EvmCallFact, EvmFeeFacts, EvmNonceIntent,
+    EvmOriginalTxFact, EvmOwnerSigningSessionUse, EvmSealedActionKind, EvmSealedIntentSubject,
+    EvmTokenFact, EvmUnsignedEnvelopeFacts, EvmValueFact, GrantStore, NonceState, PetalHost,
+    PetalPolicySnapshot, SealedAction, SignedApproval, StandingSessionRecord, ValuationPolicy,
+};
+#[cfg(test)]
+use bloom_auth_api::{
+    EVM_OWNER_SESSION_USE_ACTION_KIND, EVM_TX_SIGN_INTENT, EvmOwnerSessionUseFact,
+    EvmOwnerSigningSessionScope, SignHashRequest, SigningAttestation,
 };
 use bloom_evm::{ChainClient, ChainError, IERC20, NftKind};
 
@@ -3268,6 +3272,21 @@ impl TxEngine {
         Ok(())
     }
 
+    #[cfg(not(test))]
+    async fn host_sign_evm_sealed_subject_hash(
+        &self,
+        subject: &EvmSealedIntentSubject,
+        signing_hash: &B256,
+    ) -> Result<Signature, TxEngineError> {
+        let _ = (self, subject, signing_hash);
+        Err(TxEngineError::ApprovalServiceUnavailable(
+            "UNSUPPORTED_VERSION: legacy hash-only EVM signing is disabled; use the \
+             payload-bearing Machine-to-Broker signing protocol"
+                .into(),
+        ))
+    }
+
+    #[cfg(test)]
     async fn host_sign_evm_sealed_subject_hash(
         &self,
         subject: &EvmSealedIntentSubject,
@@ -3311,6 +3330,22 @@ impl TxEngine {
         Signature::from_raw(&raw).map_err(|e| TxEngineError::Signer(format!("host signature: {e}")))
     }
 
+    #[cfg(not(test))]
+    async fn host_sign_evm_hash(
+        &self,
+        staged: &StagedTx,
+        action_kind: EvmOutboxActionKind,
+        signing_hash: B256,
+    ) -> Result<Signature, TxEngineError> {
+        let _ = (self, staged, action_kind, signing_hash);
+        Err(TxEngineError::ApprovalServiceUnavailable(
+            "UNSUPPORTED_VERSION: legacy hash-only EVM signing is disabled; use the \
+             payload-bearing Machine-to-Broker signing protocol"
+                .into(),
+        ))
+    }
+
+    #[cfg(test)]
     async fn host_sign_evm_hash(
         &self,
         staged: &StagedTx,
@@ -3350,6 +3385,33 @@ impl TxEngine {
         Signature::from_raw(&raw).map_err(|e| TxEngineError::Signer(format!("host signature: {e}")))
     }
 
+    #[cfg(not(test))]
+    async fn host_sign_evm_owner_session_hash(
+        &self,
+        staged: &StagedTx,
+        session_id: &str,
+        reservation_id: &str,
+        request: &EvmOwnerSigningSessionUse,
+        session: &StandingSessionRecord,
+        signing_hash: &B256,
+    ) -> Result<Signature, TxEngineError> {
+        let _ = (
+            self,
+            staged,
+            session_id,
+            reservation_id,
+            request,
+            session,
+            signing_hash,
+        );
+        Err(TxEngineError::ApprovalServiceUnavailable(
+            "UNSUPPORTED_VERSION: legacy hash-only EVM session signing is disabled; use the \
+             payload-bearing Machine-to-Broker signing protocol"
+                .into(),
+        ))
+    }
+
+    #[cfg(test)]
     async fn host_sign_evm_owner_session_hash(
         &self,
         staged: &StagedTx,
@@ -4212,6 +4274,7 @@ fn outbox_canonical_envelope(
         .map_err(|e| TxEngineError::ApprovalConstruction(format!("build EVM sealed envelope: {e}")))
 }
 
+#[cfg(test)]
 fn evm_signing_attestation(
     staged: &StagedTx,
     action_kind: EvmOutboxActionKind,
@@ -4225,6 +4288,7 @@ fn evm_signing_attestation(
         })
 }
 
+#[cfg(test)]
 fn evm_owner_session_signing_attestation(
     staged: &StagedTx,
     session_id: &str,
@@ -4277,6 +4341,7 @@ fn evm_fee_facts(staged: &StagedTx) -> EvmFeeFacts {
     }
 }
 
+#[cfg(test)]
 fn evm_owner_session_sealed_subject(
     staged: &StagedTx,
     session_id: &str,
