@@ -34,3 +34,11 @@ as entitlements here.
 The root-owned edge manifest pins `trusted_time_source` to
 `macos-managed-timed`, the platform-managed time service. Peer-supplied time
 and arbitrary source identifiers are rejected.
+
+The installer renders a distinct audit checkpoint directory for Broker and
+Signer and passes it as `BLOOM_AUDIT_CHECKPOINT_DIR`. Each directory is owned
+and writable only by its service principal and lies outside the shared socket
+container; Machine and Broker cannot read the Signer audit checkpoint.
+Runtime checkpoint writes accept only exclusive append creation below the
+exact packaging-selected root and reject symlinks, replacement, and sequence
+rollback.

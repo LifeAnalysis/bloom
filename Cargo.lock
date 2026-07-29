@@ -2299,6 +2299,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-audit-checkpoint"
+version = "0.1.1"
+dependencies = [
+ "bloom-triad-protocol",
+ "ed25519-dalek",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bloom-auth"
 version = "0.1.1"
 dependencies = [

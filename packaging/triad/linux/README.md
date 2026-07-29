@@ -42,3 +42,10 @@ least two independently operated NTS servers and refuses an unauthenticated
 source. Broker and Signer query the kernel synchronization status; loss of
 synchronization produces an untrusted reading and degraded rate-limited
 signing rather than a wall-clock fallback.
+
+Packaging creates a mode-0700 `audit-checkpoints` directory below each
+service's state root and passes its absolute path through
+`BLOOM_AUDIT_CHECKPOINT_DIR`. Only that service principal can read or append
+its checkpoint records. In particular, the Machine login and Broker cannot
+read the Signer checkpoint root. Runtime checkpoint writes reject symlinks,
+non-owned directories, sequence rollback, and replacement.

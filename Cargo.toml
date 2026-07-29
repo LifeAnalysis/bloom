@@ -32,6 +32,7 @@ members = [
   "crates/bloom-triad-local-transport",
   "crates/bloom-service-activation",
   "crates/bloom-trusted-time",
+  "crates/bloom-audit-checkpoint",
 ]
 resolver = "2"
 
@@ -82,6 +83,7 @@ tempfile = "3"
 futures = "0.3"
 lru = "0.12"
 fs2 = "0.4"
+bloom-audit-checkpoint = { path = "crates/bloom-audit-checkpoint" }
 wasmtime = { version = "26", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
 wasmtime-wasi = "26"
 wat = "1"

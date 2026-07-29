@@ -19,6 +19,8 @@
     <string>@BLOOM_SIGNER_CONFIG@</string>
     <key>BLOOM_EDGE_MANIFEST</key>
     <string>@BLOOM_EDGE_MANIFEST@</string>
+    <key>BLOOM_AUDIT_CHECKPOINT_DIR</key>
+    <string>@BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR@</string>
     <key>BLOOM_SIGNER_ACTIVATION_NAME</key>
     <string>signer</string>
     <key>BLOOM_SIGNER_CONTROL_ACTIVATION_NAME</key>

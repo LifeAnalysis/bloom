@@ -11,6 +11,7 @@ ExecStart=@BLOOM_SIGNER_BINARY@
 Environment=BLOOM_SIGNER_IDENTITY=/etc/bloom/%i/signer/identity.json
 Environment=BLOOM_SIGNER_CONFIG=/etc/bloom/%i/signer/config.json
 Environment=BLOOM_EDGE_MANIFEST=/etc/bloom/%i/edge-manifest.json
+Environment=BLOOM_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/signer/audit-checkpoints
 Environment=BLOOM_SIGNER_ACTIVATION_NAME=signer
 Environment=BLOOM_SIGNER_CONTROL_ACTIVATION_NAME=signer-control
 Sockets=bloom-signer-rpc@%i.socket bloom-signer-control@%i.socket

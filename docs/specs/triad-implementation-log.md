@@ -28,6 +28,12 @@ wire detail. It does not amend that specification.
   roots are mode 0700, local Signer has a private network namespace and
   `AF_UNIX` only, and the AWS-KMS drop-in is rejected unless packaging renders
   a non-wildcard reviewed CIDR allowlist over a deny-all egress baseline.
+- Section 20 leaves the audit-checkpoint location to packaging. Consistent
+  with the section 6 containment target, packaging selects a separate
+  mode-0700 checkpoint root writable only by the owning service principal;
+  the Signer root is unreadable by Machine and Broker. This does not claim
+  protection from root. Runtime append uses exclusive file creation, rejects
+  symlinks and non-owned roots, and refuses sequence rollback or replacement.
 - Section 10.3 permits authenticated NTP, NTS, or a platform-managed time
   daemon. The edge manifest pins one reviewed source ID per platform:
   `linux-chrony-nts` or `macos-managed-timed`. Linux packaging requires two

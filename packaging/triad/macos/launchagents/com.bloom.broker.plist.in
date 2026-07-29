@@ -19,6 +19,8 @@
     <string>@BLOOM_BROKER_CONFIG@</string>
     <key>BLOOM_EDGE_MANIFEST</key>
     <string>@BLOOM_EDGE_MANIFEST@</string>
+    <key>BLOOM_AUDIT_CHECKPOINT_DIR</key>
+    <string>@BLOOM_BROKER_AUDIT_CHECKPOINT_DIR@</string>
     <key>BLOOM_BROKER_ACTIVATION_NAME</key>
     <string>broker</string>
     <key>BLOOM_BROKER_CONTROL_ACTIVATION_NAME</key>

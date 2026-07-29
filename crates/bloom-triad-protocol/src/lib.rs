@@ -5,6 +5,7 @@
 //! custody plaintext are deliberately unrepresentable here.
 
 mod approval;
+mod audit;
 mod ceremony;
 mod claims;
 mod codec;
@@ -21,6 +22,7 @@ mod signing;
 mod webauthn;
 
 pub use approval::*;
+pub use audit::*;
 pub use ceremony::*;
 pub use claims::*;
 pub use codec::*;
