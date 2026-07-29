@@ -78,3 +78,24 @@ This log records fail-closed implementation choices where
   and activation until reconciliation converges.
 - The W4 review gate passed with 12 W2 journal tests and 7 W4 authority tests,
   all-feature workspace tests, and Clippy with warnings denied.
+
+## W5 ceremony
+
+- Machine protocol commit `0bd5a9c` freezes canonical ceremony challenges,
+  raw WebAuthn proofs, HPKE AAD, signed Signer contributions and custody
+  results, public credential summaries, and reviewed vectors.
+- Signer commit `94170be` consumes protocol commit `0bd5a9c`. It independently
+  verifies raw WebAuthn bytes, keeps PRF and custody plaintext behind
+  single-use HPKE, atomically commits wallet/credential/policy/backend effects,
+  provisions signed public root KeyRefs, preserves exact imported secp256k1
+  scalar identity, delivers optional recovery material only to Browser, and
+  reconciles interrupted key derivation without path reuse.
+- Broker commit `88cde7c` consumes protocol commit `0bd5a9c` and Signer commit
+  `94170be`. It owns the canonical listener and review manifest, enforces
+  origin/host/token/rate limits, independently verifies WebAuthn, keeps opaque
+  custody ciphertext out of public status, and retains authenticated
+  Browser-only results in `AWAITING_RECOVERY_ACK` until durable acknowledgement.
+- The W5 review gate passed after three read-only review rounds. All-feature
+  workspace tests and Clippy with warnings denied pass in Machine, Signer, and
+  Broker; the shipped Browser asset additionally executes its ChaCha20-
+  Poly1305 and X25519/HPKE self-tests under Node.
