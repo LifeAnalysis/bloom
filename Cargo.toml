@@ -30,6 +30,7 @@ members = [
   "crates/bloom-update",
   "crates/bloom-triad-protocol",
   "crates/bloom-triad-local-transport",
+  "crates/bloom-service-activation",
 ]
 resolver = "2"
 
@@ -57,6 +58,7 @@ async-trait = "0.1"
 parking_lot = "0.12"
 dirs = "5"
 hex = "0.4"
+libc = "0.2"
 blake3 = "1"
 sha3 = "0.10"
 sha2 = "0.10"
@@ -134,6 +136,7 @@ bloom-auth     = { path = "crates/bloom-auth" }
 bloom-update   = { path = "crates/bloom-update" }
 bloom-triad-protocol = { path = "crates/bloom-triad-protocol" }
 bloom-triad-local-transport = { path = "crates/bloom-triad-local-transport" }
+bloom-service-activation = { path = "crates/bloom-service-activation" }
 bloom-machine-client = { path = "crates/bloom-machine-client" }
 # ---- example core petal: generic capability primitives (/bloom/core/cap) ----
 

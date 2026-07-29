@@ -2747,6 +2747,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-service-activation"
+version = "0.1.1"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bloom-tools"
 version = "0.1.1"
 dependencies = [

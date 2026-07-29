@@ -90,6 +90,13 @@ pub struct WalletRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct WalletOperationRequest {
+    pub operation_id: OperationId,
+    pub wallet_id: Token,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyRequest {
     pub key_ref: KeyRef,
 }
@@ -97,6 +104,7 @@ pub struct KeyRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalPrepareRequest {
+    pub operation_id: OperationId,
     pub terms: SealedApprovalTerms,
     pub canonical_plan_facts_digest: Digest32,
 }
@@ -104,6 +112,7 @@ pub struct ApprovalPrepareRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRenewRequest {
+    pub operation_id: OperationId,
     pub old_approval_id: Digest32,
     pub replacement_terms: SealedApprovalTerms,
 }
@@ -111,6 +120,7 @@ pub struct ApprovalRenewRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevokeRequest {
+    pub operation_id: OperationId,
     pub approval_id: Digest32,
     pub wallet_id: Token,
     pub reason: String,
@@ -303,7 +313,7 @@ pub enum MachineBrokerRequest {
     #[serde(rename = "sealed_approval.revoke")]
     SealedApprovalRevoke(RevokeRequest),
     #[serde(rename = "sealed_approval.revoke_all")]
-    SealedApprovalRevokeAll(WalletRequest),
+    SealedApprovalRevokeAll(WalletOperationRequest),
     #[serde(rename = "sealed_approval.renew")]
     SealedApprovalRenew(ApprovalRenewRequest),
     #[serde(rename = "signing.sign")]
@@ -483,7 +493,7 @@ pub enum BrokerSignerRequest {
     #[serde(rename = "sealed_approval.revoke")]
     SealedApprovalRevoke(RevokeRequest),
     #[serde(rename = "sealed_approval.revoke_all")]
-    SealedApprovalRevokeAll(WalletRequest),
+    SealedApprovalRevokeAll(WalletOperationRequest),
     #[serde(rename = "revocation.state")]
     RevocationState(WalletRequest),
     #[serde(rename = "signer.sign")]
@@ -544,9 +554,9 @@ pub enum BrokerSignerResponse {
     #[serde(rename = "key.list_derived")]
     KeyListDerived(Vec<KeyPublic>),
     #[serde(rename = "key.derive_prepare")]
-    KeyDerivePrepare(CustodyPrepareResponse),
+    KeyDerivePrepare(crate::CustodySignerContribution),
     #[serde(rename = "key.enroll_prepare")]
-    KeyEnrollPrepare(CustodyPrepareResponse),
+    KeyEnrollPrepare(crate::CustodySignerContribution),
     #[serde(rename = "key.enroll_status")]
     KeyEnrollStatus(CeremonyPublicStatus),
     #[serde(rename = "ceremony.prepare")]
@@ -611,7 +621,7 @@ pub enum ControlRequest {
     #[serde(rename = "control.revoke")]
     Revoke(RevokeRequest),
     #[serde(rename = "control.revoke_all")]
-    RevokeAll(WalletRequest),
+    RevokeAll(WalletOperationRequest),
     #[serde(rename = "control.status")]
     Status(WalletRequest),
 }
@@ -649,6 +659,10 @@ impl crate::TypedRequestMethod for MachineBrokerRequest {
     fn operation_id(&self) -> Result<Option<OperationId>, ProtocolError> {
         use MachineBrokerRequest as Request;
         Ok(match self {
+            Request::SealedApprovalPrepare(request) => Some(request.operation_id.clone()),
+            Request::SealedApprovalRenew(request) => Some(request.operation_id.clone()),
+            Request::SealedApprovalRevoke(request) => Some(request.operation_id.clone()),
+            Request::SealedApprovalRevokeAll(request) => Some(request.operation_id.clone()),
             Request::SigningSign(request) | Request::SigningSignBatch(request) => {
                 Some(request.operation_id.clone())
             }
@@ -680,6 +694,8 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
         Ok(match self {
             Request::CeremonyPrepare(request) => Some(request.activation_operation_id.clone()),
             Request::CeremonyComplete(request) => Some(request.activation_operation_id.clone()),
+            Request::SealedApprovalRevoke(request) => Some(request.operation_id.clone()),
+            Request::SealedApprovalRevokeAll(request) => Some(request.operation_id.clone()),
             Request::SignerSign(request) | Request::SignerSignBatch(request) => {
                 Some(request.unsigned.operation_id.clone())
             }
@@ -705,7 +721,15 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
         })
     }
 }
-impl crate::TypedRequestMethod for ControlRequest {}
+impl crate::TypedRequestMethod for ControlRequest {
+    fn operation_id(&self) -> Result<Option<OperationId>, ProtocolError> {
+        Ok(match self {
+            Self::Revoke(request) => Some(request.operation_id.clone()),
+            Self::RevokeAll(request) => Some(request.operation_id.clone()),
+            Self::Status(_) => None,
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
