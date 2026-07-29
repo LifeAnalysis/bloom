@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Base64UrlBytes, BootEpoch, CeremonyCompleteRequest, CeremonyKind, CeremonyPrepareRequest,
-    CustodyCompleteRequest, CustodyPrepareRequest, CustodyPrepareResponse, CustodyResult,
-    DecimalU64, Digest32, KeyRef, MachineSignRequest, OperationId, PolicyCommitReceipt,
-    PolicyCompareAndSwapRequest, ProtocolError, ProtocolVersion, RevocationState,
-    SealedApprovalPrepareResponse, SealedApprovalTerms, ServiceFuture, SignRequest,
-    SignedPolicySnapshot, SigningResult, Token,
+    Base64UrlBytes, BootEpoch, CeremonyKind, CustodyCompleteRequest, CustodyPrepareRequest,
+    CustodyPrepareResponse, CustodyResult, DecimalU64, Digest32, KeyRef, MachineSignRequest,
+    OperationId, PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyCompareAndSwapRequest,
+    PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError, ProtocolVersion,
+    RevocationState, SealedApprovalPrepareResponse, SealedApprovalTerms, ServiceFuture,
+    SignRequest, SignedPolicySnapshot, SigningResult, Token,
 };
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -93,6 +93,13 @@ pub struct WalletRequest {
 pub struct WalletOperationRequest {
     pub operation_id: OperationId,
     pub wallet_id: Token,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustodyBindOutputRecipientRequest {
+    pub operation_id: OperationId,
+    pub recipient_key: Base64UrlBytes,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -327,9 +334,9 @@ pub enum MachineBrokerRequest {
     #[serde(rename = "policy.read")]
     PolicyRead(WalletRequest),
     #[serde(rename = "policy.validate_update")]
-    PolicyValidateUpdate(PolicyCompareAndSwapRequest),
+    PolicyValidateUpdate(PolicyUpdateRequest),
     #[serde(rename = "policy.commit_update")]
-    PolicyCommitUpdate(PolicyCompareAndSwapRequest),
+    PolicyCommitUpdate(PolicyCommitUpdateRequest),
     #[serde(rename = "wallet.list_public")]
     WalletListPublic(Empty),
     #[serde(rename = "wallet.get_public")]
@@ -410,7 +417,7 @@ pub enum MachineBrokerResponse {
     #[serde(rename = "policy.read")]
     PolicyRead(SignedPolicySnapshot),
     #[serde(rename = "policy.validate_update")]
-    PolicyValidateUpdate(Digest32),
+    PolicyValidateUpdate(PolicyUpdatePrepareResponse),
     #[serde(rename = "policy.commit_update")]
     PolicyCommitUpdate(PolicyCommitReceipt),
     #[serde(rename = "wallet.list_public")]
@@ -481,9 +488,9 @@ pub enum BrokerSignerRequest {
     #[serde(rename = "key.enroll_status")]
     KeyEnrollStatus(OperationRequest),
     #[serde(rename = "ceremony.prepare")]
-    CeremonyPrepare(CeremonyPrepareRequest),
+    CeremonyPrepare(crate::SignerCeremonyPrepareRequest),
     #[serde(rename = "ceremony.complete")]
-    CeremonyComplete(CeremonyCompleteRequest),
+    CeremonyComplete(crate::SignerCeremonyCompleteRequest),
     #[serde(rename = "ceremony.status")]
     CeremonyStatus(IdRequest),
     #[serde(rename = "ceremony.cancel")]
@@ -530,6 +537,8 @@ pub enum BrokerSignerRequest {
     RecoveryPrepare(CustodyPrepareRequest),
     #[serde(rename = "custody.complete")]
     CustodyComplete(CustodyCompleteRequest),
+    #[serde(rename = "custody.bind_output_recipient")]
+    CustodyBindOutputRecipient(CustodyBindOutputRecipientRequest),
     #[serde(rename = "custody.result")]
     CustodyResult(OperationRequest),
     #[serde(rename = "custody.status")]
@@ -554,21 +563,21 @@ pub enum BrokerSignerResponse {
     #[serde(rename = "key.list_derived")]
     KeyListDerived(Vec<KeyPublic>),
     #[serde(rename = "key.derive_prepare")]
-    KeyDerivePrepare(crate::CustodySignerContribution),
+    KeyDerivePrepare(crate::SignerPreparedCustody),
     #[serde(rename = "key.enroll_prepare")]
-    KeyEnrollPrepare(crate::CustodySignerContribution),
+    KeyEnrollPrepare(crate::SignerPreparedCustody),
     #[serde(rename = "key.enroll_status")]
     KeyEnrollStatus(CeremonyPublicStatus),
     #[serde(rename = "ceremony.prepare")]
-    CeremonyPrepare(crate::SignerCeremonyContribution),
+    CeremonyPrepare(crate::SignerCeremonyPrepareResponse),
     #[serde(rename = "ceremony.complete")]
-    CeremonyComplete(crate::SignerActivationReceipt),
+    CeremonyComplete(crate::SignerCeremonyCompleteResponse),
     #[serde(rename = "ceremony.cancel")]
     CeremonyCancel(CeremonyPublicStatus),
     #[serde(rename = "operation.status")]
     OperationStatus(OperationPublicStatus),
     #[serde(rename = "ceremony.status")]
-    CeremonyStatus(CeremonyPublicStatus),
+    CeremonyStatus(crate::SignerCeremonyStatus),
     #[serde(rename = "sealed_approval.status")]
     SealedApprovalStatus(ApprovalPublicStatus),
     #[serde(rename = "sealed_approval.revoke")]
@@ -576,7 +585,7 @@ pub enum BrokerSignerResponse {
     #[serde(rename = "sealed_approval.revoke_all")]
     SealedApprovalRevokeAll(RevocationState),
     #[serde(rename = "revocation.state")]
-    RevocationState(RevocationState),
+    RevocationState(crate::RevocationSnapshot),
     #[serde(rename = "signer.sign")]
     SignerSign(SigningResult),
     #[serde(rename = "signer.sign_batch")]
@@ -586,29 +595,31 @@ pub enum BrokerSignerResponse {
     #[serde(rename = "policy.compare_and_swap")]
     PolicyCompareAndSwap(PolicyCommitReceipt),
     #[serde(rename = "wallet.registration_prepare")]
-    WalletRegistrationPrepare(crate::CustodySignerContribution),
+    WalletRegistrationPrepare(crate::SignerPreparedCustody),
     #[serde(rename = "wallet.registration_status")]
     WalletRegistrationStatus(CeremonyPublicStatus),
     #[serde(rename = "wallet.unlock_prepare")]
-    WalletUnlockPrepare(crate::CustodySignerContribution),
+    WalletUnlockPrepare(crate::SignerPreparedCustody),
     #[serde(rename = "wallet.import_prepare")]
-    WalletImportPrepare(crate::CustodySignerContribution),
+    WalletImportPrepare(crate::SignerPreparedCustody),
     #[serde(rename = "wallet.export_prepare")]
-    WalletExportPrepare(crate::CustodySignerContribution),
+    WalletExportPrepare(crate::SignerPreparedCustody),
     #[serde(rename = "wallet.delete_prepare")]
-    WalletDeletePrepare(crate::CustodySignerContribution),
+    WalletDeletePrepare(crate::SignerPreparedCustody),
     #[serde(rename = "credential.list_public")]
     CredentialListPublic(Vec<CredentialPublic>),
     #[serde(rename = "credential.add_prepare")]
-    CredentialAddPrepare(crate::CustodySignerContribution),
+    CredentialAddPrepare(crate::SignerPreparedCustody),
     #[serde(rename = "credential.remove_prepare")]
-    CredentialRemovePrepare(crate::CustodySignerContribution),
+    CredentialRemovePrepare(crate::SignerPreparedCustody),
     #[serde(rename = "credential.replace_prepare")]
-    CredentialReplacePrepare(crate::CustodySignerContribution),
+    CredentialReplacePrepare(crate::SignerPreparedCustody),
     #[serde(rename = "recovery.prepare")]
-    RecoveryPrepare(crate::CustodySignerContribution),
+    RecoveryPrepare(crate::SignerPreparedCustody),
     #[serde(rename = "custody.complete")]
     CustodyComplete(CustodyResult),
+    #[serde(rename = "custody.bind_output_recipient")]
+    CustodyBindOutputRecipient(crate::SignerPreparedCustody),
     #[serde(rename = "custody.result")]
     CustodyResult(CustodyResult),
     #[serde(rename = "custody.status")]
@@ -669,9 +680,8 @@ impl crate::TypedRequestMethod for MachineBrokerRequest {
             Request::OperationStatus(request)
             | Request::OperationCancel(request)
             | Request::CustodyResult(request) => Some(request.operation_id.clone()),
-            Request::PolicyValidateUpdate(request) | Request::PolicyCommitUpdate(request) => {
-                Some(request.operation_id.clone())
-            }
+            Request::PolicyValidateUpdate(request) => Some(request.operation_id.clone()),
+            Request::PolicyCommitUpdate(request) => Some(request.operation_id.clone()),
             Request::WalletRegistrationPrepare(request)
             | Request::WalletUnlockPrepare(request)
             | Request::WalletImportPrepare(request)
@@ -692,8 +702,22 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
     fn operation_id(&self) -> Result<Option<OperationId>, ProtocolError> {
         use BrokerSignerRequest as Request;
         Ok(match self {
-            Request::CeremonyPrepare(request) => Some(request.activation_operation_id.clone()),
-            Request::CeremonyComplete(request) => Some(request.activation_operation_id.clone()),
+            Request::CeremonyPrepare(request) => Some(match request {
+                crate::SignerCeremonyPrepareRequest::SealedApproval(request) => {
+                    request.activation_operation_id.clone()
+                }
+                crate::SignerCeremonyPrepareRequest::PolicyUpdate(request) => {
+                    request.custody.custody_operation_id.clone()
+                }
+            }),
+            Request::CeremonyComplete(request) => Some(match request {
+                crate::SignerCeremonyCompleteRequest::SealedApproval(request) => {
+                    request.activation_operation_id.clone()
+                }
+                crate::SignerCeremonyCompleteRequest::PolicyUpdate(request) => {
+                    request.custody.custody_operation_id.clone()
+                }
+            }),
             Request::SealedApprovalRevoke(request) => Some(request.operation_id.clone()),
             Request::SealedApprovalRevokeAll(request) => Some(request.operation_id.clone()),
             Request::SignerSign(request) | Request::SignerSignBatch(request) => {
@@ -704,7 +728,7 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
             | Request::WalletRegistrationStatus(request)
             | Request::CustodyResult(request)
             | Request::CustodyStatus(request) => Some(request.operation_id.clone()),
-            Request::PolicyCompareAndSwap(request) => Some(request.operation_id.clone()),
+            Request::PolicyCompareAndSwap(request) => Some(request.update.operation_id.clone()),
             Request::KeyDerivePrepare(request)
             | Request::KeyEnrollPrepare(request)
             | Request::WalletRegistrationPrepare(request)
@@ -717,6 +741,7 @@ impl crate::TypedRequestMethod for BrokerSignerRequest {
             | Request::CredentialReplacePrepare(request)
             | Request::RecoveryPrepare(request) => Some(request.custody_operation_id.clone()),
             Request::CustodyComplete(request) => Some(request.custody_operation_id.clone()),
+            Request::CustodyBindOutputRecipient(request) => Some(request.operation_id.clone()),
             _ => None,
         })
     }
@@ -736,6 +761,6 @@ mod tests {
     #[test]
     fn typed_request_inventories_cover_every_normative_method() {
         assert_eq!(crate::MachineBrokerMethod::ALL.len(), 39);
-        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 37);
+        assert_eq!(crate::BrokerSignerMethod::ALL.len(), 38);
     }
 }

@@ -107,6 +107,18 @@ pub struct SignerCeremonyContribution {
     pub signer_signature: Base64UrlBytes,
 }
 
+/// Complete Signer-owned material needed for Broker to render and verify an
+/// approval ceremony. The signed contribution alone is insufficient because
+/// WebAuthn challenge bytes and credential options are also Signer-derived.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignerPreparedApproval {
+    pub contribution: SignerCeremonyContribution,
+    pub challenges: Vec<CeremonyChallenge>,
+    pub webauthn_options: CeremonyWebAuthnOptions,
+    pub verification_credentials: Vec<WebAuthnCredential>,
+}
+
 impl SignerCeremonyContribution {
     pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, crate::ProtocolError> {
         #[derive(Serialize)]
@@ -250,6 +262,43 @@ pub struct SignerActivationReceipt {
     pub signer_signature: Base64UrlBytes,
 }
 
+impl SignerActivationReceipt {
+    pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, crate::ProtocolError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            activation_operation_id: &'a OperationId,
+            ceremony_id: &'a Digest32,
+            approval_id: &'a Digest32,
+            approval_digest: &'a Digest32,
+            review_manifest_digest: &'a Digest32,
+            key_ref: &'a KeyRef,
+            allowed_crypto_suites: &'a [CryptoSuite],
+            activation_mode: ActivationMode,
+            wallet_revocation_epoch: &'a DecimalU64,
+            replaced_approval_id: &'a Option<Digest32>,
+            activated_at_ms: &'a DecimalU64,
+            expires_at_ms: &'a DecimalU64,
+            signer_key_id: &'a Token,
+        }
+        serde_jcs::to_vec(&Unsigned {
+            activation_operation_id: &self.activation_operation_id,
+            ceremony_id: &self.ceremony_id,
+            approval_id: &self.approval_id,
+            approval_digest: &self.approval_digest,
+            review_manifest_digest: &self.review_manifest_digest,
+            key_ref: &self.key_ref,
+            allowed_crypto_suites: &self.allowed_crypto_suites,
+            activation_mode: self.activation_mode.clone(),
+            wallet_revocation_epoch: &self.wallet_revocation_epoch,
+            replaced_approval_id: &self.replaced_approval_id,
+            activated_at_ms: &self.activated_at_ms,
+            expires_at_ms: &self.expires_at_ms,
+            signer_key_id: &self.signer_key_id,
+        })
+        .map_err(canonical_error)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SealedApprovalPrepareResponse {
@@ -319,6 +368,59 @@ pub struct CustodySignerContribution {
     pub expires_at_ms: DecimalU64,
     pub signer_key_id: Token,
     pub signer_signature: Base64UrlBytes,
+}
+
+/// Complete Signer-owned material needed for Broker to render and verify a
+/// custody ceremony.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignerPreparedCustody {
+    pub contribution: CustodySignerContribution,
+    pub challenges: Vec<CeremonyChallenge>,
+    pub webauthn_options: CeremonyWebAuthnOptions,
+    pub verification_credentials: Vec<WebAuthnCredential>,
+}
+
+/// Restart-safe Broker-facing ceremony status. Terminal receipts are returned
+/// verbatim so Broker can reconcile without replaying a browser proof.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", content = "result", rename_all = "snake_case")]
+pub enum SignerCeremonyStatus {
+    Pending,
+    CompletedApproval(Box<SignerActivationReceipt>),
+    CompletedCustody(Box<CustodyResult>),
+    Missing,
+}
+
+/// The generic `ceremony.prepare` body. Policy update is the sole custody kind
+/// whose semantic review is originated by Broker and therefore shares this
+/// method with sealed-approval preparation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "ceremony_kind", content = "request", rename_all = "snake_case")]
+pub enum SignerCeremonyPrepareRequest {
+    SealedApproval(Box<CeremonyPrepareRequest>),
+    PolicyUpdate(Box<crate::PolicyUpdateCeremonyPrepareRequest>),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "ceremony_kind", content = "prepared", rename_all = "snake_case")]
+pub enum SignerCeremonyPrepareResponse {
+    SealedApproval(SignerPreparedApproval),
+    PolicyUpdate(SignerPreparedCustody),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "ceremony_kind", content = "request", rename_all = "snake_case")]
+pub enum SignerCeremonyCompleteRequest {
+    SealedApproval(Box<CeremonyCompleteRequest>),
+    PolicyUpdate(Box<crate::PolicyUpdateCeremonyCompleteRequest>),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "ceremony_kind", content = "result", rename_all = "snake_case")]
+pub enum SignerCeremonyCompleteResponse {
+    SealedApproval(Box<SignerActivationReceipt>),
+    PolicyUpdate(Box<CustodyResult>),
 }
 
 impl CustodySignerContribution {
@@ -506,6 +608,7 @@ pub struct CustodyResult {
     pub wallet_id: Option<Token>,
     pub public_key_refs: Vec<KeyRef>,
     pub credential_summaries: Vec<CredentialSummary>,
+    pub initial_policy: Option<crate::SignedPolicySnapshot>,
     pub receipt_digest: Digest32,
     pub encrypted_browser_result: Option<HpkeEnvelope>,
     pub signer_key_id: Token,
@@ -530,6 +633,7 @@ impl CustodyResult {
             wallet_id: &'a Option<Token>,
             public_key_refs: &'a [KeyRef],
             credential_summaries: &'a [CredentialSummary],
+            initial_policy: &'a Option<crate::SignedPolicySnapshot>,
             receipt_digest: &'a Digest32,
             encrypted_browser_result: &'a Option<HpkeEnvelope>,
             signer_key_id: &'a Token,
@@ -541,6 +645,7 @@ impl CustodyResult {
             wallet_id: &self.wallet_id,
             public_key_refs: &self.public_key_refs,
             credential_summaries: &self.credential_summaries,
+            initial_policy: &self.initial_policy,
             receipt_digest: &self.receipt_digest,
             encrypted_browser_result: &self.encrypted_browser_result,
             signer_key_id: &self.signer_key_id,

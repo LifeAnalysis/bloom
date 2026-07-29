@@ -41,3 +41,12 @@ pub struct RevocationState {
     pub key_id: Token,
     pub signature: Base64UrlBytes,
 }
+
+/// Signed revocation summary plus the exact append-only approval tombstone
+/// union whose count and digest the summary authenticates.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationSnapshot {
+    pub state: RevocationState,
+    pub approval_tombstones: Vec<ApprovalTombstone>,
+}

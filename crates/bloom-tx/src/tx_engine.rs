@@ -12,9 +12,9 @@ use alloy::eips::eip2930::AccessList;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, B256, Bytes, Signature, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
-#[cfg(feature = "unsafe-debug-signer")]
+#[cfg(all(test, feature = "unsafe-debug-signer"))]
 use alloy::signers::SignerSync;
-#[cfg(any(test, feature = "unsafe-debug-signer"))]
+#[cfg(feature = "unsafe-debug-signer")]
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;

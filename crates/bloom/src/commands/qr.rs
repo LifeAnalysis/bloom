@@ -23,12 +23,3 @@ pub fn render_qr_svg(data: &str) -> Option<String> {
             .build(),
     )
 }
-
-/// Print the deposit QR + plain address block for a single address.
-pub fn print_deposit(address: &str) {
-    println!("deposit address (same EOA on every EVM chain; send only on supported chains):");
-    if let Some(qr) = render_qr(address) {
-        println!("\n{qr}");
-    }
-    println!("  {address}\n");
-}

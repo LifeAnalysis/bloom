@@ -647,7 +647,7 @@ impl RequestsHandler {
         #[cfg(not(test))]
         {
             let _ = (wallet, action_id);
-            return Arc::new(UnwiredPaidHttpHostSigner);
+            Arc::new(UnwiredPaidHttpHostSigner)
         }
         #[cfg(test)]
         match self.auth_services.petal_host() {
@@ -4155,7 +4155,11 @@ mod tests {
             .sign_paid_http_hash("x402.sign", [0u8; 32], &facts)
             .await
             .unwrap_err();
-        assert!(err.contains("requires a wired PetalHost"), "{err}");
+        assert!(
+            err.contains("UNSUPPORTED_VERSION")
+                && err.contains("payload-bearing Machine-to-Broker"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

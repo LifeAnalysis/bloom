@@ -125,6 +125,7 @@ method_enum!(BrokerSignerMethod {
     CredentialRemovePrepare => "credential.remove_prepare",
     CredentialReplacePrepare => "credential.replace_prepare",
     RecoveryPrepare => "recovery.prepare",
+    CustodyBindOutputRecipient => "custody.bind_output_recipient",
     CustodyComplete => "custody.complete",
     CustodyResult => "custody.result",
     CustodyStatus => "custody.status",

@@ -5,9 +5,10 @@
 
 #![forbid(unsafe_code)]
 
-pub mod ceremony_server;
 pub mod ipc;
+#[cfg(test)]
 pub mod registration;
+#[cfg(test)]
 pub mod sealed_ceremony;
 #[cfg(test)]
 pub mod sign_hash;
@@ -21,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
-#[cfg(feature = "unsafe-debug-signer")]
+#[cfg(all(test, feature = "unsafe-debug-signer"))]
 use alloy::signers::SignerSync;
 #[cfg(feature = "unsafe-debug-signer")]
 use alloy::signers::local::PrivateKeySigner;
@@ -335,7 +336,7 @@ impl DaemonPetalHost {
         self
     }
 
-    #[cfg(feature = "unsafe-debug-signer")]
+    #[cfg(all(test, feature = "unsafe-debug-signer"))]
     fn unsafe_debug_signer(&self, wallet: &str) -> Option<&Arc<PrivateKeySigner>> {
         self.unsafe_debug_signer
             .as_ref()
@@ -2150,19 +2151,10 @@ impl Daemon {
                 tx_engine.with_host_signing_services(grant_store.clone(), petal_host.clone());
         }
 
-        // Wallet registration coordinator: always constructed (so every
-        // VFS/IPC caller sees the same instance), but stays unarmed until
-        // `ceremony_server::spawn` marks the shared loopback listener bound.
-        // Restart reconciliation deliberately does NOT run here: this
-        // constructor runs for every `Daemon`, including one-shot read-only
-        // CLI commands (`wallet list`, `status`, ...) invoked alongside a
-        // live `bloom serve`. Running reconciliation unconditionally would
-        // let such a command mark a still-live `bloom serve` registration
-        // session `failed` in the shared store purely because this second
-        // process has no in-memory session of its own to compare against.
-        // `ceremony_server::spawn` runs it instead, gated on this process
-        // having just proven exclusive listener ownership via a successful
-        // bind.
+        // The legacy Machine-owned registration coordinator remains available
+        // only to unit tests while its fixtures are migrated. Production
+        // registration is prepared through Broker and the Machine never owns
+        // the ceremony listener.
         #[cfg(test)]
         let registration_coordinator: Arc<
             dyn bloom_auth_api::WalletRegistrationCoordinator,

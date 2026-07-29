@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
@@ -30,13 +29,6 @@ use zeroize::Zeroize;
 const SESSION_TTL_MS: u64 = 5 * 60 * 1000;
 const RECOVERY_ACK_TTL_MS: u64 = 5 * 60 * 1000;
 const MAX_ATTEMPTS: usize = 5;
-
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 fn gen_token() -> String {
     let mut t = [0u8; 32];

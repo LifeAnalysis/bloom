@@ -64,13 +64,12 @@ summary = "Demo app used by CLI tests."
     );
 }
 
-/// Write `passphrase` to a file under `home` and return its path string. Used
-/// to feed `--passphrase-file` for non-interactive passphrase-wallet creation
-/// (the only way to create a local wallet without a tty — passkey is default).
-fn write_passphrase_file(home: &Path, passphrase: &str) -> String {
-    let path = home.join(".passphrase");
-    std::fs::write(&path, passphrase).expect("write passphrase file");
-    path.to_string_lossy().into_owned()
+/// Seed a pre-migration wallet solely as a read/staging fixture. Production
+/// CLI custody commands must never call these keystore creation methods.
+fn seed_legacy_wallet_fixture(home: &Path, name: &str) -> String {
+    let keystore = bloom_keystore::Keystore::new(home.join("keystore")).unwrap();
+    let info = keystore.create_local(name, "test-only-passphrase").unwrap();
+    bloom_proto::checksum_address(&info.address)
 }
 
 #[derive(Default)]
@@ -265,18 +264,14 @@ fn init_respects_persistent_preinstalled_petal_opt_out_without_network() {
 }
 
 #[test]
-fn vfs_write_help_lists_unlock_flags() {
+fn vfs_write_help_exposes_no_unlock_or_secret_flags() {
     let home = fresh_home();
     bloom_cmd(home.path())
         .args(["vfs", "write", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--unlock-wallet"))
-        .stdout(predicate::str::contains("--passphrase"))
-        // The dual-runtime guidance an agent needs: in-process daemon (bypasses
-        // IPC) and the foreground requirement for the passkey ceremony.
-        .stdout(predicate::str::contains("in-process"))
-        .stdout(predicate::str::contains("FOREGROUND"));
+        .stdout(predicate::str::contains("--unlock-wallet").not())
+        .stdout(predicate::str::contains("--passphrase").not());
 }
 
 #[test]
@@ -781,205 +776,65 @@ fn wallet_stage_without_daemon_uses_in_process_parser() {
 }
 
 #[test]
-fn wallet_new_then_list_round_trip() {
+fn wallet_list_reads_a_pre_migration_public_projection_without_broker() {
     let home = fresh_home();
-    let pass_file = write_passphrase_file(home.path(), "smoke-test-pass");
-    let create = bloom_cmd(home.path())
-        .args([
-            "wallet",
-            "new",
-            "alice",
-            "--local",
-            "--allow-passphrase-wallet",
-            "--passphrase-file",
-            &pass_file,
-        ])
-        .assert()
-        .success();
-    let create_out = String::from_utf8(create.get_output().stdout.clone()).unwrap();
-    assert!(
-        create_out.contains("created wallet 'alice'"),
-        "unexpected create output: {create_out}"
-    );
-    assert!(
-        create_out.contains("default_wallet: alice"),
-        "first wallet creation should announce default wallet selection: {create_out}"
-    );
-    let config = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
-    assert!(
-        config.contains("default_wallet = \"alice\""),
-        "config should persist default wallet, got:\n{config}"
-    );
-    // Address line is `created wallet 'alice': 0x...` — capture and reuse
-    // the address to assert the listing matches what was just minted.
-    let addr = create_out
-        .split_whitespace()
-        .find(|tok| tok.starts_with("0x") && tok.len() == 42)
-        .expect("create output should contain a 0x-prefixed address");
-
+    let address = seed_legacy_wallet_fixture(home.path(), "alice");
     let list = bloom_cmd(home.path())
         .args(["wallet", "list"])
         .assert()
         .success();
-    let list_out = String::from_utf8(list.get_output().stdout.clone()).unwrap();
+    let output = String::from_utf8(list.get_output().stdout.clone()).unwrap();
     assert!(
-        list_out.lines().any(|l| {
-            let mut parts = l.split('\t');
-            parts.next() == Some("alice")
-                && parts.next() == Some(addr)
-                && parts.next() == Some("local")
-        }),
-        "wallet list missing freshly-created entry; got:\n{list_out}"
+        output
+            .lines()
+            .any(|line| line == format!("alice\t{address}\tlocal")),
+        "wallet list missing fixture projection: {output}"
     );
 }
 
 #[test]
-fn wallet_new_local_via_passphrase_file() {
-    // BLOOM_PASSPHRASE no longer creates wallets — passkey is the default, and
-    // passphrase-wallet creation must be explicit: --local +
-    // --allow-passphrase-wallet + --passphrase-file (non-interactive).
+fn wallet_new_requires_broker_and_never_creates_machine_key_material() {
     let home = fresh_home();
-    let pass_file = write_passphrase_file(home.path(), "env-pass-1");
     bloom_cmd(home.path())
-        .args([
-            "wallet",
-            "new",
-            "bob",
-            "--local",
-            "--allow-passphrase-wallet",
-            "--passphrase-file",
-            &pass_file,
-        ])
+        .args(["wallet", "new", "alice"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("created wallet 'bob'"));
-    let bob_dir = home.path().join("keystore").join("bob");
-    assert!(
-        bob_dir.join("address").exists(),
-        "expected keystore/bob/address to be written"
-    );
-    assert!(
-        bob_dir.join("encrypted.key").exists(),
-        "expected keystore/bob/encrypted.key to be written"
-    );
-    assert!(
-        bob_dir.join("RECOVERY.txt").exists(),
-        "passphrase wallets must write a RECOVERY.txt"
-    );
+        .failure()
+        .stderr(predicate::str::contains(
+            "custody requires the authenticated Machine-to-Broker edge",
+        ));
+    assert!(!home.path().join("keystore").join("alice").exists());
 }
 
-/// Creating a passphrase wallet non-interactively WITHOUT --allow-passphrase-wallet
-/// must fail closed — this is the gate that stops an agent from silently minting
-/// a passphrase wallet. (assert_cmd stdin is not a tty.)
 #[test]
-fn wallet_new_local_refused_without_ack_when_noninteractive() {
+fn wallet_import_accepts_no_machine_private_key_argument() {
     let home = fresh_home();
-    let pass_file = write_passphrase_file(home.path(), "pw");
-    let assert = bloom_cmd(home.path())
-        .args([
-            "wallet",
-            "new",
-            "sneaky",
-            "--local",
-            "--passphrase-file",
-            &pass_file,
-        ])
-        .assert()
-        .failure();
-    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
-    assert!(
-        err.contains("--allow-passphrase-wallet"),
-        "error should demand the ack flag, got: {err}"
-    );
-    // Nothing was created.
-    assert!(
-        !home.path().join("keystore").join("sneaky").exists(),
-        "no wallet directory should exist after a refused creation"
-    );
-}
-
-/// A successful wallet creation appends a first-class `wallet.created` audit
-/// record — the CLI path does not flow through the VFS router, so without this
-/// event a CLI-created wallet leaves no trail (the original eth-long-1 bug).
-#[test]
-fn wallet_created_audit_event() {
-    let home = fresh_home();
-    let pass_file = write_passphrase_file(home.path(), "audit-pass");
     bloom_cmd(home.path())
-        .args([
-            "wallet",
-            "new",
-            "audited",
-            "--local",
-            "--allow-passphrase-wallet",
-            "--passphrase-file",
-            &pass_file,
-        ])
+        .args(["wallet", "import", "alice", "deadbeef"])
         .assert()
-        .success();
-    let audit = std::fs::read_to_string(home.path().join("audit.jsonl")).unwrap();
-    assert!(
-        audit.contains("\"kind\":\"wallet.created\"") && audit.contains("audited"),
-        "audit log should contain a wallet.created event for 'audited', got:\n{audit}"
-    );
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument 'deadbeef'"));
+    assert!(!home.path().join("keystore").join("alice").exists());
 }
 
-/// `wallet import <name> <key>` (passkey, the default — no `--local`) must
-/// reject a malformed name *before* it can reach `prepare_passkey_wallet`'s
-/// `root.join(temp_id)`/`finalize_passkey_wallet`'s `root.join(&name)`. This
-/// used to rely on `keystore.info_unverified(&name).is_ok()` as an
-/// "already exists" check, but `info_unverified` validates the name first —
-/// so an invalid name also returns `Err`, indistinguishable under `.is_ok()`
-/// from "not found," and the name flowed straight through to the
-/// filesystem-path joins below. Every name here must be rejected before any
-/// WebAuthn ceremony would launch (this test would hang on a browser
-/// otherwise), and none may leave a trace on disk.
 #[test]
-fn wallet_import_passkey_rejects_path_traversal_names() {
+fn wallet_import_rejects_path_names_before_broker_contact() {
     let home = fresh_home();
     for name in ["../escape", "../../escape", "a/b", "..", "/etc/passwd"] {
-        let assert = bloom_cmd(home.path())
-            .args(["wallet", "import", name, "deadbeef"])
+        bloom_cmd(home.path())
+            .args(["wallet", "import", name])
             .assert()
-            .failure();
-        let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
-        assert!(
-            err.contains("invalid wallet name"),
-            "name={name:?} expected invalid-name error, got: {err}"
-        );
+            .failure()
+            .stderr(predicate::str::contains(
+                "requested wallet name must be a safe single path segment",
+            ));
     }
-    assert!(
-        !home.path().join("keystore").join("escape").exists(),
-        "traversal name must not create a wallet dir"
-    );
-    assert!(
-        !home
-            .path()
-            .join("keystore")
-            .parent()
-            .unwrap()
-            .join("escape")
-            .exists(),
-        "traversal name must not escape the keystore root"
-    );
+    assert!(!home.path().join("keystore").join("escape").exists());
 }
 
 #[test]
 fn request_cli_dry_run_uses_vfs_lifecycle_and_body_receipt_helpers() {
     let home = fresh_home();
-    let pass_file = write_passphrase_file(home.path(), "pw");
-    bloom_cmd(home.path())
-        .args([
-            "wallet",
-            "new",
-            "alice",
-            "--local",
-            "--allow-passphrase-wallet",
-            "--passphrase-file",
-            &pass_file,
-        ])
-        .assert()
-        .success();
+    seed_legacy_wallet_fixture(home.path(), "alice");
 
     let (url, hits) = http_fixture(200, &[("content-type", "text/plain")], b"cli-body\n");
     let new = bloom_cmd(home.path())
@@ -1041,19 +896,7 @@ fn status_on_empty_keystore_points_to_wallet_creation() {
 #[test]
 fn wallet_address_with_and_without_qr() {
     let home = fresh_home();
-    let pass_file = write_passphrase_file(home.path(), "addr-smoke-pass");
-    bloom_cmd(home.path())
-        .args([
-            "wallet",
-            "new",
-            "alice",
-            "--local",
-            "--allow-passphrase-wallet",
-            "--passphrase-file",
-            &pass_file,
-        ])
-        .assert()
-        .success();
+    seed_legacy_wallet_fixture(home.path(), "alice");
 
     let plain = bloom_cmd(home.path())
         .args(["wallet", "address", "alice"])
@@ -1086,19 +929,7 @@ fn wallet_address_with_and_without_qr() {
 #[test]
 fn wallet_address_qr_out_writes_svg() {
     let home = fresh_home();
-    let pass_file = write_passphrase_file(home.path(), "qr-out-pass");
-    bloom_cmd(home.path())
-        .args([
-            "wallet",
-            "new",
-            "alice",
-            "--local",
-            "--allow-passphrase-wallet",
-            "--passphrase-file",
-            &pass_file,
-        ])
-        .assert()
-        .success();
+    seed_legacy_wallet_fixture(home.path(), "alice");
     let svg_path = home.path().join("deposit.svg");
     let out = bloom_cmd(home.path())
         .args([
@@ -1349,8 +1180,10 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
 }
 
 #[test]
-#[ignore = "clones and builds the public Polymarket Petal source repo"]
 fn github_source_install_polymarket_dispatches_route_contract() {
+    if std::env::var_os("BLOOM_RUN_NETWORK_TESTS").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
     let petal_ref = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
