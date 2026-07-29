@@ -54,3 +54,27 @@ This log records fail-closed implementation choices where
   reconciliation.
 - W0 packaging remains an explicit parallel release gate; no W2/W3 service
   code claims that host-level isolation has already passed.
+
+## W4 Broker seam
+
+- Broker commit `0bf0e81` consumes Machine protocol commit `f30340c` and
+  Signer seam commit `2fe667a`.
+- Canonical approval metadata and lifecycle activation share the Broker
+  journal transaction. Authorization and revocation reconciliation additionally
+  share one in-process linearization barrier; the reservation transaction
+  independently requires the canonical approval to be exactly `ACTIVE`.
+- Installer-signed provenance is required for Petal, CLI, and System subjects
+  at prepare and on every use. Runtime provenance must equal the frozen record.
+- Petal value accounting aggregates duplicate debit and fee lines with checked
+  unsigned 256-bit arithmetic. Native fees consume the same atomic asset
+  ledger while retaining a distinct fee-exhaustion status.
+- Assurance implementations are compile-time registry entries pinned by
+  artifact digest. A proof or attestation can satisfy required assurance only
+  when its reviewed contract explicitly establishes every selector and
+  accounting field used for that decision.
+- Signer approval-tombstone unions are independently signature-checked,
+  digest/count checked, monotonically persisted, and enforced even if journal
+  state application is interrupted. Wallet epoch divergence blocks prepare
+  and activation until reconciliation converges.
+- The W4 review gate passed with 12 W2 journal tests and 7 W4 authority tests,
+  all-feature workspace tests, and Clippy with warnings denied.
