@@ -38,6 +38,18 @@ struct SignOperationVector {
     attempt_digest: Digest32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CeremonyVector {
+    name: String,
+    challenge: CeremonyChallenge,
+    challenge_canonical_jcs: String,
+    challenge_base64url: Base64UrlBytes,
+    challenge_digest: Digest32,
+    local_prf_aad: LocalPrfHpkeAad,
+    local_prf_aad_canonical_jcs: String,
+}
+
 #[test]
 fn keyref_jcs_and_exact_equality_match_reviewed_artifact() {
     let vector: KeyRefVector =
@@ -211,6 +223,26 @@ fn operation_and_attempt_digests_match_reviewed_artifact() {
     assert_eq!(
         vector.unsigned_request.computed_attempt_digest().unwrap(),
         vector.attempt_digest
+    );
+}
+
+#[test]
+fn ceremony_challenge_and_hpke_aad_match_reviewed_artifact() {
+    let vector: CeremonyVector =
+        serde_json::from_str(include_str!("../vectors/ceremony-local-prf-v1.json")).unwrap();
+    assert_eq!(vector.name, "sealed-approval-local-prf-v1");
+    assert_eq!(
+        String::from_utf8(vector.challenge.canonical_bytes().unwrap()).unwrap(),
+        vector.challenge_canonical_jcs
+    );
+    assert_eq!(
+        vector.challenge.webauthn_challenge().unwrap(),
+        vector.challenge_base64url
+    );
+    assert_eq!(vector.challenge.digest().unwrap(), vector.challenge_digest);
+    assert_eq!(
+        String::from_utf8(vector.local_prf_aad.canonical_bytes().unwrap()).unwrap(),
+        vector.local_prf_aad_canonical_jcs
     );
 }
 

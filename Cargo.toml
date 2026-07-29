@@ -94,6 +94,8 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # Echo-free passphrase entry for interactive wallet creation.
 rpassword = "7"
 serde_jcs = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+ciborium = "0.2"
 
 # Ethereum stack
 alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract", "transport-throttle", "json-rpc"] }

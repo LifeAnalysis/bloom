@@ -17,6 +17,7 @@ mod policy;
 mod revocation;
 mod service;
 mod signing;
+mod webauthn;
 
 pub use approval::*;
 pub use ceremony::*;
@@ -31,6 +32,7 @@ pub use policy::*;
 pub use revocation::*;
 pub use service::*;
 pub use signing::*;
+pub use webauthn::*;
 
 /// Protocol compatibility contract frozen by W1.
 pub const PROTOCOL_MAJOR: u16 = 1;
