@@ -22,6 +22,28 @@ pub enum CeremonyKind {
     PolicyUpdate,
 }
 
+impl CeremonyKind {
+    /// Normative successful terminal state from §13.6. Registration completes
+    /// only after its recovery-output acknowledgement; every other custody
+    /// workflow uses the generic/credential `SUCCEEDED` terminal.
+    pub const fn successful_terminal_state(self) -> Option<crate::CeremonyState> {
+        match self {
+            Self::SealedApproval => None,
+            Self::WalletRegistration => Some(crate::CeremonyState::Completed),
+            Self::WalletImport
+            | Self::WalletExport
+            | Self::WalletDelete
+            | Self::WalletRecovery
+            | Self::CredentialAdd
+            | Self::CredentialReplace
+            | Self::CredentialRemove
+            | Self::BackendEnrollment
+            | Self::KeyDerive
+            | Self::PolicyUpdate => Some(crate::CeremonyState::Succeeded),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewManifest {
@@ -661,4 +683,40 @@ fn digest_canonical(bytes: Vec<u8>) -> Result<Digest32, crate::ProtocolError> {
 
 fn canonical_error(error: impl std::fmt::Display) -> crate::ProtocolError {
     crate::ProtocolError::new(crate::ProtocolErrorCode::MalformedFrame, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CeremonyState;
+
+    #[test]
+    fn custody_success_states_match_section_13_6() {
+        assert_eq!(
+            CeremonyKind::WalletRegistration.successful_terminal_state(),
+            Some(CeremonyState::Completed)
+        );
+        for kind in [
+            CeremonyKind::WalletImport,
+            CeremonyKind::WalletExport,
+            CeremonyKind::WalletDelete,
+            CeremonyKind::WalletRecovery,
+            CeremonyKind::CredentialAdd,
+            CeremonyKind::CredentialReplace,
+            CeremonyKind::CredentialRemove,
+            CeremonyKind::BackendEnrollment,
+            CeremonyKind::KeyDerive,
+            CeremonyKind::PolicyUpdate,
+        ] {
+            assert_eq!(
+                kind.successful_terminal_state(),
+                Some(CeremonyState::Succeeded),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            CeremonyKind::SealedApproval.successful_terminal_state(),
+            None
+        );
+    }
 }

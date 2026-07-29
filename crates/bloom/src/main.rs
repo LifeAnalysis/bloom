@@ -393,7 +393,7 @@ fn is_completed_policy_update_receipt(
 ) -> bool {
     receipt.custody_operation_id == *operation_id
         && receipt.ceremony_kind == bloom_triad_protocol::CeremonyKind::PolicyUpdate
-        && receipt.public_status == bloom_triad_protocol::CeremonyState::Completed
+        && receipt.public_status == bloom_triad_protocol::CeremonyState::Succeeded
 }
 
 fn current_unix_ms() -> u64 {
@@ -3020,7 +3020,7 @@ mod tests {
         let mut receipt = bloom_triad_protocol::CustodyResult {
             ceremony_kind: bloom_triad_protocol::CeremonyKind::PolicyUpdate,
             custody_operation_id: operation_id.clone(),
-            public_status: bloom_triad_protocol::CeremonyState::Completed,
+            public_status: bloom_triad_protocol::CeremonyState::Succeeded,
             wallet_id: Some(bloom_triad_protocol::Token::new("wallet").unwrap()),
             public_key_refs: Vec::new(),
             credential_summaries: Vec::new(),
@@ -3032,9 +3032,9 @@ mod tests {
         };
         assert!(is_completed_policy_update_receipt(&receipt, &operation_id));
 
-        receipt.public_status = bloom_triad_protocol::CeremonyState::Succeeded;
-        assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
         receipt.public_status = bloom_triad_protocol::CeremonyState::Completed;
+        assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
+        receipt.public_status = bloom_triad_protocol::CeremonyState::Succeeded;
         receipt.ceremony_kind = bloom_triad_protocol::CeremonyKind::WalletDelete;
         assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
     }

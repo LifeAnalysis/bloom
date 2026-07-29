@@ -372,7 +372,7 @@ fn read_policy_file(path: &Path) -> Result<Vec<u8>> {
 fn is_completed_policy_update_receipt(receipt: &CustodyResult, operation_id: &OperationId) -> bool {
     receipt.custody_operation_id == *operation_id
         && receipt.ceremony_kind == CeremonyKind::PolicyUpdate
-        && receipt.public_status == CeremonyState::Completed
+        && receipt.public_status == CeremonyState::Succeeded
 }
 
 fn print_public_custody_result(result: &CustodyResult) -> Result<()> {
@@ -647,7 +647,7 @@ mod tests {
         CustodyResult {
             ceremony_kind: CeremonyKind::PolicyUpdate,
             custody_operation_id: operation_id,
-            public_status: CeremonyState::Completed,
+            public_status: CeremonyState::Succeeded,
             wallet_id: Some(Token::new("wallet").unwrap()),
             public_key_refs: Vec::new(),
             credential_summaries: Vec::new(),
@@ -691,7 +691,7 @@ mod tests {
         let operation_id = OperationId::from_bytes([41; 32]);
         let mut receipt = completed_receipt(operation_id.clone());
         assert!(is_completed_policy_update_receipt(&receipt, &operation_id));
-        receipt.public_status = CeremonyState::Succeeded;
+        receipt.public_status = CeremonyState::Completed;
         assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
     }
 
@@ -729,7 +729,7 @@ mod tests {
         terminal
             .reconcile_custody(
                 &bloom_triad_protocol::CeremonyPublicStatus {
-                    state: CeremonyState::Completed,
+                    state: CeremonyState::Succeeded,
                     ceremony_url: None,
                     receipt_digest: Some(Digest32::from_bytes([46; 32])),
                     ..status
@@ -773,7 +773,7 @@ mod tests {
         assert_eq!(
             terminal.state(),
             Some(bloom_machine_client::CeremonyProjectionState::Custody(
-                CeremonyState::Completed
+                CeremonyState::Succeeded
             ))
         );
         assert_eq!(terminal.receipt_digest(), Some(&result.receipt_digest));
