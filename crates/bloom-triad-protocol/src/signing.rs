@@ -98,6 +98,7 @@ impl SignRequest {
         if self.unsigned.schema.as_str() != "bloom.sign-request/1"
             || self.unsigned.audience.as_str() != "bloom-signer"
             || self.unsigned.expires_at_ms.get() <= self.unsigned.not_before_ms.get()
+            || self.unsigned.issued_at_ms.get() > self.unsigned.expires_at_ms.get()
             || self
                 .unsigned
                 .expires_at_ms

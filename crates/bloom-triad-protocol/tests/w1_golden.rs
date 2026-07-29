@@ -254,3 +254,21 @@ fn operation_identity_excludes_attempt_only_fields() {
     changed.policy_version = DecimalU64::new(8);
     assert_ne!(changed.digest().unwrap(), baseline_operation);
 }
+
+#[test]
+fn sign_request_rejects_issue_time_after_expiry() {
+    let vector: SignOperationVector =
+        serde_json::from_str(include_str!("../vectors/sign-operation-local-v1.json")).unwrap();
+    let mut unsigned = vector.unsigned_request;
+    unsigned.issued_at_ms = DecimalU64::new(unsigned.expires_at_ms.get() + 1);
+    unsigned.attempt_digest = Digest32::new("00".repeat(32)).unwrap();
+    unsigned.attempt_digest = unsigned.computed_attempt_digest().unwrap();
+    let request = SignRequest {
+        unsigned,
+        broker_signature: Base64UrlBytes::from_bytes(&[0; 64]),
+    };
+    assert_eq!(
+        request.validate_shape().unwrap_err().code,
+        ProtocolErrorCode::MalformedFrame
+    );
+}
