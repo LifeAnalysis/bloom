@@ -136,7 +136,18 @@ fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {
     let broker_socket = std::env::var_os("BLOOM_BROKER_SOCKET")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("/var/run/bloom/broker.sock"));
-    let broker = bloom_machine_client::MachineBrokerClient::connect_unix(broker_socket);
+    let machine_identity = std::env::var_os("BLOOM_MACHINE_IDENTITY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/run/bloom/machine-identity.json"));
+    let edge_manifest = std::env::var_os("BLOOM_EDGE_MANIFEST")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/etc/bloom/edge-manifest.json"));
+    let broker = bloom_machine_client::MachineBrokerClient::connect_unix_from_files(
+        broker_socket,
+        machine_identity,
+        edge_manifest,
+    )
+    .context("load authenticated Machine-to-Broker edge")?;
     let daemon = Daemon::from_home_with_permit_and_broker(home, permit.clone(), broker)
         .context("build daemon")?;
     Ok((permit, daemon))

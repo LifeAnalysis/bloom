@@ -6,8 +6,12 @@
 
 #![forbid(unsafe_code)]
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use bloom_triad_protocol::{
     ApprovalLifecycleState, ApprovalPrepareRequest, ApprovalPublicStatus, Base64UrlBytes,
     CeremonyPublicStatus, CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest,
@@ -20,22 +24,22 @@ use bloom_triad_protocol::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-const FRAME_MAX_BYTES: usize = 1024 * 1024;
 
 /// Production Machine→Broker connector. It carries only the public typed
-/// protocol over a bounded Unix socket frame; peer/application envelope
-/// authentication is layered by the W8 process transport.
-#[derive(Clone, Debug)]
+/// protocol over mutually authenticated, signed, bounded Unix socket frames.
+#[derive(Clone)]
 pub struct UnixMachineBrokerService {
     socket_path: PathBuf,
+    identity: LocalIdentity,
+    broker: PeerAcl,
 }
 
 impl UnixMachineBrokerService {
-    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+    pub fn new(socket_path: impl Into<PathBuf>, identity: LocalIdentity, broker: PeerAcl) -> Self {
         Self {
             socket_path: socket_path.into(),
+            identity,
+            broker,
         }
     }
 }
@@ -49,39 +53,14 @@ impl MachineBrokerService for UnixMachineBrokerService {
             let mut stream = tokio::net::UnixStream::connect(&self.socket_path)
                 .await
                 .map_err(|error| service_unavailable(format!("connect Broker: {error}")))?;
-            let frame = bloom_triad_protocol::encode_frame(&request)?;
-            stream
-                .write_all(&frame)
-                .await
-                .map_err(|error| service_unavailable(format!("write Broker request: {error}")))?;
-            stream
-                .shutdown()
-                .await
-                .map_err(|error| service_unavailable(format!("finish Broker request: {error}")))?;
-
-            let mut prefix = [0_u8; 4];
-            stream
-                .read_exact(&mut prefix)
-                .await
-                .map_err(|error| service_unavailable(format!("read Broker response: {error}")))?;
-            let length = u32::from_be_bytes(prefix) as usize;
-            if length > FRAME_MAX_BYTES {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::LimitExceededFrame,
-                    "Broker response frame exceeds 1 MiB",
-                ));
-            }
-            let mut payload = vec![0_u8; length];
-            stream
-                .read_exact(&mut payload)
-                .await
-                .map_err(|error| service_unavailable(format!("read Broker response: {error}")))?;
-            let mut response_frame = Vec::with_capacity(length + 4);
-            response_frame.extend_from_slice(&prefix);
-            response_frame.extend_from_slice(&payload);
-            bloom_triad_protocol::decode_frame::<Result<MachineBrokerResponse, ProtocolError>>(
-                &response_frame,
-            )?
+            bloom_triad_local_transport::call(
+                &mut stream,
+                &self.identity,
+                &self.broker,
+                request,
+                30_000,
+            )
+            .await
         })
     }
 }
@@ -96,8 +75,51 @@ impl MachineBrokerClient {
         Self { service }
     }
 
-    pub fn connect_unix(socket_path: impl Into<PathBuf>) -> Self {
-        Self::new(Arc::new(UnixMachineBrokerService::new(socket_path)))
+    pub fn connect_unix(
+        socket_path: impl Into<PathBuf>,
+        identity: LocalIdentity,
+        broker: PeerAcl,
+    ) -> Self {
+        Self::new(Arc::new(UnixMachineBrokerService::new(
+            socket_path,
+            identity,
+            broker,
+        )))
+    }
+
+    /// Loads the Machine application identity and the root-owned edge manifest
+    /// without permitting an unauthenticated transport fallback.
+    pub fn connect_unix_from_files(
+        socket_path: impl Into<PathBuf>,
+        identity_path: impl AsRef<Path>,
+        edge_manifest_path: impl AsRef<Path>,
+    ) -> Result<Self, ProtocolError> {
+        let identity_path = identity_path.as_ref();
+        let manifest_path = edge_manifest_path.as_ref();
+        let (identity, manifest) = bloom_triad_local_transport::load_identity_and_manifest(
+            identity_path,
+            manifest_path,
+            "bloom-machine",
+        )?;
+        let machine = manifest.machine.into_acl()?;
+        let broker = manifest.broker.into_acl()?;
+        if machine.service_id != identity.service_id
+            || machine.boot_epoch != identity.boot_epoch
+            || machine.application_key_id != identity.application_key_id
+            || machine.application_public_key != identity.signing_key.verifying_key().to_bytes()
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "Machine identity does not match the pinned edge manifest",
+            ));
+        }
+        if broker.service_id.as_str() != "bloom-broker" {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "edge manifest Broker service ID is invalid",
+            ));
+        }
+        Ok(Self::connect_unix(socket_path, identity, broker))
     }
 
     pub async fn request(
@@ -766,12 +788,13 @@ fn service_unavailable(message: String) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::{os::unix::fs::MetadataExt, sync::Mutex};
 
     use bloom_triad_protocol::{
         ApprovalPrepareState, CeremonyKind, CustodyPrepareState, DeclaredFee, KeySpec,
         NormalizedSignature, RequestNonce, ServiceFuture, SignatureEncoding,
     };
+    use ed25519_dalek::SigningKey;
 
     struct MockBroker {
         wallet: WalletPublic,
@@ -1062,39 +1085,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unix_service_transports_bounded_typed_frames() {
+    async fn unix_service_transports_authenticated_signed_envelopes() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("broker.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let uid = std::fs::metadata(directory.path()).unwrap().uid();
+        let machine = local_identity("bloom-machine", "machine-key", 7);
+        let broker = local_identity("bloom-broker", "broker-key", 8);
+        let machine_acl = peer_acl(uid, &machine);
+        let broker_acl = peer_acl(uid, &broker);
         let expected = digest(42);
         let server_expected = expected.clone();
+        let server_identity = broker.clone();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut prefix = [0_u8; 4];
-            stream.read_exact(&mut prefix).await.unwrap();
-            let length = u32::from_be_bytes(prefix) as usize;
-            let mut payload = vec![0_u8; length];
-            stream.read_exact(&mut payload).await.unwrap();
-            let mut frame = prefix.to_vec();
-            frame.extend_from_slice(&payload);
+            let request = bloom_triad_local_transport::receive_request::<MachineBrokerRequest>(
+                &mut stream,
+                &server_identity,
+                &machine_acl,
+            )
+            .await
+            .unwrap();
             assert_eq!(
-                bloom_triad_protocol::decode_frame::<MachineBrokerRequest>(&frame).unwrap(),
+                request.unsigned.body,
                 MachineBrokerRequest::ActionValidate(server_expected.clone())
             );
             let response: Result<MachineBrokerResponse, ProtocolError> =
                 Ok(MachineBrokerResponse::ActionValidate(server_expected));
-            stream
-                .write_all(&bloom_triad_protocol::encode_frame(&response).unwrap())
-                .await
-                .unwrap();
+            bloom_triad_local_transport::send_response(
+                &mut stream,
+                &server_identity,
+                &request,
+                response,
+            )
+            .await
+            .unwrap();
         });
 
-        let response = MachineBrokerClient::connect_unix(socket)
+        let response = MachineBrokerClient::connect_unix(socket, machine, broker_acl)
             .request(MachineBrokerRequest::ActionValidate(expected.clone()))
             .await
             .unwrap();
         assert_eq!(response, MachineBrokerResponse::ActionValidate(expected));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn security_files_fail_closed_on_writable_or_non_root_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let identity_path = directory.path().join("machine-identity.json");
+        let manifest_path = directory.path().join("edge-manifest.json");
+        std::fs::write(&identity_path, b"{}").unwrap();
+        std::fs::write(&manifest_path, b"{}").unwrap();
+
+        std::fs::set_permissions(&identity_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error =
+            MachineBrokerClient::connect_unix_from_files("unused", &identity_path, &manifest_path)
+                .err()
+                .expect("insecure identity metadata must fail");
+        assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+
+        std::fs::set_permissions(&identity_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let error =
+            MachineBrokerClient::connect_unix_from_files("unused", &identity_path, &manifest_path)
+                .err()
+                .expect("writable manifest metadata must fail");
+        assert_eq!(error.code, ProtocolErrorCode::UnauthenticatedPeer);
+    }
+
+    fn local_identity(service: &str, key_id: &str, byte: u8) -> LocalIdentity {
+        LocalIdentity {
+            service_id: token(service),
+            boot_epoch: bloom_triad_protocol::BootEpoch::from_bytes([byte; 16]),
+            application_key_id: token(key_id),
+            signing_key: Arc::new(SigningKey::from_bytes(&[byte; 32])),
+        }
+    }
+
+    fn peer_acl(uid: u32, identity: &LocalIdentity) -> PeerAcl {
+        PeerAcl {
+            effective_uid: uid,
+            service_id: identity.service_id.clone(),
+            boot_epoch: identity.boot_epoch.clone(),
+            application_key_id: identity.application_key_id.clone(),
+            application_public_key: identity.signing_key.verifying_key().to_bytes(),
+        }
     }
 
     fn digest(byte: u8) -> Digest32 {

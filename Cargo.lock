@@ -2523,10 +2523,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-machine"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "bloom-machine-client",
+ "bloom-triad-protocol",
+ "clap",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "bloom-machine-client"
 version = "0.1.1"
 dependencies = [
+ "bloom-triad-local-transport",
  "bloom-triad-protocol",
+ "ed25519-dalek",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -2744,6 +2758,21 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bloom-triad-local-transport"
+version = "0.1.1"
+dependencies = [
+ "bloom-triad-protocol",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.6",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]

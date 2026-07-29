@@ -1,20 +1,20 @@
 [package]
-name = "bloom-machine-client"
+name = "bloom-triad-local-transport"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-bloom-triad-local-transport.workspace = true
 bloom-triad-protocol.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true
 sha2.workspace = true
-sha3.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["io-util", "net"] }
 
 [dev-dependencies]
-ed25519-dalek.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

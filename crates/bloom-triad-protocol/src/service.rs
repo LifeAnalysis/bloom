@@ -645,8 +645,66 @@ pub trait RevocationControlService: Send + Sync {
     fn dispatch<'a>(&'a self, request: ControlRequest) -> ServiceFuture<'a, ControlResponse>;
 }
 
-impl crate::TypedRequestMethod for MachineBrokerRequest {}
-impl crate::TypedRequestMethod for BrokerSignerRequest {}
+impl crate::TypedRequestMethod for MachineBrokerRequest {
+    fn operation_id(&self) -> Result<Option<OperationId>, ProtocolError> {
+        use MachineBrokerRequest as Request;
+        Ok(match self {
+            Request::SigningSign(request) | Request::SigningSignBatch(request) => {
+                Some(request.operation_id.clone())
+            }
+            Request::OperationStatus(request)
+            | Request::OperationCancel(request)
+            | Request::CustodyResult(request) => Some(request.operation_id.clone()),
+            Request::PolicyValidateUpdate(request) | Request::PolicyCommitUpdate(request) => {
+                Some(request.operation_id.clone())
+            }
+            Request::WalletRegistrationPrepare(request)
+            | Request::WalletUnlockPrepare(request)
+            | Request::WalletImportPrepare(request)
+            | Request::WalletExportPrepare(request)
+            | Request::WalletDeletePrepare(request)
+            | Request::KeyDerivePrepare(request)
+            | Request::KeyEnrollPrepare(request)
+            | Request::CredentialAddPrepare(request)
+            | Request::CredentialReplacePrepare(request)
+            | Request::CredentialRemovePrepare(request)
+            | Request::RecoveryPrepare(request) => Some(request.custody_operation_id.clone()),
+            _ => None,
+        })
+    }
+}
+
+impl crate::TypedRequestMethod for BrokerSignerRequest {
+    fn operation_id(&self) -> Result<Option<OperationId>, ProtocolError> {
+        use BrokerSignerRequest as Request;
+        Ok(match self {
+            Request::CeremonyPrepare(request) => Some(request.activation_operation_id.clone()),
+            Request::CeremonyComplete(request) => Some(request.activation_operation_id.clone()),
+            Request::SignerSign(request) | Request::SignerSignBatch(request) => {
+                Some(request.unsigned.operation_id.clone())
+            }
+            Request::OperationStatus(request)
+            | Request::KeyEnrollStatus(request)
+            | Request::WalletRegistrationStatus(request)
+            | Request::CustodyResult(request)
+            | Request::CustodyStatus(request) => Some(request.operation_id.clone()),
+            Request::PolicyCompareAndSwap(request) => Some(request.operation_id.clone()),
+            Request::KeyDerivePrepare(request)
+            | Request::KeyEnrollPrepare(request)
+            | Request::WalletRegistrationPrepare(request)
+            | Request::WalletUnlockPrepare(request)
+            | Request::WalletImportPrepare(request)
+            | Request::WalletExportPrepare(request)
+            | Request::WalletDeletePrepare(request)
+            | Request::CredentialAddPrepare(request)
+            | Request::CredentialRemovePrepare(request)
+            | Request::CredentialReplacePrepare(request)
+            | Request::RecoveryPrepare(request) => Some(request.custody_operation_id.clone()),
+            Request::CustodyComplete(request) => Some(request.custody_operation_id.clone()),
+            _ => None,
+        })
+    }
+}
 impl crate::TypedRequestMethod for ControlRequest {}
 
 #[cfg(test)]
