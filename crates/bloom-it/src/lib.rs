@@ -8,6 +8,10 @@
 
 use std::net::TcpListener;
 use std::process::Stdio;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -20,6 +24,14 @@ use bloom_auth_api::{
         FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET,
     },
 };
+use bloom_machine_client::MachineBrokerClient;
+use bloom_triad_protocol::{
+    ApprovalLifecycleState, ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes, DecimalU64,
+    Digest32, KeyRef, KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
+    NormalizedSignature, ProvenanceCatalog, ProvenanceFeeAsset, ProvenanceOperationClass,
+    ProvenanceRecord, ProvenanceSubject, ServiceFuture, SigningPayloads, SigningResult, Token,
+    WalletPublic,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -27,6 +39,147 @@ use tokio::time::timeout;
 /// Default funder; anvil's prefunded account #0.
 pub const FUNDER_PRIV_KEY: &str =
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+/// Test-only Broker boundary for real-chain integration tests. It signs the
+/// exact payload bytes received over the production Machine client contract;
+/// it does not expose or emulate the retired hash-only PetalHost path.
+pub struct ExactSigningBrokerFixture {
+    active: AtomicBool,
+    signer: alloy::signers::local::PrivateKeySigner,
+    key_ref: KeyRef,
+    requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
+}
+
+impl ExactSigningBrokerFixture {
+    pub fn activate(&self) {
+        self.active.store(true, Ordering::SeqCst);
+    }
+
+    pub fn requests(&self) -> Vec<MachineBrokerRequest> {
+        self.requests.lock().clone()
+    }
+}
+
+impl MachineBrokerService for ExactSigningBrokerFixture {
+    fn dispatch<'a>(
+        &'a self,
+        request: MachineBrokerRequest,
+    ) -> ServiceFuture<'a, MachineBrokerResponse> {
+        Box::pin(async move {
+            self.requests.lock().push(request.clone());
+            match request {
+                MachineBrokerRequest::WalletGetPublic(request) => {
+                    Ok(MachineBrokerResponse::WalletGetPublic(WalletPublic {
+                        wallet_id: request.wallet_id,
+                        wallet_kind: Token::new("local").unwrap(),
+                        key_refs: vec![self.key_ref.clone()],
+                        policy_version: DecimalU64::new(1),
+                        policy_digest: Digest32::from_bytes([7; 32]),
+                        wallet_revocation_epoch: DecimalU64::new(0),
+                    }))
+                }
+                MachineBrokerRequest::SealedApprovalPrepare(request) => {
+                    Ok(MachineBrokerResponse::SealedApprovalPrepare(
+                        bloom_triad_protocol::SealedApprovalPrepareResponse {
+                            approval_id: request.terms.approval_id()?,
+                            state: ApprovalPrepareState::AwaitingCeremony,
+                            ceremony_url:
+                                "http://localhost:18734/ceremony/exact-signing-test-secret".into(),
+                            ceremony_expires_at_ms: request.terms.expires_at_ms,
+                            review_manifest_digest: Digest32::from_bytes([8; 32]),
+                        },
+                    ))
+                }
+                MachineBrokerRequest::SealedApprovalStatus(request) => {
+                    let active = self.active.load(Ordering::SeqCst);
+                    Ok(MachineBrokerResponse::SealedApprovalStatus(
+                        ApprovalPublicStatus {
+                            approval_id: request.id,
+                            wallet_id: Token::new("alice").unwrap(),
+                            state: if active {
+                                ApprovalLifecycleState::Active
+                            } else {
+                                ApprovalLifecycleState::AwaitingCeremony
+                            },
+                            effective_claim_assurance: None,
+                            ceremony_url: (!active).then(|| {
+                                "http://localhost:18734/ceremony/exact-signing-test-secret".into()
+                            }),
+                            ceremony_expires_at_ms: (!active).then(|| DecimalU64::new(u64::MAX)),
+                        },
+                    ))
+                }
+                MachineBrokerRequest::SigningSign(request) => {
+                    let SigningPayloads::Single { payload } = &request.payloads else {
+                        panic!("exact signing fixture expects one payload");
+                    };
+                    use alloy::signers::SignerSync as _;
+                    let hash = alloy::primitives::keccak256(payload.decode());
+                    let signature = self.signer.sign_hash_sync(&hash).unwrap();
+                    Ok(MachineBrokerResponse::SigningSign(SigningResult {
+                        operation_id: request.operation_id,
+                        operation_digest: request.operation_digest,
+                        signatures: vec![NormalizedSignature {
+                            crypto_suite: request.crypto_suite,
+                            bytes: Base64UrlBytes::from_bytes(&signature.as_bytes()),
+                        }],
+                        signer_receipt_digest: Digest32::from_bytes([9; 32]),
+                        broker_receipt_digest: Digest32::from_bytes([10; 32]),
+                    }))
+                }
+                other => panic!("unexpected exact signing Broker request: {other:?}"),
+            }
+        })
+    }
+}
+
+pub fn exact_signing_broker(
+    private_key_hex: &str,
+) -> Result<(MachineBrokerClient, Arc<ExactSigningBrokerFixture>)> {
+    let signer = private_key_hex
+        .parse()
+        .map_err(|error| anyhow!("parse exact-signing fixture key: {error}"))?;
+    let fixture = Arc::new(ExactSigningBrokerFixture {
+        active: AtomicBool::new(false),
+        signer,
+        key_ref: KeyRef {
+            backend: Token::new("local").unwrap(),
+            backend_instance: Token::new("integration-test").unwrap(),
+            locator: "integration-test-wallet-key".into(),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: Digest32::from_bytes([6; 32]),
+            derivation: None,
+        },
+        requests: parking_lot::Mutex::new(Vec::new()),
+    });
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    Ok((MachineBrokerClient::new(service), fixture))
+}
+
+pub fn exact_signing_catalog(operation_classes: &[&str]) -> ProvenanceCatalog {
+    ProvenanceCatalog {
+        schema: bloom_triad_protocol::PROVENANCE_CATALOG_SCHEMA.into(),
+        records: operation_classes
+            .iter()
+            .map(|operation_class| ProvenanceRecord {
+                subject: ProvenanceSubject::System {
+                    component_id: Token::new("bloom-machine").unwrap(),
+                    operation_class: Token::new(*operation_class).unwrap(),
+                },
+                publisher: Token::new("bloom-installer").unwrap(),
+                operation_classes: vec![ProvenanceOperationClass {
+                    operation_class: Token::new(*operation_class).unwrap(),
+                    fee_asset: Some(ProvenanceFeeAsset {
+                        chain: Token::new("ethereum").unwrap(),
+                        asset: "native".into(),
+                    }),
+                }],
+                installer_key_id: Token::new("installer-key").unwrap(),
+                installer_signature: Base64UrlBytes::from_bytes(&[11; 64]),
+            })
+            .collect(),
+    }
+}
 
 /// Foundry binaries; rely on `$PATH`. Override with `BLOOM_ANVIL_BIN` /
 /// `BLOOM_CAST_BIN` if you need to point at a specific install.

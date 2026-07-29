@@ -16,11 +16,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bloom_daemon::Daemon;
-use bloom_it::{cast_send, mint_evm_test_grant, spawn_anvil};
+use bloom_it::{cast_send, exact_signing_broker, exact_signing_catalog, spawn_anvil};
 use bloom_proto::{ChainSpec, Config, HomeDir, HomeWritePermit};
 use bloom_vfs::VfsPath;
 use bloom_vfs::handler::Handler;
 use tokio::time::sleep;
+
+const TEST_WALLET_PRIVATE_KEY: &str =
+    "0x0000000000000000000000000000000000000000000000000000000000000001";
 
 /// Fund `to_addr` with `value_eth` ETH from anvil's prefunded account #0.
 async fn fund_via_cast(rpc_url: &str, to_addr: &str, value_eth: u64) -> Result<()> {
@@ -45,14 +48,6 @@ fn write_config(home_root: &std::path::Path, rpc_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn now_ms_u64() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn anvil_full_stage_confirm_flow() -> Result<()> {
     let _ = tracing_subscriber::fmt()
@@ -73,14 +68,23 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     write_config(&home_root, &rpc_url)?;
     let home = HomeDir::at(&home_root);
     let permit = Arc::new(HomeWritePermit::acquire(&home)?);
-    let daemon = Daemon::from_home_with_permit(home, permit).map_err(|e| anyhow!("daemon: {e}"))?;
-
-    // 3. Create a wallet via the keystore.
     let passphrase = "integration-test-pass";
-    let info = daemon
-        .keystore
-        .create_local("alice", passphrase)
+    let keystore =
+        bloom_keystore::Keystore::new(home.keystore_dir()).map_err(|e| anyhow!("keystore: {e}"))?;
+    let info = keystore
+        .import_hex("alice", TEST_WALLET_PRIVATE_KEY, passphrase)
         .map_err(|e| anyhow!("create_local: {e}"))?;
+    let (broker, fixture) = exact_signing_broker(TEST_WALLET_PRIVATE_KEY)?;
+    let daemon = Daemon::from_home_with_permit_and_broker(
+        home,
+        permit,
+        broker,
+        exact_signing_catalog(&["transaction.confirm"]),
+    )
+    .map_err(|e| anyhow!("daemon: {e}"))?;
+
+    // 3. The local keystore is only a pre-triad public wallet projection for
+    // VFS staging. Exact signing below is performed exclusively by Broker.
     let alice_addr = format!("{:#x}", info.address);
 
     // Keep broadcast in fresh-review mode. The pre-minted Sealed Approval
@@ -168,20 +172,9 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     let _: serde_json::Value =
         serde_json::from_slice(&policy_bytes).context("policy_check.json must be valid JSON")?;
 
-    // 8. First confirm must fail closed and emit a Sealed Approval challenge.
-    // Then mint the same in-memory grant that a successful ceremony would mint
-    // for the emitted central action id and retry confirm to broadcast. The
-    // Anvil test does not have a browser/WebAuthn device, but this still
-    // exercises the mounted denial boundary, challenge projection, production
-    // grant-gated KeystorePetalHost sign_hash path, and raw tx broadcast.
-    daemon
-        .keystore
-        .unlock("alice", passphrase)
-        .map_err(|e| anyhow!("unlock: {e}"))?;
-    let grant_store = daemon
-        .auth_services
-        .require_grant_store()
-        .map_err(|e| anyhow!("grant store: {e}"))?;
+    // 8. First confirm must fail closed and persist the exact Broker ceremony
+    // projection. Once the fixture reports the same approval active, retry
+    // signs the exact EIP-1559 preimage through MachineBrokerClient.
     let confirm_path = VfsPath::parse(&format!(
         "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/confirm"
     ))
@@ -196,46 +189,63 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         "initial confirm unexpectedly succeeded without Sealed Approval"
     );
 
-    let challenge_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/approval_challenge.json"
+    let ceremony_path = VfsPath::parse(&format!(
+        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/ceremony.json"
     ))
     .unwrap();
-    let challenge_bytes = daemon
+    let ceremony_bytes = daemon
         .vfs
-        .read(&challenge_path)
+        .read(&ceremony_path)
         .await
-        .map_err(|e| anyhow!("read approval_challenge.json: {e}"))?;
-    let challenge: serde_json::Value = serde_json::from_slice(&challenge_bytes)
-        .context("approval_challenge.json must be valid JSON")?;
-    let action_id = challenge
-        .get("action_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("approval_challenge.json missing action_id: {challenge}"))?;
+        .map_err(|e| anyhow!("read ceremony.json: {e}"))?;
+    let ceremony: serde_json::Value =
+        serde_json::from_slice(&ceremony_bytes).context("ceremony.json must be valid JSON")?;
     assert!(
-        challenge
+        ceremony
             .get("ceremony_url")
             .and_then(|v| v.as_str())
-            .map(|url| url.starts_with("http://localhost") || url.starts_with("http://127.0.0.1"))
-            .unwrap_or(false),
-        "approval_challenge.json missing local ceremony_url: {challenge}"
+            .is_some_and(|url| url == "http://localhost:18734/ceremony/exact-signing-test-secret"),
+        "ceremony.json omitted the Broker launch URL: {ceremony}"
+    );
+    assert!(
+        ceremony
+            .get("approval_operation_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id.len() == 64),
+        "ceremony.json omitted durable operation identity: {ceremony}"
     );
 
-    mint_evm_test_grant(
-        grant_store.as_ref(),
-        "alice",
-        action_id,
-        "confirm",
-        31337,
-        &alice_addr,
-        now_ms_u64(),
-    )
-    .await
-    .map_err(|e| anyhow!("mint confirm grant: {e}"))?;
+    fixture.activate();
     daemon
         .vfs
         .write(&confirm_path, confirm_body.as_bytes())
         .await
-        .map_err(|e| anyhow!("confirm retry write: {e}"))?;
+        .map_err(|e| anyhow!("Broker-backed confirm retry write: {e}"))?;
+    let terminal: serde_json::Value = serde_json::from_slice(
+        &daemon
+            .vfs
+            .read(
+                &VfsPath::parse(&format!(
+                    "/wallets/alice/chains/anvil/outbox/sent/{pending_id}/ceremony.json"
+                ))
+                .unwrap(),
+            )
+            .await
+            .map_err(|e| anyhow!("read terminal ceremony.json: {e}"))?,
+    )?;
+    assert!(
+        terminal
+            .get("ceremony_url")
+            .is_some_and(serde_json::Value::is_null),
+        "terminal signing projection retained launch URL: {terminal}"
+    );
+    assert!(
+        terminal
+            .get("sign_dispatched")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "terminal signing projection omitted durable dispatch marker: {terminal}"
+    );
 
     // 9. Verify the entry now lives in `sent/` with a tx_hash artefact.
     let sent_dir = VfsPath::parse("/wallets/alice/chains/anvil/outbox/sent").unwrap();
@@ -310,13 +320,20 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
     write_config(&home_root, &rpc_url)?;
     let home = HomeDir::at(&home_root);
     let permit = Arc::new(HomeWritePermit::acquire(&home)?);
-    let daemon = Daemon::from_home_with_permit(home, permit).map_err(|e| anyhow!("daemon: {e}"))?;
-
     let passphrase = "integration-test-pass";
-    let info = daemon
-        .keystore
-        .create_local("alice", passphrase)
+    let keystore =
+        bloom_keystore::Keystore::new(home.keystore_dir()).map_err(|e| anyhow!("keystore: {e}"))?;
+    let info = keystore
+        .import_hex("alice", TEST_WALLET_PRIVATE_KEY, passphrase)
         .map_err(|e| anyhow!("create_local: {e}"))?;
+    let (broker, _fixture) = exact_signing_broker(TEST_WALLET_PRIVATE_KEY)?;
+    let daemon = Daemon::from_home_with_permit_and_broker(
+        home,
+        permit,
+        broker,
+        exact_signing_catalog(&["transaction.confirm"]),
+    )
+    .map_err(|e| anyhow!("daemon: {e}"))?;
     let alice_addr = format!("{:#x}", info.address);
 
     let wallet_dir = tmp.path().join("keystore").join("alice");
@@ -357,63 +374,26 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
     assert_eq!(entries.len(), 1, "expected exactly one pending entry");
     let pending_id = entries[0].name.clone();
 
-    // First confirm fails closed → emits a challenge; mint the grant a ceremony
-    // would produce and retry.
-    daemon
-        .keystore
-        .unlock("alice", passphrase)
-        .map_err(|e| anyhow!("unlock: {e}"))?;
-    let grant_store = daemon
-        .auth_services
-        .require_grant_store()
-        .map_err(|e| anyhow!("grant store: {e}"))?;
+    // The nonce gap is a deterministic pre-signing failure. It must be denied
+    // before Machine creates a Broker ceremony or dispatches a signing request.
     let confirm_path = VfsPath::parse(&format!(
         "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/confirm"
     ))
     .unwrap();
-    let first_confirm = daemon.vfs.write(&confirm_path, b"y\n").await;
-    assert!(
-        first_confirm.is_err(),
-        "initial confirm unexpectedly succeeded without Sealed Approval"
-    );
-
-    let challenge_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/approval_challenge.json"
-    ))
-    .unwrap();
-    let challenge: serde_json::Value = serde_json::from_slice(
-        &daemon
-            .vfs
-            .read(&challenge_path)
-            .await
-            .map_err(|e| anyhow!("read approval_challenge.json: {e}"))?,
-    )
-    .context("approval_challenge.json must be valid JSON")?;
-    let action_id = challenge
-        .get("action_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("approval_challenge.json missing action_id: {challenge}"))?;
-
-    mint_evm_test_grant(
-        grant_store.as_ref(),
-        "alice",
-        action_id,
-        "confirm",
-        31337,
-        &alice_addr,
-        now_ms_u64(),
-    )
-    .await
-    .map_err(|e| anyhow!("mint confirm grant: {e}"))?;
-
-    // Retry with a live grant: the approval gate is now satisfied, but the
-    // broadcast must be refused because nonce 5 is ahead of chain nonce 0.
     let gap_confirm = daemon.vfs.write(&confirm_path, b"y\n").await;
     let err = gap_confirm.expect_err("confirm at a nonce gap must be refused");
     let err = err.to_string().to_lowercase();
     assert!(
         err.contains("nonce gap"),
         "expected a nonce-gap refusal, got: {err}"
+    );
+    let ceremony_path = VfsPath::parse(&format!(
+        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/ceremony.json"
+    ))
+    .unwrap();
+    assert!(
+        daemon.vfs.read(&ceremony_path).await.is_err(),
+        "nonce-gap denial must not create a signing ceremony"
     );
 
     // The entry stays pending (never sent), with a machine-readable advisory.

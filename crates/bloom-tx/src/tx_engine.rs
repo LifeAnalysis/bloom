@@ -2677,6 +2677,7 @@ impl TxEngine {
         let signing_preimage = Self::unsigned_signing_preimage(&prepared.unsigned);
         let signature = self
             .host_sign_evm_hash(
+                entry,
                 staged,
                 action_kind,
                 &signing_preimage,
@@ -3357,6 +3358,7 @@ impl TxEngine {
 
     async fn triad_sign_evm_payload(
         &self,
+        entry: &crate::outbox::OutboxEntry,
         staged: &StagedTx,
         action_kind: EvmOutboxActionKind,
         signing_preimage: &[u8],
@@ -3378,12 +3380,6 @@ impl TxEngine {
                     "installer provenance does not authorize {operation_class}"
                 ))
             })?;
-        let entry = self.outbox.read_in_state(
-            &staged.wallet,
-            &staged.chain,
-            &staged.id,
-            OutboxState::Pending,
-        )?;
         let action_id = outbox_action_id(staged, action_kind);
         let payload_digest = Digest32::from_bytes(sha2::Sha256::digest(signing_preimage).into());
         let claimed_hash = Digest32::from_bytes(signing_hash.0);
@@ -3391,6 +3387,46 @@ impl TxEngine {
             .digest()
             .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?;
         let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let new_state = || -> Result<TriadEvmSigningState, TxEngineError> {
+            let now = now_ms() as u64;
+            let expires = now.saturating_add(TRIAD_EXACT_APPROVAL_TTL_MS);
+            let expires = if staged.expires_ms == 0 {
+                expires
+            } else {
+                expires.min(staged.expires_ms.min(u128::from(u64::MAX)) as u64)
+            };
+            if expires <= now {
+                return Err(TxEngineError::ApprovalDenied(
+                    "staged transaction expired before approval prepare".into(),
+                ));
+            }
+            Ok(TriadEvmSigningState {
+                schema: "bloom.machine-evm-signing.1".into(),
+                action_id: action_id.clone(),
+                payload_digest: payload_digest.clone(),
+                claimed_hash: claimed_hash.clone(),
+                provenance_digest: provenance_digest.clone(),
+                approval_operation_id: random_operation_id(),
+                signing_operation_id: random_operation_id(),
+                request_nonce: random_request_nonce(),
+                issued_at_ms: DecimalU64::new(now),
+                expires_at_ms: DecimalU64::new(expires),
+                canonical_plan_facts_digest: Digest32::from_bytes(
+                    sha2::Sha256::digest(serde_jcs::to_vec(staged).map_err(|error| {
+                        TxEngineError::ApprovalConstruction(format!(
+                            "canonicalize staged transaction plan: {error}"
+                        ))
+                    })?)
+                    .into(),
+                ),
+                approval_id: None,
+                ceremony_url: None,
+                ceremony_expires_at_ms: None,
+                review_manifest_digest: None,
+                sign_dispatched: false,
+                expected_operation_digest: None,
+            })
+        };
         let mut state = match read_triad_signing_state(&state_path)? {
             Some(state) => {
                 if state.schema != "bloom.machine-evm-signing.1"
@@ -3399,56 +3435,30 @@ impl TxEngine {
                     || state.claimed_hash != claimed_hash
                     || state.provenance_digest != provenance_digest
                 {
-                    return Err(TxEngineError::ApprovalState(
-                        "durable Broker signing projection conflicts with exact transaction bytes"
-                            .into(),
-                    ));
-                }
-                state
-            }
-            None => {
-                let now = now_ms() as u64;
-                let expires = now.saturating_add(TRIAD_EXACT_APPROVAL_TTL_MS);
-                let expires = if staged.expires_ms == 0 {
-                    expires
+                    if state.action_id != action_id
+                        && state.sign_dispatched
+                        && state.ceremony_url.is_none()
+                        && state.ceremony_expires_at_ms.is_none()
+                    {
+                        // Confirm, replace, and cancel are distinct exact
+                        // operations over one outbox entry. A completed prior
+                        // operation must not authorize the next one, but its
+                        // terminal owner projection may be atomically
+                        // superseded by the next ceremony.
+                        new_state()?
+                    } else {
+                        return Err(TxEngineError::ApprovalState(
+                            "durable Broker signing projection conflicts with exact transaction bytes"
+                                .into(),
+                        ));
+                    }
                 } else {
-                    expires.min(staged.expires_ms.min(u128::from(u64::MAX)) as u64)
-                };
-                if expires <= now {
-                    return Err(TxEngineError::ApprovalDenied(
-                        "staged transaction expired before approval prepare".into(),
-                    ));
+                    state
                 }
-                let state = TriadEvmSigningState {
-                    schema: "bloom.machine-evm-signing.1".into(),
-                    action_id: action_id.clone(),
-                    payload_digest,
-                    claimed_hash,
-                    provenance_digest,
-                    approval_operation_id: random_operation_id(),
-                    signing_operation_id: random_operation_id(),
-                    request_nonce: random_request_nonce(),
-                    issued_at_ms: DecimalU64::new(now),
-                    expires_at_ms: DecimalU64::new(expires),
-                    canonical_plan_facts_digest: Digest32::from_bytes(
-                        sha2::Sha256::digest(serde_jcs::to_vec(staged).map_err(|error| {
-                            TxEngineError::ApprovalConstruction(format!(
-                                "canonicalize staged transaction plan: {error}"
-                            ))
-                        })?)
-                        .into(),
-                    ),
-                    approval_id: None,
-                    ceremony_url: None,
-                    ceremony_expires_at_ms: None,
-                    review_manifest_digest: None,
-                    sign_dispatched: false,
-                    expected_operation_digest: None,
-                };
-                write_triad_signing_state(&state_path, &state)?;
-                state
             }
+            None => new_state()?,
         };
+        write_triad_signing_state(&state_path, &state)?;
 
         if state.sign_dispatched {
             match service
@@ -3665,18 +3675,20 @@ impl TxEngine {
     #[cfg(not(test))]
     async fn host_sign_evm_hash(
         &self,
+        entry: &crate::outbox::OutboxEntry,
         staged: &StagedTx,
         action_kind: EvmOutboxActionKind,
         signing_preimage: &[u8],
         signing_hash: B256,
     ) -> Result<Signature, TxEngineError> {
-        self.triad_sign_evm_payload(staged, action_kind, signing_preimage, signing_hash)
+        self.triad_sign_evm_payload(entry, staged, action_kind, signing_preimage, signing_hash)
             .await
     }
 
     #[cfg(test)]
     async fn host_sign_evm_hash(
         &self,
+        entry: &crate::outbox::OutboxEntry,
         staged: &StagedTx,
         action_kind: EvmOutboxActionKind,
         signing_preimage: &[u8],
@@ -3684,7 +3696,7 @@ impl TxEngine {
     ) -> Result<Signature, TxEngineError> {
         if self.triad_signing.is_some() {
             return self
-                .triad_sign_evm_payload(staged, action_kind, signing_preimage, signing_hash)
+                .triad_sign_evm_payload(entry, staged, action_kind, signing_preimage, signing_hash)
                 .await;
         }
         #[cfg(feature = "unsafe-debug-signer")]
@@ -6654,6 +6666,9 @@ mod tests {
         staged.wallet = "alice".into();
         staged.created_ms = now_ms();
         outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state("alice", "anvil", "triad-confirm", OutboxState::Pending)
+            .unwrap();
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(false),
             lose_sign_response_once: AtomicBool::new(false),
@@ -6682,6 +6697,7 @@ mod tests {
 
         let required = engine
             .triad_sign_evm_payload(
+                &entry,
                 &staged,
                 EvmOutboxActionKind::Confirm,
                 &preimage,
@@ -6696,9 +6712,6 @@ mod tests {
             required.ceremony_url,
             "http://localhost:18734/ceremony/triad-test-secret"
         );
-        let entry = outbox
-            .read_in_state("alice", "anvil", "triad-confirm", OutboxState::Pending)
-            .unwrap();
         let first: TriadEvmSigningState =
             serde_json::from_slice(&std::fs::read(entry.dir.join("ceremony.json")).unwrap())
                 .unwrap();
@@ -6711,6 +6724,7 @@ mod tests {
             .unwrap();
         let signature = restarted
             .triad_sign_evm_payload(
+                &entry,
                 &staged,
                 EvmOutboxActionKind::Confirm,
                 &preimage,
@@ -6756,6 +6770,14 @@ mod tests {
         staged.wallet = "alice".into();
         staged.created_ms = now_ms();
         outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state(
+                "alice",
+                "anvil",
+                "triad-response-loss",
+                OutboxState::Pending,
+            )
+            .unwrap();
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(false),
             lose_sign_response_once: AtomicBool::new(true),
@@ -6785,6 +6807,7 @@ mod tests {
         assert!(matches!(
             engine
                 .triad_sign_evm_payload(
+                    &entry,
                     &staged,
                     EvmOutboxActionKind::Confirm,
                     &preimage,
@@ -6796,6 +6819,7 @@ mod tests {
         fixture.active.store(true, Ordering::SeqCst);
         let lost = engine
             .triad_sign_evm_payload(
+                &entry,
                 &staged,
                 EvmOutboxActionKind::Confirm,
                 &preimage,
@@ -6805,14 +6829,6 @@ mod tests {
             .unwrap_err();
         assert!(matches!(lost, TxEngineError::ApprovalServiceUnavailable(_)));
 
-        let entry = outbox
-            .read_in_state(
-                "alice",
-                "anvil",
-                "triad-response-loss",
-                OutboxState::Pending,
-            )
-            .unwrap();
         let dispatched: TriadEvmSigningState =
             serde_json::from_slice(&std::fs::read(entry.dir.join("ceremony.json")).unwrap())
                 .unwrap();
@@ -6824,6 +6840,7 @@ mod tests {
             .unwrap();
         let recovered = restarted
             .triad_sign_evm_payload(
+                &entry,
                 &staged,
                 EvmOutboxActionKind::Confirm,
                 &preimage,
