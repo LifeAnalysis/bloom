@@ -99,3 +99,28 @@ This log records fail-closed implementation choices where
   workspace tests and Clippy with warnings denied pass in Machine, Signer, and
   Broker; the shipped Browser asset additionally executes its ChaCha20-
   Poly1305 and X25519/HPKE self-tests under Node.
+
+## W6 AWS KMS backend
+
+- Signer commit `a3ce379` implements the compile-time AWS KMS backend and
+  consumes Machine protocol commit `0bd5a9c` and Signer ceremony commit
+  `94170be`.
+- Production construction uses the AWS SDK with a statically configured
+  WebIdentity role, token file, and session name. It does not instantiate the
+  ambient credential chain. Regional KMS and STS hosts are declared exactly,
+  SDK retries are disabled, and provider calls are deadline- and quota-bound.
+- Enrollment pins the immutable key ARN, account, region, usage, spec,
+  algorithm, canonical SPKI, fingerprint, and secp256k1 address. Enrollment
+  and provider-audit state is atomically persisted under HMAC-SHA256 using a
+  Signer-owned key and is bound to the canonical full backend configuration.
+- KMS signing uses `ECDSA_SHA_256` with `DIGEST`, DER-decodes signatures,
+  normalizes low `s`, derives recovery parity against the pinned public key,
+  and returns Bloom's recoverable encoding. Unknown, internal, dispatch, and
+  timeout outcomes remain indeterminate; only a narrow reviewed rejection
+  allowlist is definitive, and the backend never retries a signing call.
+- The W6 review gate passed after three read-only review rounds. The AWS SDK
+  replay test and ten backend fault/restart/normalization tests pass, as do the
+  all-feature Signer workspace tests and Clippy with warnings denied.
+- W0 remains the release gate for OS-enforced egress and installed IAM policy,
+  CloudTrail, principal, and sandbox configuration. W6 validates and binds the
+  declarations but does not claim those host controls have been provisioned.
