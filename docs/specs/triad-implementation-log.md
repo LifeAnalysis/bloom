@@ -39,3 +39,6 @@ This log records fail-closed implementation choices where
   section 13.6. The initial public credential registry is deliberately limited
   to `ACTIVE` and `REVOKED`; adding a state requires a protocol-minor change
   rather than silently accepting an unknown token.
+- **W1 cross-repository baseline:** Machine protocol commit `d01e82f` is
+  consumed by Signer commit `5c09a6a` and Broker commit `6e3985b`. The sibling
+  repositories intentionally have no remotes during extraction.
