@@ -174,11 +174,13 @@ mod tests {
 
     #[cfg(feature = "live-providers")]
     #[tokio::test]
-    #[ignore = "requires ALCHEMY_API_KEY env and network access"]
     async fn alchemy_live_subscribe_yields_pending_tx() {
         use crate::provider::MempoolProvider;
         use futures::StreamExt;
-        let key = std::env::var("ALCHEMY_API_KEY").expect("set ALCHEMY_API_KEY to run live test");
+        let Ok(key) = std::env::var("ALCHEMY_API_KEY") else {
+            eprintln!("skip: ALCHEMY_API_KEY is not set");
+            return;
+        };
         let url = format!("wss://eth-mainnet.g.alchemy.com/v2/{key}");
         let provider = AlchemyProvider::new(url);
         let mut stream = provider.subscribe().await.expect("subscribe");

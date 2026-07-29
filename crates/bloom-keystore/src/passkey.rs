@@ -3100,7 +3100,7 @@ mod approval_uv_tests {
     //
     // The happy path (and the no-PRF / missing-UV cases) drives `auth_ceremony`,
     // which binds a real socket and launches a browser — not unit-testable
-    // headlessly. Those cases live below as `#[ignore]` integration tests gated
+    // headlessly. Those cases live below as integration tests gated
     // on `BLOOM_TEST_BROWSER=1`. The three pure-logic tests that follow exercise
     // the validation gates that fire BEFORE the ceremony, so they need no
     // authenticator.
@@ -3177,11 +3177,10 @@ mod approval_uv_tests {
     // ── sealed_approval_ceremony: browser-gated integration tests ───────────
     //
     // These need a real authenticator (the ceremony binds port 18734 and opens
-    // a browser). Run with: `BLOOM_TEST_BROWSER=1 cargo test -p bloom-keystore
-    // -- --ignored sealed_approval`. They are compiled but skipped by default.
+    // a browser). Set `BLOOM_TEST_BROWSER=1` and select `sealed_approval` to
+    // run them; otherwise they explicitly self-skip.
 
     #[tokio::test]
-    #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
     async fn sealed_approval_ceremony_returns_assertion_and_signer() {
         if skip_browser_test_if_disabled("sealed_approval_ceremony_returns_assertion_and_signer") {
             return;
@@ -3207,7 +3206,6 @@ mod approval_uv_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
     async fn sealed_approval_ceremony_fails_when_no_prf_output() {
         if skip_browser_test_if_disabled("sealed_approval_ceremony_fails_when_no_prf_output") {
             return;
@@ -3226,7 +3224,6 @@ mod approval_uv_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
     async fn sealed_approval_ceremony_fails_when_uv_missing_for_hardened() {
         if skip_browser_test_if_disabled(
             "sealed_approval_ceremony_fails_when_uv_missing_for_hardened",

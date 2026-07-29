@@ -330,11 +330,14 @@ async fn serve_test_mount(
 
 /// Manual issue #77 coverage: a real shell redirect through a kernel NFS
 /// mount must fail when the handler stages a challenge and returns
-/// PermissionDenied. This needs platform mount privileges, so it is ignored
-/// and self-skips when `serve_nfs` cannot establish the mount.
+/// PermissionDenied. This needs platform mount privileges and runs only when
+/// `BLOOM_MOUNT_TEST_REQUIRE_REAL=1`.
 #[tokio::test]
-#[ignore = "requires local NFS mount privileges"]
 async fn mounted_printf_surfaces_permission_denied() {
+    if !require_real_mount_test() {
+        eprintln!("skip: BLOOM_MOUNT_TEST_REQUIRE_REAL is not set");
+        return;
+    }
     let mount_dir = unique_mount_dir();
     std::fs::create_dir(&mount_dir).expect("create temporary mount dir");
 
@@ -537,8 +540,11 @@ async fn mounted_printf_surfaces_permission_denied() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires the host to allow a real localhost NFS mount"]
 async fn mounted_hyperliquid_session_flow_reaches_handler() {
+    if !require_real_mount_test() {
+        eprintln!("skip: BLOOM_MOUNT_TEST_REQUIRE_REAL is not set");
+        return;
+    }
     let mount_dir = unique_mount_dir();
     std::fs::create_dir_all(&mount_dir).expect("create Hyperliquid mount test directory");
     let handler = Arc::new(HyperliquidMountWorkflowHandler::default());

@@ -8,9 +8,11 @@ use futures::StreamExt;
 use std::time::Duration;
 
 #[tokio::test]
-#[ignore = "requires ALCHEMY_API_KEY env and network access"]
 async fn alchemy_yields_at_least_one_pending_tx_in_30s() {
-    let key = std::env::var("ALCHEMY_API_KEY").expect("set ALCHEMY_API_KEY to run this test");
+    let Ok(key) = std::env::var("ALCHEMY_API_KEY") else {
+        eprintln!("skip: ALCHEMY_API_KEY is not set");
+        return;
+    };
     let url = format!("wss://eth-mainnet.g.alchemy.com/v2/{key}");
     let provider = AlchemyProvider::new(url);
     let mut stream = provider.subscribe().await.unwrap();

@@ -9,14 +9,7 @@
 //! mines three blocks via `evm_mine`, and asserts three headers
 //! arrive within the budget.
 //!
-//! Gated `#[ignore]` to match the rest of `bloom-it`. Run with:
-//!
-//! ```text
-//! cargo test -p bloom-it -- --ignored rpc_ws_subscriptions
-//! ```
-//!
-//! Skips if `anvil` is not on `$PATH` (the spawn helper times out and
-//! the test fails — same convention as the other bloom-it tests).
+//! Requires `anvil` on `$PATH`.
 //! See `docs/specs/rpc-robustness.md` §C.4 / §F.2 for the WS
 //! lifecycle decisions this exercises.
 
@@ -31,7 +24,6 @@ use futures::StreamExt;
 use tokio::time::timeout;
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn ws_subscribe_blocks_against_anvil() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

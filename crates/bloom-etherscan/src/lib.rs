@@ -1310,10 +1310,9 @@ mod tests {
     // ---- Live integration (gated) -----------------------------------------
 
     /// Live test against the real Etherscan API. Needs
-    /// `BLOOM_ETHERSCAN_KEY` in env. Skipped by default; run with
-    /// `cargo test -p bloom-etherscan -- --ignored`.
+    /// `BLOOM_ETHERSCAN_KEY` in env. It exits successfully when the key is
+    /// absent.
     #[tokio::test]
-    #[ignore]
     async fn live_etherscan_smoke() {
         let key = match std::env::var("BLOOM_ETHERSCAN_KEY") {
             Ok(k) if !k.is_empty() => k,

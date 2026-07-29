@@ -5,8 +5,11 @@ use bloom_proto::config::Config;
 /// deposit/system transaction (type `0x7e`) on Base mainnet, and that
 /// the receipt carries L1-fee fields.
 #[tokio::test]
-#[ignore = "hits live Base RPC"]
 async fn op_stack_live_base_deposit_tx() {
+    if std::env::var_os("BLOOM_RUN_LIVE_TESTS").is_none() {
+        eprintln!("skip: BLOOM_RUN_LIVE_TESTS is not set");
+        return;
+    }
     let config = Config::local_default();
     let spec = config
         .chains

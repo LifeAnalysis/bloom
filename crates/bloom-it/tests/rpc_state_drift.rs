@@ -35,13 +35,7 @@
 //!   exercises the retry logic that real-world cross-provider drift
 //!   triggers.
 //!
-//! Like the rest of `bloom-it`, the test is gated `#[ignore]` so CI
-//! runs that lack a foundry install (or just don't want to spawn
-//! processes) skip cleanly. Invoke with:
-//!
-//! ```text
-//! cargo test -p bloom-it -- --ignored rpc_state_drift
-//! ```
+//! Requires `anvil` from Foundry on `$PATH`.
 
 use anyhow::{Context, Result, anyhow};
 use bloom_evm::ChainClient;
@@ -74,7 +68,6 @@ async fn mine(rpc_url: &str, count: u32) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn session_pins_across_two_anvils_with_different_heights() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

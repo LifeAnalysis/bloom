@@ -98,11 +98,12 @@ mod tests {
 
     #[cfg(feature = "live-providers")]
     #[tokio::test]
-    #[ignore = "requires GENERIC_WS_URL env and network access"]
     async fn generic_eth_subscribe_live_yields_pending_hash() {
         use crate::provider::MempoolProvider;
-        let url = std::env::var("GENERIC_WS_URL")
-            .expect("set GENERIC_WS_URL to a node with eth_subscribe + newPendingTransactions");
+        let Ok(url) = std::env::var("GENERIC_WS_URL") else {
+            eprintln!("skip: GENERIC_WS_URL is not set");
+            return;
+        };
         let provider = GenericEthSubscribeProvider::new(url);
         let mut stream = provider.subscribe().await.expect("subscribe");
         let tx = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())

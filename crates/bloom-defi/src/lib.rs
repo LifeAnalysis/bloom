@@ -1128,11 +1128,9 @@ mod tests {
         assert_eq!(q.amount_out, "999");
     }
 
-    /// Live test against the real Enso API. Gated behind `--ignored` and
-    /// the `BLOOM_ENSO_KEY` env var; `cargo test -p bloom-defi -- --ignored`
-    /// will exercise it.
+    /// Live test against the real Enso API. It exits successfully unless
+    /// `BLOOM_ENSO_KEY` is present.
     #[tokio::test]
-    #[ignore]
     async fn live_route_eth_to_usdc() {
         let key = match std::env::var("BLOOM_ENSO_KEY") {
             Ok(k) if !k.is_empty() => k,
