@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bloom.signer</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BLOOM_SIGNER_BINARY@</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BLOOM_SIGNER_IDENTITY</key>
+    <string>@BLOOM_SIGNER_IDENTITY@</string>
+    <key>BLOOM_SIGNER_CONFIG</key>
+    <string>@BLOOM_SIGNER_CONFIG@</string>
+    <key>BLOOM_EDGE_MANIFEST</key>
+    <string>@BLOOM_EDGE_MANIFEST@</string>
+    <key>BLOOM_SIGNER_ACTIVATION_NAME</key>
+    <string>signer</string>
+    <key>BLOOM_SIGNER_CONTROL_ACTIVATION_NAME</key>
+    <string>signer-control</string>
+  </dict>
+
+  <key>Sockets</key>
+  <dict>
+    <key>signer</key>
+    <dict>
+      <key>SockPathName</key>
+      <string>@BLOOM_SIGNER_SOCKET@</string>
+      <key>SockPathMode</key>
+      <integer>384</integer>
+      <key>SockType</key>
+      <string>stream</string>
+    </dict>
+    <key>signer-control</key>
+    <dict>
+      <key>SockPathName</key>
+      <string>@BLOOM_SIGNER_CONTROL_SOCKET@</string>
+      <key>SockPathMode</key>
+      <integer>384</integer>
+      <key>SockType</key>
+      <string>stream</string>
+    </dict>
+  </dict>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LimitLoadToSessionType</key>
+  <array>
+    <string>Aqua</string>
+    <string>Background</string>
+  </array>
+  <key>StandardOutPath</key>
+  <string>@BLOOM_SIGNER_LOG@</string>
+  <key>StandardErrorPath</key>
+  <string>@BLOOM_SIGNER_LOG@</string>
+</dict>
+</plist>

@@ -6,6 +6,19 @@ wire detail. It does not amend that specification.
 
 ## 2026-07-29
 
+- Section 6 already treats a second local login as an availability case, and
+  sections 22/27 require a listener conflict to fail closed rather than
+  guaranteeing that every concurrent login can acquire the host-wide port.
+  Broker therefore adds a non-authoritative
+  `X-Bloom-Ceremony-Owner: bloom-broker-v1` response marker. Machine consults
+  it only after its authenticated Unix edge fails, to report whether a
+  Bloom-shaped listener appears or the occupant is unrelated in the
+  user-visible fatal diagnostic. A foreign process can imitate the marker; it
+  grants no access, is not an authentication input, and does not replace the
+  256-bit session token. Unknown ceremony URL tokens return 404. The launchd
+  source requests failure-only `KeepAlive`; the platform integration lane must
+  prove reacquisition after a conflict clears before packaging may claim it.
+  Neither path binds a fallback port.
 - Section 13 requires Browser's single-use HPKE output-recipient key to be
   bound before the WebAuthn proof, but section 17.2 lists no RPC capable of
   carrying that key after Browser launch. The implementation adds the

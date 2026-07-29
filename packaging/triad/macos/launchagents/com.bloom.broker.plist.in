@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bloom.broker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BLOOM_BROKER_BINARY@</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BLOOM_BROKER_IDENTITY</key>
+    <string>@BLOOM_BROKER_IDENTITY@</string>
+    <key>BLOOM_BROKER_CONFIG</key>
+    <string>@BLOOM_BROKER_CONFIG@</string>
+    <key>BLOOM_EDGE_MANIFEST</key>
+    <string>@BLOOM_EDGE_MANIFEST@</string>
+    <key>BLOOM_BROKER_ACTIVATION_NAME</key>
+    <string>broker</string>
+    <key>BLOOM_BROKER_CONTROL_ACTIVATION_NAME</key>
+    <string>broker-control</string>
+    <key>BLOOM_BROKER_CEREMONY_ACTIVATION_NAME</key>
+    <string>broker-ceremony</string>
+  </dict>
+
+  <key>Sockets</key>
+  <dict>
+    <key>broker</key>
+    <dict>
+      <key>SockPathName</key>
+      <string>@BLOOM_BROKER_SOCKET@</string>
+      <key>SockPathMode</key>
+      <integer>384</integer>
+      <key>SockType</key>
+      <string>stream</string>
+    </dict>
+    <key>broker-control</key>
+    <dict>
+      <key>SockPathName</key>
+      <string>@BLOOM_BROKER_CONTROL_SOCKET@</string>
+      <key>SockPathMode</key>
+      <integer>384</integer>
+      <key>SockType</key>
+      <string>stream</string>
+    </dict>
+    <key>broker-ceremony</key>
+    <dict>
+      <key>SockNodeName</key>
+      <string>127.0.0.1</string>
+      <key>SockServiceName</key>
+      <integer>18734</integer>
+      <key>SockFamily</key>
+      <string>IPv4</string>
+      <key>SockProtocol</key>
+      <string>TCP</string>
+      <key>SockType</key>
+      <string>stream</string>
+    </dict>
+  </dict>
+
+  <!-- A bind/activation conflict is fatal inside Broker. launchd retries the
+       failed job after throttling; Broker never selects a fallback port. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LimitLoadToSessionType</key>
+  <array>
+    <string>Aqua</string>
+    <string>Background</string>
+  </array>
+  <key>StandardOutPath</key>
+  <string>@BLOOM_BROKER_LOG@</string>
+  <key>StandardErrorPath</key>
+  <string>@BLOOM_BROKER_LOG@</string>
+</dict>
+</plist>

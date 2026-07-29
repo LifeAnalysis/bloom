@@ -8,6 +8,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "crates/**"
+      - "packaging/**"
       - "scripts/**"
       - "tests/**"
       - "Dockerfile"
@@ -168,6 +169,21 @@ jobs:
           -E 'package(bloom-it) or package(bloom-watch)'
           --run-ignored ignored-only
           --no-fail-fast
+
+  macos_w0_launchd:
+    name: macOS W0 launchd listener retry
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Exercise real launchd socket ownership and retry
+        env:
+          BLOOM_RUN_MACOS_LAUNCHD_W0: "1"
+        run: >
+          cargo test -p bloom-service-activation
+          --test macos_launchd_retry
+          -- --nocapture
 
   e2e_tests:
     name: external e2e tests

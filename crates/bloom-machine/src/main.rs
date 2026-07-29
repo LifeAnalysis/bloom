@@ -4,6 +4,7 @@
 
 use std::{
     path::{Path, PathBuf},
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -18,6 +19,11 @@ use bloom_triad_protocol::{
 use clap::{Parser, Subcommand};
 use rand::RngCore as _;
 use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+const CEREMONY_OWNER_HEADER: &str = "x-bloom-ceremony-owner";
+const CEREMONY_OWNER_VALUE: &str = "bloom-broker-v1";
+const CEREMONY_DIAGNOSTIC_ADDR: &str = "127.0.0.1:18734";
 
 const MAX_POLICY_DOCUMENT_BYTES: u64 = 1024 * 1024;
 
@@ -110,7 +116,7 @@ async fn main() -> Result<()> {
     )
     .context("load authenticated Machine-to-Broker edge")?;
 
-    match cli.command {
+    let result = match cli.command {
         Command::Readiness => {
             dispatch_and_print(
                 &broker,
@@ -134,6 +140,86 @@ async fn main() -> Result<()> {
         }
         Command::Ceremony(command) => handle_ceremony(&broker, &cli.state_dir, command).await,
         Command::Policy(command) => handle_policy(&broker, &cli.state_dir, command).await,
+    };
+    if let Err(error) = &result
+        && error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<ProtocolError>())
+            .any(is_broker_connect_failure)
+    {
+        report_ceremony_listener_owner().await;
+    }
+    result
+}
+
+fn is_broker_connect_failure(error: &ProtocolError) -> bool {
+    error.code == ProtocolErrorCode::ServiceUnavailable
+        && error.message.starts_with("connect Broker:")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CeremonyListenerOwner {
+    BloomBroker,
+    ForeignProcess,
+    Unbound,
+}
+
+async fn report_ceremony_listener_owner() {
+    eprintln!(
+        "{}",
+        ceremony_listener_diagnostic(probe_ceremony_listener_owner().await)
+    );
+}
+
+fn ceremony_listener_diagnostic(owner: CeremonyListenerOwner) -> String {
+    match owner {
+        CeremonyListenerOwner::BloomBroker => format!(
+            "Bloom Broker startup failed: a Bloom Broker appears to own the canonical ceremony listener at {CEREMONY_DIAGNOSTIC_ADDR}, normally because another login session acquired it first; this login fails closed"
+        ),
+        CeremonyListenerOwner::ForeignProcess => format!(
+            "Bloom Broker startup failed: a foreign process occupies the canonical ceremony listener at {CEREMONY_DIAGNOSTIC_ADDR}; no fallback port will be used"
+        ),
+        CeremonyListenerOwner::Unbound => format!(
+            "Bloom Broker is unavailable and no process currently owns the canonical ceremony listener at {CEREMONY_DIAGNOSTIC_ADDR}; the service manager may still be retrying activation"
+        ),
+    }
+}
+
+async fn probe_ceremony_listener_owner() -> CeremonyListenerOwner {
+    let Ok(Ok(mut stream)) = tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::net::TcpStream::connect(CEREMONY_DIAGNOSTIC_ADDR),
+    )
+    .await
+    else {
+        return CeremonyListenerOwner::Unbound;
+    };
+    let request = b"GET / HTTP/1.1\r\nHost: localhost:18734\r\nConnection: close\r\n\r\n";
+    if tokio::time::timeout(Duration::from_millis(500), stream.write_all(request))
+        .await
+        .is_err()
+    {
+        return CeremonyListenerOwner::ForeignProcess;
+    }
+    let mut response = Vec::with_capacity(2048);
+    let read = tokio::time::timeout(
+        Duration::from_millis(500),
+        stream.take(8192).read_to_end(&mut response),
+    )
+    .await;
+    if read.is_err() {
+        return CeremonyListenerOwner::ForeignProcess;
+    }
+    classify_ceremony_listener_response(&response)
+}
+
+fn classify_ceremony_listener_response(response: &[u8]) -> CeremonyListenerOwner {
+    let response = String::from_utf8_lossy(response).to_ascii_lowercase();
+    let marker = format!("\r\n{}: {}", CEREMONY_OWNER_HEADER, CEREMONY_OWNER_VALUE);
+    if response.contains(&marker) {
+        CeremonyListenerOwner::BloomBroker
+    } else {
+        CeremonyListenerOwner::ForeignProcess
     }
 }
 
@@ -693,6 +779,72 @@ mod tests {
         assert!(is_completed_policy_update_receipt(&receipt, &operation_id));
         receipt.public_status = CeremonyState::Completed;
         assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
+    }
+
+    #[test]
+    fn listener_diagnostic_distinguishes_bloom_from_a_foreign_process() {
+        let bloom = b"HTTP/1.1 404 Not Found\r\nX-Bloom-Ceremony-Owner: bloom-broker-v1\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            classify_ceremony_listener_response(bloom),
+            CeremonyListenerOwner::BloomBroker
+        );
+        assert_eq!(
+            classify_ceremony_listener_response(b"HTTP/1.1 200 OK\r\nServer: unrelated\r\n\r\n"),
+            CeremonyListenerOwner::ForeignProcess
+        );
+        assert_eq!(
+            classify_ceremony_listener_response(
+                b"HTTP/1.1 200 OK\r\nX-Bloom-Ceremony-Owner: bloom-broker-v2\r\n\r\n"
+            ),
+            CeremonyListenerOwner::ForeignProcess,
+            "unknown marker versions fail closed as foreign"
+        );
+        let bloom_message = ceremony_listener_diagnostic(CeremonyListenerOwner::BloomBroker);
+        assert!(bloom_message.contains("another login session acquired it first"));
+        assert!(bloom_message.contains("fails closed"));
+        let foreign_message = ceremony_listener_diagnostic(CeremonyListenerOwner::ForeignProcess);
+        assert!(foreign_message.contains("foreign process occupies"));
+        assert!(foreign_message.contains("no fallback port"));
+        assert!(is_broker_connect_failure(&ProtocolError::new(
+            ProtocolErrorCode::ServiceUnavailable,
+            "connect Broker: connection refused"
+        )));
+        assert!(
+            !is_broker_connect_failure(&ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "Signer is unavailable"
+            )),
+            "an application-level outage must not be misreported as listener ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_diagnostic_is_bounded_and_uses_the_canonical_port() {
+        let listener = tokio::net::TcpListener::bind(CEREMONY_DIAGNOSTIC_ADDR)
+            .await
+            .expect("canonical listener must be free for the focused diagnostic test");
+        let server = tokio::spawn(async move {
+            let (mut bloom, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 128];
+            let _ = bloom.read(&mut request).await.unwrap();
+            bloom
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nX-Bloom-Ceremony-Owner: bloom-broker-v1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            probe_ceremony_listener_owner().await,
+            CeremonyListenerOwner::BloomBroker
+        );
+        server.await.unwrap();
+
+        assert_eq!(
+            probe_ceremony_listener_owner().await,
+            CeremonyListenerOwner::Unbound,
+            "a freed canonical listener is not misreported as a foreign owner"
+        );
     }
 
     #[test]
