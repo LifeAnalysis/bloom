@@ -31,6 +31,7 @@ members = [
   "crates/bloom-triad-protocol",
   "crates/bloom-triad-local-transport",
   "crates/bloom-service-activation",
+  "crates/bloom-trusted-time",
 ]
 resolver = "2"
 
@@ -137,6 +138,7 @@ bloom-update   = { path = "crates/bloom-update" }
 bloom-triad-protocol = { path = "crates/bloom-triad-protocol" }
 bloom-triad-local-transport = { path = "crates/bloom-triad-local-transport" }
 bloom-service-activation = { path = "crates/bloom-service-activation" }
+bloom-trusted-time = { path = "crates/bloom-trusted-time" }
 bloom-machine-client = { path = "crates/bloom-machine-client" }
 # ---- example core petal: generic capability primitives (/bloom/core/cap) ----
 

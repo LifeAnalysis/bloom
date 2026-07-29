@@ -2783,6 +2783,7 @@ name = "bloom-triad-local-transport"
 version = "0.1.1"
 dependencies = [
  "bloom-triad-protocol",
+ "bloom-trusted-time",
  "ed25519-dalek",
  "hex",
  "rand 0.8.6",
@@ -2807,6 +2808,14 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bloom-trusted-time"
+version = "0.1.1"
+dependencies = [
+ "libc",
  "thiserror 2.0.18",
 ]
 

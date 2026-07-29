@@ -35,3 +35,10 @@ installer error.
 The templates use `@...@` placeholders where packaging must supply an absolute
 binary path, login identity, or reviewed egress list. `%i` is the systemd
 instance specifier and is intentionally left for systemd.
+
+The root-owned edge manifest pins `trusted_time_source` to
+`linux-chrony-nts`. The installer renders `chrony/bloom-nts.conf.in` with at
+least two independently operated NTS servers and refuses an unauthenticated
+source. Broker and Signer query the kernel synchronization status; loss of
+synchronization produces an untrusted reading and degraded rate-limited
+signing rather than a wall-clock fallback.

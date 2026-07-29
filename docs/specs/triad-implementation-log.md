@@ -28,6 +28,25 @@ wire detail. It does not amend that specification.
   roots are mode 0700, local Signer has a private network namespace and
   `AF_UNIX` only, and the AWS-KMS drop-in is rejected unless packaging renders
   a non-wildcard reviewed CIDR allowlist over a deny-all egress baseline.
+- Section 10.3 permits authenticated NTP, NTS, or a platform-managed time
+  daemon. The edge manifest pins one reviewed source ID per platform:
+  `linux-chrony-nts` or `macos-managed-timed`. Linux packaging requires two
+  NTS sources under chrony's `authselectmode require`; the runtime accepts UTC
+  only while the kernel reports a synchronized clock. A missing, cross-platform,
+  or peer-supplied source ID fails closed, and the compiled forward-step bound
+  is the normative one hour.
+  Sampling and durable observation are serialized per service so concurrent
+  requests cannot persist monotonic anchors out of order. SQLite upgrades add
+  the UTC, monotonic, and boot-epoch columns in place; historical reservation
+  rows retain an explicit zero/unknown anchor but retries preserve their
+  original accounting time rather than comparing it with a fresh sample.
+  Broker and Signer expose the same offline operator mode through
+  `BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS`: it opens only the service's own state,
+  lists live approvals that the accepted time expires and requires their
+  timestamp-bound digest in
+  `BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST` before mutation, appends a signed
+  `clock.repaired` audit entry atomically with the new clock state, reports the
+  confirmation, and exits before serving sockets.
 - Section 13 requires Browser's single-use HPKE output-recipient key to be
   bound before the WebAuthn proof, but section 17.2 lists no RPC capable of
   carrying that key after Browser launch. The implementation adds the

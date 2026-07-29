@@ -30,3 +30,7 @@ network capability. Broker receives only the server entitlement required for
 the loopback ceremony listener. Hardened runtime and the absence of
 `get-task-allow` are enforced by the signed-bundle scan rather than expressed
 as entitlements here.
+
+The root-owned edge manifest pins `trusted_time_source` to
+`macos-managed-timed`, the platform-managed time service. Peer-supplied time
+and arbitrary source identifiers are rejected.
