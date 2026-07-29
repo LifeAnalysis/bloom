@@ -2412,7 +2412,7 @@ impl Daemon {
             audit_arc.clone(),
             auth_services.clone(),
         )
-        .with_broker(broker)
+        .with_broker(broker.clone())
         .with_tx_outbox(PetalTxOutbox {
             tx_engine: tx_engine.clone(),
             chains: chains.clone(),
@@ -2499,6 +2499,8 @@ impl Daemon {
                         address_book.clone(),
                     )
                     .with_auth_services(auth_services.clone())
+                    .with_broker(broker.clone())
+                    .with_policy_projection_root(home.root().join("machine-policy-projections"))
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_mempool_indexes(mempool_indexes.clone())
                     .with_hyperliquid_handler(hyperliquid_handler.clone()),

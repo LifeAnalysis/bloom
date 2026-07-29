@@ -13,7 +13,8 @@
 //! - `wallets/<wallet>/addresses.json`                              — owner/signer + role addresses
 //! - `wallets/<wallet>/public_key`                                  — secp256k1 pubkey hex
 //! - `wallets/<wallet>/kind`                                        — local/watch
-//! - `wallets/<wallet>/policy.toml`                                 — read+write policy
+//! - `wallets/<wallet>/policy.toml`                                 — legacy read-only policy
+//! - `wallets/<wallet>/policy.json`                                 — canonical triad policy
 //! - `wallets/<wallet>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance
 //! - `wallets/<wallet>/chains/<chain>/nonce`
 //! - `wallets/<wallet>/chains/<chain>/outbox/new.tx`                — write to stage
@@ -28,7 +29,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD};
+#[cfg(test)]
+use base64::engine::general_purpose::STANDARD as B64_STANDARD;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bloom_auth_api::{
     ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms,
     EVM_ERC20_TRANSFER_METHOD, EVM_OWNER_SESSION_MINT_ACTION_KIND,
@@ -41,10 +44,13 @@ use bloom_auth_api::{
 use bloom_auth_api::{SIGNING_ATTESTATION_SCHEMA_V1, SignHashRequest, SigningAttestation};
 use bloom_evm::ChainRegistry;
 use bloom_keystore::Keystore;
+use bloom_machine_client::MachineBrokerClient;
 use bloom_proto::{
-    AddressBook, CapabilityStatus, CapabilityViewEntry, HomeWritePermit, Policy, PolicyEditClass,
-    RawIntent, SigningModel, Venue, classify_policy_edit,
+    AddressBook, CapabilityStatus, CapabilityViewEntry, HomeWritePermit, Policy, RawIntent,
+    SigningModel, Venue,
 };
+#[cfg(test)]
+use bloom_proto::{PolicyEditClass, classify_policy_edit};
 use bloom_tx::{
     intent_parser,
     outbox::OutboxState,
@@ -62,8 +68,11 @@ const APPROVAL_FILE: &str = "approval.json";
 const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 const WALLET_POLICY_SURFACE: &str = "wallet-policy";
+#[cfg(test)]
 const WALLET_POLICY_ACTION_KIND: &str = "policy_update";
+#[cfg(test)]
 const WALLET_POLICY_SUBJECT_SCHEMA: &str = "bloom.wallet_policy_update_subject.v1";
+#[cfg(test)]
 const WALLET_POLICY_SIGN_INTENT: &str = "wallet_policy.sign";
 /// Lifecycle states for a staged wallet-policy update, mirroring the
 /// `/outbox/{pending,sent,failed}` stage/confirm structure. A policy update is
@@ -71,6 +80,64 @@ const WALLET_POLICY_SIGN_INTENT: &str = "wallet_policy.sign";
 /// approved policy is installed, or `failed` if the staged baseline changed
 /// before the approved retry landed.
 const POLICY_UPDATE_STATES: &[&str] = &["pending", "confirmed", "failed"];
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct TriadPolicyUpdateProjection {
+    schema: String,
+    wallet_id: bloom_triad_protocol::Token,
+    operation_id: bloom_triad_protocol::OperationId,
+    baseline_version: bloom_triad_protocol::DecimalU64,
+    baseline_digest: bloom_triad_protocol::Digest32,
+    proposed_policy_digest: bloom_triad_protocol::Digest32,
+    authority_diff_digest: bloom_triad_protocol::Digest32,
+    assurance_level: bloom_triad_protocol::Token,
+    review_manifest_digest: Option<bloom_triad_protocol::Digest32>,
+    ceremony_state: bloom_triad_protocol::CeremonyState,
+    ceremony_url: Option<String>,
+    ceremony_expires_at_ms: Option<bloom_triad_protocol::DecimalU64>,
+}
+
+#[cfg(not(test))]
+impl TriadPolicyUpdateProjection {
+    fn request(
+        &self,
+        proposed_canonical_policy: &[u8],
+    ) -> bloom_triad_protocol::PolicyUpdateRequest {
+        bloom_triad_protocol::PolicyUpdateRequest {
+            operation_id: self.operation_id.clone(),
+            wallet_id: self.wallet_id.clone(),
+            baseline_version: self.baseline_version.clone(),
+            baseline_digest: self.baseline_digest.clone(),
+            proposed_canonical_policy: bloom_triad_protocol::Base64UrlBytes::from_bytes(
+                proposed_canonical_policy,
+            ),
+            proposed_policy_digest: self.proposed_policy_digest.clone(),
+            authority_diff_digest: self.authority_diff_digest.clone(),
+            assurance_level: self.assurance_level.clone(),
+        }
+    }
+
+    fn adopt_prepare(
+        &mut self,
+        prepared: bloom_triad_protocol::PolicyUpdatePrepareResponse,
+    ) -> Result<(), HandlerError> {
+        if prepared.operation_id != self.operation_id
+            || prepared.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate
+            || prepared.ceremony_url.trim().is_empty()
+            || prepared.ceremony_expires_at_ms.get() <= now_ms_u64()
+        {
+            return Err(HandlerError::backend(
+                "Broker policy prepare returned invalid identity, kind, URL, or expiry",
+            ));
+        }
+        self.review_manifest_digest = Some(prepared.review_manifest_digest);
+        self.ceremony_state = bloom_triad_protocol::CeremonyState::AwaitingUser;
+        self.ceremony_url = Some(prepared.ceremony_url);
+        self.ceremony_expires_at_ms = Some(prepared.ceremony_expires_at_ms);
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -86,6 +153,11 @@ pub struct WalletsHandler {
     /// Optional Layer-B auth services. Migrated signer paths must use this
     /// instead of marker files; absent means legacy behavior remains explicit.
     pub auth_services: AuthServices,
+    /// Authenticated production authority edge. When absent, custody and
+    /// policy mutations fail closed outside tests.
+    pub broker: Option<MachineBrokerClient>,
+    /// Machine-owned workflow projections; never a Broker or Signer state root.
+    policy_projection_root: std::path::PathBuf,
 }
 
 impl WalletsHandler {
@@ -95,6 +167,7 @@ impl WalletsHandler {
         tx_engine: TxEngine,
         address_book: AddressBook,
     ) -> Self {
+        let policy_projection_root = keystore.root().to_path_buf();
         Self {
             keystore,
             chains,
@@ -104,11 +177,23 @@ impl WalletsHandler {
             mempool_indexes: Arc::new(std::collections::BTreeMap::new()),
             hyperliquid_handler: None,
             auth_services: AuthServices::default(),
+            broker: None,
+            policy_projection_root,
         }
     }
 
     pub fn with_auth_services(mut self, auth_services: AuthServices) -> Self {
         self.auth_services = auth_services;
+        self
+    }
+
+    pub fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
+        self.broker = broker;
+        self
+    }
+
+    pub fn with_policy_projection_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.policy_projection_root = root.into();
         self
     }
 
@@ -641,6 +726,356 @@ impl WalletsHandler {
         Err(HandlerError::PermissionDenied)
     }
 
+    #[cfg(not(test))]
+    async fn read_triad_wallet_policy(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
+        use sha2::Digest as _;
+
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            HandlerError::backend(
+                "SERVICE_UNAVAILABLE: canonical policy read requires the authenticated Broker edge",
+            )
+        })?;
+        let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let snapshot = broker
+            .policy(wallet_id.clone())
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        let canonical = snapshot.canonical_policy.decode();
+        if snapshot.wallet_id != wallet_id
+            || bloom_triad_protocol::Digest32::from_bytes(sha2::Sha256::digest(&canonical).into())
+                != snapshot.policy_digest
+        {
+            return Err(HandlerError::backend(
+                "Broker policy projection has invalid wallet or digest binding",
+            ));
+        }
+        let policy: bloom_triad_protocol::CanonicalWalletPolicy =
+            serde_json::from_slice(&canonical)
+                .map_err(|error| HandlerError::backend(format!("parse Broker policy: {error}")))?;
+        if policy.wallet_id != wallet_id
+            || serde_jcs::to_vec(&policy)
+                .map_err(|error| HandlerError::backend(error.to_string()))?
+                != canonical
+        {
+            return Err(HandlerError::backend(
+                "Broker policy projection is not canonical",
+            ));
+        }
+        Ok(canonical)
+    }
+
+    #[cfg(not(test))]
+    async fn reconcile_triad_policy_projection(
+        &self,
+        wallet: &str,
+        state: &str,
+        operation_id: &str,
+    ) -> Result<String, HandlerError> {
+        if state != "pending" {
+            return Ok(state.to_owned());
+        }
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            HandlerError::backend(
+                "SERVICE_UNAVAILABLE: policy projection requires the authenticated Broker edge",
+            )
+        })?;
+        let projection_path = self
+            .policy_update_action_dir(wallet, state, operation_id)
+            .join(APPROVAL_CHALLENGE_FILE);
+        let mut projection: TriadPolicyUpdateProjection = read_json(&projection_path)?;
+        if projection.schema != "bloom.machine-policy-update-projection.1"
+            || projection.wallet_id.as_str() != wallet
+            || projection.operation_id.as_str() != operation_id
+        {
+            return Err(HandlerError::backend(
+                "policy projection identity or schema is invalid",
+            ));
+        }
+        let status = match broker
+            .ceremony_status(projection.operation_id.clone())
+            .await
+        {
+            Ok(status) => status,
+            Err(error)
+                if error.code == bloom_triad_protocol::ProtocolErrorCode::ApprovalNotFound
+                    && projection.review_manifest_digest.is_none() =>
+            {
+                // The pre-prepare journal is authoritative, but a read cannot
+                // dispatch the mutation because it does not retain proposed
+                // policy bytes. It exposes no URL and the exact write retry
+                // will resend policy.validate_update with this same ID.
+                projection.ceremony_url = None;
+                projection.ceremony_expires_at_ms = None;
+                write_atomic_json(&projection_path, &projection)?;
+                return Ok("pending".into());
+            }
+            Err(error) => return Err(HandlerError::backend(error.to_string())),
+        };
+        if status.operation_id != projection.operation_id
+            || status.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate
+        {
+            return Err(HandlerError::backend(
+                "Broker policy ceremony status changed operation identity or kind",
+            ));
+        }
+        projection.ceremony_state = status.state;
+        if status.state == bloom_triad_protocol::CeremonyState::AwaitingUser {
+            projection.ceremony_url = Some(status.ceremony_url.ok_or_else(|| {
+                HandlerError::backend(
+                    "awaiting Broker policy ceremony omitted its owner-visible URL",
+                )
+            })?);
+            projection.ceremony_expires_at_ms = Some(status.expires_at_ms);
+        } else {
+            projection.ceremony_url = None;
+            projection.ceremony_expires_at_ms = None;
+        }
+        write_atomic_json(&projection_path, &projection)?;
+        match status.state {
+            bloom_triad_protocol::CeremonyState::Cancelled
+            | bloom_triad_protocol::CeremonyState::Expired
+            | bloom_triad_protocol::CeremonyState::Failed => {
+                self.policy_update_transition(wallet, operation_id, "pending", "failed")?;
+                Ok("failed".into())
+            }
+            bloom_triad_protocol::CeremonyState::Completed => Err(HandlerError::backend(
+                "policy_update ceremony reported the wallet-registration-only COMPLETED state",
+            )),
+            _ => Ok("pending".into()),
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn write_wallet_policy_update(
+        &self,
+        wallet: &str,
+        _path: &str,
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
+        use sha2::Digest as _;
+
+        const MAX_POLICY_BYTES: usize = 1024 * 1024;
+        if data.len() > MAX_POLICY_BYTES {
+            return Err(HandlerError::invalid(format!(
+                "canonical policy exceeds {MAX_POLICY_BYTES} bytes"
+            )));
+        }
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            HandlerError::backend(
+                "SERVICE_UNAVAILABLE: policy update requires the authenticated Broker edge",
+            )
+        })?;
+        let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let proposed: bloom_triad_protocol::CanonicalWalletPolicy = serde_json::from_slice(data)
+            .map_err(|error| {
+                HandlerError::invalid(format!(
+                    "triad policy writes require canonical policy JSON: {error}"
+                ))
+            })?;
+        if proposed.wallet_id != wallet_id {
+            return Err(HandlerError::invalid(
+                "proposed policy wallet_id does not match the VFS wallet",
+            ));
+        }
+        let proposed_bytes = serde_jcs::to_vec(&proposed)
+            .map_err(|error| HandlerError::invalid(format!("canonicalize policy: {error}")))?;
+        let proposed_policy_digest = bloom_triad_protocol::Digest32::from_bytes(
+            sha2::Sha256::digest(&proposed_bytes).into(),
+        );
+        self.migrate_legacy_policy_updates(wallet);
+
+        if let Some(operation_id) = self.policy_update_latest_pending_id(wallet) {
+            let action_dir = self.policy_update_action_dir(wallet, "pending", &operation_id);
+            let projection_path = action_dir.join(APPROVAL_CHALLENGE_FILE);
+            let mut projection: TriadPolicyUpdateProjection = read_json(&projection_path)?;
+            if projection.schema != "bloom.machine-policy-update-projection.1"
+                || projection.wallet_id != wallet_id
+                || projection.operation_id.as_str() != operation_id
+                || projection.proposed_policy_digest != proposed_policy_digest
+            {
+                return Err(HandlerError::invalid(
+                    "pending policy ceremony is bound to different canonical policy bytes",
+                ));
+            }
+            let status = if projection.review_manifest_digest.is_none() {
+                match broker
+                    .ceremony_status(projection.operation_id.clone())
+                    .await
+                {
+                    Ok(status) => status,
+                    Err(error)
+                        if error.code
+                            == bloom_triad_protocol::ProtocolErrorCode::ApprovalNotFound =>
+                    {
+                        let prepared = broker
+                            .validate_policy_update(projection.request(&proposed_bytes))
+                            .await
+                            .map_err(|error| HandlerError::backend(error.to_string()))?;
+                        projection.adopt_prepare(prepared)?;
+                        write_atomic_json(&projection_path, &projection)?;
+                        return Err(HandlerError::PermissionDenied);
+                    }
+                    Err(error) => return Err(HandlerError::backend(error.to_string())),
+                }
+            } else {
+                broker
+                    .ceremony_status(projection.operation_id.clone())
+                    .await
+                    .map_err(|error| HandlerError::backend(error.to_string()))?
+            };
+            if status.operation_id != projection.operation_id
+                || status.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate
+            {
+                return Err(HandlerError::backend(
+                    "Broker policy ceremony status changed operation identity or kind",
+                ));
+            }
+            projection.ceremony_state = status.state;
+            if status.state == bloom_triad_protocol::CeremonyState::AwaitingUser {
+                projection.ceremony_url = Some(status.ceremony_url.ok_or_else(|| {
+                    HandlerError::backend(
+                        "awaiting Broker policy ceremony omitted its owner-visible URL",
+                    )
+                })?);
+                projection.ceremony_expires_at_ms = Some(status.expires_at_ms);
+            } else {
+                projection.ceremony_url = None;
+                projection.ceremony_expires_at_ms = None;
+            }
+            write_atomic_json(&projection_path, &projection)?;
+
+            match status.state {
+                bloom_triad_protocol::CeremonyState::Succeeded => {
+                    let receipt = broker
+                        .custody_result(bloom_triad_protocol::OperationRequest {
+                            operation_id: projection.operation_id.clone(),
+                        })
+                        .await
+                        .map_err(|error| HandlerError::backend(error.to_string()))?;
+                    if receipt.custody_operation_id != projection.operation_id
+                        || receipt.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate
+                        || receipt.public_status != bloom_triad_protocol::CeremonyState::Succeeded
+                    {
+                        return Err(HandlerError::backend(
+                            "policy commit requires the matching completed policy_update receipt",
+                        ));
+                    }
+                    let commit = broker
+                        .commit_policy_update(bloom_triad_protocol::PolicyCommitUpdateRequest {
+                            operation_id: projection.operation_id.clone(),
+                            ceremony_receipt: receipt,
+                        })
+                        .await
+                        .map_err(|error| HandlerError::backend(error.to_string()))?;
+                    if commit.operation_id != projection.operation_id
+                        || commit.wallet_id != wallet_id
+                        || commit.previous_version != projection.baseline_version
+                        || commit.committed.wallet_id != wallet_id
+                        || commit.committed.version.get()
+                            != projection.baseline_version.get().saturating_add(1)
+                        || commit.committed.policy_digest != proposed_policy_digest
+                        || commit.committed.canonical_policy.decode() != proposed_bytes
+                        || commit.authority_diff_digest != projection.authority_diff_digest
+                    {
+                        return Err(HandlerError::backend(
+                            "Broker policy commit receipt conflicts with the VFS projection",
+                        ));
+                    }
+                    projection.ceremony_url = None;
+                    projection.ceremony_expires_at_ms = None;
+                    write_atomic_json(&projection_path, &projection)?;
+                    self.policy_update_transition(
+                        wallet,
+                        projection.operation_id.as_str(),
+                        "pending",
+                        "confirmed",
+                    )?;
+                    return Ok(());
+                }
+                bloom_triad_protocol::CeremonyState::Cancelled
+                | bloom_triad_protocol::CeremonyState::Expired
+                | bloom_triad_protocol::CeremonyState::Failed => {
+                    projection.ceremony_url = None;
+                    projection.ceremony_expires_at_ms = None;
+                    write_atomic_json(&projection_path, &projection)?;
+                    self.policy_update_transition(
+                        wallet,
+                        projection.operation_id.as_str(),
+                        "pending",
+                        "failed",
+                    )?;
+                    return Err(HandlerError::invalid(format!(
+                        "Broker policy ceremony is terminal: {:?}",
+                        status.state
+                    )));
+                }
+                _ => return Err(HandlerError::PermissionDenied),
+            }
+        }
+
+        let baseline = broker
+            .policy(wallet_id.clone())
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        let baseline_bytes = baseline.canonical_policy.decode();
+        if bloom_triad_protocol::Digest32::from_bytes(sha2::Sha256::digest(&baseline_bytes).into())
+            != baseline.policy_digest
+        {
+            return Err(HandlerError::backend(
+                "Broker policy baseline digest does not match its canonical bytes",
+            ));
+        }
+        let baseline_policy: bloom_triad_protocol::CanonicalWalletPolicy =
+            serde_json::from_slice(&baseline_bytes)
+                .map_err(|error| HandlerError::backend(format!("parse Broker policy: {error}")))?;
+        if baseline_policy.wallet_id != wallet_id
+            || serde_jcs::to_vec(&baseline_policy)
+                .map_err(|error| HandlerError::backend(error.to_string()))?
+                != baseline_bytes
+        {
+            return Err(HandlerError::backend(
+                "Broker policy baseline is noncanonical or names another wallet",
+            ));
+        }
+        let authority_diff =
+            bloom_triad_protocol::canonical_policy_authority_diff(&baseline_policy, &proposed);
+        let authority_diff_digest = authority_diff
+            .digest()
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let mut operation_bytes = [0_u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut operation_bytes);
+        let operation_id = bloom_triad_protocol::OperationId::from_bytes(operation_bytes);
+        let mut projection = TriadPolicyUpdateProjection {
+            schema: "bloom.machine-policy-update-projection.1".into(),
+            wallet_id,
+            operation_id: operation_id.clone(),
+            baseline_version: baseline.version,
+            baseline_digest: baseline.policy_digest,
+            proposed_policy_digest,
+            authority_diff_digest,
+            assurance_level: bloom_triad_protocol::Token::new("user_verified")
+                .map_err(|error| HandlerError::invalid(error.to_string()))?,
+            review_manifest_digest: None,
+            ceremony_state: bloom_triad_protocol::CeremonyState::Prepared,
+            ceremony_url: None,
+            ceremony_expires_at_ms: None,
+        };
+        let action_dir = self.policy_update_action_dir(wallet, "pending", operation_id.as_str());
+        std::fs::create_dir_all(&action_dir)?;
+        let projection_path = action_dir.join(APPROVAL_CHALLENGE_FILE);
+        write_atomic_json(&projection_path, &projection)?;
+        let prepared = broker
+            .validate_policy_update(projection.request(&proposed_bytes))
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        projection.adopt_prepare(prepared)?;
+        write_atomic_json(&projection_path, &projection)?;
+        Err(HandlerError::PermissionDenied)
+    }
+
+    #[cfg(test)]
     async fn write_wallet_policy_update(
         &self,
         wallet: &str,
@@ -724,6 +1159,7 @@ impl WalletsHandler {
             .await
     }
 
+    #[cfg(test)]
     async fn issue_wallet_policy_challenge(
         &self,
         action_id: &str,
@@ -748,22 +1184,6 @@ impl WalletsHandler {
             // (single-use) server_nonce and is not part of the signed preimage.
             .map(|challenge| challenge.with_local_ceremony_url())
             .map_err(|e| HandlerError::backend(format!("issue wallet-policy challenge: {e}")))
-    }
-
-    #[cfg(not(test))]
-    async fn execute_wallet_policy_update(
-        &self,
-        wallet: &str,
-        action_id: &str,
-        old_policy_toml: &str,
-        proposed_policy: &[u8],
-    ) -> Result<(), HandlerError> {
-        let _ = (self, wallet, action_id, old_policy_toml, proposed_policy);
-        Err(HandlerError::Unsupported(
-            "UNSUPPORTED_VERSION: legacy hash-only wallet-policy signing is disabled; use the \
-             typed Broker policy-update ceremony"
-                .into(),
-        ))
     }
 
     #[cfg(test)]
@@ -849,7 +1269,9 @@ impl WalletsHandler {
     /// lifecycle state (`pending`, `confirmed`, `failed`), matching the
     /// `/outbox/{pending,sent,failed}` stage/confirm structure.
     fn policy_updates_dir(&self, wallet: &str) -> std::path::PathBuf {
-        self.keystore.root().join(wallet).join("policy-updates")
+        self.policy_projection_root
+            .join(wallet)
+            .join("policy-updates")
     }
 
     fn policy_update_state_dir(&self, wallet: &str, state: &str) -> std::path::PathBuf {
@@ -909,8 +1331,8 @@ impl WalletsHandler {
     /// Atomically move an action between lifecycle states (e.g. `pending` →
     /// `confirmed` once the approved policy is installed). Best-effort: a
     /// failure is logged but never overrides an already-decided install/error
-    /// outcome, because the policy bytes on disk are the source of truth.
-    #[cfg(test)]
+    /// outcome. In production the Broker/Signer receipt is authoritative and
+    /// this move changes only Machine's workflow projection.
     fn policy_update_transition(
         &self,
         wallet: &str,
@@ -1035,31 +1457,64 @@ impl WalletsHandler {
             )));
         }
         let challenge_path = action_dir.join(APPROVAL_CHALLENGE_FILE);
-        let challenge: Option<ApprovalChallenge> = if challenge_path.exists() {
-            Some(read_json(&challenge_path)?)
+        let triad_projection: Option<TriadPolicyUpdateProjection> = if challenge_path.exists() {
+            let bytes = std::fs::read(&challenge_path)?;
+            serde_json::from_slice::<TriadPolicyUpdateProjection>(&bytes)
+                .ok()
+                .filter(|projection| {
+                    projection.schema == "bloom.machine-policy-update-projection.1"
+                })
         } else {
             None
         };
+        let challenge: Option<ApprovalChallenge> =
+            if challenge_path.exists() && triad_projection.is_none() {
+                Some(read_json(&challenge_path)?)
+            } else {
+                None
+            };
         let (status, next_step) = match state {
             "confirmed" => (
                 "confirmed",
-                "policy installed; this entry is kept for audit history",
+                "policy installed by Signer compare-and-swap; this projection is audit history",
             ),
             "failed" => (
                 "failed",
-                "staged baseline changed before the approved retry; restage the policy update",
+                "Broker ceremony failed or the staged baseline changed; restage the policy update",
+            ),
+            _ if triad_projection.as_ref().is_some_and(|projection| {
+                projection.ceremony_state == bloom_triad_protocol::CeremonyState::Succeeded
+            }) =>
+            {
+                (
+                    "ready_to_commit",
+                    "re-write the exact same canonical policy JSON to submit the completed custody receipt",
+                )
+            }
+            _ if triad_projection.as_ref().is_some_and(|projection| {
+                projection.review_manifest_digest.is_none() && projection.ceremony_url.is_none()
+            }) =>
+            {
+                (
+                    "prepare_pending",
+                    "re-write the exact same canonical policy JSON to reconcile policy.validate_update with the same operation ID",
+                )
+            }
+            _ if triad_projection.is_some() => (
+                "awaiting_custody",
+                "complete the Broker policy_update ceremony, then re-write the exact same canonical policy JSON to commit",
             ),
             _ => {
                 let approved = action_dir.join(APPROVAL_FILE).exists();
                 if approved {
                     (
                         "approved",
-                        "re-write the same proposed policy to /wallets/<wallet>/policy.toml to install",
+                        "re-write the same proposed policy document to install",
                     )
                 } else {
                     (
                         "challenged",
-                        "open ceremony_url, approve, then re-write the same proposed policy.toml",
+                        "open ceremony_url, approve, then re-write the same proposed policy document",
                     )
                 }
             }
@@ -1071,12 +1526,15 @@ impl WalletsHandler {
             "surface": WALLET_POLICY_SURFACE,
             "state": state,
             "status": status,
-            "write_path": format!("/wallets/{wallet}/policy.toml"),
-            "installation_target": format!("/wallets/{wallet}/policy.toml"),
+            "write_path": policy_update_vfs_write_path(wallet),
+            "installation_target": policy_update_vfs_write_path(wallet),
             "challenge_path": format!("/wallets/{wallet}/policy-updates/{state}/{action_id}/{APPROVAL_CHALLENGE_FILE}"),
             "assurance": challenge.as_ref().map(|c| c.assurance),
-            "ceremony_url": challenge.as_ref().and_then(|c| c.ceremony_url.clone()),
-            "expiry_ms": challenge.as_ref().map(|c| c.expiry_ms),
+            "ceremony_kind": triad_projection.as_ref().map(|_| "policy_update"),
+            "ceremony_state": triad_projection.as_ref().map(|p| p.ceremony_state),
+            "review_manifest_digest": triad_projection.as_ref().map(|p| p.review_manifest_digest.clone()),
+            "ceremony_url": triad_projection.as_ref().and_then(|p| p.ceremony_url.clone()).or_else(|| challenge.as_ref().and_then(|c| c.ceremony_url.clone())),
+            "expiry_ms": triad_projection.as_ref().and_then(|p| p.ceremony_expires_at_ms.as_ref().map(bloom_triad_protocol::DecimalU64::get)).or_else(|| challenge.as_ref().map(|c| c.expiry_ms)),
             "next_step": next_step,
         });
         let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
@@ -1217,7 +1675,7 @@ impl WalletsHandler {
     }
 
     fn wallet_dir_entries(_kind: bloom_keystore::WalletKind) -> Vec<Entry> {
-        vec![
+        let entries = vec![
             Entry::file("address"),
             Entry::file("address.qr.png"),
             Entry::file("address.qr.svg"),
@@ -1230,7 +1688,17 @@ impl WalletsHandler {
             Entry::dir("policy-session"),
             Entry::dir("policy-updates"),
             Entry::dir("capabilities"),
-        ]
+        ];
+        #[cfg(test)]
+        {
+            entries
+        }
+        #[cfg(not(test))]
+        {
+            let mut production_entries = entries;
+            production_entries.push(Entry::writable_file("policy.json"));
+            production_entries
+        }
     }
 
     fn sign_dir_entries() -> Vec<Entry> {
@@ -1398,6 +1866,14 @@ fn now_ms_u64() -> u64 {
     now_ms().min(u128::from(u64::MAX)) as u64
 }
 
+fn policy_update_vfs_write_path(wallet: &str) -> String {
+    if cfg!(test) {
+        format!("/wallets/{wallet}/policy.toml")
+    } else {
+        format!("/wallets/{wallet}/policy.json")
+    }
+}
+
 fn write_json(path: impl AsRef<Path>, v: &impl serde::Serialize) -> Result<(), HandlerError> {
     std::fs::write(
         path,
@@ -1406,8 +1882,9 @@ fn write_json(path: impl AsRef<Path>, v: &impl serde::Serialize) -> Result<(), H
     Ok(())
 }
 
-#[cfg(test)]
 fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), HandlerError> {
+    use std::io::Write as _;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1415,10 +1892,31 @@ fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), HandlerError> {
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| HandlerError::backend("atomic write target has no file name"))?;
-    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", now_ms_u64()));
-    std::fs::write(&tmp, bytes)?;
+    let mut nonce = [0_u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", hex::encode(nonce)));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
     std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
+}
+
+#[cfg(not(test))]
+fn write_atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), HandlerError> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| HandlerError::backend(error.to_string()))?;
+    write_atomic_file(path, &bytes)
 }
 
 fn read_json<T: for<'de> serde::Deserialize<'de>>(
@@ -1482,10 +1980,12 @@ fn evm_owner_session_action_id(wallet: &str, data: &[u8]) -> String {
     format!("evm-ownersess-{}", hasher.finalize().to_hex())
 }
 
+#[cfg(test)]
 fn wallet_policy_hash_hex(policy: &[u8]) -> String {
     blake3::hash(policy).to_hex().to_string()
 }
 
+#[cfg(test)]
 fn wallet_policy_action_id(wallet: &str, old_policy: &[u8], proposed_policy: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.wallet_policy.update.v1");
@@ -1497,6 +1997,7 @@ fn wallet_policy_action_id(wallet: &str, old_policy: &[u8], proposed_policy: &[u
     format!("policy-update-{}", hasher.finalize().to_hex())
 }
 
+#[cfg(test)]
 fn wallet_policy_diff_summary(
     before: &Policy,
     after: &Policy,
@@ -1519,6 +2020,7 @@ fn wallet_policy_diff_summary(
     }))
 }
 
+#[cfg(test)]
 fn wallet_policy_assurance(before: &Policy, after: &Policy) -> AssuranceLevel {
     if classify_policy_edit(before, after).is_authority_expanding() {
         AssuranceLevel::Hardened
@@ -1533,6 +2035,7 @@ struct WalletPolicySealedSubject {
     proposed_policy_blake3: String,
 }
 
+#[cfg(test)]
 fn wallet_policy_canonical_envelope(
     wallet: &str,
     path: &str,
@@ -1579,6 +2082,7 @@ fn wallet_policy_canonical_envelope(
     ))
 }
 
+#[cfg(test)]
 fn wallet_policy_sealed_action(
     wallet: &str,
     path: &str,
@@ -1993,7 +2497,12 @@ impl WalletsHandler {
         match segs[1].as_str() {
             "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
             | "kind" => Ok(Entry::file(&segs[1])),
+            #[cfg(test)]
             "policy.toml" => Ok(Entry::writable_file("policy.toml")),
+            #[cfg(not(test))]
+            "policy.toml" => Ok(Entry::file("policy.toml")),
+            #[cfg(not(test))]
+            "policy.json" => Ok(Entry::writable_file("policy.json")),
             "sign" => match segs.len() {
                 2 => Ok(Entry::dir("sign")),
                 3 if matches!(segs[2].as_str(), "message" | "hash" | "typed_data") => {
@@ -2139,6 +2648,8 @@ impl WalletsHandler {
                 let body = toml::to_string_pretty(&info.policy).map_err(err_be)?;
                 Ok(body.into_bytes())
             }
+            #[cfg(not(test))]
+            "policy.json" => self.read_triad_wallet_policy(wallet).await,
             "chains" if segs.len() >= 4 => self.read_chain(wallet, &segs[2], &segs[3..]).await,
             "policy-session" if segs.len() == 3 && segs[2] == "active.json" => {
                 self.policy_session_active_json(wallet).await
@@ -2147,11 +2658,17 @@ impl WalletsHandler {
                 let action_id = self
                     .policy_update_latest_pending_id(wallet)
                     .ok_or_else(|| HandlerError::not_found("policy-updates/latest"))?;
+                #[cfg(test)]
+                let state = "pending".to_owned();
+                #[cfg(not(test))]
+                let state = self
+                    .reconcile_triad_policy_projection(wallet, "pending", &action_id)
+                    .await?;
                 match segs[3].as_str() {
                     "approval_challenge.json" => {
-                        self.read_policy_update_challenge(wallet, "pending", &action_id)
+                        self.read_policy_update_challenge(wallet, &state, &action_id)
                     }
-                    "status.json" => self.policy_update_status_json(wallet, "pending", &action_id),
+                    "status.json" => self.policy_update_status_json(wallet, &state, &action_id),
                     _ => Err(HandlerError::NotAFile(path.to_string_path())),
                 }
             }
@@ -2161,7 +2678,13 @@ impl WalletsHandler {
                     && segs[4] == "approval_challenge.json" =>
             {
                 validate_policy_action_id(&segs[3])?;
-                self.read_policy_update_challenge(wallet, &segs[2], &segs[3])
+                #[cfg(test)]
+                let state = segs[2].clone();
+                #[cfg(not(test))]
+                let state = self
+                    .reconcile_triad_policy_projection(wallet, &segs[2], &segs[3])
+                    .await?;
+                self.read_policy_update_challenge(wallet, &state, &segs[3])
             }
             "policy-updates"
                 if segs.len() == 5
@@ -2169,7 +2692,13 @@ impl WalletsHandler {
                     && segs[4] == "status.json" =>
             {
                 validate_policy_action_id(&segs[3])?;
-                self.policy_update_status_json(wallet, &segs[2], &segs[3])
+                #[cfg(test)]
+                let state = segs[2].clone();
+                #[cfg(not(test))]
+                let state = self
+                    .reconcile_triad_policy_projection(wallet, &segs[2], &segs[3])
+                    .await?;
+                self.policy_update_status_json(wallet, &state, &segs[3])
             }
             "capabilities" if segs.len() == 3 && segs[2] == "active.json" => {
                 self.capabilities_active_json(wallet)
@@ -2222,7 +2751,23 @@ impl WalletsHandler {
                     .into(),
             ));
         }
+        #[cfg(test)]
         if segs.len() == 2 && segs[1] == "policy.toml" {
+            self.write_permit()?;
+            return self
+                .write_wallet_policy_update(wallet, &path.to_string_path(), data)
+                .await;
+        }
+        #[cfg(not(test))]
+        if segs.len() == 2 && segs[1] == "policy.toml" {
+            return Err(HandlerError::Unsupported(
+                "legacy policy.toml is read-only; write the complete canonical policy document \
+                 to policy.json so Broker can prepare a policy_update custody ceremony"
+                    .into(),
+            ));
+        }
+        #[cfg(not(test))]
+        if segs.len() == 2 && segs[1] == "policy.json" {
             self.write_permit()?;
             return self
                 .write_wallet_policy_update(wallet, &path.to_string_path(), data)

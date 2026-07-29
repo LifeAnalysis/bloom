@@ -58,3 +58,10 @@ wire detail. It does not amend that specification.
   processing a completed `wallet_registration` or `wallet_import` receipt,
   verifies the self-contained snapshot, persists the pin in its own policy
   store, and rejects key self-enrollment through ordinary `policy.read`.
+- Section 19 defines the closed `CanonicalWalletPolicy` JSON shape and exact
+  canonical bytes but does not assign a VFS filename or a TOML translation.
+  Production VFS therefore exposes Broker's authenticated canonical projection
+  as `wallets/<wallet>/policy.json` and accepts complete policy replacement
+  there. The legacy `policy.toml` projection is read-only in production:
+  translating its narrower schema would omit authority fields and could not
+  preserve the exact proposed bytes bound by the policy-update ceremony.
