@@ -1,0 +1,47 @@
+[Unit]
+Description=Bloom Signer for login UID %i
+Requires=bloom-signer-rpc@%i.socket bloom-signer-control@%i.socket
+
+[Service]
+Type=simple
+User=bloom-signer-%i
+Group=bloom-signer-%i
+UMask=0077
+ExecStart=@BLOOM_SIGNER_BINARY@
+Environment=BLOOM_SIGNER_IDENTITY=/etc/bloom/%i/signer/identity.json
+Environment=BLOOM_SIGNER_CONFIG=/etc/bloom/%i/signer/config.json
+Environment=BLOOM_EDGE_MANIFEST=/etc/bloom/%i/edge-manifest.json
+Environment=BLOOM_SIGNER_ACTIVATION_NAME=signer
+Environment=BLOOM_SIGNER_CONTROL_ACTIVATION_NAME=signer-control
+Sockets=bloom-signer-rpc@%i.socket bloom-signer-control@%i.socket
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitCORE=0
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ReadWritePaths=/var/lib/bloom/%i/signer
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+# Render once per enabled interactive login.
+u bloom-broker-@LOGIN_UID@ - "Bloom Broker for login UID @LOGIN_UID@" /var/lib/bloom/@LOGIN_UID@/broker -
+u bloom-signer-@LOGIN_UID@ - "Bloom Signer for login UID @LOGIN_UID@" /var/lib/bloom/@LOGIN_UID@/signer -
+g bloom-machine-broker-@LOGIN_UID@ -
+g bloom-broker-signer-@LOGIN_UID@ -
+g bloom-revoke-@LOGIN_UID@ -
+m @LOGIN_USER@ bloom-machine-broker-@LOGIN_UID@
+m bloom-broker-@LOGIN_UID@ bloom-machine-broker-@LOGIN_UID@
+m bloom-broker-@LOGIN_UID@ bloom-broker-signer-@LOGIN_UID@
+m bloom-signer-@LOGIN_UID@ bloom-broker-signer-@LOGIN_UID@
+m @LOGIN_USER@ bloom-revoke-@LOGIN_UID@

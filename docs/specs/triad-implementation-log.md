@@ -19,6 +19,15 @@ wire detail. It does not amend that specification.
   source requests failure-only `KeepAlive`; the platform integration lane must
   prove reacquisition after a conflict clears before packaging may claim it.
   Neither path binds a fallback port.
+- Section 22 requires distinct Linux principals but does not assign their
+  names. Packaging creates `bloom-broker-UID` and `bloom-signer-UID` system
+  principals per enabled login UID. The login and Broker share only a
+  Machine--Broker group; Broker and Signer share a different group that
+  excludes Machine; a third group reaches only the revocation-control
+  sockets. systemd owns all named listeners. Service state and configuration
+  roots are mode 0700, local Signer has a private network namespace and
+  `AF_UNIX` only, and the AWS-KMS drop-in is rejected unless packaging renders
+  a non-wildcard reviewed CIDR allowlist over a deny-all egress baseline.
 - Section 13 requires Browser's single-use HPKE output-recipient key to be
   bound before the WebAuthn proof, but section 17.2 lists no RPC capable of
   carrying that key after Browser launch. The implementation adds the

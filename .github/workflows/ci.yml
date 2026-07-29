@@ -185,6 +185,50 @@ jobs:
           --test macos_launchd_retry
           -- --nocapture
 
+  linux_w0_isolation:
+    name: Linux W0 principal and socket isolation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Verify rendered systemd units
+        run: |
+          unit_dir="$(mktemp -d)"
+          cp packaging/triad/linux/systemd/*.socket "$unit_dir/"
+          for source in packaging/triad/linux/systemd/*.service.in; do
+            destination="$unit_dir/$(basename "${source%.in}")"
+            sed 's|@BLOOM_BROKER_BINARY@|/usr/bin/true|; s|@BLOOM_SIGNER_BINARY@|/usr/bin/true|' \
+              "$source" > "$destination"
+          done
+          mkdir -p "$unit_dir/bloom-signer@1000.service.d"
+          sed 's|@AWS_KMS_IP_ALLOW_DIRECTIVES@|IPAddressAllow=127.0.0.1/32|' \
+            packaging/triad/linux/systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in \
+            > "$unit_dir/bloom-signer@1000.service.d/50-aws-kms.conf"
+          cp "$unit_dir/bloom-signer@.service" "$unit_dir/bloom-signer@1000.service"
+          systemd-analyze verify \
+            "$unit_dir"/*.socket \
+            "$unit_dir"/*.service \
+            "$unit_dir/bloom-signer@1000.service"
+      - name: Run Linux packaging assertions
+        run: cargo test -p bloom-service-activation --test linux_packaging --locked
+      - name: Build UID-isolation test as the unprivileged runner
+        id: linux-w0-test
+        run: |
+          executable="$(
+            cargo test -p bloom-service-activation --test linux_uid_isolation \
+              --locked --no-run --message-format=json |
+              jq -r 'select(.profile.test == true and .target.name == "linux_uid_isolation") | .executable' |
+              tail -n 1
+          )"
+          test -n "$executable"
+          test -x "$executable"
+          echo "executable=$executable" >> "$GITHUB_OUTPUT"
+      - name: Prove Machine denial and Broker-to-Signer access under distinct UIDs
+        env:
+          TEST_EXECUTABLE: ${{ steps.linux-w0-test.outputs.executable }}
+        run: sudo env BLOOM_RUN_LINUX_PRIVILEGED_W0=1 "$TEST_EXECUTABLE" --nocapture
+
   e2e_tests:
     name: external e2e tests
     runs-on: ubuntu-latest
