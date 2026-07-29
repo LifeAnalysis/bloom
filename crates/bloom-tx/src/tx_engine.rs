@@ -14,7 +14,7 @@ use alloy::primitives::{Address, B256, Bytes, Signature, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
 #[cfg(all(test, feature = "unsafe-debug-signer"))]
 use alloy::signers::SignerSync;
-#[cfg(feature = "unsafe-debug-signer")]
+#[cfg(any(test, feature = "unsafe-debug-signer"))]
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
