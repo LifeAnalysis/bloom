@@ -71,10 +71,11 @@ pub fn run_once() -> Result<()> {
         )
         .with_context(|| format!("decode {}", path.display()))?;
         let login_uid = required_u32(&enrollment, "login_uid")?;
-        if !matches!(
-            enrollment.get("state").and_then(serde_json::Value::as_str),
-            Some("activating" | "active")
-        ) {
+        let enrollment_state = enrollment
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .context("enrollment state is not a string")?;
+        if !matches!(enrollment_state, "activating" | "active") {
             bail!("enrollment is not activating or active");
         }
         if path.file_name().and_then(|value| value.to_str()) != Some(&format!("{login_uid}.json")) {
@@ -115,7 +116,9 @@ pub fn run_once() -> Result<()> {
             available,
         };
         write_status(login_uid, &status)?;
-        restart_services_for_live_session(login_uid, revoke_gid)?;
+        if enrollment_state == "active" {
+            restart_services_for_live_session(login_uid, revoke_gid)?;
+        }
     }
     if !all_available || !trusted_time_available {
         bail!("Bloom packet-filter or managed-time platform status is unavailable");
