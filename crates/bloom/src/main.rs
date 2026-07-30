@@ -128,7 +128,13 @@ fn resolve_server_endpoint(home: &HomeDir, endpoint: Option<&str>) -> Result<Res
 }
 
 fn configured_broker_client() -> Result<bloom_machine_client::MachineBrokerClient> {
-    let installed = installed_macos_triad_paths()?;
+    configured_broker_client_with_activation(false)
+}
+
+fn configured_broker_client_with_activation(
+    allow_activating: bool,
+) -> Result<bloom_machine_client::MachineBrokerClient> {
+    let installed = installed_macos_triad_paths_with_activation(allow_activating)?;
     let broker_socket = std::env::var_os("BLOOM_BROKER_SOCKET")
         .map(std::path::PathBuf::from)
         .or_else(|| installed.as_ref().map(|paths| paths.broker_socket.clone()))
@@ -162,7 +168,8 @@ async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
         Digest32::new(expected_build.to_owned()).context("parse expected release digest")?;
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        configured_broker_client()?.request(MachineBrokerRequest::BrokerReadiness(Empty {})),
+        configured_broker_client_with_activation(true)?
+            .request(MachineBrokerRequest::BrokerReadiness(Empty {})),
     )
     .await
     .context("authenticated Broker readiness timed out")?
@@ -208,6 +215,12 @@ struct InstalledMacosTriadPaths {
 }
 
 fn installed_macos_triad_paths() -> Result<Option<InstalledMacosTriadPaths>> {
+    installed_macos_triad_paths_with_activation(false)
+}
+
+fn installed_macos_triad_paths_with_activation(
+    allow_activating: bool,
+) -> Result<Option<InstalledMacosTriadPaths>> {
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -228,6 +241,27 @@ fn installed_macos_triad_paths() -> Result<Option<InstalledMacosTriadPaths>> {
             || metadata.nlink() != 1
         {
             bail!("installed Bloom enrollment has unsafe ownership or type");
+        }
+        let enrollment_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&enrollment)?)
+                .context("decode installed Bloom enrollment")?;
+        if enrollment_value
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            != Some("bloom.macos-enrollment.1")
+            || enrollment_value
+                .get("login_uid")
+                .and_then(serde_json::Value::as_u64)
+                != Some(u64::from(uid))
+        {
+            bail!("installed Bloom enrollment identity does not match this login");
+        }
+        let state = enrollment_value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .context("installed Bloom enrollment has no state")?;
+        if state != "active" && !(allow_activating && state == "activating") {
+            bail!("installed Bloom enrollment is not active");
         }
         let config = PathBuf::from(format!(
             "/Library/Application Support/BloomTriad/config/{uid}"

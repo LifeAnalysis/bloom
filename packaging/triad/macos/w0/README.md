@@ -26,7 +26,10 @@ UID-scoped `pf` rules. It also requires the authenticated session socket to
 appear with the login UID and revoke group, then verifies the canonical
 listener's Broker marker. It removes the live anchor, waits for the root-owned
 containment attestation to turn unavailable, proves authenticated triad health
-fails, and then restores and re-verifies the anchor. Foreign/cross-login
-listener conflict, actual logout handoff, network attempts, hostile session
-authentication, install interruption, and destructive rollback cases remain
-required before the W0 claim can graduate.
+fails, and then restores and re-verifies the anchor. It also constructs a
+durable interrupted-enrollment intent plus its exact partial Directory Service
+record and proves the next installer invocation removes both without adopting
+the record. Foreign/cross-login listener conflict, actual logout handoff,
+network attempts, hostile session authentication, release-upgrade
+interruption, and destructive upgrade rollback cases remain required before
+the W0 claim can graduate.

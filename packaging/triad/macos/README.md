@@ -65,6 +65,14 @@ enrollment-material mode against the signed public templates in `config/`.
 Five application identities and the Broker/Signer signing authorities are
 fresh per login; only their public cross-pins enter the root-owned manifest.
 The temporary root-only generation directory is removed on success or error.
+Fresh enrollment is journaled before the first Directory Service mutation.
+Each record intent is durable before creation, so an interrupted installer can
+remove only names it first proved absent. The root-owned enrollment record is
+published as `activating`; only the session sentinel, PF monitor, and private
+installer health probe accept that state. Ordinary Machine discovery requires
+`active`, which is atomically published only after authenticated Broker and
+Signer health succeeds. A later installer invocation resumes a health-passed
+transaction or rolls an incomplete one back exactly.
 
 The packet-filter template denies new Broker IP flows and all Signer TCP/UDP
 flows by numeric effective UID. A root/wheel one-shot monitor is launched once

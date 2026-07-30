@@ -64,6 +64,12 @@ pub fn run_once() -> Result<()> {
         )
         .with_context(|| format!("decode {}", path.display()))?;
         let login_uid = required_u32(&enrollment, "login_uid")?;
+        if !matches!(
+            enrollment.get("state").and_then(serde_json::Value::as_str),
+            Some("activating" | "active")
+        ) {
+            bail!("enrollment is not activating or active");
+        }
         if path.file_name().and_then(|value| value.to_str()) != Some(&format!("{login_uid}.json")) {
             bail!("enrollment filename does not match its login UID");
         }

@@ -74,6 +74,53 @@ field() {
   plutil -extract "$1" raw -o - "$enrollment"
 }
 
+recovery_uid=424242
+recovery_group="bloom-broker-$recovery_uid"
+[[ "$recovery_uid" != "$login_uid" ]] || exit 65
+for recovery_path in \
+  "/Library/Application Support/BloomTriad/enrollments/$recovery_uid.json" \
+  "/Library/Application Support/BloomTriad/config/$recovery_uid" \
+  "/private/var/db/bloom/$recovery_uid" \
+  "/private/var/run/bloom/$recovery_uid"
+do
+  [[ ! -e "$recovery_path" ]] || {
+    echo "W0 recovery probe UID already has Bloom state" >&2
+    exit 65
+  }
+done
+if dscl . -read "/Groups/$recovery_group" >/dev/null 2>&1; then
+  echo "W0 recovery probe group already exists" >&2
+  exit 65
+fi
+recovery_gid="$(
+  dscl . -list /Groups PrimaryGroupID |
+    awk '$NF ~ /^[0-9]+$/ && $NF > maximum { maximum = $NF } END { print maximum + 1 }'
+)"
+recovery_transaction="/Library/Application Support/BloomTriad/enrollment-transactions/$recovery_uid"
+mkdir "$recovery_transaction"
+chmod 0700 "$recovery_transaction"
+chown root:wheel "$recovery_transaction"
+printf '%s\n' 'bloom.macos-enrollment-transaction.1' \
+  > "$recovery_transaction/schema"
+printf '%s\n' "$recovery_uid" > "$recovery_transaction/login-uid"
+printf '%s\n' 'bloom-w0-recovery' > "$recovery_transaction/login-user"
+printf '%s\n' provisioning > "$recovery_transaction/phase"
+printf '%s\n' Groups "$recovery_group" PrimaryGroupID "$recovery_gid" \
+  > "$recovery_transaction/record.001"
+chmod 0600 "$recovery_transaction"/*
+dscl . -create "/Groups/$recovery_group"
+dscl . -create "/Groups/$recovery_group" PrimaryGroupID "$recovery_gid"
+sync
+"$installer" install / "$login_uid" "$login_user" "$payload"
+[[ ! -e "$recovery_transaction" ]] || {
+  echo "installer did not consume the interrupted enrollment journal" >&2
+  exit 1
+}
+if dscl . -read "/Groups/$recovery_group" >/dev/null 2>&1; then
+  echo "installer did not remove the journal-owned partial group" >&2
+  exit 1
+fi
+
 broker_uid="$(field broker_uid)"
 signer_uid="$(field signer_uid)"
 broker_gid="$(field broker_gid)"
@@ -81,6 +128,10 @@ signer_gid="$(field signer_gid)"
 machine_broker_gid="$(field machine_broker_gid)"
 broker_signer_gid="$(field broker_signer_gid)"
 revoke_gid="$(field revoke_gid)"
+[[ "$(field state)" == "active" ]] || {
+  echo "installer published the enrollment before activation completed" >&2
+  exit 1
+}
 
 assert_record() {
   kind="$1"

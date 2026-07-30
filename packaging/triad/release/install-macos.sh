@@ -27,7 +27,7 @@ shift
 source_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 live_install=false
 provision_committed=false
-pf_reference_installed=false
+provision_started=false
 installer_lock=""
 generated_material=""
 release_staging=""
@@ -35,12 +35,11 @@ existing_enrollment=false
 fresh_enrollment=false
 has_installed_enrollments=false
 global_installed_release_digest=""
-containment_monitor_created=false
 upgrade_in_progress=false
 upgrade_transaction=""
 upgrade_transaction_staging=""
-created_users=()
-created_groups=()
+enrollment_transaction=""
+enrollment_record_index=0
 
 validate_root_uid() {
   root="$1"
@@ -146,34 +145,12 @@ rollback_provisioning() {
   if $upgrade_in_progress; then
     rollback_upgrade
   fi
-  if $live_install && ! $provision_committed; then
-    if [[ -n "${login_uid:-}" && "$login_uid" =~ ^[1-9][0-9]*$ ]]; then
-      launchctl bootout "gui/$login_uid/com.bloom.session" 2>/dev/null
-      launchctl bootout "system/com.bloom.broker.$login_uid" 2>/dev/null
-      launchctl bootout "system/com.bloom.signer.$login_uid" 2>/dev/null
-      if $containment_monitor_created && ! $has_installed_enrollments; then
-        launchctl bootout "system/com.bloom.containment" 2>/dev/null
-        rm -f -- "/Library/LaunchDaemons/com.bloom.containment.plist"
-      fi
-      if $pf_reference_installed; then
-        rewrite_pf_reference remove
-      fi
-      rm -f -- \
-        "/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist" \
-        "/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist" \
-        "/etc/pf.anchors/com.bloom.triad.$login_uid" \
-        "/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
-      rm -rf -- \
-        "/Library/Application Support/BloomTriad/config/$login_uid" \
-        "/private/var/db/bloom/$login_uid" \
-        "/private/var/run/bloom/$login_uid"
+  if $live_install && $provision_started && ! $provision_committed; then
+    if [[ -n "$enrollment_transaction" && -d "$enrollment_transaction" ]]; then
+      rollback_enrollment_transaction
+    else
+      echo "fresh provisioning failed without a recoverable enrollment journal" >&2
     fi
-    for ((index = ${#created_users[@]} - 1; index >= 0; index--)); do
-      dscl . -delete "/Users/${created_users[$index]}" 2>/dev/null
-    done
-    for ((index = ${#created_groups[@]} - 1; index >= 0; index--)); do
-      dscl . -delete "/Groups/${created_groups[$index]}" 2>/dev/null
-    done
   fi
   release_installer_lock
   exit "$status"
@@ -211,6 +188,55 @@ next_directory_id() {
   printf '%s\n' "$candidate"
 }
 
+prepare_enrollment_transaction() {
+  transaction_root="$product_root/enrollment-transactions"
+  if [[ -e "$product_root" ]]; then
+    require_live_directory_metadata "$product_root" 0 0 755
+  else
+    mkdir "$product_root"
+    chown root:wheel "$product_root"
+    chmod 0755 "$product_root"
+  fi
+  if [[ -e "$transaction_root" ]]; then
+    require_live_directory_metadata "$transaction_root" 0 0 700
+  else
+    mkdir "$transaction_root"
+    chown root:wheel "$transaction_root"
+    chmod 0700 "$transaction_root"
+  fi
+  enrollment_transaction="$transaction_root/$login_uid"
+  [[ ! -e "$enrollment_transaction" ]] || {
+    echo "an enrollment transaction already exists for login UID $login_uid" >&2
+    return 75
+  }
+  mkdir "$enrollment_transaction"
+  chown root:wheel "$enrollment_transaction"
+  chmod 0700 "$enrollment_transaction"
+  printf '%s\n' 'bloom.macos-enrollment-transaction.1' \
+    > "$enrollment_transaction/schema"
+  printf '%s\n' "$login_uid" > "$enrollment_transaction/login-uid"
+  printf '%s\n' "$login_user" > "$enrollment_transaction/login-user"
+  printf '%s\n' provisioning > "$enrollment_transaction/phase"
+  chmod 0600 "$enrollment_transaction"/*
+  sync
+}
+
+record_directory_intent() {
+  kind="$1"
+  name="$2"
+  attribute="$3"
+  numeric_id="$4"
+  enrollment_record_index=$((enrollment_record_index + 1))
+  intent="$enrollment_transaction/record.$(
+    printf '%03d' "$enrollment_record_index"
+  )"
+  temporary="$intent.new"
+  printf '%s\n' "$kind" "$name" "$attribute" "$numeric_id" > "$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$intent"
+  sync
+}
+
 create_service_group() {
   name="$1"
   gid="$2"
@@ -218,8 +244,8 @@ create_service_group() {
     echo "refusing to adopt pre-existing group $name" >&2
     exit 65
   }
+  record_directory_intent Groups "$name" PrimaryGroupID "$gid"
   dscl . -create "/Groups/$name"
-  created_groups+=("$name")
   dscl . -create "/Groups/$name" PrimaryGroupID "$gid"
   dscl . -create "/Groups/$name" RealName "Bloom isolated service group"
 }
@@ -232,8 +258,8 @@ create_service_user() {
     echo "refusing to adopt pre-existing user $name" >&2
     exit 65
   }
+  record_directory_intent Users "$name" UniqueID "$uid"
   dscl . -create "/Users/$name"
-  created_users+=("$name")
   dscl . -create "/Users/$name" UniqueID "$uid"
   dscl . -create "/Users/$name" PrimaryGroupID "$gid"
   dscl . -create "/Users/$name" RealName "Bloom isolated service"
@@ -352,6 +378,7 @@ require_network_containment_config() {
 
 verify_existing_enrollment() {
   [[ "$(read_enrollment_field "$enrollment" schema)" == "bloom.macos-enrollment.1" ]]
+  [[ "$(read_enrollment_field "$enrollment" state)" == "active" ]]
   [[ "$(read_enrollment_field "$enrollment" login_uid)" == "$login_uid" ]]
   [[ "$(read_enrollment_field "$enrollment" login_user)" == "$login_user" ]]
   [[ "$(read_enrollment_field "$enrollment" broker_user)" == "$broker_user" ]]
@@ -1286,9 +1313,6 @@ bootstrap_live_jobs() {
     "$containment_plist" \
     "$session_plist" >/dev/null
   pfctl -nf "$pf_target"
-  if ! launchctl print "system/com.bloom.containment" >/dev/null 2>&1; then
-    containment_monitor_created=true
-  fi
   launchctl bootout "system/com.bloom.containment" 2>/dev/null || true
   launchctl bootstrap system "$containment_plist"
   "$machine_binary" --triad-pf-monitor-once
@@ -1317,6 +1341,146 @@ health_check_enrollment() {
     echo "Bloom triad activation failed for login UID $login_uid" >&2
     return 69
   }
+}
+
+publish_enrollment_active() {
+  temporary="$enrollment.active.$$"
+  cp -p "$enrollment" "$temporary"
+  plutil -replace state -string active "$temporary"
+  chown root:wheel "$temporary"
+  chmod 0644 "$temporary"
+  mv -f "$temporary" "$enrollment"
+  sync
+}
+
+write_enrollment_phase() {
+  phase="$1"
+  temporary="$enrollment_transaction/phase.new"
+  printf '%s\n' "$phase" > "$temporary"
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$enrollment_transaction/phase"
+  sync
+}
+
+load_enrollment_transaction_identity() {
+  enrollment_transaction="$1"
+  [[ -d "$enrollment_transaction" && ! -L "$enrollment_transaction" ]] || return 65
+  [[ "$(stat -f '%u:%Lp' "$enrollment_transaction")" == "0:700" ]] || return 65
+  for required in schema login-uid login-user phase; do
+    [[ -f "$enrollment_transaction/$required" &&
+      ! -L "$enrollment_transaction/$required" ]] || return 65
+  done
+  grep -Fx 'bloom.macos-enrollment-transaction.1' \
+    "$enrollment_transaction/schema" >/dev/null || return 65
+  login_uid="$(<"$enrollment_transaction/login-uid")"
+  login_user="$(<"$enrollment_transaction/login-user")"
+  [[ "$login_uid" =~ ^[1-9][0-9]*$ ]] || return 65
+  [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || return 65
+  [[ "$(basename "$enrollment_transaction")" == "$login_uid" ]] || return 65
+  broker_user="bloom-broker-$login_uid"
+  broker_group="$broker_user"
+  signer_user="bloom-signer-$login_uid"
+  signer_group="$signer_user"
+  machine_broker_group="bloom-machine-broker-$login_uid"
+  broker_signer_group="bloom-broker-signer-$login_uid"
+  revoke_group="bloom-revoke-$login_uid"
+  enrollment_root="$product_root/enrollments"
+  enrollment="$enrollment_root/$login_uid.json"
+}
+
+rollback_enrollment_transaction() {
+  stop_uid="$login_uid"
+  launchctl bootout "gui/$stop_uid/com.bloom.session" 2>/dev/null || true
+  launchctl bootout "system/com.bloom.broker.$stop_uid" 2>/dev/null || true
+  launchctl bootout "system/com.bloom.signer.$stop_uid" 2>/dev/null || true
+  if [[ -f /etc/pf.conf && ! -L /etc/pf.conf ]]; then
+    rewrite_pf_reference remove
+  fi
+  rm -f -- \
+    "/Library/LaunchDaemons/com.bloom.broker.$stop_uid.plist" \
+    "/Library/LaunchDaemons/com.bloom.signer.$stop_uid.plist" \
+    "/etc/pf.anchors/com.bloom.triad.$stop_uid" \
+    "$enrollment"
+  rm -rf -- \
+    "$product_root/config/$stop_uid" \
+    "/private/var/db/bloom/$stop_uid" \
+    "/private/var/run/bloom/$stop_uid"
+
+  shopt -s nullglob
+  intent_files=("$enrollment_transaction"/record.*)
+  shopt -u nullglob
+  for ((index = ${#intent_files[@]} - 1; index >= 0; index--)); do
+    intent="${intent_files[$index]}"
+    [[ -f "$intent" && ! -L "$intent" ]] || return 65
+    kind="$(sed -n '1p' "$intent")"
+    name="$(sed -n '2p' "$intent")"
+    attribute="$(sed -n '3p' "$intent")"
+    numeric_id="$(sed -n '4p' "$intent")"
+    [[ "$numeric_id" =~ ^[1-9][0-9]*$ ]] || return 65
+    case "$kind:$name:$attribute" in
+      "Users:$broker_user:UniqueID" | \
+        "Users:$signer_user:UniqueID" | \
+        "Groups:$broker_group:PrimaryGroupID" | \
+        "Groups:$signer_group:PrimaryGroupID" | \
+        "Groups:$machine_broker_group:PrimaryGroupID" | \
+        "Groups:$broker_signer_group:PrimaryGroupID" | \
+        "Groups:$revoke_group:PrimaryGroupID") ;;
+      *) return 65 ;;
+    esac
+    if directory_record_exists "$kind" "$name"; then
+      if dscl . -read "/$kind/$name" "$attribute" >/dev/null 2>&1; then
+        require_directory_value "$kind" "$name" "$attribute" "$numeric_id"
+      fi
+      dscl . -delete "/$kind/$name"
+    fi
+  done
+  rm -rf -- "$enrollment_transaction"
+  enrollment_transaction=""
+  if ! find "$enrollment_root" -type f -name '*.json' -mindepth 1 -maxdepth 1 |
+    grep . >/dev/null
+  then
+    launchctl bootout "system/com.bloom.containment" 2>/dev/null || true
+    rm -f -- \
+      "/Library/LaunchDaemons/com.bloom.containment.plist" \
+      "/Library/LaunchAgents/com.bloom.session.plist"
+  fi
+}
+
+recover_pending_enrollments() {
+  transaction_root="$product_root/enrollment-transactions"
+  [[ -e "$transaction_root" ]] || return
+  require_live_directory_metadata "$transaction_root" 0 0 700
+  shopt -s nullglob
+  pending_transactions=("$transaction_root"/[1-9]*)
+  shopt -u nullglob
+  for pending_transaction in "${pending_transactions[@]}"; do
+    load_enrollment_transaction_identity "$pending_transaction"
+    phase="$(<"$enrollment_transaction/phase")"
+    if [[ "$phase" == "committed" && -f "$enrollment" ]] &&
+      [[ "$(read_enrollment_field "$enrollment" state)" == "active" ]]
+    then
+      rm -rf -- "$enrollment_transaction"
+      enrollment_transaction=""
+      continue
+    fi
+    if [[ "$phase" == "health-passed" && -f "$enrollment" ]]; then
+      enrollment_state="$(read_enrollment_field "$enrollment" state)"
+      if [[ "$enrollment_state" == "activating" || "$enrollment_state" == "active" ]]; then
+        BLOOM_RELEASE_DIGEST="$(read_enrollment_field "$enrollment" release_digest)"
+        machine_binary="/usr/local/libexec/bloom/current/bloom"
+        if health_check_enrollment; then
+          if [[ "$enrollment_state" == "activating" ]]; then
+            publish_enrollment_active
+          fi
+          write_enrollment_phase committed
+          rm -rf -- "$enrollment_transaction"
+          enrollment_transaction=""
+          continue
+        fi
+      fi
+    fi
+    rollback_enrollment_transaction
+  done
 }
 
 delete_directory_record_exact() {
@@ -1353,7 +1517,12 @@ case "$action" in
       product_root="/Library/Application Support/BloomTriad"
       enrollment_root="$product_root/enrollments"
       release_base="/usr/local/libexec/bloom"
+      requested_login_uid="$login_uid"
+      requested_login_user="$login_user"
       recover_interrupted_upgrade
+      recover_pending_enrollments
+      login_uid="$requested_login_uid"
+      login_user="$requested_login_user"
       [[ "$(id -u "$login_user")" == "$login_uid" ]] || {
         echo "LOGIN_USER does not resolve to LOGIN_UID" >&2
         exit 65
@@ -1552,6 +1721,8 @@ case "$action" in
       mv -f "$current_new" "$current_link"
     fi
     if $live_install && $fresh_enrollment; then
+      prepare_enrollment_transaction
+      provision_started=true
       provision_fresh_accounts
     fi
     machine_binary="$current_link/bloom"
@@ -1697,9 +1868,15 @@ case "$action" in
     fi
 
     enrollment_new="$enrollment.new.$$"
+    if $existing_enrollment; then
+      enrollment_state=active
+    else
+      enrollment_state=activating
+    fi
     printf '%s\n' \
       '{' \
       '  "schema": "bloom.macos-enrollment.1",' \
+      "  \"state\": \"$enrollment_state\"," \
       "  \"login_uid\": $login_uid," \
       "  \"login_user\": \"$login_user\"," \
       "  \"broker_user\": \"$broker_user\"," \
@@ -1751,10 +1928,16 @@ case "$action" in
       0600
     if $live_install; then
       set_live_ownership
-      pf_reference_installed=true
       rewrite_pf_reference add
       bootstrap_live_jobs
       health_check_enrollment
+      if $fresh_enrollment; then
+        write_enrollment_phase health-passed
+        publish_enrollment_active
+        write_enrollment_phase committed
+        rm -rf -- "$enrollment_transaction"
+        enrollment_transaction=""
+      fi
       provision_committed=true
       echo "Bloom macOS enrollment installed; log out and back in before first use so the login principal receives its new RPC groups"
     fi
@@ -1772,7 +1955,14 @@ case "$action" in
     if $live_install; then
       require_live_macos_root
       acquire_installer_lock
-      enrollment="$root_prefix/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
+      product_root="/Library/Application Support/BloomTriad"
+      enrollment_root="$product_root/enrollments"
+      release_base="/usr/local/libexec/bloom"
+      requested_login_uid="$login_uid"
+      recover_interrupted_upgrade
+      recover_pending_enrollments
+      login_uid="$requested_login_uid"
+      enrollment="$enrollment_root/$login_uid.json"
       broker_user="bloom-broker-$login_uid"
       broker_group="$broker_user"
       signer_user="bloom-signer-$login_uid"
@@ -1784,6 +1974,7 @@ case "$action" in
         echo "enrollment record is missing or invalid" >&2
         exit 66
       }
+      login_user="$(read_enrollment_field "$enrollment" login_user)"
       verify_existing_enrollment
       provision_committed=true
     fi
@@ -1819,10 +2010,24 @@ case "$action" in
     if $live_install; then
       require_live_macos_root
       acquire_installer_lock
+      release_base="/usr/local/libexec/bloom"
+      requested_login_uid="$login_uid"
+      recover_interrupted_upgrade
+      recover_pending_enrollments
+      login_uid="$requested_login_uid"
+      enrollment="$enrollment_root/$login_uid.json"
+      broker_user="bloom-broker-$login_uid"
+      broker_group="$broker_user"
+      signer_user="bloom-signer-$login_uid"
+      signer_group="$signer_user"
+      machine_broker_group="bloom-machine-broker-$login_uid"
+      broker_signer_group="bloom-broker-signer-$login_uid"
+      revoke_group="bloom-revoke-$login_uid"
       [[ -f "$enrollment" && ! -L "$enrollment" ]] || {
         echo "enrollment record is missing or invalid" >&2
         exit 66
       }
+      login_user="$(read_enrollment_field "$enrollment" login_user)"
       verify_existing_enrollment
       provision_committed=true
       launchctl bootout "gui/$login_uid/com.bloom.session" 2>/dev/null || true

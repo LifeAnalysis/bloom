@@ -174,6 +174,22 @@ fn load_enrollment(root: &Path, effective_uid: u32) -> Result<Option<()>> {
     {
         bail!("Bloom enrollment is not an immutable root-owned regular file");
     }
+    let enrollment: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).context("read Bloom enrollment")?)
+            .context("decode Bloom enrollment")?;
+    if enrollment.get("schema").and_then(serde_json::Value::as_str)
+        != Some("bloom.macos-enrollment.1")
+        || enrollment
+            .get("login_uid")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(effective_uid))
+        || !matches!(
+            enrollment.get("state").and_then(serde_json::Value::as_str),
+            Some("activating" | "active")
+        )
+    {
+        bail!("Bloom enrollment is not valid for this login session");
+    }
     Ok(Some(()))
 }
 
