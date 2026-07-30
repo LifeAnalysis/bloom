@@ -60,6 +60,10 @@ The installers stop an existing instance before replacement, atomically
 replace each file, and reactivate only after the complete set is present. An
 interrupted upgrade is unavailable rather than mixed-version. They also
 support service-config rotation and confirmation-bound per-login uninstall.
+Live macOS config rotation uses a root-only transaction, validates both the
+input and its root-staged copy against immutable identity and containment
+fields, and rolls back the prior config and loaded-job set on failed health or
+interruption.
 The Linux AWS KMS profile requires credentials and a non-wildcard reviewed
 CIDR allowlist together; reinstall without that pair removes any prior
 instance credential and egress drop-in.

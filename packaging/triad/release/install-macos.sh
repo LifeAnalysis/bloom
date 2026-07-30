@@ -40,6 +40,9 @@ upgrade_transaction=""
 upgrade_transaction_staging=""
 enrollment_transaction=""
 enrollment_record_index=0
+rotation_in_progress=false
+rotation_transaction=""
+rotation_transaction_staging=""
 
 validate_root_uid() {
   root="$1"
@@ -167,6 +170,17 @@ release_installer_lock() {
     esac
     generated_material=""
   fi
+  if [[ -n "$rotation_transaction_staging" ]]; then
+    case "$rotation_transaction_staging" in
+      "/Library/Application Support/BloomTriad/.rotation-transaction.new."*)
+        rm -rf -- "$rotation_transaction_staging"
+        ;;
+      *)
+        echo "refusing to remove unexpected rotation-transaction staging path" >&2
+        ;;
+    esac
+    rotation_transaction_staging=""
+  fi
   if [[ -n "$installer_lock" && -d "$installer_lock" ]]; then
     rm -f -- "$installer_lock/pid"
     rmdir "$installer_lock"
@@ -180,6 +194,9 @@ rollback_provisioning() {
   set +e
   if $upgrade_in_progress; then
     rollback_upgrade
+  fi
+  if $rotation_in_progress; then
+    rollback_rotation
   fi
   if $live_install && $provision_started && ! $provision_committed; then
     if [[ -n "$enrollment_transaction" && -d "$enrollment_transaction" ]]; then
@@ -1519,6 +1536,225 @@ recover_pending_enrollments() {
   done
 }
 
+write_rotation_phase() {
+  phase="$1"
+  temporary="$rotation_transaction/phase.new"
+  printf '%s\n' "$phase" > "$temporary"
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$rotation_transaction/phase"
+  sync
+}
+
+load_rotation_identity() {
+  rotation_transaction="$product_root/rotation-transaction"
+  [[ -d "$rotation_transaction" && ! -L "$rotation_transaction" ]] || return 65
+  [[ "$(stat -f '%u:%Lp' "$rotation_transaction")" == "0:700" ]] || return 65
+  for required in schema login-uid principal phase backup.json staged.json jobs; do
+    [[ -f "$rotation_transaction/$required" &&
+      ! -L "$rotation_transaction/$required" ]] || return 65
+  done
+  grep -Fx 'bloom.macos-config-rotation.1' \
+    "$rotation_transaction/schema" >/dev/null || return 65
+  login_uid="$(<"$rotation_transaction/login-uid")"
+  principal="$(<"$rotation_transaction/principal")"
+  [[ "$login_uid" =~ ^[1-9][0-9]*$ ]] || return 65
+  [[ "$principal" == "broker" || "$principal" == "signer" ]] || return 65
+  enrollment_root="$product_root/enrollments"
+  enrollment="$enrollment_root/$login_uid.json"
+  [[ -f "$enrollment" && ! -L "$enrollment" ]] || return 65
+  login_user="$(read_enrollment_field "$enrollment" login_user)"
+  BLOOM_RELEASE_DIGEST="$(read_enrollment_field "$enrollment" release_digest)"
+  machine_binary="/usr/local/libexec/bloom/current/bloom"
+}
+
+restore_rotation_jobs() {
+  while IFS= read -r job; do
+    case "$job" in
+      signer)
+        launchctl bootstrap \
+          system \
+          "/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist"
+        ;;
+      broker)
+        launchctl bootstrap \
+          system \
+          "/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
+        ;;
+      "") ;;
+      *) return 65 ;;
+    esac
+  done < "$rotation_transaction/jobs"
+}
+
+rollback_rotation() {
+  load_rotation_identity || return
+  phase="$(<"$rotation_transaction/phase")"
+  if [[ "$phase" == "committed" ]]; then
+    rm -rf -- "$rotation_transaction"
+    rotation_in_progress=false
+    return
+  fi
+  launchctl bootout "system/com.bloom.broker.$login_uid" 2>/dev/null || true
+  launchctl bootout "system/com.bloom.signer.$login_uid" 2>/dev/null || true
+  destination="$product_root/config/$login_uid/$principal/config.json"
+  atomic_copy_preserving_metadata "$rotation_transaction/backup.json" "$destination" ||
+    return
+  restore_rotation_jobs || return
+  if grep -Fx broker "$rotation_transaction/jobs" >/dev/null; then
+    health_check_enrollment || return
+  fi
+  rm -rf -- "$rotation_transaction"
+  rotation_in_progress=false
+}
+
+recover_interrupted_rotation() {
+  rotation_transaction="$product_root/rotation-transaction"
+  [[ -e "$rotation_transaction" ]] || return
+  rotation_in_progress=true
+  echo "recovering an interrupted Bloom macOS config rotation" >&2
+  rollback_rotation
+  $rotation_in_progress && {
+    echo "Bloom macOS config rotation rollback remains incomplete" >&2
+    exit 70
+  }
+}
+
+require_same_config_field() {
+  old_config="$1"
+  new_config="$2"
+  field="$3"
+  old_value="$(plutil -extract "$field" raw -o - "$old_config")"
+  new_value="$(plutil -extract "$field" raw -o - "$new_config")"
+  [[ "$old_value" == "$new_value" ]] || {
+    echo "config rotation may not change $field" >&2
+    return 65
+  }
+}
+
+verify_config_rotation() {
+  old_config="$1"
+  new_config="$2"
+  principal="$3"
+  plutil -lint "$new_config" >/dev/null
+  common_fields=(
+    build_digest
+    network_containment.status_path
+    network_containment.login_uid
+    network_containment.maximum_age_ms
+  )
+  if [[ "$principal" == "broker" ]]; then
+    immutable_fields=(
+      journal_path
+      authority_path
+      ceremony_path
+      signer_socket_path
+      broker_signing_key_id
+      broker_signing_seed_hex
+      audit_key_id
+      audit_signing_seed_hex
+      review_manifest_key_id
+      review_manifest_signing_seed_hex
+      installer_key_id
+      installer_public_key_hex
+      signer_ceremony_key_id
+      signer_ceremony_public_key_hex
+      signer_revocation_key_id
+      signer_revocation_public_key_hex
+      provenance_catalog_path
+    )
+  else
+    immutable_fields=(
+      database_path
+      broker_signing_key_id
+      broker_signing_public_key_hex
+      ceremony_verifying_public_key_hex
+      revocation_key_id
+      revocation_signing_seed_hex
+      ceremony_key_id
+      ceremony_signing_seed_hex
+    )
+    [[ "$(plutil -extract aws_kms_backends raw -o - "$new_config")" == "0" ]] || {
+      echo "macOS Unix-principal Signer rotation requires LocalSignerBackend only" >&2
+      return 65
+    }
+  fi
+  for field in "${common_fields[@]}" "${immutable_fields[@]}"; do
+    require_same_config_field "$old_config" "$new_config" "$field"
+  done
+  require_network_containment_config "$new_config" "$login_uid"
+  rotated_build="$(plutil -extract build_digest raw -o - "$new_config")"
+  [[ "$rotated_build" == "$BLOOM_RELEASE_DIGEST" ]]
+}
+
+prepare_rotation() {
+  replacement="$1"
+  rotation_transaction="$product_root/rotation-transaction"
+  [[ ! -e "$rotation_transaction" ]] || return 75
+  destination="$product_root/config/$login_uid/$principal/config.json"
+  verify_config_rotation \
+    "$destination" \
+    "$replacement" \
+    "$principal"
+  rotation_transaction_staging="$product_root/.rotation-transaction.new.$$"
+  [[ ! -e "$rotation_transaction_staging" ]] || return 75
+  mkdir "$rotation_transaction_staging"
+  chown root:wheel "$rotation_transaction_staging"
+  chmod 0700 "$rotation_transaction_staging"
+  printf '%s\n' 'bloom.macos-config-rotation.1' \
+    > "$rotation_transaction_staging/schema"
+  printf '%s\n' "$login_uid" > "$rotation_transaction_staging/login-uid"
+  printf '%s\n' "$principal" > "$rotation_transaction_staging/principal"
+  printf '%s\n' prepared > "$rotation_transaction_staging/phase"
+  : > "$rotation_transaction_staging/jobs"
+  cp -p "$destination" "$rotation_transaction_staging/backup.json"
+  install -m 0600 "$replacement" "$rotation_transaction_staging/staged.json"
+  verify_config_rotation \
+    "$rotation_transaction_staging/backup.json" \
+    "$rotation_transaction_staging/staged.json" \
+    "$principal"
+  if [[ "$principal" == "broker" ]]; then
+    chown "$BLOOM_MACOS_BROKER_UID:$BLOOM_MACOS_BROKER_GID" \
+      "$rotation_transaction_staging/staged.json"
+  else
+    chown "$BLOOM_MACOS_SIGNER_UID:$BLOOM_MACOS_SIGNER_GID" \
+      "$rotation_transaction_staging/staged.json"
+  fi
+  if launchctl print "system/com.bloom.signer.$login_uid" >/dev/null 2>&1; then
+    printf '%s\n' signer >> "$rotation_transaction_staging/jobs"
+  fi
+  if launchctl print "system/com.bloom.broker.$login_uid" >/dev/null 2>&1; then
+    printf '%s\n' broker >> "$rotation_transaction_staging/jobs"
+  fi
+  chmod 0600 \
+    "$rotation_transaction_staging/schema" \
+    "$rotation_transaction_staging/login-uid" \
+    "$rotation_transaction_staging/principal" \
+    "$rotation_transaction_staging/phase" \
+    "$rotation_transaction_staging/jobs"
+  sync
+  mv "$rotation_transaction_staging" "$rotation_transaction"
+  rotation_transaction_staging=""
+  sync
+  rotation_in_progress=true
+}
+
+activate_rotation() {
+  launchctl bootout "system/com.bloom.broker.$login_uid" 2>/dev/null || true
+  launchctl bootout "system/com.bloom.signer.$login_uid" 2>/dev/null || true
+  write_rotation_phase switching
+  destination="$product_root/config/$login_uid/$principal/config.json"
+  atomic_copy_preserving_metadata "$rotation_transaction/staged.json" "$destination"
+  write_rotation_phase switched
+  restore_rotation_jobs
+  write_rotation_phase activating
+  if grep -Fx broker "$rotation_transaction/jobs" >/dev/null; then
+    health_check_enrollment
+  fi
+  write_rotation_phase committed
+  rotation_in_progress=false
+  rm -rf -- "$rotation_transaction"
+}
+
 delete_directory_record_exact() {
   kind="$1"
   name="$2"
@@ -1557,6 +1793,7 @@ case "$action" in
       requested_login_user="$login_user"
       recover_interrupted_upgrade
       recover_pending_enrollments
+      recover_interrupted_rotation
       login_uid="$requested_login_uid"
       login_user="$requested_login_user"
       [[ "$(id -u "$login_user")" == "$login_uid" ]] || {
@@ -1995,9 +2232,12 @@ case "$action" in
       enrollment_root="$product_root/enrollments"
       release_base="/usr/local/libexec/bloom"
       requested_login_uid="$login_uid"
+      requested_principal="$principal"
       recover_interrupted_upgrade
       recover_pending_enrollments
+      recover_interrupted_rotation
       login_uid="$requested_login_uid"
+      principal="$requested_principal"
       enrollment="$enrollment_root/$login_uid.json"
       broker_user="bloom-broker-$login_uid"
       broker_group="$broker_user"
@@ -2012,7 +2252,14 @@ case "$action" in
       }
       login_user="$(read_enrollment_field "$enrollment" login_user)"
       verify_existing_enrollment
+      BLOOM_RELEASE_DIGEST="$(read_enrollment_field "$enrollment" release_digest)"
+      machine_binary="$release_base/current/bloom"
+      verify_installed_security_files "$product_root/config/$login_uid" "$enrollment"
       provision_committed=true
+      prepare_rotation "$replacement"
+      activate_rotation
+      echo "Bloom macOS $principal config rotated atomically"
+      exit 0
     fi
     destination="$root_prefix/Library/Application Support/BloomTriad/config/$login_uid/$principal/config.json"
     test -d "$(dirname "$destination")" || {
@@ -2050,6 +2297,7 @@ case "$action" in
       requested_login_uid="$login_uid"
       recover_interrupted_upgrade
       recover_pending_enrollments
+      recover_interrupted_rotation
       login_uid="$requested_login_uid"
       enrollment="$enrollment_root/$login_uid.json"
       broker_user="bloom-broker-$login_uid"

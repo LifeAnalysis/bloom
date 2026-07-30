@@ -60,6 +60,17 @@ report `ready` on the same build. A failed check restores the complete old set.
 An installer invocation that finds a non-committed transaction performs that
 same rollback before doing new work.
 
+Live Broker and Signer config rotation is separately root-journaled. The
+installer first validates the caller's replacement and then validates the
+root-staged copy again, rejecting changes to release identity, containment,
+state paths, cross-pinned keys, or service-principal identity. It records the
+previous config and exact loaded-job set, stops both services, atomically swaps
+the one service-owned config, restores only those jobs, and requires the
+authenticated triad health check when Broker was active. Failure or a later
+invocation after interruption restores the byte-identical prior config and
+job set. The disposable W0 lane exercises valid rotation, immutable-field
+rejection, and SIGKILL recovery.
+
 Production enrollment invokes the installed Machine binary's root-only
 enrollment-material mode against the signed public templates in `config/`.
 Five application identities and the Broker/Signer signing authorities are

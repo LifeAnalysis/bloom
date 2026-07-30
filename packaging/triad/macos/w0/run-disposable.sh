@@ -56,12 +56,14 @@ launchctl print "gui/$login_uid" >/dev/null 2>&1 || {
 triad_source="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 installer="$triad_source/release/install-macos.sh"
 enrollment="/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
+rotation_fixtures="$(mktemp -d /private/tmp/bloom-w0-rotation.XXXXXX)"
 
 cleanup() {
   status=$?
   if [[ -f "$enrollment" ]]; then
     "$installer" uninstall / "$login_uid" "delete-bloom-login-$login_uid" || true
   fi
+  rm -rf -- "$rotation_fixtures"
   exit "$status"
 }
 trap cleanup EXIT
@@ -294,6 +296,77 @@ pfctl \
   -a "com.bloom.triad/$login_uid" \
   -f "/etc/pf.anchors/com.bloom.triad.$login_uid"
 "$machine_binary" --triad-pf-monitor-once
+sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
+
+broker_config="/Library/Application Support/BloomTriad/config/$login_uid/broker/config.json"
+rotated_config="$rotation_fixtures/broker-valid.json"
+cp "$broker_config" "$rotated_config"
+plutil -replace maximum_connections -integer 63 "$rotated_config"
+"$installer" rotate-config / "$login_uid" broker "$rotated_config"
+[[ "$(plutil -extract maximum_connections raw -o - "$broker_config")" == "63" ]] || {
+  echo "valid Broker config rotation did not become active" >&2
+  exit 1
+}
+sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
+rotated_digest="$(shasum -a 256 "$broker_config" | awk '{print $1}')"
+
+immutable_config="$rotation_fixtures/broker-immutable.json"
+cp "$broker_config" "$immutable_config"
+plutil -replace signer_socket_path -string /private/tmp/forbidden.sock "$immutable_config"
+if "$installer" rotate-config / "$login_uid" broker "$immutable_config"; then
+  echo "Broker config rotation changed an immutable cross-principal field" >&2
+  exit 1
+fi
+[[ ! -e "/Library/Application Support/BloomTriad/rotation-transaction" ]] || {
+  echo "rejected Broker config rotation published a recovery journal" >&2
+  exit 1
+}
+[[ "$(shasum -a 256 "$broker_config" | awk '{print $1}')" == "$rotated_digest" ]]
+
+failing_config="$rotation_fixtures/broker-failing.json"
+cp "$broker_config" "$failing_config"
+plutil -replace maximum_connections -string invalid "$failing_config"
+"$installer" rotate-config / "$login_uid" broker "$failing_config" &
+interrupted_rotation_pid=$!
+rotation_phase="/Library/Application Support/BloomTriad/rotation-transaction/phase"
+deadline=$((SECONDS + 30))
+while [[ $SECONDS -lt $deadline ]]; do
+  if [[ -f "$rotation_phase" ]] &&
+    [[ "$(<"$rotation_phase")" == "activating" ]]
+  then
+    break
+  fi
+  if ! kill -0 "$interrupted_rotation_pid" 2>/dev/null; then
+    echo "W0 config rotation exited before its interruption point" >&2
+    wait "$interrupted_rotation_pid" || true
+    exit 1
+  fi
+  sleep 0.05
+done
+[[ -f "$rotation_phase" && "$(<"$rotation_phase")" == "activating" ]] || {
+  echo "W0 did not observe the config rotation activation phase" >&2
+  kill "$interrupted_rotation_pid" 2>/dev/null || true
+  wait "$interrupted_rotation_pid" || true
+  exit 1
+}
+kill -9 "$interrupted_rotation_pid"
+wait "$interrupted_rotation_pid" 2>/dev/null || true
+[[ -d "/Library/Application Support/BloomTriad/rotation-transaction" ]] || {
+  echo "interrupted W0 config rotation did not leave a recovery journal" >&2
+  exit 1
+}
+"$installer" rotate-config / "$login_uid" broker "$rotated_config"
+[[ ! -e "/Library/Application Support/BloomTriad/rotation-transaction" ]] || {
+  echo "W0 config rotation recovery did not consume its journal" >&2
+  exit 1
+}
+[[ "$(shasum -a 256 "$broker_config" | awk '{print $1}')" == "$rotated_digest" ]]
 sudo -u "$login_user" \
   "$machine_binary" \
   --triad-health-check \
