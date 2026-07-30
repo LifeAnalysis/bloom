@@ -816,6 +816,7 @@ render_template() {
     -e "s|@BLOOM_BROKER_GROUP@|$broker_group|g" \
     -e "s|@BLOOM_SIGNER_USER@|$signer_user|g" \
     -e "s|@BLOOM_SIGNER_GROUP@|$signer_group|g" \
+    -e "s|@BLOOM_REVOKE_GROUP@|$revoke_group|g" \
     -e "s|@BLOOM_BROKER_UID@|$BLOOM_MACOS_BROKER_UID|g" \
     -e "s|@BLOOM_SIGNER_UID@|$BLOOM_MACOS_SIGNER_UID|g" \
     -e "s|@MACHINE_BROKER_GID@|$BLOOM_MACOS_MACHINE_BROKER_GID|g" \

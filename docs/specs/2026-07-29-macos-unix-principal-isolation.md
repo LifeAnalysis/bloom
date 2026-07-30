@@ -213,6 +213,10 @@ Each daemon:
 
 - receives exact Unix socket paths from its signed LaunchDaemon profile and
   binds only in its verified service-owned endpoint directories;
+- uses `bloom-revoke-U` as its explicit runtime primary group because the
+  authenticated login-session and control edges are shared by both services;
+  service-private files remain owner-only and its account retains its distinct
+  service primary group;
 - sets `InitGroups=true`; enrollment flushes the Directory Service membership
   cache and verifies every effective edge membership before bootstrap;
 - has `ProcessType=Background`;

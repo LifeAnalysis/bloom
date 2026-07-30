@@ -9,7 +9,7 @@
   <key>UserName</key>
   <string>@BLOOM_BROKER_USER@</string>
   <key>GroupName</key>
-  <string>@BLOOM_BROKER_GROUP@</string>
+  <string>@BLOOM_REVOKE_GROUP@</string>
   <key>InitGroups</key>
   <true/>
   <key>Umask</key>
