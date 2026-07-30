@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+report_error() {
+  status=$?
+  echo "macOS W0 failed at line ${BASH_LINENO[0]} (status $status)" >&2
+  return "$status"
+}
+trap report_error ERR
+
 usage() {
   echo "usage: run-disposable.sh PAYLOAD_DIR LOGIN_UID LOGIN_USER [UPGRADE_PAYLOAD [FAILING_UPGRADE_PAYLOAD]]" >&2
   exit 64
@@ -94,6 +101,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "macOS W0 preflight passed; checking fresh service-principal names"
 for kind_and_name in \
   "Users bloom-broker-$login_uid" \
   "Users bloom-signer-$login_uid" \
@@ -111,6 +119,7 @@ do
   fi
 done
 
+echo "macOS W0 installing the verified candidate"
 "$installer" install / "$login_uid" "$login_user" "$payload"
 
 field() {

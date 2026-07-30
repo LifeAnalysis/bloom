@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+report_error() {
+  status=$?
+  echo "macOS installer failed at line ${BASH_LINENO[0]} (status $status)" >&2
+  return "$status"
+}
+trap report_error ERR
+
 usage() {
   cat >&2 <<'EOF'
 usage:
