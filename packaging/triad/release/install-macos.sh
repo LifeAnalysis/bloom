@@ -217,8 +217,10 @@ release_installer_lock() {
 
 rollback_provisioning() {
   status=$?
+  failed_line="${BASH_LINENO[0]}"
   trap - ERR
   set +e
+  echo "macOS installer failed at line $failed_line (status $status)" >&2
   if $upgrade_in_progress; then
     rollback_upgrade
   fi
