@@ -127,6 +127,19 @@ pub fn run_once() -> Result<()> {
 }
 
 fn restart_services_for_live_session(login_uid: u32, revoke_gid: u32) -> Result<()> {
+    let session_target = format!("gui/{login_uid}/com.bloom.session");
+    let Ok(session_state) = command_output("/bin/launchctl", &["print", &session_target]) else {
+        // An absent login job means this is a stale socket or a logged-out
+        // session. Either case must not restart the service principals.
+        return Ok(());
+    };
+    if !session_state
+        .lines()
+        .any(|line| line.trim() == "state = running")
+    {
+        return Ok(());
+    }
+
     let session_directory = PathBuf::from(format!("/private/var/run/bloom/{login_uid}/session"));
     require_service_directory(&session_directory, login_uid, revoke_gid, 0o710)?;
     let session_socket = session_directory.join("session.sock");
