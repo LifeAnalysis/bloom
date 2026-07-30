@@ -266,13 +266,15 @@ assert_metadata() {
 
 assert_metadata "/private/var/db/bloom/$login_uid/broker" "$broker_uid:$broker_gid:700"
 assert_metadata "/private/var/db/bloom/$login_uid/signer" "$signer_uid:$signer_gid:700"
+assert_metadata "/private/var/run/bloom/$login_uid" "0:0:711"
+assert_metadata "/private/var/run/bloom/$login_uid/containment" "0:0:755"
 assert_metadata \
   "/private/var/run/bloom/$login_uid/machine-broker" \
   "$broker_uid:$machine_broker_gid:710"
 assert_metadata \
   "/private/var/run/bloom/$login_uid/broker-signer" \
   "$signer_uid:$broker_signer_gid:710"
-assert_metadata "/private/var/run/bloom/$login_uid/revoke" "0:$revoke_gid:710"
+assert_metadata "/private/var/run/bloom/$login_uid/revoke" "0:0:711"
 assert_metadata \
   "/private/var/run/bloom/$login_uid/revoke/broker" \
   "$broker_uid:$revoke_gid:710"
@@ -282,6 +284,9 @@ assert_metadata \
 assert_metadata \
   "/private/var/run/bloom/$login_uid/session" \
   "$login_uid:$revoke_gid:710"
+assert_metadata \
+  "/private/var/run/bloom/$login_uid/status" \
+  "$broker_uid:$machine_broker_gid:750"
 
 broker_probe="/private/var/db/bloom/$login_uid/broker/w0-private"
 signer_probe="/private/var/db/bloom/$login_uid/signer/w0-private"
