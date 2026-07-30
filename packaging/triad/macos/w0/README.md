@@ -54,20 +54,35 @@ prove that claim generation fails. A final process/health recheck precedes
 digest-bound `mui_01.pass`, `mui_11.pass`, `installed_ac_01_35.pass`, and
 `mui_12.pass` evidence.
 
-The manually dispatched `macOS Unix-principal W0` workflow is the repository's
-disposable-host provisioner. It runs only on a fresh GitHub-hosted macOS VM,
-first proves that the runner login has a GUI launchd domain, builds all three
-public repositories from the selected refs, creates a non-production W0
-bundle, installs an ephemeral root-owned release pin and host marker, runs this
-harness including the installed acceptance rerun, uploads only digest-bound
-criterion files after success, and removes those markers in an unconditional
-cleanup step. The workflow does not produce or advertise a production
-platform claim.
+The primary development provisioner is a local Tart VM on Apple Silicon
+macOS. Install `tart` and `sshpass`, then create the immutable upstream cache
+and Rust-capable development base once:
 
-The workflow is also reusable. Until its standalone filename reaches the
-default branch, manually dispatching the existing `CI` workflow at
-`triad-architecture` calls the same disposable W0 job from that exact commit.
-Pull requests and ordinary pushes never enter the destructive lane.
+```sh
+brew install cirruslabs/cli/tart cirruslabs/cli/sshpass
+packaging/triad/macos/w0/provision-tart-local.sh
+```
+
+Run the complete single-login lane with:
+
+```sh
+packaging/triad/macos/w0/run-tart-local.sh
+```
+
+The runner builds all three sibling working trees in the stopped/reusable
+`bloom-macos-w0-dev-base`, writes the verified candidate and evidence below
+the workspace-local `.w0-local/runs/` directory, and then clones the
+development base for the destructive phase. All root operations, Directory
+Service changes, LaunchDaemon installation, and packet-filter changes occur
+inside that copy-on-write guest. The guest clone is stopped and deleted after
+the run. Set `BLOOM_TART_KEEP_FAILED=true` only when a failed guest must be
+preserved for interactive diagnosis. The downloaded
+`bloom-macos-w0-base` is never booted or modified by the harness.
+
+The manually dispatched `macOS Unix-principal W0` workflow remains an optional
+independent reproduction lane. It is not the implementation loop and is not
+required to diagnose or advance local macOS work. Neither lane produces or
+advertises a production platform claim.
 
 The lane currently proves account/group shape, non-transitive membership,
 root/service filesystem ownership, explicit checkpoint/config/database

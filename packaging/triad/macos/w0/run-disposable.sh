@@ -334,8 +334,19 @@ launchctl print "system/com.bloom.signer.$login_uid" >/dev/null
 launchctl print "gui/$login_uid/com.bloom.session" >/dev/null
 
 pf_rules="$(pfctl -a "com.bloom.triad/$login_uid" -sr)"
-grep -E "user (<?$broker_uid|bloom-broker-$login_uid)" <<<"$pf_rules" >/dev/null
-grep -E "user (<?$signer_uid|bloom-signer-$login_uid)" <<<"$pf_rules" >/dev/null
+assert_pf_principal() {
+  principal_uid="$1"
+  principal_name="$2"
+  grep -E \
+    "user[[:space:]]+(=[[:space:]]+)?(<?$principal_uid|$principal_name)([[:space:]]|$)" \
+    <<<"$pf_rules" >/dev/null || {
+    echo "loaded Bloom pf rules omit $principal_name ($principal_uid):" >&2
+    printf '%s\n' "$pf_rules" >&2
+    exit 1
+  }
+}
+assert_pf_principal "$broker_uid" "bloom-broker-$login_uid"
+assert_pf_principal "$signer_uid" "bloom-signer-$login_uid"
 
 for socket in \
   "/private/var/run/bloom/$login_uid/machine-broker/broker.sock" \
