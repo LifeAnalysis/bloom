@@ -188,7 +188,15 @@ async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
         || readiness.build_digest != expected_build
         || readiness.state != ReadinessState::Ready
     {
-        bail!("Broker/Signer triad is not ready on the exact installed build");
+        bail!(
+            "Broker/Signer triad is not ready on the exact installed build: service_id={}, observed_build={}, expected_build={}, state={:?}, conditions={}",
+            readiness.service_id,
+            readiness.build_digest,
+            expected_build,
+            readiness.state,
+            serde_json::to_string(&readiness.conditions)
+                .unwrap_or_else(|_| "[\"unreportable\"]".into())
+        );
     }
     Ok(())
 }

@@ -258,6 +258,13 @@ rollback_provisioning() {
 
 emit_live_activation_diagnostics() {
   [[ "${login_uid:-}" =~ ^[1-9][0-9]*$ ]] || return 0
+  containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
+  if [[ -f "$containment_status" && ! -L "$containment_status" ]] &&
+    [[ "$(stat -f '%u:%g:%Lp' "$containment_status" 2>/dev/null)" == "0:0:644" ]]
+  then
+    echo "----- Bloom containment status -----" >&2
+    cat "$containment_status" >&2
+  fi
   for service in broker signer; do
     service_log="/private/var/db/bloom/$login_uid/$service/$service.log"
     case "$service" in
