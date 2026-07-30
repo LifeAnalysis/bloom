@@ -268,11 +268,17 @@ assert_metadata "/private/var/db/bloom/$login_uid/broker" "$broker_uid:$broker_g
 assert_metadata "/private/var/db/bloom/$login_uid/signer" "$signer_uid:$signer_gid:700"
 assert_metadata \
   "/private/var/run/bloom/$login_uid/machine-broker" \
-  "0:$machine_broker_gid:710"
+  "$broker_uid:$machine_broker_gid:710"
 assert_metadata \
   "/private/var/run/bloom/$login_uid/broker-signer" \
-  "0:$broker_signer_gid:710"
+  "$signer_uid:$broker_signer_gid:710"
 assert_metadata "/private/var/run/bloom/$login_uid/revoke" "0:$revoke_gid:710"
+assert_metadata \
+  "/private/var/run/bloom/$login_uid/revoke/broker" \
+  "$broker_uid:$revoke_gid:710"
+assert_metadata \
+  "/private/var/run/bloom/$login_uid/revoke/signer" \
+  "$signer_uid:$revoke_gid:710"
 assert_metadata \
   "/private/var/run/bloom/$login_uid/session" \
   "$login_uid:$revoke_gid:710"
@@ -329,8 +335,8 @@ grep -E "user (<?$signer_uid|bloom-signer-$login_uid)" <<<"$pf_rules" >/dev/null
 for socket in \
   "/private/var/run/bloom/$login_uid/machine-broker/broker.sock" \
   "/private/var/run/bloom/$login_uid/broker-signer/signer.sock" \
-  "/private/var/run/bloom/$login_uid/revoke/broker-control.sock" \
-  "/private/var/run/bloom/$login_uid/revoke/signer-control.sock" \
+  "/private/var/run/bloom/$login_uid/revoke/broker/control.sock" \
+  "/private/var/run/bloom/$login_uid/revoke/signer/control.sock" \
   "/private/var/run/bloom/$login_uid/session/session.sock"
 do
   deadline=$((SECONDS + 20))
@@ -338,7 +344,7 @@ do
     sleep 1
   done
   [[ -S "$socket" ]] || {
-    echo "launchd did not create $socket" >&2
+    echo "Bloom service did not create $socket" >&2
     exit 1
   }
 done
@@ -350,10 +356,10 @@ assert_metadata \
   "/private/var/run/bloom/$login_uid/broker-signer/signer.sock" \
   "$signer_uid:$broker_signer_gid:660"
 assert_metadata \
-  "/private/var/run/bloom/$login_uid/revoke/broker-control.sock" \
+  "/private/var/run/bloom/$login_uid/revoke/broker/control.sock" \
   "$broker_uid:$revoke_gid:660"
 assert_metadata \
-  "/private/var/run/bloom/$login_uid/revoke/signer-control.sock" \
+  "/private/var/run/bloom/$login_uid/revoke/signer/control.sock" \
   "$signer_uid:$revoke_gid:660"
 assert_metadata \
   "/private/var/run/bloom/$login_uid/session/session.sock" \
@@ -421,8 +427,8 @@ id "$unrelated_user" >/dev/null 2>&1 || {
 for socket in \
   "/private/var/run/bloom/$login_uid/machine-broker/broker.sock" \
   "/private/var/run/bloom/$login_uid/broker-signer/signer.sock" \
-  "/private/var/run/bloom/$login_uid/revoke/broker-control.sock" \
-  "/private/var/run/bloom/$login_uid/revoke/signer-control.sock"
+  "/private/var/run/bloom/$login_uid/revoke/broker/control.sock" \
+  "/private/var/run/bloom/$login_uid/revoke/signer/control.sock"
 do
   if sudo -u "$unrelated_user" /usr/bin/nc -z -w 1 -U "$socket"; then
     echo "unrelated local UID opened protected Unix endpoint $socket" >&2
