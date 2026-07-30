@@ -1566,10 +1566,8 @@ recover_pending_enrollments() {
   transaction_root="$product_root/enrollment-transactions"
   [[ -e "$transaction_root" ]] || return 0
   require_live_directory_metadata "$transaction_root" 0 0 700
-  shopt -s nullglob
-  pending_transactions=("$transaction_root"/[1-9]*)
-  shopt -u nullglob
-  for pending_transaction in "${pending_transactions[@]}"; do
+  for pending_transaction in "$transaction_root"/[1-9]*; do
+    [[ -e "$pending_transaction" || -L "$pending_transaction" ]] || continue
     load_enrollment_transaction_identity "$pending_transaction"
     phase="$(<"$enrollment_transaction/phase")"
     if [[ "$phase" == "committed" && -f "$enrollment" ]] &&
@@ -1772,10 +1770,8 @@ rollback_rotation() {
 
 recover_interrupted_rotation() {
   rotation_transaction="$product_root/rotation-transaction"
-  shopt -s nullglob
-  abandoned_rotation_staging=("$product_root"/.rotation-transaction.new.*)
-  shopt -u nullglob
-  for staging in "${abandoned_rotation_staging[@]}"; do
+  for staging in "$product_root"/.rotation-transaction.new.*; do
+    [[ -e "$staging" || -L "$staging" ]] || continue
     [[ -d "$staging" && ! -L "$staging" ]] || return 65
     [[ "$(stat -f '%u:%Lp' "$staging")" == "0:700" ]] || return 65
     rm -rf -- "$staging"
@@ -2227,18 +2223,14 @@ recover_interrupted_uninstalls() {
   [[ -e "$uninstall_root" ]] || return 0
   [[ -d "$uninstall_root" && ! -L "$uninstall_root" ]] || return 65
   [[ "$(stat -f '%u:%Lp' "$uninstall_root")" == "0:700" ]] || return 65
-  shopt -s nullglob
-  abandoned_uninstall_staging=("$uninstall_root"/.new.*)
-  shopt -u nullglob
-  for staging in "${abandoned_uninstall_staging[@]}"; do
+  for staging in "$uninstall_root"/.new.*; do
+    [[ -e "$staging" || -L "$staging" ]] || continue
     [[ -d "$staging" && ! -L "$staging" ]] || return 65
     [[ "$(stat -f '%u:%Lp' "$staging")" == "0:700" ]] || return 65
     rm -rf -- "$staging"
   done
-  shopt -s nullglob
-  transactions=("$uninstall_root"/*)
-  shopt -u nullglob
-  for uninstall_transaction in "${transactions[@]}"; do
+  for uninstall_transaction in "$uninstall_root"/*; do
+    [[ -e "$uninstall_transaction" || -L "$uninstall_transaction" ]] || continue
     echo "resuming interrupted Bloom macOS uninstall ${uninstall_transaction##*/}" >&2
     execute_uninstall_transaction
   done
@@ -2303,10 +2295,8 @@ recover_retained_restores() {
   [[ -e "$retained_root" ]] || return 0
   [[ -d "$retained_root" && ! -L "$retained_root" ]] || return 65
   [[ "$(stat -f '%u:%Lp' "$retained_root")" == "0:700" ]] || return 65
-  shopt -s nullglob
-  retained_records=("$retained_root"/*.json)
-  shopt -u nullglob
-  for retained_record in "${retained_records[@]}"; do
+  for retained_record in "$retained_root"/*.json; do
+    [[ -e "$retained_record" || -L "$retained_record" ]] || continue
     load_retained_identity "$retained_record"
     active_record="$enrollment_root/$login_uid.json"
     [[ -e "$active_record" ]] || continue
@@ -2476,10 +2466,8 @@ case "$action" in
           awk '{print $1}'
       )"
       if [[ -d "$enrollment_root" && ! -L "$enrollment_root" ]]; then
-        shopt -s nullglob
-        installed_enrollment_files=("$enrollment_root"/*.json)
-        shopt -u nullglob
-        for installed_enrollment in "${installed_enrollment_files[@]}"; do
+        for installed_enrollment in "$enrollment_root"/*.json; do
+          [[ -e "$installed_enrollment" || -L "$installed_enrollment" ]] || continue
           [[ -f "$installed_enrollment" && ! -L "$installed_enrollment" ]] || {
             echo "installed enrollment set contains a substituted record" >&2
             exit 65
