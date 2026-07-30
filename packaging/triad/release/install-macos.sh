@@ -770,6 +770,7 @@ render_template() {
     -e "s|@BLOOM_BROKER_CONTROL_SOCKET@|$runtime_root/revoke/broker-control.sock|g" \
     -e "s|@BLOOM_SIGNER_CONTROL_SOCKET@|$runtime_root/revoke/signer-control.sock|g" \
     -e "s|@BLOOM_SESSION_SOCKET@|$runtime_root/session/session.sock|g" \
+    -e "s|@BLOOM_BROKER_STARTUP_STATUS@|$runtime_root/status/broker-startup.json|g" \
     -e "s|@BLOOM_CONTAINMENT_STATUS@|$runtime_root/containment/status.json|g" \
     -e "s|@BLOOM_PROVENANCE_CATALOG@|$config_root/provenance-catalog.json|g" \
     -e "s|@BLOOM_BROKER_LOG@|$broker_state/broker.log|g" \

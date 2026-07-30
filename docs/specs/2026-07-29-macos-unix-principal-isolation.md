@@ -253,6 +253,12 @@ writes bounded `broker-startup.json` status distinguishing:
 
 Machine reports that status rather than waiting indefinitely.
 
+The incident distinction is an operational diagnostic, not an authorization
+decision: Broker recognizes the fixed Bloom ceremony-owner HTTP marker, while
+an absent, malformed, or unresponsive marker is foreign or unverifiable. A
+foreign process can imitate that public marker, so both incidents have the
+same fatal, fail-closed consequence and neither grants authority.
+
 Failure-only KeepAlive retries a waiting Broker. When the owning login sentinel
 disconnects and its Broker closes the listener, a waiting Broker may acquire
 the canonical port without user action. No fairness guarantee is claimed.

@@ -166,14 +166,20 @@ async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
 
     let expected_build =
         Digest32::new(expected_build.to_owned()).context("parse expected release digest")?;
+    let installed = installed_macos_triad_paths_with_activation(true)
+        .ok()
+        .flatten();
+    let client = configured_broker_client_with_activation(true)
+        .map_err(|error| enrich_broker_startup_failure(error, installed.as_ref()))?;
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        configured_broker_client_with_activation(true)?
-            .request(MachineBrokerRequest::BrokerReadiness(Empty {})),
+        client.request(MachineBrokerRequest::BrokerReadiness(Empty {})),
     )
     .await
-    .context("authenticated Broker readiness timed out")?
-    .context("request authenticated Broker readiness")?;
+    .context("authenticated Broker readiness timed out")
+    .map_err(|error| enrich_broker_startup_failure(error, installed.as_ref()))?
+    .context("request authenticated Broker readiness")
+    .map_err(|error| enrich_broker_startup_failure(error, installed.as_ref()))?;
     let readiness = match response {
         MachineBrokerResponse::BrokerReadiness(readiness) => readiness,
         _ => bail!("Broker returned the wrong response to broker.readiness"),
@@ -212,6 +218,9 @@ struct InstalledMacosTriadPaths {
     machine_identity: PathBuf,
     edge_manifest: PathBuf,
     provenance_catalog: PathBuf,
+    startup_status: PathBuf,
+    broker_uid: u32,
+    machine_broker_gid: u32,
 }
 
 fn installed_macos_triad_paths() -> Result<Option<InstalledMacosTriadPaths>> {
@@ -266,6 +275,20 @@ fn installed_macos_triad_paths_with_activation(
         if state != "active" && !(allow_activating && state == "activating") {
             bail!("installed Bloom enrollment is not active");
         }
+        let broker_uid = u32::try_from(
+            enrollment_value
+                .get("broker_uid")
+                .and_then(serde_json::Value::as_u64)
+                .context("installed Bloom enrollment has no Broker UID")?,
+        )
+        .context("installed Bloom Broker UID is outside the platform range")?;
+        let machine_broker_gid = u32::try_from(
+            enrollment_value
+                .get("machine_broker_gid")
+                .and_then(serde_json::Value::as_u64)
+                .context("installed Bloom enrollment has no Machine-Broker GID")?,
+        )
+        .context("installed Bloom Machine-Broker GID is outside the platform range")?;
         let config = PathBuf::from(format!(
             "/Library/Application Support/BloomTriad/config/{uid}"
         ));
@@ -276,10 +299,115 @@ fn installed_macos_triad_paths_with_activation(
             machine_identity: config.join("machine/identity.json"),
             edge_manifest: config.join("edge-manifest.json"),
             provenance_catalog: config.join("provenance-catalog.json"),
+            startup_status: PathBuf::from(format!(
+                "/private/var/run/bloom/{uid}/status/broker-startup.json"
+            )),
+            broker_uid,
+            machine_broker_gid,
         }))
     }
     #[cfg(not(target_os = "macos"))]
     Ok(None)
+}
+
+fn enrich_broker_startup_failure(
+    error: anyhow::Error,
+    installed: Option<&InstalledMacosTriadPaths>,
+) -> anyhow::Error {
+    let Some(diagnostic) = installed.and_then(read_broker_startup_failure) else {
+        return error;
+    };
+    anyhow::anyhow!("{diagnostic}; authenticated Broker readiness failed: {error:#}")
+}
+
+fn read_broker_startup_failure(paths: &InstalledMacosTriadPaths) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(&paths.startup_status).ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != paths.broker_uid
+        || metadata.gid() != paths.machine_broker_gid
+        || metadata.mode() & 0o777 != 0o640
+        || metadata.nlink() != 1
+        || metadata.len() > 1024
+    {
+        return None;
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&paths.startup_status).ok()?).ok()?;
+    if value.as_object().map(serde_json::Map::len) != Some(6)
+        || value.get("schema").and_then(serde_json::Value::as_str) != Some("bloom.broker-startup.1")
+        || value.get("state").and_then(serde_json::Value::as_str) != Some("fatal")
+        || value.get("address").and_then(serde_json::Value::as_str) != Some("127.0.0.1:18734")
+        || value
+            .get("observed_at_ms")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+    {
+        return None;
+    }
+    let incident = value.get("incident").and_then(serde_json::Value::as_str)?;
+    let expected_message = match incident {
+        "another_login_session" => "another login session owns the Bloom ceremony listener",
+        "foreign_or_unverifiable_process" => {
+            "a foreign or unverifiable process owns the Bloom ceremony listener"
+        }
+        _ => return None,
+    };
+    if value.get("message").and_then(serde_json::Value::as_str) != Some(expected_message) {
+        return None;
+    }
+    Some(format!("Bloom Broker startup failed: {expected_message}"))
+}
+
+#[cfg(test)]
+mod broker_startup_failure_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    fn installed_paths(startup_status: PathBuf) -> InstalledMacosTriadPaths {
+        let metadata = std::fs::symlink_metadata(
+            startup_status
+                .parent()
+                .expect("startup status has a parent"),
+        )
+        .expect("status parent metadata");
+        InstalledMacosTriadPaths {
+            broker_socket: PathBuf::new(),
+            machine_identity: PathBuf::new(),
+            edge_manifest: PathBuf::new(),
+            provenance_catalog: PathBuf::new(),
+            startup_status,
+            broker_uid: metadata.uid(),
+            machine_broker_gid: metadata.gid(),
+        }
+    }
+
+    #[test]
+    fn machine_reports_only_an_exact_authenticated_startup_diagnostic() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let path = temporary.path().join("broker-startup.json");
+        std::fs::write(
+            &path,
+            br#"{"schema":"bloom.broker-startup.1","state":"fatal","incident":"another_login_session","address":"127.0.0.1:18734","message":"another login session owns the Bloom ceremony listener","observed_at_ms":1}"#,
+        )
+        .expect("write startup diagnostic");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("set startup diagnostic permissions");
+        let installed = installed_paths(path.clone());
+
+        assert_eq!(
+            read_broker_startup_failure(&installed).as_deref(),
+            Some(
+                "Bloom Broker startup failed: another login session owns the Bloom ceremony listener"
+            )
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("weaken startup diagnostic permissions");
+        assert!(read_broker_startup_failure(&installed).is_none());
+    }
 }
 
 fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {

@@ -26,7 +26,11 @@ group transitive. Socket mode is decimal `432`, equivalent to octal `0660`.
 Broker owns the canonical ceremony listener by direct exclusive bind to
 `127.0.0.1:18734`. The LaunchDaemon does not declare or pre-bind that TCP
 socket. A conflict is fatal, reported, retried by failure-only `KeepAlive`, and
-never selects a fallback address or port.
+never selects a fallback address or port. Before exiting, Broker atomically
+writes a Broker-owned, Machine-readable `broker-startup.json`. Machine accepts
+only its exact owner, group, mode, schema, address, incident, and message, so a
+bind failure is reported promptly as either another Bloom login or a foreign
+or unverifiable listener. A successful retry removes the stale diagnostic.
 
 The global `com.bloom.session` LaunchAgent invokes only Machine's
 `--session-sentinel` mode. It exits successfully for an unenrolled login,

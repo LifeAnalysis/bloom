@@ -72,15 +72,17 @@ wire detail. It does not amend that specification.
   sections 22/27 require a listener conflict to fail closed rather than
   guaranteeing that every concurrent login can acquire the host-wide port.
   Broker therefore adds a non-authoritative
-  `X-Bloom-Ceremony-Owner: bloom-broker-v1` response marker. Machine consults
-  it only after its authenticated Unix edge fails, to report whether a
-  Bloom-shaped listener appears or the occupant is unrelated in the
-  user-visible fatal diagnostic. A foreign process can imitate the marker; it
-  grants no access, is not an authentication input, and does not replace the
-  256-bit session token. Unknown ceremony URL tokens return 404. The launchd
-  source requests failure-only `KeepAlive`; the platform integration lane must
-  prove reacquisition after a conflict clears before packaging may claim it.
-  Neither path binds a fallback port.
+  `X-Bloom-Ceremony-Owner: bloom-broker-v1` response marker. After a bind
+  conflict Broker probes that marker and atomically writes the resulting
+  operational incident to its Broker-owned, Machine-readable status
+  directory. Machine accepts only the exact owner, group, mode, schema,
+  address, incident, and message after authenticated readiness fails. A
+  foreign process can imitate the marker; it grants no access, is not an
+  authentication input, and does not replace the 256-bit session token.
+  Unknown ceremony URL tokens return 404. The launchd source requests
+  failure-only `KeepAlive`; the platform integration lane must prove
+  reacquisition after a conflict clears before packaging may claim it. Neither
+  path binds a fallback port.
 - Section 22 requires distinct Linux principals but does not assign their
   names. Packaging creates `bloom-broker-UID` and `bloom-signer-UID` system
   principals per enabled login UID. The login and Broker share only a

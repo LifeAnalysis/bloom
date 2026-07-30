@@ -34,6 +34,8 @@
     <string>broker-control</string>
     <key>BLOOM_SESSION_SOCKET</key>
     <string>@BLOOM_SESSION_SOCKET@</string>
+    <key>BLOOM_BROKER_STARTUP_STATUS</key>
+    <string>@BLOOM_BROKER_STARTUP_STATUS@</string>
   </dict>
 
   <key>Sockets</key>

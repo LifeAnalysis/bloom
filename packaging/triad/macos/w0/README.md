@@ -20,6 +20,18 @@ It refuses to run unless all of the following hold:
 The marker is deliberately not created by this repository. Disposable VM
 provisioning owns it. Never create it on a developer workstation.
 
+`run-two-login.sh PAYLOAD UID_A USER_A UID_B USER_B` is the separate
+cross-login lifecycle lane. It has the same root, Darwin, payload-claim, and
+external disposable-marker guards, additionally requires two distinct active
+GUI launchd domains, and refuses existing Bloom state or principals for either
+login. It enrolls both UIDs, proves the second Broker dies fatally with the
+specific Machine-visible cross-login diagnostic and no fallback listener,
+terminates the owning GUI domain, then proves failure-only KeepAlive transfers
+the canonical listener before another Machine request. If
+`BLOOM_MACOS_W0_EVIDENCE_DIR` names an existing absolute directory, a
+successful run writes digest-bound `mui_05.pass`, `mui_06.pass`, and
+`two_login_lifecycle.pass` evidence for the tested payload.
+
 The manually dispatched `macOS Unix-principal W0` workflow is the repository's
 disposable-host provisioner. It runs only on a fresh GitHub-hosted macOS VM,
 first proves that the runner login has a GUI launchd domain, builds all three
@@ -61,5 +73,6 @@ session-domain bootout/rebootstrap cycle proves Broker and Signer drain, the
 ceremony listener closes, and socket activation restores authenticated health
 without reinstalling or manually restarting either service.
 
-Cross-login listener conflict and actual Fast User Switching/logout on a
-two-login disposable VM remain required before the W0 claim can graduate.
+The cross-login harness is intentionally not run on the ordinary
+single-login GitHub-hosted lane. A recorded successful run on a disposable
+two-login VM remains required before the W0 claim can graduate.

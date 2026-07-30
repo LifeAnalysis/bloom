@@ -529,6 +529,7 @@ grep -Fi 'x-bloom-ceremony-owner: bloom-broker-v1' <<<"$ceremony_headers" >/dev/
 
 broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
 broker_log="/private/var/db/bloom/$login_uid/broker/broker.log"
+broker_startup_status="/private/var/run/bloom/$login_uid/status/broker-startup.json"
 launchctl bootout "$broker_label"
 /usr/bin/nc -l 127.0.0.1 18734 >/dev/null 2>&1 &
 foreign_listener_pid=$!
@@ -553,14 +554,30 @@ done
 grep -F \
   'fatal canonical ceremony listener ownership conflict at 127.0.0.1:18734; no fallback port will be used' \
   "$broker_log" >/dev/null
-if sudo -u "$login_user" \
-  "$machine_binary" \
-  --triad-health-check \
-  "$release_digest"
+assert_metadata \
+  "$broker_startup_status" \
+  "$broker_uid:$machine_broker_gid:640"
+[[ "$(plutil -extract schema raw -o - "$broker_startup_status")" == \
+  "bloom.broker-startup.1" ]]
+[[ "$(plutil -extract state raw -o - "$broker_startup_status")" == "fatal" ]]
+[[ "$(plutil -extract incident raw -o - "$broker_startup_status")" == \
+  "foreign_or_unverifiable_process" ]]
+[[ "$(plutil -extract address raw -o - "$broker_startup_status")" == \
+  "127.0.0.1:18734" ]]
+[[ "$(plutil -extract message raw -o - "$broker_startup_status")" == \
+  "a foreign or unverifiable process owns the Bloom ceremony listener" ]]
+if foreign_machine_failure="$(
+  sudo -u "$login_user" \
+    "$machine_binary" \
+    --triad-health-check "$release_digest" 2>&1
+)"
 then
   echo "Machine reported healthy while a foreign process owned the ceremony port" >&2
   exit 1
 fi
+grep -F \
+  'Bloom Broker startup failed: a foreign or unverifiable process owns the Bloom ceremony listener' \
+  <<<"$foreign_machine_failure" >/dev/null
 if lsof -nP -a -u "bloom-broker-$login_uid" -iTCP -sTCP:LISTEN |
   grep . >/dev/null
 then
@@ -585,6 +602,10 @@ sudo -u "$login_user" \
   "$machine_binary" \
   --triad-health-check \
   "$release_digest"
+[[ ! -e "$broker_startup_status" ]] || {
+  echo "Broker retained a stale startup diagnostic after acquiring the listener" >&2
+  exit 1
+}
 
 if sudo -u "bloom-signer-$login_uid" \
   /usr/bin/nc -z -w 2 127.0.0.1 18734
