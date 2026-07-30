@@ -1070,7 +1070,7 @@ rollback_upgrade() {
 
 recover_interrupted_upgrade() {
   upgrade_transaction="$product_root/upgrade-transaction"
-  [[ -e "$upgrade_transaction" ]] || return
+  [[ -e "$upgrade_transaction" ]] || return 0
   upgrade_in_progress=true
   echo "recovering an interrupted Bloom macOS upgrade" >&2
   rollback_upgrade
@@ -1564,7 +1564,7 @@ rollback_enrollment_transaction() {
 
 recover_pending_enrollments() {
   transaction_root="$product_root/enrollment-transactions"
-  [[ -e "$transaction_root" ]] || return
+  [[ -e "$transaction_root" ]] || return 0
   require_live_directory_metadata "$transaction_root" 0 0 700
   shopt -s nullglob
   pending_transactions=("$transaction_root"/[1-9]*)
@@ -1780,7 +1780,7 @@ recover_interrupted_rotation() {
     [[ "$(stat -f '%u:%Lp' "$staging")" == "0:700" ]] || return 65
     rm -rf -- "$staging"
   done
-  [[ -e "$rotation_transaction" ]] || return
+  [[ -e "$rotation_transaction" ]] || return 0
   rotation_in_progress=true
   echo "recovering an interrupted Bloom macOS config/identity rotation" >&2
   rollback_rotation
@@ -2224,7 +2224,7 @@ execute_uninstall_transaction() {
 
 recover_interrupted_uninstalls() {
   uninstall_root="$product_root/uninstall-transactions"
-  [[ -e "$uninstall_root" ]] || return
+  [[ -e "$uninstall_root" ]] || return 0
   [[ -d "$uninstall_root" && ! -L "$uninstall_root" ]] || return 65
   [[ "$(stat -f '%u:%Lp' "$uninstall_root")" == "0:700" ]] || return 65
   shopt -s nullglob
@@ -2300,7 +2300,7 @@ rollback_retained_restore() {
 
 recover_retained_restores() {
   retained_root="$product_root/retained"
-  [[ -e "$retained_root" ]] || return
+  [[ -e "$retained_root" ]] || return 0
   [[ -d "$retained_root" && ! -L "$retained_root" ]] || return 65
   [[ "$(stat -f '%u:%Lp' "$retained_root")" == "0:700" ]] || return 65
   shopt -s nullglob
