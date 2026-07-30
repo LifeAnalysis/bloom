@@ -781,6 +781,17 @@ assert_udp_blocked "bloom-broker-$login_uid" -4 "$host_ipv4" 18739
 
 containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
 assert_metadata "$containment_status" "0:0:644"
+deadline=$((SECONDS + 20))
+while [[ $SECONDS -lt $deadline ]]; do
+  if sudo -u "$login_user" \
+    "$machine_binary" \
+    --triad-health-check \
+    "$release_digest"
+  then
+    break
+  fi
+  sleep 1
+done
 sudo -u "$login_user" \
   "$machine_binary" \
   --triad-health-check \
