@@ -678,10 +678,6 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         //     stages an approval challenge on the first write and signs the
         //     x402/Tempo MPP credential only under a grant-gated PetalHost
         //     signature.
-        //   * Hyperliquid owner approvals (`agent_sessions/<wallet>/new.json`
-        //     and `exchange/<wallet>/send_asset.json`): the Hyperliquid
-        //     handler stages approval and signs only under a grant-gated
-        //     PetalHost signature.
         // None of these silently consumes a cached signer, and the old
         // write_unlocked lane is disabled for passkey wallets — denying them here
         // would leave mounted confirm/mint with no working path.
@@ -774,18 +770,6 @@ fn sealed_approval_paths(
             dir.join("approval.json"),
         ));
     }
-    if let Some(dir) = hyperliquid_usd_send_dir(home, wallet, path) {
-        return Some((
-            dir.join("approval_challenge.json"),
-            dir.join("approval.json"),
-        ));
-    }
-    if let Some(dir) = hyperliquid_agent_session_dir(home, wallet, path, bytes) {
-        return Some((
-            dir.join("approval_challenge.json"),
-            dir.join("approval.json"),
-        ));
-    }
     None
 }
 
@@ -836,59 +820,6 @@ fn outbox_confirm_dir(wallet: &str, path: &VfsPath, outbox_root: &Path) -> Optio
     }
 }
 
-fn hyperliquid_usd_send_dir(home: &Path, wallet: &str, path: &VfsPath) -> Option<PathBuf> {
-    let [root, network, branch, w, leaf] = path.segments() else {
-        return None;
-    };
-    if root == "hyperliquid" && branch == "exchange" && w == wallet && leaf == "send_asset.json" {
-        Some(
-            home.join("hyperliquid")
-                .join("exchange")
-                .join(safe_sealed_approval_segment(network)?)
-                .join(safe_sealed_approval_segment(wallet)?),
-        )
-    } else {
-        None
-    }
-}
-
-fn hyperliquid_agent_session_dir(
-    home: &Path,
-    wallet: &str,
-    path: &VfsPath,
-    bytes: &[u8],
-) -> Option<PathBuf> {
-    let [root, network, branch, w, leaf] = path.segments() else {
-        return None;
-    };
-    if !(root == "hyperliquid" && branch == "agent_sessions" && w == wallet && leaf == "new.json") {
-        return None;
-    }
-    let body: Value = serde_json::from_slice(bytes).ok()?;
-    let session_id = body.get("id")?.as_str()?;
-    Some(
-        home.join("hyperliquid")
-            .join("agent_sessions")
-            .join(safe_sealed_approval_segment(network)?)
-            .join(safe_sealed_approval_segment(wallet)?)
-            .join(safe_sealed_approval_segment(session_id)?),
-    )
-}
-
-fn safe_sealed_approval_segment(raw: &str) -> Option<String> {
-    if raw.is_empty()
-        || raw == "."
-        || raw == ".."
-        || raw.len() > 128
-        || !raw
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    {
-        return None;
-    }
-    Some(raw.to_string())
-}
-
 #[cfg(test)]
 fn write_unlocked_intent(
     wallet: &str,
@@ -896,7 +827,6 @@ fn write_unlocked_intent(
     body: &[u8],
     wallet_address: Option<String>,
     outbox_root: Option<PathBuf>,
-    wallet_policy_toml: Option<&str>,
 ) -> CeremonyIntent {
     let path_s = path.to_string_path();
     let segs = path.segments();
@@ -954,17 +884,6 @@ fn write_unlocked_intent(
         segs,
         wallet_address.clone(),
         outbox_root.as_deref(),
-    ) {
-        return intent;
-    }
-
-    if let Some(intent) = bloom_proto::hyperliquid_write_unlock_intent(
-        wallet,
-        &path_s,
-        segs,
-        body,
-        wallet_address.clone(),
-        wallet_policy_toml,
     ) {
         return intent;
     }
@@ -1322,18 +1241,18 @@ summary = "Demo app used by IPC tests."
             "/requests/pending/req_123/confirm",
             "/requests/new",
             "/requests/pending/req_123/cancel",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
-            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_cancel_all",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_close_all",
-            "/hyperliquid/mainnet/exchange/minnow/order.json",
-            "/hyperliquid/mainnet/exchange/minnow/cancel.json",
-            "/hyperliquid/mainnet/exchange/minnow/schedule_cancel.json",
-            "/hyperliquid/mainnet/exchange/minnow/update_leverage.json",
-            "/hyperliquid/mainnet/exchange/minnow/send_asset.json",
-            "/hyperliquid/mainnet/exchange/minnow/raw_signed.json",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/new.json",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_cancel_all",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_close_all",
+            "/petals/hyperliquid/mainnet/exchange/minnow/order.json",
+            "/petals/hyperliquid/mainnet/exchange/minnow/cancel.json",
+            "/petals/hyperliquid/mainnet/exchange/minnow/schedule_cancel.json",
+            "/petals/hyperliquid/mainnet/exchange/minnow/update_leverage.json",
+            "/petals/hyperliquid/mainnet/exchange/minnow/send_asset.json",
+            "/petals/hyperliquid/mainnet/exchange/minnow/raw_signed.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!write_path_uses_wallet_signer(&p), "{path}");
@@ -1391,52 +1310,13 @@ summary = "Demo app used by IPC tests."
     fn policy_write_unlock_intent_shows_policy_body() {
         let p = VfsPath::parse("/wallets/minnow/policy.toml").unwrap();
         let body = b"[defi]\nrequire_calldata_verification = false\n";
-        let intent = write_unlocked_intent("minnow", &p, body, Some("0xabc".into()), None, None);
+        let intent = write_unlocked_intent("minnow", &p, body, Some("0xabc".into()), None);
         assert_eq!(intent.kind, CeremonyIntentKind::SignPolicy);
         assert_eq!(intent.canonical_subject["kind"], "vfs_policy_write");
         assert_eq!(intent.wallet_address.as_deref(), Some("0xabc"));
         let policy = intent.policy_lines.join("\n");
         assert!(policy.contains("require_calldata_verification = false"));
         assert!(intent.summary_lines.join("\n").contains("Review rules"));
-    }
-
-    #[test]
-    fn hyperliquid_agent_session_intent_shows_authority_and_bounds() {
-        let p = VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/new.json").unwrap();
-        let body = br#"{"id":"btc-hour-1","agent_name":"bloom-btc-hour"}"#;
-        let policy = r#"
-[hyperliquid]
-allowed_assets = ["BTC"]
-allowed_order_types = ["limit"]
-max_notional_usd = "12"
-max_position_usd = "12"
-max_loss_usd = "5"
-max_leverage = 3
-max_session_secs = 1800
-allow_reduce_only = true
-allow_trigger_orders = false
-allow_twap = false
-allow_builder_fees = false
-allow_vault_or_subaccount = false
-"#;
-        let intent =
-            write_unlocked_intent("minnow", &p, body, Some("0xabc".into()), None, Some(policy));
-        let summary = intent.summary_lines.join("\n");
-        let review = intent.policy_lines.join("\n");
-        assert_eq!(intent.title, "Authorize Hyperliquid Trading Session");
-        assert_eq!(
-            intent.canonical_subject["kind"],
-            "hyperliquid_agent_session_grant"
-        );
-        assert!(summary.contains("trade-only API wallet"));
-        assert!(summary.contains("Session id: btc-hour-1"));
-        assert!(summary.contains("Agent name: bloom-btc-hour"));
-        assert!(summary.contains("without more passkey prompts"));
-        assert!(review.contains("session_key = \"trade-only API wallet\""));
-        assert!(review.contains("allowed_assets = \"BTC\""));
-        assert!(review.contains("max_notional_usd = \"$12"));
-        assert!(review.contains("max_session_secs = \"1800\""));
-        assert!(review.contains("withdrawals = \"not allowed\""));
     }
 
     #[test]
@@ -1462,7 +1342,6 @@ allow_vault_or_subaccount = false
             b"y",
             Some("0xabc".into()),
             Some(tmp.path().to_path_buf()),
-            None,
         );
         assert_eq!(intent.title, "Approve base Transaction");
         assert_eq!(intent.kind, CeremonyIntentKind::EvmTransaction);
