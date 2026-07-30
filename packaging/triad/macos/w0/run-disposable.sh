@@ -616,7 +616,7 @@ broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
 broker_log="/private/var/db/bloom/$login_uid/broker/broker.log"
 broker_startup_status="/private/var/run/bloom/$login_uid/status/broker-startup.json"
 launchctl bootout "$broker_label"
-/usr/bin/nc -l 127.0.0.1 18734 >/dev/null 2>&1 &
+/usr/bin/nc -lk 127.0.0.1 18734 >/dev/null 2>&1 &
 foreign_listener_pid=$!
 deadline=$((SECONDS + 10))
 while [[ $SECONDS -lt $deadline ]]; do
