@@ -39,14 +39,22 @@ wire detail. It does not amend that specification.
   logical alias.
 - The login sentinel uses the existing mutual application-key challenge
   directly on a dedicated Unix stream; it is not an RPC request and adds no
-  method to either closed surface. The login UID owns the socket, the
-  Machine--Broker group is pinned in the root-owned edge manifest, and Broker
+  method to either closed surface. The login UID owns the socket, its
+  numeric group is pinned in the root-owned edge manifest, and Broker
   authenticates both peer UID and the separately pinned `bloom-session`
   public key before binding the ceremony listener. Sentinel disconnect first
   drains HTTP acceptance, then makes every remaining browser session terminal
   and lets Broker exit successfully. W0 may temporarily carry the session
   identity as a signed fixture; production claim generation remains blocked
   until enrollment creates all private identities locally.
+- The single session socket reuses `bloom-revoke-U`, the only declared group
+  already containing the login, Broker, and Signer. This introduces no new
+  group membership or RPC access: the sentinel selects the pinned peer by
+  kernel UID and completes a separate mutual application-key challenge for
+  Broker and Signer. Both services wait for that authenticated channel before
+  serving. Logout closes both channels; Broker terminalizes browser sessions,
+  while Signer stops accepting and gives already accepted bounded requests up
+  to their protocol deadline to finish before exiting successfully.
 - Production macOS enrollment uses the already verified installed Machine
   executable in a root-only, noninteractive material-generation mode. Signed
   release inputs contain public JSON templates and an unsigned provenance

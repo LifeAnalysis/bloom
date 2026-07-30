@@ -32,8 +32,12 @@ The global `com.bloom.session` LaunchAgent invokes only Machine's
 `--session-sentinel` mode. It exits successfully for an unenrolled login,
 keeps no custody or signing authority, and is destroyed with its GUI login
 domain. It owns `session/session.sock` as the login UID and authenticates a
-separately pinned `bloom-session` identity. Broker authenticates that channel
-before binding the canonical ceremony listener and drains it on disconnect.
+separately pinned `bloom-session` identity. The socket reuses the already
+declared revoke group, whose membership contains the login, Broker, and
+Signer, while mutual application-key authentication distinguishes the two
+service channels. Broker authenticates before binding the canonical ceremony
+listener; Signer authenticates before accepting RPC. Both drain and exit
+successfully on disconnect.
 
 ## Filesystem and network boundaries
 

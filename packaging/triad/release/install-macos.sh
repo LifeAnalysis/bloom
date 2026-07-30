@@ -422,7 +422,7 @@ render_template() {
     -e "s|@MACHINE_BROKER_GID@|$BLOOM_MACOS_MACHINE_BROKER_GID|g" \
     -e "s|@BROKER_SIGNER_GID@|$BLOOM_MACOS_BROKER_SIGNER_GID|g" \
     -e "s|@REVOKE_GID@|$BLOOM_MACOS_REVOKE_GID|g" \
-    -e "s|@SESSION_SOCKET_GID@|$BLOOM_MACOS_MACHINE_BROKER_GID|g" \
+    -e "s|@SESSION_SOCKET_GID@|$BLOOM_MACOS_REVOKE_GID|g" \
     -e "s|@BLOOM_MACHINE_BINARY@|$machine_binary|g" \
     -e "s|@BLOOM_BROKER_BINARY@|$broker_binary|g" \
     -e "s|@BLOOM_SIGNER_BINARY@|$signer_binary|g" \
@@ -469,7 +469,8 @@ set_live_ownership() {
   chown "$login_user:$machine_broker_group" \
     "$machine_config_root" \
     "$machine_config_root/identity.json" \
-    "$machine_config_root/revoke-identity.json" \
+    "$machine_config_root/revoke-identity.json"
+  chown "$login_user:$revoke_group" \
     "$session_config_root" \
     "$session_config_root/identity.json" \
     "$runtime_root/session"
@@ -812,8 +813,7 @@ case "$action" in
         600
       for login_private in \
         "$machine_config_root/identity.json" \
-        "$machine_config_root/revoke-identity.json" \
-        "$session_config_root/identity.json"
+        "$machine_config_root/revoke-identity.json"
       do
         require_live_file_metadata \
           "$login_private" \
@@ -821,6 +821,11 @@ case "$action" in
           "$BLOOM_MACOS_MACHINE_BROKER_GID" \
           600
       done
+      require_live_file_metadata \
+        "$session_config_root/identity.json" \
+        "$login_uid" \
+        "$BLOOM_MACOS_REVOKE_GID" \
+        600
       require_live_file_metadata "$installer_config_root/identity.json" 0 0 600
     else
       if [[ "$platform_claim" == "macos-unix-principals" ]]; then
@@ -834,7 +839,7 @@ case "$action" in
           "$login_uid" \
           "$BLOOM_MACOS_BROKER_UID" \
           "$BLOOM_MACOS_SIGNER_UID" \
-          "$BLOOM_MACOS_MACHINE_BROKER_GID" \
+          "$BLOOM_MACOS_REVOKE_GID" \
           "$BLOOM_RELEASE_DIGEST"
         config_source="$generated_material"
       else

@@ -456,7 +456,7 @@ mod tests {
             login_uid: 501,
             broker_uid: 250_501,
             signer_uid: 250_502,
-            session_socket_gid: 260_501,
+            session_socket_gid: 260_503,
             release_digest: "11".repeat(32),
         };
         generate_for_owner(&plan, rustix::process::geteuid().as_raw()).unwrap();
@@ -481,7 +481,7 @@ mod tests {
                     .to_bytes()
             )
         );
-        assert_eq!(edge["session_socket_gid"], 260_501);
+        assert_eq!(edge["session_socket_gid"], 260_503);
 
         let installer: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("installer-identity.json")).unwrap())

@@ -32,6 +32,8 @@
     <string>signer</string>
     <key>BLOOM_SIGNER_CONTROL_ACTIVATION_NAME</key>
     <string>signer-control</string>
+    <key>BLOOM_SESSION_SOCKET</key>
+    <string>@BLOOM_SESSION_SOCKET@</string>
   </dict>
 
   <key>Sockets</key>

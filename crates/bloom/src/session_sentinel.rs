@@ -9,6 +9,7 @@ use std::{
         net::UnixListener as StdUnixListener,
     },
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,7 +19,7 @@ use rustix::{
     fs::{Gid, fchown},
     process::geteuid,
 };
-use tokio::{io::AsyncReadExt as _, net::UnixListener};
+use tokio::{io::AsyncReadExt as _, net::UnixListener, sync::Semaphore};
 
 const SESSION_SERVICE_ID: &str = "bloom-session";
 const BROKER_SERVICE_ID: &str = "bloom-broker";
@@ -53,7 +54,13 @@ pub async fn run() -> Result<()> {
         .broker
         .into_acl()
         .context("load pinned Broker session peer")?;
-    if broker_acl.service_id.as_str() != BROKER_SERVICE_ID {
+    let signer_acl = manifest
+        .signer
+        .into_acl()
+        .context("load pinned Signer session peer")?;
+    if broker_acl.service_id.as_str() != BROKER_SERVICE_ID
+        || signer_acl.service_id.as_str() != "bloom-signer"
+    {
         bail!("edge manifest has the wrong session peer");
     }
     let socket_gid = manifest
@@ -83,36 +90,72 @@ pub async fn run() -> Result<()> {
         gid: socket_gid,
     };
 
-    serve_authenticated_brokers(listener, identity, broker_acl).await
+    serve_authenticated_services(listener, identity, [broker_acl, signer_acl]).await
 }
 
-async fn serve_authenticated_brokers(
+async fn serve_authenticated_services(
     listener: UnixListener,
     identity: bloom_triad_local_transport::LocalIdentity,
-    broker_acl: PeerAcl,
+    peers: [PeerAcl; 2],
 ) -> Result<()> {
+    let connections = Arc::new(Semaphore::new(8));
     loop {
         let (mut stream, _) = listener
             .accept()
             .await
-            .context("accept Broker session connection")?;
-        if let Err(error) = authenticate_server(&mut stream, &identity, &broker_acl).await {
-            tracing::warn!(%error, "session_sentinel.rejected_peer");
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            .context("accept service session connection")?;
+        let observed_uid = stream
+            .peer_cred()
+            .context("inspect session peer credentials")?
+            .uid();
+        let Some(peer) = peers
+            .iter()
+            .find(|candidate| candidate.effective_uid == observed_uid)
+            .cloned()
+        else {
+            tracing::warn!(observed_uid, "session_sentinel.rejected_uid");
             continue;
-        }
-        tracing::info!("session_sentinel.broker_authenticated");
-        let mut unexpected = [0_u8; 1];
-        match stream.read(&mut unexpected).await {
-            Ok(0) => {
-                // Broker crashed or was deliberately restarted while the
-                // login remains live. Keep the sentinel and authenticate its
-                // replacement.
-                tracing::info!("session_sentinel.broker_disconnected");
+        };
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            tracing::warn!("session_sentinel.connection_quota_exhausted");
+            continue;
+        };
+        let identity = identity.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let authenticated = tokio::time::timeout(
+                Duration::from_secs(2),
+                authenticate_server(&mut stream, &identity, &peer),
+            )
+            .await;
+            if !matches!(authenticated, Ok(Ok(()))) {
+                tracing::warn!(
+                    service_id = peer.service_id.as_str(),
+                    "session_sentinel.rejected_peer"
+                );
+                return;
             }
-            Ok(_) => bail!("authenticated Broker sent unexpected session-channel data"),
-            Err(error) => return Err(error).context("monitor Broker session connection"),
-        }
+            tracing::info!(
+                service_id = peer.service_id.as_str(),
+                "session_sentinel.service_authenticated"
+            );
+            let mut unexpected = [0_u8; 1];
+            match stream.read(&mut unexpected).await {
+                Ok(0) => tracing::info!(
+                    service_id = peer.service_id.as_str(),
+                    "session_sentinel.service_disconnected"
+                ),
+                Ok(_) => tracing::warn!(
+                    service_id = peer.service_id.as_str(),
+                    "session_sentinel.unexpected_channel_data"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    service_id = peer.service_id.as_str(),
+                    "session_sentinel.monitor_failed"
+                ),
+            }
+        });
     }
 }
 
