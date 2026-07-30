@@ -213,14 +213,23 @@ assert_record() {
   name="$2"
   attribute="$3"
   expected="$4"
-  observed="$(
-    dscl -plist . -read "/$kind/$name" "$attribute" |
-      plutil \
-        -extract "dsAttrTypeStandard:$attribute".0 \
-        raw \
-        -o - \
-        -
-  )"
+  record="$(dscl -plist . -read "/$kind/$name" "$attribute")"
+  if observed="$(
+    plutil -extract "dsAttrTypeStandard:$attribute".0 raw -o - - <<<"$record" 2>/dev/null
+  )"; then
+    attribute_key="dsAttrTypeStandard:$attribute"
+  elif observed="$(
+    plutil -extract "dsAttrTypeNative:$attribute".0 raw -o - - <<<"$record" 2>/dev/null
+  )"; then
+    attribute_key="dsAttrTypeNative:$attribute"
+  else
+    echo "$kind/$name is missing required attribute $attribute" >&2
+    exit 1
+  fi
+  if plutil -type "$attribute_key".1 -o - - <<<"$record" >/dev/null 2>&1; then
+    echo "$kind/$name has multiple values for $attribute" >&2
+    exit 1
+  fi
   [[ "$observed" == "$expected" ]] || {
     echo "$kind/$name $attribute: expected $expected, observed $observed" >&2
     exit 1
