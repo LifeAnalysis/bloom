@@ -1883,7 +1883,7 @@ verify_config_rotation() {
   old_config="$1"
   new_config="$2"
   principal="$3"
-  plutil -lint "$new_config" >/dev/null
+  plutil -convert json -o /dev/null -- "$new_config"
   common_fields=(
     build_digest
     network_containment.status_path
