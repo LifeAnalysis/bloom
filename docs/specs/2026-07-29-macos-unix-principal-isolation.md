@@ -213,6 +213,8 @@ Each daemon:
 
 - receives exact Unix socket paths from its signed LaunchDaemon profile and
   binds only in its verified service-owned endpoint directories;
+- sets `InitGroups=true`; enrollment flushes the Directory Service membership
+  cache and verifies every effective edge membership before bootstrap;
 - has `ProcessType=Background`;
 - uses `KeepAlive` only for abnormal exit;
 - exits successfully when its enrolled login session ends;

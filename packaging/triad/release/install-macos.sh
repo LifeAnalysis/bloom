@@ -434,6 +434,16 @@ require_group_nonmember() {
   fi
 }
 
+require_effective_group_member() {
+  group="$1"
+  member="$2"
+  dsmemberutil checkmembership -U "$member" -G "$group" |
+    grep -Fx "user is a member of the group" >/dev/null || {
+    echo "$member does not have effective membership in required group $group" >&2
+    exit 65
+  }
+}
+
 require_directory_contains() {
   kind="$1"
   name="$2"
@@ -757,6 +767,14 @@ provision_fresh_accounts() {
   add_group_member "$revoke_group" "$login_user"
   add_group_member "$revoke_group" "$broker_user"
   add_group_member "$revoke_group" "$signer_user"
+  dsmemberutil flushcache
+  require_effective_group_member "$machine_broker_group" "$login_user"
+  require_effective_group_member "$machine_broker_group" "$broker_user"
+  require_effective_group_member "$broker_signer_group" "$broker_user"
+  require_effective_group_member "$broker_signer_group" "$signer_user"
+  require_effective_group_member "$revoke_group" "$login_user"
+  require_effective_group_member "$revoke_group" "$broker_user"
+  require_effective_group_member "$revoke_group" "$signer_user"
 }
 
 atomic_install() {

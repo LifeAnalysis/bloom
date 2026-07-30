@@ -23,6 +23,11 @@ wire detail. It does not amend that specification.
   service validates the directory and publishes its own `0660` socket.
   Broker and Signer use separate service-owned revoke subdirectories. This
   preserves the RPC and mutual authentication model without a fallback path.
+- Fresh macOS Directory Service group edits are followed by
+  `dsmemberutil flushcache` and effective membership checks before any job is
+  bootstrapped. Both service LaunchDaemons explicitly set `InitGroups=true`;
+  relying on an implicit/default supplementary-group state made immediate
+  post-enrollment activation fail closed at the session socket.
 - The Unix-principal Broker uses its existing direct exclusive canonical bind;
   its LaunchDaemon supplies only reviewed endpoint paths. Failure-only
   `KeepAlive` retries a fatal `127.0.0.1:18734` conflict. The disposable macOS

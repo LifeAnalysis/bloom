@@ -10,6 +10,8 @@
   <string>@BLOOM_SIGNER_USER@</string>
   <key>GroupName</key>
   <string>@BLOOM_SIGNER_GROUP@</string>
+  <key>InitGroups</key>
+  <true/>
   <key>Umask</key>
   <integer>63</integer>
 
