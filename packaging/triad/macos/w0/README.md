@@ -24,7 +24,9 @@ root/service filesystem ownership, negative private-state reads, system-domain
 LaunchDaemon registration, numeric launchd socket ownership, and loaded
 UID-scoped `pf` rules. It also requires the authenticated session socket to
 appear with the login UID and revoke group, then verifies the canonical
-listener's Broker marker. Foreign/cross-login listener conflict, actual logout
-handoff, network attempts, hostile session authentication, install
-interruption, and destructive rollback cases remain required before the W0
-claim can graduate.
+listener's Broker marker. It removes the live anchor, waits for the root-owned
+containment attestation to turn unavailable, proves authenticated triad health
+fails, and then restores and re-verifies the anchor. Foreign/cross-login
+listener conflict, actual logout handoff, network attempts, hostile session
+authentication, install interruption, and destructive rollback cases remain
+required before the W0 claim can graduate.

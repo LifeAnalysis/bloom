@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bloom.containment</string>
+  <key>UserName</key>
+  <string>root</string>
+  <key>GroupName</key>
+  <string>wheel</string>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BLOOM_MACHINE_BINARY@</string>
+    <string>--triad-pf-monitor-once</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>1</integer>
+  <key>ThrottleInterval</key>
+  <integer>1</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+    <key>NumberOfFiles</key>
+    <integer>64</integer>
+    <key>NumberOfProcesses</key>
+    <integer>16</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+    <key>NumberOfFiles</key>
+    <integer>64</integer>
+    <key>NumberOfProcesses</key>
+    <integer>16</integer>
+  </dict>
+</dict>
+</plist>

@@ -12,6 +12,7 @@ mod commands {
     pub mod qr;
 }
 mod github_source;
+mod pf_monitor;
 mod session_sentinel;
 mod triad_enrollment;
 
@@ -1211,6 +1212,18 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("Bloom triad health check failed: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if std::env::args_os().len() == 2
+        && std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new("--triad-pf-monitor-once"))
+    {
+        return match pf_monitor::run_once() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Bloom packet-filter monitor failed: {error:#}");
                 ExitCode::FAILURE
             }
         };

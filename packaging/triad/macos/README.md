@@ -67,10 +67,16 @@ fresh per login; only their public cross-pins enter the root-owned manifest.
 The temporary root-only generation directory is removed on success or error.
 
 The packet-filter template denies new Broker IP flows and all Signer TCP/UDP
-flows by numeric effective UID. Production activation is prohibited until the
-disposable macOS W0 lane proves IPv4/IPv6, TCP/UDP, loopback, accepted Broker
-responses, anchor drift, Fast User Switching, and removal behavior. Local
-Signer is the only initial backend.
+flows by numeric effective UID. A root/wheel one-shot monitor is launched once
+per second with no socket, RPC, custody, or signing surface. It verifies the
+loaded per-UID anchors and atomically publishes short-lived root-owned status
+records. Broker and Signer require the exact login UID, release digest,
+ownership, mode, availability bit, and freshness before readiness or any
+signing/custody/policy mutation; revocation and public status remain
+available. Production activation is prohibited until the disposable macOS W0
+lane proves IPv4/IPv6, TCP/UDP, loopback, accepted Broker responses, anchor
+drift, Fast User Switching, and removal behavior. Local Signer is the only
+initial backend.
 
 Static template and staged-root tests are conformance inputs, not proof of an
 operating-system boundary. Tests that create accounts, load LaunchDaemons,

@@ -193,4 +193,44 @@ ceremony_headers="$(curl --silent --show-error --max-time 2 --dump-header - \
   --output /dev/null http://127.0.0.1:18734/)"
 grep -Fi 'x-bloom-ceremony-owner: bloom-broker-v1' <<<"$ceremony_headers" >/dev/null
 
+containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
+assert_metadata "$containment_status" "0:0:644"
+release_digest="$(field release_digest)"
+machine_binary="/usr/local/libexec/bloom/current/bloom"
+sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
+
+pfctl -a "com.bloom.triad/$login_uid" -F rules
+deadline=$((SECONDS + 10))
+while [[ $SECONDS -lt $deadline ]]; do
+  if [[ -f "$containment_status" ]] &&
+    [[ "$(plutil -extract available raw -o - "$containment_status")" == "false" ]]
+  then
+    break
+  fi
+  sleep 1
+done
+[[ "$(plutil -extract available raw -o - "$containment_status")" == "false" ]] || {
+  echo "packet-filter monitor did not report the removed anchor" >&2
+  exit 1
+}
+if sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
+then
+  echo "Broker remained ready after its packet-filter anchor disappeared" >&2
+  exit 1
+fi
+pfctl \
+  -a "com.bloom.triad/$login_uid" \
+  -f "/etc/pf.anchors/com.bloom.triad.$login_uid"
+"$machine_binary" --triad-pf-monitor-once
+sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
+
 echo "Bloom macOS Unix-principal disposable W0 isolation checks passed"

@@ -35,6 +35,7 @@ existing_enrollment=false
 fresh_enrollment=false
 has_installed_enrollments=false
 global_installed_release_digest=""
+containment_monitor_created=false
 upgrade_in_progress=false
 upgrade_transaction=""
 upgrade_transaction_staging=""
@@ -150,6 +151,10 @@ rollback_provisioning() {
       launchctl bootout "gui/$login_uid/com.bloom.session" 2>/dev/null
       launchctl bootout "system/com.bloom.broker.$login_uid" 2>/dev/null
       launchctl bootout "system/com.bloom.signer.$login_uid" 2>/dev/null
+      if $containment_monitor_created && ! $has_installed_enrollments; then
+        launchctl bootout "system/com.bloom.containment" 2>/dev/null
+        rm -f -- "/Library/LaunchDaemons/com.bloom.containment.plist"
+      fi
       if $pf_reference_installed; then
         rewrite_pf_reference remove
       fi
@@ -329,6 +334,22 @@ require_live_directory_metadata() {
   }
 }
 
+require_network_containment_config() {
+  config_file="$1"
+  enrolled_uid="$2"
+  expected_status="/private/var/run/bloom/$enrolled_uid/containment/status.json"
+  observed="$(
+    plutil -extract network_containment.status_path raw -o - "$config_file"
+  )"
+  [[ "$observed" == "$expected_status" ]]
+  observed="$(plutil -extract network_containment.login_uid raw -o - "$config_file")"
+  [[ "$observed" == "$enrolled_uid" ]]
+  observed="$(
+    plutil -extract network_containment.maximum_age_ms raw -o - "$config_file"
+  )"
+  [[ "$observed" == "5000" ]]
+}
+
 verify_existing_enrollment() {
   [[ "$(read_enrollment_field "$enrollment" schema)" == "bloom.macos-enrollment.1" ]]
   [[ "$(read_enrollment_field "$enrollment" login_uid)" == "$login_uid" ]]
@@ -449,6 +470,7 @@ verify_installed_security_files() {
     "$BLOOM_MACOS_SIGNER_GID" \
     700
   require_live_directory_metadata "$enrolled_runtime_root" 0 0 711
+  require_live_directory_metadata "$enrolled_runtime_root/containment" 0 0 755
   require_live_directory_metadata \
     "$enrolled_runtime_root/machine-broker" \
     0 \
@@ -501,6 +523,12 @@ verify_installed_security_files() {
     "$BLOOM_MACOS_SIGNER_UID" \
     "$BLOOM_MACOS_SIGNER_GID" \
     600
+  require_network_containment_config \
+    "$enrolled_config_root/broker/config.json" \
+    "$enrolled_uid"
+  require_network_containment_config \
+    "$enrolled_config_root/signer/config.json" \
+    "$enrolled_uid"
   for login_private in \
     "$enrolled_config_root/machine/identity.json" \
     "$enrolled_config_root/machine/revoke-identity.json"
@@ -587,6 +615,22 @@ atomic_install() {
   mv -f "$temporary" "$destination"
 }
 
+install_network_containment_config() {
+  config_file="$1"
+  enrolled_uid="$2"
+  containment_json="$(
+    printf \
+      '{"status_path":"/private/var/run/bloom/%s/containment/status.json","login_uid":%s,"maximum_age_ms":5000}' \
+      "$enrolled_uid" \
+      "$enrolled_uid"
+  )"
+  if plutil -type network_containment "$config_file" >/dev/null 2>&1; then
+    plutil -replace network_containment -json "$containment_json" "$config_file"
+  else
+    plutil -insert network_containment -json "$containment_json" "$config_file"
+  fi
+}
+
 render_template() {
   source_file="$1"
   destination="$2"
@@ -623,6 +667,7 @@ render_template() {
     -e "s|@BLOOM_BROKER_CONTROL_SOCKET@|$runtime_root/revoke/broker-control.sock|g" \
     -e "s|@BLOOM_SIGNER_CONTROL_SOCKET@|$runtime_root/revoke/signer-control.sock|g" \
     -e "s|@BLOOM_SESSION_SOCKET@|$runtime_root/session/session.sock|g" \
+    -e "s|@BLOOM_CONTAINMENT_STATUS@|$runtime_root/containment/status.json|g" \
     -e "s|@BLOOM_PROVENANCE_CATALOG@|$config_root/provenance-catalog.json|g" \
     -e "s|@BLOOM_BROKER_LOG@|$broker_state/broker.log|g" \
     -e "s|@BLOOM_SIGNER_LOG@|$signer_state/signer.log|g" \
@@ -661,11 +706,17 @@ set_live_ownership() {
     "$installer_config_root" \
     "$installer_config_root/identity.json" \
     "$config_root/provenance-catalog.json"
+  chown root:wheel "$runtime_root/containment"
   chown "root:$machine_broker_group" "$runtime_root/machine-broker"
   chown "root:$broker_signer_group" "$runtime_root/broker-signer"
   chown "root:$revoke_group" "$runtime_root/revoke"
   chown "$broker_user:$machine_broker_group" "$runtime_root/status"
-  chown root:wheel "$broker_plist" "$signer_plist" "$session_plist" "$pf_target"
+  chown root:wheel \
+    "$broker_plist" \
+    "$signer_plist" \
+    "$containment_plist" \
+    "$session_plist" \
+    "$pf_target"
 }
 
 rewrite_pf_reference() {
@@ -765,6 +816,7 @@ validate_upgrade_transaction() {
 }
 
 stop_upgrade_jobs() {
+  launchctl bootout "system/com.bloom.containment" 2>/dev/null || true
   while IFS= read -r enrolled_uid; do
     [[ "$enrolled_uid" =~ ^[1-9][0-9]*$ ]] || return 65
     launchctl bootout "gui/$enrolled_uid/com.bloom.session" 2>/dev/null || true
@@ -777,20 +829,28 @@ restore_upgrade_jobs() {
   job_kind="$1"
   while IFS=' ' read -r kind enrolled_uid; do
     [[ -n "$kind" ]] || continue
-    [[ "$enrolled_uid" =~ ^[1-9][0-9]*$ ]] || return 65
     [[ "$kind" == "$job_kind" ]] || continue
     case "$kind" in
+      monitor)
+        [[ "$enrolled_uid" == "0" ]] || return 65
+        launchctl bootstrap \
+          system \
+          "/Library/LaunchDaemons/com.bloom.containment.plist"
+        ;;
       session)
+        [[ "$enrolled_uid" =~ ^[1-9][0-9]*$ ]] || return 65
         launchctl bootstrap \
           "gui/$enrolled_uid" \
           "/Library/LaunchAgents/com.bloom.session.plist"
         ;;
       signer)
+        [[ "$enrolled_uid" =~ ^[1-9][0-9]*$ ]] || return 65
         launchctl bootstrap \
           system \
           "/Library/LaunchDaemons/com.bloom.signer.$enrolled_uid.plist"
         ;;
       broker)
+        [[ "$enrolled_uid" =~ ^[1-9][0-9]*$ ]] || return 65
         launchctl bootstrap \
           system \
           "/Library/LaunchDaemons/com.bloom.broker.$enrolled_uid.plist"
@@ -854,6 +914,9 @@ restore_upgrade_files() {
   atomic_copy_preserving_metadata \
     "$upgrade_transaction/backup/session.plist" \
     "/Library/LaunchAgents/com.bloom.session.plist"
+  atomic_copy_preserving_metadata \
+    "$upgrade_transaction/backup/containment.plist" \
+    "/Library/LaunchDaemons/com.bloom.containment.plist"
   repoint_current_release "$(<"$upgrade_transaction/old-current-target")"
   pfctl -f /etc/pf.conf
   sync
@@ -869,6 +932,8 @@ rollback_upgrade() {
   fi
   stop_upgrade_jobs || return
   restore_upgrade_files || return
+  restore_upgrade_jobs monitor || return
+  "$release_base/current/bloom" --triad-pf-monitor-once || return
   restore_upgrade_jobs session || return
   restore_upgrade_jobs signer || return
   restore_upgrade_jobs broker || return
@@ -929,10 +994,21 @@ prepare_upgrade_transaction() {
   : > "$upgrade_transaction_staging/uids"
   : > "$upgrade_transaction_staging/jobs"
   session_plist="/Library/LaunchAgents/com.bloom.session.plist"
+  containment_plist="/Library/LaunchDaemons/com.bloom.containment.plist"
   [[ -f "$session_plist" && ! -L "$session_plist" ]] || return 65
+  [[ -f "$containment_plist" && ! -L "$containment_plist" ]] || return 65
   require_live_file_metadata "$session_plist" 0 0 644
+  require_live_file_metadata "$containment_plist" 0 0 644
   require_live_file_metadata /etc/pf.conf 0 0 644
   cp -p "$session_plist" "$upgrade_transaction_staging/backup/session.plist"
+  cp -p \
+    "$containment_plist" \
+    "$upgrade_transaction_staging/backup/containment.plist"
+  launchctl print "system/com.bloom.containment" >/dev/null 2>&1 || {
+    echo "Bloom packet-filter monitor is not loaded" >&2
+    return 69
+  }
+  printf '%s\n' 'monitor 0' >> "$upgrade_transaction_staging/jobs"
   session_rendered=false
 
   shopt -s nullglob
@@ -999,6 +1075,8 @@ prepare_upgrade_transaction() {
       "$staged/enrollment.json"
     plutil -replace build_digest -string "$new_digest" "$staged/broker.json"
     plutil -replace build_digest -string "$new_digest" "$staged/signer.json"
+    install_network_containment_config "$staged/broker.json" "$enrolled_uid"
+    install_network_containment_config "$staged/signer.json" "$enrolled_uid"
     staged_digest="$(
       read_enrollment_field "$staged/enrollment.json" release_digest
     )"
@@ -1046,6 +1124,10 @@ prepare_upgrade_transaction() {
         "$upgrade_transaction_staging/staged/session.plist" \
         0644
       session_rendered=true
+      render_template \
+        "$source_root/macos/launchdaemons/com.bloom.containment.plist.in" \
+        "$upgrade_transaction_staging/staged/containment.plist" \
+        0644
     fi
     chown root:wheel \
       "$staged/broker.plist" \
@@ -1067,8 +1149,12 @@ prepare_upgrade_transaction() {
         >> "$upgrade_transaction_staging/jobs"
     fi
   done
-  chown root:wheel "$upgrade_transaction_staging/staged/session.plist"
-  plutil -lint "$upgrade_transaction_staging/staged/session.plist" >/dev/null
+  chown root:wheel \
+    "$upgrade_transaction_staging/staged/session.plist" \
+    "$upgrade_transaction_staging/staged/containment.plist"
+  plutil -lint \
+    "$upgrade_transaction_staging/staged/session.plist" \
+    "$upgrade_transaction_staging/staged/containment.plist" >/dev/null
   printf '%s\n' prepared > "$upgrade_transaction_staging/phase"
   chmod 0600 \
     "$upgrade_transaction_staging/schema" \
@@ -1123,8 +1209,13 @@ activate_upgrade_transaction() {
   atomic_copy_preserving_metadata \
     "$upgrade_transaction/staged/session.plist" \
     "/Library/LaunchAgents/com.bloom.session.plist"
+  atomic_copy_preserving_metadata \
+    "$upgrade_transaction/staged/containment.plist" \
+    "/Library/LaunchDaemons/com.bloom.containment.plist"
   repoint_current_release "releases/$new_digest"
   pfctl -f /etc/pf.conf
+  launchctl bootstrap system "/Library/LaunchDaemons/com.bloom.containment.plist"
+  "$release_base/current/bloom" --triad-pf-monitor-once
   sync
   write_upgrade_phase switched
   restore_upgrade_jobs session
@@ -1189,8 +1280,18 @@ install_immutable_release() {
 }
 
 bootstrap_live_jobs() {
-  plutil -lint "$broker_plist" "$signer_plist" "$session_plist" >/dev/null
+  plutil -lint \
+    "$broker_plist" \
+    "$signer_plist" \
+    "$containment_plist" \
+    "$session_plist" >/dev/null
   pfctl -nf "$pf_target"
+  if ! launchctl print "system/com.bloom.containment" >/dev/null 2>&1; then
+    containment_monitor_created=true
+  fi
+  launchctl bootout "system/com.bloom.containment" 2>/dev/null || true
+  launchctl bootstrap system "$containment_plist"
+  "$machine_binary" --triad-pf-monitor-once
   launchctl bootout "gui/$login_uid/com.bloom.session" 2>/dev/null || true
   launchctl bootout "system/com.bloom.broker.$login_uid" 2>/dev/null || true
   launchctl bootout "system/com.bloom.signer.$login_uid" 2>/dev/null || true
@@ -1488,6 +1589,7 @@ case "$action" in
       "$runtime_root/broker-signer" \
       "$runtime_root/revoke" \
       "$runtime_root/session" \
+      "$runtime_root/containment" \
       "$runtime_root/status"
     for security_directory in \
       "$product_root" \
@@ -1507,6 +1609,7 @@ case "$action" in
       "$runtime_root/broker-signer" \
       "$runtime_root/revoke" \
       "$runtime_root/session" \
+      "$runtime_root/containment" \
       "$runtime_root/status"
     do
       [[ -d "$security_directory" && ! -L "$security_directory" ]] || {
@@ -1531,6 +1634,7 @@ case "$action" in
       "$runtime_root/broker-signer" \
       "$runtime_root/revoke" \
       "$runtime_root/session"
+    chmod 0755 "$runtime_root/containment"
     chmod 0750 "$runtime_root/status"
 
     if ! $existing_enrollment; then
@@ -1554,6 +1658,14 @@ case "$action" in
       render_template "$config_source/edge-manifest.json" "$edge_manifest" 0644
       render_template "$config_source/broker.json" "$broker_config_root/config.json" 0600
       render_template "$config_source/signer.json" "$signer_config_root/config.json" 0600
+      if $live_install; then
+        install_network_containment_config \
+          "$broker_config_root/config.json" \
+          "$login_uid"
+        install_network_containment_config \
+          "$signer_config_root/config.json" \
+          "$login_uid"
+      fi
       atomic_install \
         "$config_source/machine-identity.json" \
         "$machine_config_root/identity.json" \
@@ -1613,6 +1725,7 @@ case "$action" in
     launch_agent_root="$root_prefix/Library/LaunchAgents"
     broker_plist="$launch_daemon_root/com.bloom.broker.$login_uid.plist"
     signer_plist="$launch_daemon_root/com.bloom.signer.$login_uid.plist"
+    containment_plist="$launch_daemon_root/com.bloom.containment.plist"
     session_plist="$launch_agent_root/com.bloom.session.plist"
     render_template \
       "$source_root/macos/launchdaemons/com.bloom.broker.plist.in" \
@@ -1621,6 +1734,10 @@ case "$action" in
     render_template \
       "$source_root/macos/launchdaemons/com.bloom.signer.plist.in" \
       "$signer_plist" \
+      0644
+    render_template \
+      "$source_root/macos/launchdaemons/com.bloom.containment.plist.in" \
+      "$containment_plist" \
       0644
     render_template \
       "$source_root/macos/launchagents/com.bloom.session.plist.in" \
@@ -1744,6 +1861,8 @@ case "$action" in
       if ! find "$enrollment_root" -type f -name '*.json' -mindepth 1 -maxdepth 1 |
         grep . >/dev/null
       then
+        launchctl bootout "system/com.bloom.containment" 2>/dev/null || true
+        rm -f -- "$root_prefix/Library/LaunchDaemons/com.bloom.containment.plist"
         rm -f -- "$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
         rm -rf -- "$root_prefix/usr/local/libexec/bloom"
       fi
