@@ -2850,36 +2850,38 @@ case "$action" in
         0644
     fi
 
-    enrollment_new="$enrollment.new.$$"
-    if $existing_enrollment && ! $restoring_retained; then
-      enrollment_state=active
-    else
-      enrollment_state=activating
+    if ! $restoring_retained; then
+      enrollment_new="$enrollment.new.$$"
+      if $existing_enrollment; then
+        enrollment_state=active
+      else
+        enrollment_state=activating
+      fi
+      printf '%s\n' \
+        '{' \
+        '  "schema": "bloom.macos-enrollment.1",' \
+        "  \"state\": \"$enrollment_state\"," \
+        "  \"login_uid\": $login_uid," \
+        "  \"login_user\": \"$login_user\"," \
+        "  \"broker_user\": \"$broker_user\"," \
+        "  \"broker_uid\": $BLOOM_MACOS_BROKER_UID," \
+        "  \"broker_group\": \"$broker_group\"," \
+        "  \"broker_gid\": $BLOOM_MACOS_BROKER_GID," \
+        "  \"signer_user\": \"$signer_user\"," \
+        "  \"signer_uid\": $BLOOM_MACOS_SIGNER_UID," \
+        "  \"signer_group\": \"$signer_group\"," \
+        "  \"signer_gid\": $BLOOM_MACOS_SIGNER_GID," \
+        "  \"machine_broker_group\": \"$machine_broker_group\"," \
+        "  \"machine_broker_gid\": $BLOOM_MACOS_MACHINE_BROKER_GID," \
+        "  \"broker_signer_group\": \"$broker_signer_group\"," \
+        "  \"broker_signer_gid\": $BLOOM_MACOS_BROKER_SIGNER_GID," \
+        "  \"revoke_group\": \"$revoke_group\"," \
+        "  \"revoke_gid\": $BLOOM_MACOS_REVOKE_GID," \
+        "  \"release_digest\": \"$BLOOM_RELEASE_DIGEST\"" \
+        '}' > "$enrollment_new"
+      chmod 0644 "$enrollment_new"
+      mv -f "$enrollment_new" "$enrollment"
     fi
-    printf '%s\n' \
-      '{' \
-      '  "schema": "bloom.macos-enrollment.1",' \
-      "  \"state\": \"$enrollment_state\"," \
-      "  \"login_uid\": $login_uid," \
-      "  \"login_user\": \"$login_user\"," \
-      "  \"broker_user\": \"$broker_user\"," \
-      "  \"broker_uid\": $BLOOM_MACOS_BROKER_UID," \
-      "  \"broker_group\": \"$broker_group\"," \
-      "  \"broker_gid\": $BLOOM_MACOS_BROKER_GID," \
-      "  \"signer_user\": \"$signer_user\"," \
-      "  \"signer_uid\": $BLOOM_MACOS_SIGNER_UID," \
-      "  \"signer_group\": \"$signer_group\"," \
-      "  \"signer_gid\": $BLOOM_MACOS_SIGNER_GID," \
-      "  \"machine_broker_group\": \"$machine_broker_group\"," \
-      "  \"machine_broker_gid\": $BLOOM_MACOS_MACHINE_BROKER_GID," \
-      "  \"broker_signer_group\": \"$broker_signer_group\"," \
-      "  \"broker_signer_gid\": $BLOOM_MACOS_BROKER_SIGNER_GID," \
-      "  \"revoke_group\": \"$revoke_group\"," \
-      "  \"revoke_gid\": $BLOOM_MACOS_REVOKE_GID," \
-      "  \"release_digest\": \"$BLOOM_RELEASE_DIGEST\"" \
-      '}' > "$enrollment_new"
-    chmod 0644 "$enrollment_new"
-    mv -f "$enrollment_new" "$enrollment"
 
     launch_daemon_root="$root_prefix/Library/LaunchDaemons"
     launch_agent_root="$root_prefix/Library/LaunchAgents"
