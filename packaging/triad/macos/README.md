@@ -56,8 +56,14 @@ release directory, then writes a root-only transaction containing exact
 backups and staged Broker/Signer configurations, LaunchDaemon definitions,
 and packet-filter anchors for every enrollment, plus the global session
 LaunchAgent. It stops all loaded instances, swaps the complete set, repoints
-`current`, reloads the root packet-filter ruleset, and restores only the jobs
-that were loaded beforehand.
+`current`, and reloads the root packet-filter ruleset. Because concurrent
+Brokers cannot both own the canonical listener, activation restores session
+and Signer jobs first, then bootstraps and health-checks each recorded Broker
+whose login-session job was active, exclusively in turn. Logged-out
+enrollments have no authenticated session to test; their root-owned staged
+files and release bindings still participate in the same atomic transaction.
+After each active Broker is stopped, the installer restores the complete prior
+loaded-job set. Rollback validates the old release the same way.
 Machine's private installer health mode asks Broker for the existing
 `broker.readiness`; Broker in turn requires the existing `signer.readiness` to
 report `ready` on the same build. A failed check restores the complete old set.

@@ -2,16 +2,24 @@
 set -Eeuo pipefail
 
 usage() {
-  echo "usage: run-two-login.sh PAYLOAD_DIR LOGIN_UID_A LOGIN_USER_A LOGIN_UID_B LOGIN_USER_B" >&2
+  echo "usage: run-two-login.sh PAYLOAD_DIR LOGIN_UID_A LOGIN_USER_A LOGIN_UID_B LOGIN_USER_B [UPGRADE_PAYLOAD [FAILING_UPGRADE_PAYLOAD]]" >&2
   exit 64
 }
 
-[[ $# -eq 5 ]] || usage
+[[ $# -ge 5 && $# -le 7 ]] || usage
 payload="$(cd "$1" && pwd -P)"
 login_uid_a="$2"
 login_user_a="$3"
 login_uid_b="$4"
 login_user_b="$5"
+upgrade_payload=""
+failing_upgrade_payload=""
+if [[ $# -ge 6 ]]; then
+  upgrade_payload="$(cd "$6" && pwd -P)"
+fi
+if [[ $# -eq 7 ]]; then
+  failing_upgrade_payload="$(cd "$7" && pwd -P)"
+fi
 for login_uid in "$login_uid_a" "$login_uid_b"; do
   [[ "$login_uid" =~ ^[1-9][0-9]*$ ]] || usage
 done
@@ -36,6 +44,13 @@ fi
   echo "two-login W0 payload has the wrong platform claim" >&2
   exit 65
 }
+for additional_payload in "$upgrade_payload" "$failing_upgrade_payload"; do
+  [[ -z "$additional_payload" ]] && continue
+  [[ "$(<"$additional_payload/PLATFORM_CLAIM")" == "macos-unix-principals-w0" ]] || {
+    echo "two-login W0 upgrade payload has the wrong platform claim" >&2
+    exit 65
+  }
+done
 for pair in "$login_uid_a:$login_user_a" "$login_uid_b:$login_user_b"; do
   login_uid="${pair%%:*}"
   login_user="${pair#*:}"
@@ -56,6 +71,7 @@ session_plist="/Library/LaunchAgents/com.bloom.session.plist"
 scratch="$(mktemp -d /private/tmp/bloom-w0-two-login.XXXXXX)"
 installed_a=false
 installed_b=false
+tested_payload="$payload"
 
 cleanup() {
   status=$?
@@ -166,6 +182,75 @@ done
   exit 1
 }
 
+if [[ -n "$upgrade_payload" ]]; then
+  prior_digest="$release_digest"
+  upgrade_digest="$(<"$upgrade_payload/RELEASE_DIGEST")"
+  [[ "$upgrade_digest" != "$prior_digest" ]]
+  "$installer" install / "$login_uid_a" "$login_user_a" "$upgrade_payload"
+  for login_uid in "$login_uid_a" "$login_uid_b"; do
+    [[ "$(field "$login_uid" release_digest)" == "$upgrade_digest" ]] || {
+      echo "two-login upgrade did not publish one complete release" >&2
+      exit 1
+    }
+  done
+  [[ "$(readlink /usr/local/libexec/bloom/current)" == \
+    "releases/$upgrade_digest" ]]
+  release_digest="$upgrade_digest"
+  tested_payload="$upgrade_payload"
+
+  if [[ -n "$failing_upgrade_payload" ]]; then
+    failing_digest="$(<"$failing_upgrade_payload/RELEASE_DIGEST")"
+    [[ "$failing_digest" != "$release_digest" ]]
+    set +e
+    "$installer" install \
+      / \
+      "$login_uid_a" \
+      "$login_user_a" \
+      "$failing_upgrade_payload"
+    failing_status=$?
+    set -e
+    [[ "$failing_status" -ne 0 ]] || {
+      echo "two-login failing upgrade unexpectedly committed" >&2
+      exit 1
+    }
+    [[ ! -e "/Library/Application Support/BloomTriad/upgrade-transaction" ]] || {
+      echo "two-login failing upgrade left an unrecovered transaction" >&2
+      exit 1
+    }
+    for login_uid in "$login_uid_a" "$login_uid_b"; do
+      [[ "$(field "$login_uid" release_digest)" == "$release_digest" ]] || {
+        echo "two-login upgrade rollback split the installed release" >&2
+        exit 1
+      }
+    done
+    [[ "$(readlink /usr/local/libexec/bloom/current)" == \
+      "releases/$release_digest" ]]
+  fi
+
+  # Sequential upgrade validation deliberately leaves the ordinary loaded-job
+  # set restored. Normalize B as owner so the cross-login fatal path below has
+  # a deterministic second Broker.
+  broker_label_a="system/com.bloom.broker.$login_uid_a"
+  broker_label_b="system/com.bloom.broker.$login_uid_b"
+  broker_plist_a="/Library/LaunchDaemons/com.bloom.broker.$login_uid_a.plist"
+  broker_plist_b="/Library/LaunchDaemons/com.bloom.broker.$login_uid_b.plist"
+  launchctl bootout "$broker_label_a" 2>/dev/null || true
+  launchctl bootout "$broker_label_b" 2>/dev/null || true
+  launchctl bootstrap system "$broker_plist_b"
+  deadline=$((SECONDS + 20))
+  while [[ $SECONDS -lt $deadline ]]; do
+    if sudo -u "$login_user_b" \
+      "$machine_binary" --triad-health-check "$release_digest"
+    then
+      break
+    fi
+    sleep 1
+  done
+  sudo -u "$login_user_b" \
+    "$machine_binary" --triad-health-check "$release_digest"
+  launchctl bootstrap system "$broker_plist_a"
+fi
+
 if machine_failure="$(
   sudo -u "$login_user_a" \
     "$machine_binary" --triad-health-check "$release_digest" 2>&1
@@ -244,13 +329,21 @@ if [[ -n "${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" ]]; then
     echo "BLOOM_MACOS_W0_EVIDENCE_DIR must be an existing absolute directory" >&2
     exit 65
   }
-  subject_digest="$("$triad_source/release/macos-conformance-subject.sh" "$payload")"
+  subject_digest="$(
+    "$triad_source/release/macos-conformance-subject.sh" "$tested_payload"
+  )"
   for criterion in mui_05 mui_06 two_login_lifecycle; do
     temporary="$evidence_dir/.$criterion.$$.new"
     printf '%s\n' "$subject_digest" > "$temporary"
     chmod 0644 "$temporary"
     mv -f "$temporary" "$evidence_dir/$criterion.pass"
   done
+  if [[ -n "$upgrade_payload" && -n "$failing_upgrade_payload" ]]; then
+    temporary="$evidence_dir/.mui_09.$$.new"
+    printf '%s\n' "$subject_digest" > "$temporary"
+    chmod 0644 "$temporary"
+    mv -f "$temporary" "$evidence_dir/mui_09.pass"
+  fi
 fi
 
 echo "two-login macOS Unix-principal W0 passed"

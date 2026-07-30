@@ -20,17 +20,25 @@ It refuses to run unless all of the following hold:
 The marker is deliberately not created by this repository. Disposable VM
 provisioning owns it. Never create it on a developer workstation.
 
-`run-two-login.sh PAYLOAD UID_A USER_A UID_B USER_B` is the separate
-cross-login lifecycle lane. It has the same root, Darwin, payload-claim, and
-external disposable-marker guards, additionally requires two distinct active
-GUI launchd domains, and refuses existing Bloom state or principals for either
-login. It enrolls both UIDs, proves the second Broker dies fatally with the
-specific Machine-visible cross-login diagnostic and no fallback listener,
-terminates the owning GUI domain, then proves failure-only KeepAlive transfers
-the canonical listener before another Machine request. If
+`run-two-login.sh PAYLOAD UID_A USER_A UID_B USER_B [UPGRADE_PAYLOAD
+[FAILING_UPGRADE_PAYLOAD]]` is the separate cross-login lifecycle lane. It has
+the same root, Darwin, payload-claim, and external disposable-marker guards,
+additionally requires two distinct active GUI launchd domains, and refuses
+existing Bloom state or principals for either login. It enrolls both UIDs,
+proves the second Broker dies fatally with the specific Machine-visible
+cross-login diagnostic and no fallback listener, terminates the owning GUI
+domain, then proves failure-only KeepAlive transfers the canonical listener
+before another Machine request. When both optional bundles are supplied, it
+also proves a successful complete-version upgrade is published to both
+enrollments and a deliberately failing subsequent upgrade rolls both back to
+the same healthy version. Upgrade validation gives each Broker exclusive use
+of the canonical listener in turn before restoring the original loaded-job
+set. If
 `BLOOM_MACOS_W0_EVIDENCE_DIR` names an existing absolute directory, a
 successful run writes digest-bound `mui_05.pass`, `mui_06.pass`, and
-`two_login_lifecycle.pass` evidence for the tested payload.
+`two_login_lifecycle.pass` evidence for the tested payload. It writes
+`mui_09.pass` only when both the successful and failing two-login upgrade cases
+pass.
 
 `run-installed-acceptance.sh PAYLOAD UID USER MAIN_ROOT BROKER_ROOT SIGNER_ROOT
 EVIDENCE_DIR` is invoked by the single-login harness while the installed
@@ -40,8 +48,11 @@ source revisions matching `SOURCE_REVISIONS`, and authenticated health. It
 then reruns the triad protocol, transport, activation, checkpoint, Machine
 client, policy-update, Broker, and Signer acceptance sources while the real
 installed services remain active. Fault injection stays confined to test
-executables. A final process/health recheck precedes digest-bound
-`installed_ac_01_35.pass` and `mui_12.pass` evidence.
+executables. It also rejects provisioning profiles, Developer-ID authorities,
+or Team IDs and executes the production builder without conformance inputs to
+prove that claim generation fails. A final process/health recheck precedes
+digest-bound `mui_01.pass`, `mui_11.pass`, `installed_ac_01_35.pass`, and
+`mui_12.pass` evidence.
 
 The manually dispatched `macOS Unix-principal W0` workflow is the repository's
 disposable-host provisioner. It runs only on a fresh GitHub-hosted macOS VM,

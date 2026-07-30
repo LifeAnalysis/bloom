@@ -20,6 +20,16 @@ wire detail. It does not amend that specification.
   its LaunchDaemon owns only Unix RPC listeners. Failure-only `KeepAlive`
   retries a fatal `127.0.0.1:18734` conflict. The disposable macOS test uses a
   real direct-bind child, not launchd TCP handover.
+- A complete-version upgrade may have several recorded Broker LaunchDaemons
+  but only one Broker can pass readiness while owning the host-wide canonical
+  listener. Upgrade and rollback therefore restore every session and Signer
+  job first, then bootstrap, authenticate, and stop each recorded Broker with
+  an active login-session job serially against the candidate release.
+  Logged-out enrollments remain in the same root-owned atomic file
+  transaction but cannot have a live authenticated health check. Only after
+  every active Broker has passed does the installer restore the exact prior
+  loaded-Broker set. This validates the runnable enrollment set without
+  weakening AC-31 or introducing a fallback port.
 - Until a disposable W0 VM proves account creation/rollback, system-domain
   launchd ownership, socket modes, `pf` behavior, and uninstall, the installer
   accepts live test activation only for the non-production

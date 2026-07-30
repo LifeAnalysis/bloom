@@ -41,6 +41,21 @@ conformance key. `verify-macos-conformance.sh` verifies that signature,
 criterion completeness, source revisions, subject binding, and—during
 production assembly—the out-of-band conformance-key fingerprint.
 
+For one candidate payload `C`, the disposable evidence matrix is:
+
+- run the single-login W0 with `C` as its primary payload to produce MUI-01,
+  MUI-02, MUI-03, MUI-04, MUI-07, MUI-08, MUI-10, MUI-11, MUI-12,
+  `installed_ac_01_35`, and `negative_access`;
+- on a two-GUI-login disposable VM, run the two-login W0 with an older valid
+  payload as the baseline, `C` as `UPGRADE_PAYLOAD`, and a distinct
+  deliberately activation-failing payload as `FAILING_UPGRADE_PAYLOAD` to
+  produce MUI-05, MUI-06, MUI-09, and `two_login_lifecycle`;
+- merge only `.pass` files whose contents equal `C`'s canonical subject
+  digest, then review and sign them with
+  `sign-macos-conformance-report.sh`.
+
+The signer refuses a mixture of evidence from different candidates.
+
 `triad-release-gate.sh` rejects modified or untracked release inputs, runs
 locked fmt, clippy, and tests in all three sibling workspaces, builds release
 binaries, assembles the bundle twice, verifies both, requires byte-identical

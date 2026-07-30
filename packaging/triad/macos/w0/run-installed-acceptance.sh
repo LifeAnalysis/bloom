@@ -42,6 +42,14 @@ fi
   exit 65
 }
 
+static_work="$(mktemp -d /private/tmp/bloom-w0-static-conformance.XXXXXX)"
+cleanup() {
+  status=$?
+  rm -rf -- "$static_work"
+  exit "$status"
+}
+trap cleanup EXIT
+
 enrollment="/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
 [[ -f "$enrollment" && ! -L "$enrollment" ]] || {
   echo "installed acceptance requires an active enrollment" >&2
@@ -61,6 +69,61 @@ for binary in bloom bloom-broker bloom-signer; do
     exit 1
   }
 done
+
+if find "$payload" \
+  \( -name embedded.provisionprofile \
+  -o -name '*.provisionprofile' \
+  -o -name '*.mobileprovision' \
+  -o -name '_CodeSignature' \) |
+  grep . >/dev/null
+then
+  echo "tested payload contains an Apple Developer Program artifact" >&2
+  exit 1
+fi
+for binary in bloom bloom-broker bloom-signer; do
+  codesign_report="$static_work/$binary.codesign"
+  codesign -d --verbose=4 "$payload/bin/$binary" \
+    >"$codesign_report" 2>&1 || true
+  team_identifier="$(sed -n 's/^TeamIdentifier=//p' "$codesign_report")"
+  if grep -E '^Authority=' "$codesign_report" >/dev/null ||
+    [[ -n "$team_identifier" && "$team_identifier" != "not set" ]]
+  then
+    echo "$binary unexpectedly depends on an Apple signing identity" >&2
+    exit 1
+  fi
+done
+
+# Prove the same Mach-O binaries cannot be relabelled as production without
+# supplying the separately reviewed conformance report and pinned public key.
+mkdir -p "$static_work/staging/bin"
+for binary in bloom bloom-broker bloom-signer; do
+  cp "$payload/bin/$binary" "$static_work/staging/bin/$binary"
+done
+openssl genpkey \
+  -algorithm ED25519 \
+  -out "$static_work/release-key.pem" >/dev/null 2>&1
+set +e
+env \
+  BLOOM_PLATFORM_CLAIM=macos-unix-principals \
+  BLOOM_MACOS_CONFORMANCE_REPORT= \
+  BLOOM_MACOS_CONFORMANCE_SIGNATURE= \
+  BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY= \
+  BLOOM_MACOS_CONFORMANCE_KEY_SHA256= \
+  "$main_root/packaging/triad/release/build-bundle.sh" \
+  "$static_work/staging" \
+  "$static_work/forbidden-production.tar.gz" \
+  "$static_work/release-key.pem" \
+  1700000000 \
+  >"$static_work/production-gate.log" 2>&1
+production_gate_status=$?
+set -e
+[[ "$production_gate_status" -ne 0 ]] || {
+  echo "release gate emitted a production macOS claim without conformance evidence" >&2
+  exit 1
+}
+grep -F \
+  'BLOOM_MACOS_CONFORMANCE_REPORT must name a regular conformance input' \
+  "$static_work/production-gate.log" >/dev/null
 
 assert_installed_process() {
   process_name="$1"
@@ -170,7 +233,7 @@ sudo -u "$login_user" \
 subject_digest="$(
   "$main_root/packaging/triad/release/macos-conformance-subject.sh" "$payload"
 )"
-for criterion in installed_ac_01_35 mui_12; do
+for criterion in mui_01 mui_11 installed_ac_01_35 mui_12; do
   temporary="$evidence_dir/.$criterion.$$.new"
   printf '%s\n' "$subject_digest" > "$temporary"
   chmod 0644 "$temporary"

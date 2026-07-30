@@ -964,14 +964,24 @@ restore_upgrade_jobs() {
   done < "$upgrade_transaction/jobs"
 }
 
-health_check_upgrade_jobs() {
+health_check_upgrade_brokers_sequentially() {
   expected_digest="$1"
+  active_session_uids="$(
+    sed -n 's/^session //p' "$upgrade_transaction/jobs"
+  )"
   while IFS=' ' read -r kind enrolled_uid; do
     [[ "$kind" == "broker" ]] || continue
     [[ "$enrolled_uid" =~ ^[1-9][0-9]*$ ]] || return 65
+    if ! grep -Fx "$enrolled_uid" <<<"$active_session_uids" >/dev/null; then
+      continue
+    fi
     enrollment_file="$enrollment_root/$enrolled_uid.json"
     enrolled_user="$(read_enrollment_field "$enrollment_file" login_user)"
     [[ "$enrolled_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || return 65
+    broker_plist="/Library/LaunchDaemons/com.bloom.broker.$enrolled_uid.plist"
+    [[ -f "$broker_plist" && ! -L "$broker_plist" ]] || return 65
+    require_live_file_metadata "$broker_plist" 0 0 644
+    launchctl bootstrap system "$broker_plist"
     healthy=false
     for _attempt in {1..20}; do
       if /usr/bin/sudo -n -u "$enrolled_user" -- \
@@ -984,6 +994,7 @@ health_check_upgrade_jobs() {
       fi
       sleep 1
     done
+    launchctl bootout "system/com.bloom.broker.$enrolled_uid" 2>/dev/null || true
     $healthy || {
       echo "Bloom triad activation failed for login UID $enrolled_uid" >&2
       return 69
@@ -1040,9 +1051,9 @@ rollback_upgrade() {
   "$release_base/current/bloom" --triad-pf-monitor-once || return
   restore_upgrade_jobs session || return
   restore_upgrade_jobs signer || return
-  restore_upgrade_jobs broker || return
   old_digest="$(<"$upgrade_transaction/old-digest")"
-  health_check_upgrade_jobs "$old_digest" || return
+  health_check_upgrade_brokers_sequentially "$old_digest" || return
+  restore_upgrade_jobs broker || return
   rm -rf -- "$upgrade_transaction"
   upgrade_in_progress=false
 }
@@ -1324,9 +1335,9 @@ activate_upgrade_transaction() {
   write_upgrade_phase switched
   restore_upgrade_jobs session
   restore_upgrade_jobs signer
-  restore_upgrade_jobs broker
   write_upgrade_phase activating
-  health_check_upgrade_jobs "$new_digest"
+  health_check_upgrade_brokers_sequentially "$new_digest"
+  restore_upgrade_jobs broker
   write_upgrade_phase committed
   upgrade_in_progress=false
   rm -rf -- "$upgrade_transaction"
