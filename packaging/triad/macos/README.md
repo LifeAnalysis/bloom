@@ -71,6 +71,17 @@ invocation after interruption restores the byte-identical prior config and
 job set. The disposable W0 lane exercises valid rotation, immutable-field
 rejection, and SIGKILL recovery.
 
+Permanent per-login uninstall is also a root-journaled operation. The exact
+verified enrollment record is copied into a durable transaction before the
+public enrollment state becomes `uninstalling`. Teardown is idempotent: a
+later installer invocation resumes stopping integration, removing only the
+recorded login's files, deleting Directory Service records only when their
+numeric IDs still match, and finally removing global integration when no
+enrollment remains. The disposable W0 lane kills an uninstall after its
+journal becomes durable and verifies forward recovery. The architecture's
+retain-custody uninstall mode is not yet exposed; the implemented confirmation
+token explicitly selects permanent deletion and reports it as unrecoverable.
+
 Production enrollment invokes the installed Machine binary's root-only
 enrollment-material mode against the signed public templates in `config/`.
 Five application identities and the Broker/Signer signing authorities are

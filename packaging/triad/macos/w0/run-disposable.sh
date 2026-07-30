@@ -451,4 +451,51 @@ if [[ -n "$failing_upgrade_payload" ]]; then
   assert_active_release "$baseline_digest"
 fi
 
+uninstall_transaction="/Library/Application Support/BloomTriad/uninstall-transactions/$login_uid"
+"$installer" uninstall / "$login_uid" "delete-bloom-login-$login_uid" &
+interrupted_uninstall_pid=$!
+deadline=$((SECONDS + 30))
+while [[ $SECONDS -lt $deadline ]]; do
+  if [[ -d "$uninstall_transaction" ]]; then
+    kill -STOP "$interrupted_uninstall_pid" 2>/dev/null || true
+    break
+  fi
+  if ! kill -0 "$interrupted_uninstall_pid" 2>/dev/null; then
+    echo "W0 uninstall exited before its interruption point" >&2
+    wait "$interrupted_uninstall_pid" || true
+    exit 1
+  fi
+  sleep 0.01
+done
+[[ -d "$uninstall_transaction" ]] || {
+  echo "W0 did not observe the uninstall transaction" >&2
+  kill "$interrupted_uninstall_pid" 2>/dev/null || true
+  wait "$interrupted_uninstall_pid" || true
+  exit 1
+}
+kill -9 "$interrupted_uninstall_pid"
+wait "$interrupted_uninstall_pid" 2>/dev/null || true
+"$installer" uninstall / "$login_uid" "delete-bloom-login-$login_uid"
+[[ ! -e "$uninstall_transaction" ]] || {
+  echo "W0 uninstall recovery did not consume its journal" >&2
+  exit 1
+}
+[[ ! -e "$enrollment" ]]
+for kind_and_name in \
+  "Users bloom-broker-$login_uid" \
+  "Users bloom-signer-$login_uid" \
+  "Groups bloom-broker-$login_uid" \
+  "Groups bloom-signer-$login_uid" \
+  "Groups bloom-machine-broker-$login_uid" \
+  "Groups bloom-broker-signer-$login_uid" \
+  "Groups bloom-revoke-$login_uid"
+do
+  kind="${kind_and_name%% *}"
+  name="${kind_and_name#* }"
+  if dscl . -read "/$kind/$name" >/dev/null 2>&1; then
+    echo "W0 uninstall recovery left Directory Service record $kind/$name" >&2
+    exit 1
+  fi
+done
+
 echo "Bloom macOS Unix-principal disposable W0 isolation checks passed"
