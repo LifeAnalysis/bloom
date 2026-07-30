@@ -299,6 +299,12 @@ short expiry stated in section 6.
 
 No Apple Network Extension entitlement is assumed. The privileged installer
 loads a dedicated `pf` anchor whose rules match the allocated service UIDs.
+Signer has no permitted IP traffic. Broker receives one preceding `lo0` rule
+for ACK-bearing IPv4 TCP packets whose source is the fixed canonical listener
+`127.0.0.1:18734`; this admits listener replies but not an initiated SYN.
+The following UID-wide rule blocks every other Broker TCP/UDP packet, including
+all non-loopback traffic, and the W0 lane proves both the allowed listener and
+the denied initiation cases.
 The anchor and its inclusion in the system ruleset are root-owned release
 assets.
 
