@@ -217,7 +217,7 @@ release_installer_lock() {
 
 rollback_provisioning() {
   status=$?
-  failed_line="${BASH_LINENO[0]}"
+  failed_line="${1:-unknown}"
   trap - ERR
   set +e
   echo "macOS installer failed at line $failed_line (status $status)" >&2
@@ -241,7 +241,7 @@ rollback_provisioning() {
   exit "$status"
 }
 
-trap rollback_provisioning ERR
+trap 'rollback_provisioning "$LINENO"' ERR
 trap release_installer_lock EXIT
 
 directory_record_exists() {
