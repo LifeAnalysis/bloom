@@ -13,6 +13,7 @@ mod commands {
 }
 mod github_source;
 mod session_sentinel;
+mod triad_enrollment;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -126,14 +127,22 @@ fn resolve_server_endpoint(home: &HomeDir, endpoint: Option<&str>) -> Result<Res
 }
 
 fn configured_broker_client() -> Result<bloom_machine_client::MachineBrokerClient> {
+    let installed = installed_macos_triad_paths()?;
     let broker_socket = std::env::var_os("BLOOM_BROKER_SOCKET")
         .map(std::path::PathBuf::from)
+        .or_else(|| installed.as_ref().map(|paths| paths.broker_socket.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from("/var/run/bloom/broker.sock"));
     let machine_identity = std::env::var_os("BLOOM_MACHINE_IDENTITY")
         .map(std::path::PathBuf::from)
+        .or_else(|| {
+            installed
+                .as_ref()
+                .map(|paths| paths.machine_identity.clone())
+        })
         .unwrap_or_else(|| std::path::PathBuf::from("/var/run/bloom/machine-identity.json"));
     let edge_manifest = std::env::var_os("BLOOM_EDGE_MANIFEST")
         .map(std::path::PathBuf::from)
+        .or_else(|| installed.as_ref().map(|paths| paths.edge_manifest.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from("/etc/bloom/edge-manifest.json"));
     bloom_machine_client::MachineBrokerClient::connect_unix_from_files(
         broker_socket,
@@ -148,12 +157,64 @@ fn configured_broker_connection() -> Result<(
     bloom_triad_protocol::ProvenanceCatalog,
 )> {
     let broker = configured_broker_client()?;
+    let installed = installed_macos_triad_paths()?;
     let provenance_catalog = std::env::var_os("BLOOM_PROVENANCE_CATALOG")
         .map(std::path::PathBuf::from)
+        .or_else(|| {
+            installed
+                .as_ref()
+                .map(|paths| paths.provenance_catalog.clone())
+        })
         .unwrap_or_else(|| std::path::PathBuf::from("/etc/bloom/provenance-catalog.json"));
     let catalog = bloom_machine_client::load_provenance_catalog(provenance_catalog)
         .context("load installer-owned provenance catalog")?;
     Ok((broker, catalog))
+}
+
+#[derive(Clone)]
+struct InstalledMacosTriadPaths {
+    broker_socket: PathBuf,
+    machine_identity: PathBuf,
+    edge_manifest: PathBuf,
+    provenance_catalog: PathBuf,
+}
+
+fn installed_macos_triad_paths() -> Result<Option<InstalledMacosTriadPaths>> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let uid = rustix::process::geteuid().as_raw();
+        let enrollment = PathBuf::from(format!(
+            "/Library/Application Support/BloomTriad/enrollments/{uid}.json"
+        ));
+        let metadata = match std::fs::symlink_metadata(&enrollment) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("inspect installed Bloom enrollment"),
+        };
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o022 != 0
+            || metadata.nlink() != 1
+        {
+            bail!("installed Bloom enrollment has unsafe ownership or type");
+        }
+        let config = PathBuf::from(format!(
+            "/Library/Application Support/BloomTriad/config/{uid}"
+        ));
+        return Ok(Some(InstalledMacosTriadPaths {
+            broker_socket: PathBuf::from(format!(
+                "/private/var/run/bloom/{uid}/machine-broker/broker.sock"
+            )),
+            machine_identity: config.join("machine/identity.json"),
+            edge_manifest: config.join("edge-manifest.json"),
+            provenance_catalog: config.join("provenance-catalog.json"),
+        }));
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(None)
 }
 
 fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {
@@ -1093,6 +1154,18 @@ fn print_portfolio_table(rows: &[WalletPortfolioRow], network: &str) {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args_os().len() == 9
+        && std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new("--triad-render-macos-enrollment"))
+    {
+        return match triad_enrollment::run_from_process_args() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Bloom macOS enrollment generation failed: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if std::env::args_os().len() == 2
         && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--session-sentinel"))
     {

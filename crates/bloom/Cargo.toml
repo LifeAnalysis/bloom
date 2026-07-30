@@ -39,6 +39,7 @@ bloom-vfs.workspace = true
 bloom-update.workspace = true
 bloom-hyperliquid.workspace = true
 bloom-petals.workspace = true
+ed25519-dalek.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
@@ -59,6 +60,7 @@ tempfile.workspace = true
 humantime.workspace = true
 flate2.workspace = true
 sha2.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2"

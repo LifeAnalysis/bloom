@@ -34,20 +34,27 @@ post-extraction rerun is bound to the exact clean source revisions recorded in
 the signed bundle; process/artifact acceptance additionally executes and
 inspects the extracted production binaries.
 
-Instance configuration and identities are site-specific security inputs and
-are deliberately not reusable release credentials. They must be placed in the
-following `config/` layout beside the extracted binaries before installation:
+Linux instance configuration and the disposable macOS W0 fixtures are
+site-specific security inputs and are deliberately not reusable release
+credentials. The W0 fixture uses the following `config/` layout beside the
+extracted binaries:
 `edge-manifest.json`, `broker.json`, `signer.json`,
-`broker-identity.json`, `signer-identity.json`, and, for the disposable macOS
-W0 lane only, `session-identity.json`. On Linux,
+`machine-identity.json`, `broker-identity.json`, `signer-identity.json`,
+`revoke-identity.json`, `session-identity.json`, `installer-identity.json`,
+and `provenance-catalog.json`. On Linux,
 `nts-servers.conf`. The last file contains at least two distinct reviewed NTS
 host names, one per line. AWS credentials and `aws-kms-ip-allow.conf` are an
 optional paired site overlay.
 
-The W0 session identity is a temporary conformance input. A production macOS
-claim remains disabled until enrollment generates every per-login identity
-locally, cross-pins its public key in the root-owned edge manifest, and proves
-that no private identity or backend secret is present in the release bundle.
+Production macOS enrollment does not accept that private fixture layout. Its
+installed Machine binary generates fresh per-login Machine, Broker, Signer,
+revoke-client, session, installer, audit, review, ceremony, and revocation
+keys from the OS CSPRNG in a root-owned empty staging directory. It renders
+only signed public templates from `installer/macos/config`, cross-pins the
+public keys, signs the provenance catalog locally, atomically installs the
+private outputs under their final principals, and removes the staging
+directory. Bundle build and verification reject concrete private seeds and
+identity-shaped JSON for a production macOS claim.
 
 The installers stop an existing instance before replacement, atomically
 replace each file, and reactivate only after the complete set is present. An

@@ -2281,6 +2281,7 @@ dependencies = [
  "bloom-vfs",
  "clap",
  "clap_complete",
+ "ed25519-dalek",
  "flate2",
  "hex",
  "humantime",
@@ -2298,6 +2299,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "url",
+ "zeroize",
 ]
 
 [[package]]

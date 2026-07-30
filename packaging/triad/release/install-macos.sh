@@ -29,6 +29,8 @@ live_install=false
 provision_committed=false
 pf_reference_installed=false
 installer_lock=""
+generated_material=""
+existing_enrollment=false
 created_users=()
 created_groups=()
 
@@ -90,6 +92,17 @@ acquire_installer_lock() {
 }
 
 release_installer_lock() {
+  if [[ -n "$generated_material" ]]; then
+    case "$generated_material" in
+      "/Library/Application Support/BloomTriad/.enrollment-material."*)
+        rm -rf -- "$generated_material"
+        ;;
+      *)
+        echo "refusing to remove unexpected enrollment-material path" >&2
+        ;;
+    esac
+    generated_material=""
+  fi
   if [[ -n "$installer_lock" && -d "$installer_lock" ]]; then
     rmdir "$installer_lock"
   fi
@@ -246,6 +259,23 @@ require_directory_contains() {
   dscl . -read "/$kind/$name" "$attribute" |
     grep -F "$expected_fragment" >/dev/null || {
     echo "$kind/$name does not have required $attribute" >&2
+    exit 65
+  }
+}
+
+require_live_file_metadata() {
+  path="$1"
+  expected_uid="$2"
+  expected_gid="$3"
+  expected_mode="$4"
+  [[ -f "$path" && ! -L "$path" ]] || {
+    echo "security file is missing, substituted, or a symlink: $path" >&2
+    exit 65
+  }
+  observed="$(stat -f '%u:%g:%Lp:%l' "$path")"
+  expected="$expected_uid:$expected_gid:$expected_mode:1"
+  [[ "$observed" == "$expected" ]] || {
+    echo "security file has unexpected owner, group, mode, or link count: $path" >&2
     exit 65
   }
 }
@@ -410,6 +440,7 @@ render_template() {
     -e "s|@BLOOM_BROKER_CONTROL_SOCKET@|$runtime_root/revoke/broker-control.sock|g" \
     -e "s|@BLOOM_SIGNER_CONTROL_SOCKET@|$runtime_root/revoke/signer-control.sock|g" \
     -e "s|@BLOOM_SESSION_SOCKET@|$runtime_root/session/session.sock|g" \
+    -e "s|@BLOOM_PROVENANCE_CATALOG@|$config_root/provenance-catalog.json|g" \
     -e "s|@BLOOM_BROKER_LOG@|$broker_state/broker.log|g" \
     -e "s|@BLOOM_SIGNER_LOG@|$signer_state/signer.log|g" \
     "$source_file" > "$temporary"
@@ -436,9 +467,16 @@ set_live_ownership() {
     "$signer_state" \
     "$signer_state/audit-checkpoints"
   chown "$login_user:$machine_broker_group" \
+    "$machine_config_root" \
+    "$machine_config_root/identity.json" \
+    "$machine_config_root/revoke-identity.json" \
     "$session_config_root" \
     "$session_config_root/identity.json" \
     "$runtime_root/session"
+  chown root:wheel \
+    "$installer_config_root" \
+    "$installer_config_root/identity.json" \
+    "$config_root/provenance-catalog.json"
   chown "root:$machine_broker_group" "$runtime_root/machine-broker"
   chown "root:$broker_signer_group" "$runtime_root/broker-signer"
   chown "root:$revoke_group" "$runtime_root/revoke"
@@ -545,19 +583,32 @@ case "$action" in
     for required in \
       bin/bloom \
       bin/bloom-broker \
-      bin/bloom-signer \
-      config/edge-manifest.json \
-      config/broker.json \
-      config/signer.json \
-      config/broker-identity.json \
-      config/signer-identity.json \
-      config/session-identity.json
+      bin/bloom-signer
     do
       test -f "$payload/$required" || {
         echo "payload is missing $required" >&2
         exit 66
       }
     done
+    if [[ "$platform_claim" != "macos-unix-principals" ]]; then
+      for required in \
+        config/edge-manifest.json \
+        config/broker.json \
+        config/signer.json \
+        config/machine-identity.json \
+        config/broker-identity.json \
+        config/signer-identity.json \
+        config/revoke-identity.json \
+        config/session-identity.json \
+        config/installer-identity.json \
+        config/provenance-catalog.json
+      do
+        test -f "$payload/$required" || {
+          echo "payload is missing $required" >&2
+          exit 66
+        }
+      done
+    fi
 
     broker_user="bloom-broker-$login_uid"
     broker_group="$broker_user"
@@ -620,6 +671,12 @@ case "$action" in
           exit 65
         }
         verify_existing_enrollment
+        existing_enrollment=true
+        installed_release_digest="$(read_enrollment_field "$enrollment" release_digest)"
+        [[ "$installed_release_digest" == "$BLOOM_RELEASE_DIGEST" ]] || {
+          echo "macOS atomic release upgrade is not enabled until rollback health checks are implemented" >&2
+          exit 69
+        }
         provision_committed=true
       else
         provision_fresh_accounts
@@ -660,7 +717,9 @@ case "$action" in
     config_root="$product_root/config/$login_uid"
     broker_config_root="$config_root/broker"
     signer_config_root="$config_root/signer"
+    machine_config_root="$config_root/machine"
     session_config_root="$config_root/session"
+    installer_config_root="$config_root/installer"
     edge_manifest="$config_root/edge-manifest.json"
     if $live_install; then
       variable_root="/private/var"
@@ -674,7 +733,9 @@ case "$action" in
       "$enrollment_root" \
       "$broker_config_root" \
       "$signer_config_root" \
+      "$machine_config_root" \
       "$session_config_root" \
+      "$installer_config_root" \
       "$broker_state/audit-checkpoints" \
       "$signer_state/audit-checkpoints" \
       "$runtime_root/machine-broker" \
@@ -688,7 +749,9 @@ case "$action" in
       "$config_root" \
       "$broker_config_root" \
       "$signer_config_root" \
+      "$machine_config_root" \
       "$session_config_root" \
+      "$installer_config_root" \
       "$broker_state" \
       "$signer_state" \
       "$broker_state/audit-checkpoints" \
@@ -710,7 +773,9 @@ case "$action" in
     chmod 0700 \
       "$broker_config_root" \
       "$signer_config_root" \
+      "$machine_config_root" \
       "$session_config_root" \
+      "$installer_config_root" \
       "$broker_state" \
       "$signer_state" \
       "$broker_state/audit-checkpoints" \
@@ -722,21 +787,91 @@ case "$action" in
       "$runtime_root/session"
     chmod 0750 "$runtime_root/status"
 
-    render_template "$payload/config/edge-manifest.json" "$edge_manifest" 0644
-    render_template "$payload/config/broker.json" "$broker_config_root/config.json" 0600
-    render_template "$payload/config/signer.json" "$signer_config_root/config.json" 0600
-    atomic_install \
-      "$payload/config/broker-identity.json" \
-      "$broker_config_root/identity.json" \
-      0600
-    atomic_install \
-      "$payload/config/signer-identity.json" \
-      "$signer_config_root/identity.json" \
-      0600
-    atomic_install \
-      "$payload/config/session-identity.json" \
-      "$session_config_root/identity.json" \
-      0600
+    if $existing_enrollment; then
+      require_live_file_metadata "$edge_manifest" 0 0 644
+      require_live_file_metadata "$config_root/provenance-catalog.json" 0 0 644
+      require_live_file_metadata \
+        "$broker_config_root/config.json" \
+        "$BLOOM_MACOS_BROKER_UID" \
+        "$BLOOM_MACOS_BROKER_GID" \
+        600
+      require_live_file_metadata \
+        "$broker_config_root/identity.json" \
+        "$BLOOM_MACOS_BROKER_UID" \
+        "$BLOOM_MACOS_BROKER_GID" \
+        600
+      require_live_file_metadata \
+        "$signer_config_root/config.json" \
+        "$BLOOM_MACOS_SIGNER_UID" \
+        "$BLOOM_MACOS_SIGNER_GID" \
+        600
+      require_live_file_metadata \
+        "$signer_config_root/identity.json" \
+        "$BLOOM_MACOS_SIGNER_UID" \
+        "$BLOOM_MACOS_SIGNER_GID" \
+        600
+      for login_private in \
+        "$machine_config_root/identity.json" \
+        "$machine_config_root/revoke-identity.json" \
+        "$session_config_root/identity.json"
+      do
+        require_live_file_metadata \
+          "$login_private" \
+          "$login_uid" \
+          "$BLOOM_MACOS_MACHINE_BROKER_GID" \
+          600
+      done
+      require_live_file_metadata "$installer_config_root/identity.json" 0 0 600
+    else
+      if [[ "$platform_claim" == "macos-unix-principals" ]]; then
+        generated_material="$(mktemp -d "$product_root/.enrollment-material.XXXXXX")"
+        chmod 0700 "$generated_material"
+        chown root:wheel "$generated_material"
+        "$machine_binary" \
+          --triad-render-macos-enrollment \
+          "$source_root/macos/config" \
+          "$generated_material" \
+          "$login_uid" \
+          "$BLOOM_MACOS_BROKER_UID" \
+          "$BLOOM_MACOS_SIGNER_UID" \
+          "$BLOOM_MACOS_MACHINE_BROKER_GID" \
+          "$BLOOM_RELEASE_DIGEST"
+        config_source="$generated_material"
+      else
+        config_source="$payload/config"
+      fi
+      render_template "$config_source/edge-manifest.json" "$edge_manifest" 0644
+      render_template "$config_source/broker.json" "$broker_config_root/config.json" 0600
+      render_template "$config_source/signer.json" "$signer_config_root/config.json" 0600
+      atomic_install \
+        "$config_source/machine-identity.json" \
+        "$machine_config_root/identity.json" \
+        0600
+      atomic_install \
+        "$config_source/broker-identity.json" \
+        "$broker_config_root/identity.json" \
+        0600
+      atomic_install \
+        "$config_source/signer-identity.json" \
+        "$signer_config_root/identity.json" \
+        0600
+      atomic_install \
+        "$config_source/revoke-identity.json" \
+        "$machine_config_root/revoke-identity.json" \
+        0600
+      atomic_install \
+        "$config_source/session-identity.json" \
+        "$session_config_root/identity.json" \
+        0600
+      atomic_install \
+        "$config_source/installer-identity.json" \
+        "$installer_config_root/identity.json" \
+        0600
+      atomic_install \
+        "$config_source/provenance-catalog.json" \
+        "$config_root/provenance-catalog.json" \
+        0644
+    fi
 
     enrollment_new="$enrollment.new.$$"
     printf '%s\n' \

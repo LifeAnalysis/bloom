@@ -87,3 +87,19 @@ case "$platform_claim" in
     exit 65
     ;;
 esac
+if [[ "$platform_claim" == "macos-unix-principals" ]]; then
+  if find "$payload" -type f \
+    \( -name '*identity*.json' -o -name '*credentials*' \) |
+    grep . >/dev/null
+  then
+    echo "production macOS bundle contains a private identity-shaped file" >&2
+    exit 65
+  fi
+  if LC_ALL=C grep -aER \
+    '"[^"]*(private_key_seed_hex|signing_seed_hex|state_authentication_key_hex)"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"' \
+    "$payload" >/dev/null
+  then
+    echo "production macOS bundle contains private key material" >&2
+    exit 65
+  fi
+fi

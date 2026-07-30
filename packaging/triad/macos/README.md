@@ -42,6 +42,12 @@ record, LaunchDaemon definitions, session LaunchAgent, and packet-filter
 anchor. Broker and Signer state/checkpoint roots remain owned by their
 respective service UIDs and mode `0700`.
 
+Production enrollment invokes the installed Machine binary's root-only
+enrollment-material mode against the signed public templates in `config/`.
+Five application identities and the Broker/Signer signing authorities are
+fresh per login; only their public cross-pins enter the root-owned manifest.
+The temporary root-only generation directory is removed on success or error.
+
 The packet-filter template denies new Broker IP flows and all Signer TCP/UDP
 flows by numeric effective UID. Production activation is prohibited until the
 disposable macOS W0 lane proves IPv4/IPv6, TCP/UDP, loopback, accepted Broker

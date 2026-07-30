@@ -145,6 +145,8 @@ install -o "bloom-signer-$login_uid" -g "bloom-signer-$login_uid" -m 0600 /dev/n
 sudo -u "$login_user" test ! -r "$broker_probe"
 sudo -u "$login_user" test ! -r "$signer_probe"
 sudo -u "bloom-broker-$login_uid" test ! -r "$signer_probe"
+sudo -u "$login_user" test ! -r \
+  "/Library/Application Support/BloomTriad/config/$login_uid/installer/identity.json"
 
 launchctl print "system/com.bloom.broker.$login_uid" >/dev/null
 launchctl print "system/com.bloom.signer.$login_uid" >/dev/null
@@ -186,5 +188,9 @@ assert_metadata \
 assert_metadata \
   "/private/var/run/bloom/$login_uid/session/session.sock" \
   "$login_uid:$machine_broker_gid:660"
+
+ceremony_headers="$(curl --silent --show-error --max-time 2 --dump-header - \
+  --output /dev/null http://127.0.0.1:18734/)"
+grep -Fi 'x-bloom-ceremony-owner: bloom-broker-v1' <<<"$ceremony_headers" >/dev/null
 
 echo "Bloom macOS Unix-principal disposable W0 isolation checks passed"

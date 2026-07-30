@@ -47,6 +47,16 @@ wire detail. It does not amend that specification.
   and lets Broker exit successfully. W0 may temporarily carry the session
   identity as a signed fixture; production claim generation remains blocked
   until enrollment creates all private identities locally.
+- Production macOS enrollment uses the already verified installed Machine
+  executable in a root-only, noninteractive material-generation mode. Signed
+  release inputs contain public JSON templates and an unsigned provenance
+  catalog, never concrete identity files or seeds. The generator creates five
+  application identities plus the Broker, Signer, installer, audit, review,
+  ceremony, and revocation authorities from the OS CSPRNG, cross-pins their
+  public keys, signs provenance locally, and writes each output with
+  create-new mode `0600` inside an empty root-owned `0700` directory. The
+  installer then assigns final principal ownership and removes that temporary
+  directory. This mode cannot alter accounts, launchd, or `pf` itself.
 
 ## 2026-07-29
 
