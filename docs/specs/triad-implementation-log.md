@@ -109,7 +109,7 @@ wire detail. It does not amend that specification.
   protection from root. Runtime append uses exclusive file creation, rejects
   symlinks and non-owned roots, and refuses sequence rollback or replacement.
 - Section 25 leaves the exact adjacent-version window open. v1 ships a closed
-  current/current matrix only: Machine 0.1.1 with Broker 0.1.0 and Signer
+  current/current matrix only: Machine 0.1.3 with Broker 0.1.0 and Signer
   0.1.0 over protocol 1.0. No adjacent combination is advertised, so the
   requirement to test every supported adjacent combination is vacuous rather
   than silently downgraded. Bundle assembly rejects any version outside that
