@@ -14,8 +14,10 @@
   <dict>
     <key>BLOOM_ENROLLMENT_ROOT</key>
     <string>/Library/Application Support/BloomTriad/enrollments</string>
+    <key>BLOOM_CONFIG_ROOT</key>
+    <string>/Library/Application Support/BloomTriad/config</string>
     <key>BLOOM_RUNTIME_ROOT</key>
-    <string>/var/run/bloom</string>
+    <string>/private/var/run/bloom</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

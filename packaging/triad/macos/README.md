@@ -31,8 +31,9 @@ never selects a fallback address or port.
 The global `com.bloom.session` LaunchAgent invokes only Machine's
 `--session-sentinel` mode. It exits successfully for an unenrolled login,
 keeps no custody or signing authority, and is destroyed with its GUI login
-domain. Broker must require its authenticated sentinel before serving
-ceremonies.
+domain. It owns `session/session.sock` as the login UID and authenticates a
+separately pinned `bloom-session` identity. Broker authenticates that channel
+before binding the canonical ceremony listener and drains it on disconnect.
 
 ## Filesystem and network boundaries
 

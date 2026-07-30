@@ -37,6 +37,16 @@ wire detail. It does not amend that specification.
   `/private/var/...` paths so its own no-symlink checks do not make an exception
   for a path component. The documented `/var/...` layout remains the standard
   logical alias.
+- The login sentinel uses the existing mutual application-key challenge
+  directly on a dedicated Unix stream; it is not an RPC request and adds no
+  method to either closed surface. The login UID owns the socket, the
+  Machine--Broker group is pinned in the root-owned edge manifest, and Broker
+  authenticates both peer UID and the separately pinned `bloom-session`
+  public key before binding the ceremony listener. Sentinel disconnect first
+  drains HTTP acceptance, then makes every remaining browser session terminal
+  and lets Broker exit successfully. W0 may temporarily carry the session
+  identity as a signed fixture; production claim generation remains blocked
+  until enrollment creates all private identities locally.
 
 ## 2026-07-29
 

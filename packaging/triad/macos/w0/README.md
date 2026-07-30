@@ -22,6 +22,8 @@ provisioning owns it. Never create it on a developer workstation.
 The lane currently proves account/group shape, non-transitive membership,
 root/service filesystem ownership, negative private-state reads, system-domain
 LaunchDaemon registration, numeric launchd socket ownership, and loaded
-UID-scoped `pf` rules. Listener conflict, logout handoff, network attempts,
-session-sentinel authentication, install interruption, and destructive
-rollback cases remain required before the W0 claim can graduate.
+UID-scoped `pf` rules. It also requires the authenticated session socket to
+appear with the login UID and Machine-Broker group. Listener conflict, actual
+logout handoff, network attempts, hostile session authentication, install
+interruption, and destructive rollback cases remain required before the W0
+claim can graduate.

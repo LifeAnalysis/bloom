@@ -38,10 +38,16 @@ Instance configuration and identities are site-specific security inputs and
 are deliberately not reusable release credentials. They must be placed in the
 following `config/` layout beside the extracted binaries before installation:
 `edge-manifest.json`, `broker.json`, `signer.json`,
-`broker-identity.json`, `signer-identity.json`, and (on Linux)
+`broker-identity.json`, `signer-identity.json`, and, for the disposable macOS
+W0 lane only, `session-identity.json`. On Linux,
 `nts-servers.conf`. The last file contains at least two distinct reviewed NTS
 host names, one per line. AWS credentials and `aws-kms-ip-allow.conf` are an
 optional paired site overlay.
+
+The W0 session identity is a temporary conformance input. A production macOS
+claim remains disabled until enrollment generates every per-login identity
+locally, cross-pins its public key in the root-owned edge manifest, and proves
+that no private identity or backend secret is present in the release bundle.
 
 The installers stop an existing instance before replacement, atomically
 replace each file, and reactivate only after the complete set is present. An

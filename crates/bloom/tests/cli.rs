@@ -38,6 +38,20 @@ fn fresh_home() -> TempDir {
     tempfile::tempdir().expect("create temp home")
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn global_session_agent_exits_successfully_for_an_unenrolled_login() {
+    let root = tempfile::tempdir().expect("create isolated sentinel roots");
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .arg("--session-sentinel")
+        .env("BLOOM_ENROLLMENT_ROOT", root.path().join("enrollments"))
+        .env("BLOOM_CONFIG_ROOT", root.path().join("config"))
+        .env("BLOOM_RUNTIME_ROOT", root.path().join("runtime"))
+        .assert()
+        .success();
+}
+
 fn write_file(root: &Path, rel: &str, body: &[u8]) {
     let path = root.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).expect("create fixture parent");

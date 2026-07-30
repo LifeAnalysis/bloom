@@ -134,6 +134,9 @@ assert_metadata \
   "/private/var/run/bloom/$login_uid/broker-signer" \
   "0:$broker_signer_gid:710"
 assert_metadata "/private/var/run/bloom/$login_uid/revoke" "0:$revoke_gid:710"
+assert_metadata \
+  "/private/var/run/bloom/$login_uid/session" \
+  "$login_uid:$machine_broker_gid:710"
 
 broker_probe="/private/var/db/bloom/$login_uid/broker/w0-private"
 signer_probe="/private/var/db/bloom/$login_uid/signer/w0-private"
@@ -155,7 +158,8 @@ for socket in \
   "/private/var/run/bloom/$login_uid/machine-broker/broker.sock" \
   "/private/var/run/bloom/$login_uid/broker-signer/signer.sock" \
   "/private/var/run/bloom/$login_uid/revoke/broker-control.sock" \
-  "/private/var/run/bloom/$login_uid/revoke/signer-control.sock"
+  "/private/var/run/bloom/$login_uid/revoke/signer-control.sock" \
+  "/private/var/run/bloom/$login_uid/session/session.sock"
 do
   deadline=$((SECONDS + 20))
   while [[ ! -S "$socket" && $SECONDS -lt $deadline ]]; do
@@ -179,5 +183,8 @@ assert_metadata \
 assert_metadata \
   "/private/var/run/bloom/$login_uid/revoke/signer-control.sock" \
   "$signer_uid:$revoke_gid:660"
+assert_metadata \
+  "/private/var/run/bloom/$login_uid/session/session.sock" \
+  "$login_uid:$machine_broker_gid:660"
 
 echo "Bloom macOS Unix-principal disposable W0 isolation checks passed"

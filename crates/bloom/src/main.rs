@@ -12,6 +12,7 @@ mod commands {
     pub mod qr;
 }
 mod github_source;
+mod session_sentinel;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1092,6 +1093,24 @@ fn print_portfolio_table(rows: &[WalletPortfolioRow], network: &str) {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args_os().len() == 2
+        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--session-sentinel"))
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .try_init();
+        return match session_sentinel::run().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Bloom session sentinel failed: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let cli = Cli::parse();
 
     // RUST_LOG wins when set; otherwise default to `info`, or `error`

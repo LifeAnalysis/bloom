@@ -392,6 +392,7 @@ render_template() {
     -e "s|@MACHINE_BROKER_GID@|$BLOOM_MACOS_MACHINE_BROKER_GID|g" \
     -e "s|@BROKER_SIGNER_GID@|$BLOOM_MACOS_BROKER_SIGNER_GID|g" \
     -e "s|@REVOKE_GID@|$BLOOM_MACOS_REVOKE_GID|g" \
+    -e "s|@SESSION_SOCKET_GID@|$BLOOM_MACOS_MACHINE_BROKER_GID|g" \
     -e "s|@BLOOM_MACHINE_BINARY@|$machine_binary|g" \
     -e "s|@BLOOM_BROKER_BINARY@|$broker_binary|g" \
     -e "s|@BLOOM_SIGNER_BINARY@|$signer_binary|g" \
@@ -408,6 +409,7 @@ render_template() {
     -e "s|@BLOOM_SIGNER_SOCKET@|$runtime_root/broker-signer/signer.sock|g" \
     -e "s|@BLOOM_BROKER_CONTROL_SOCKET@|$runtime_root/revoke/broker-control.sock|g" \
     -e "s|@BLOOM_SIGNER_CONTROL_SOCKET@|$runtime_root/revoke/signer-control.sock|g" \
+    -e "s|@BLOOM_SESSION_SOCKET@|$runtime_root/session/session.sock|g" \
     -e "s|@BLOOM_BROKER_LOG@|$broker_state/broker.log|g" \
     -e "s|@BLOOM_SIGNER_LOG@|$signer_state/signer.log|g" \
     "$source_file" > "$temporary"
@@ -433,7 +435,11 @@ set_live_ownership() {
     "$signer_config_root/identity.json" \
     "$signer_state" \
     "$signer_state/audit-checkpoints"
-  chown "root:$machine_broker_group" "$runtime_root/machine-broker" "$runtime_root/session"
+  chown "$login_user:$machine_broker_group" \
+    "$session_config_root" \
+    "$session_config_root/identity.json" \
+    "$runtime_root/session"
+  chown "root:$machine_broker_group" "$runtime_root/machine-broker"
   chown "root:$broker_signer_group" "$runtime_root/broker-signer"
   chown "root:$revoke_group" "$runtime_root/revoke"
   chown "$broker_user:$machine_broker_group" "$runtime_root/status"
@@ -544,7 +550,8 @@ case "$action" in
       config/broker.json \
       config/signer.json \
       config/broker-identity.json \
-      config/signer-identity.json
+      config/signer-identity.json \
+      config/session-identity.json
     do
       test -f "$payload/$required" || {
         echo "payload is missing $required" >&2
@@ -653,6 +660,7 @@ case "$action" in
     config_root="$product_root/config/$login_uid"
     broker_config_root="$config_root/broker"
     signer_config_root="$config_root/signer"
+    session_config_root="$config_root/session"
     edge_manifest="$config_root/edge-manifest.json"
     if $live_install; then
       variable_root="/private/var"
@@ -666,6 +674,7 @@ case "$action" in
       "$enrollment_root" \
       "$broker_config_root" \
       "$signer_config_root" \
+      "$session_config_root" \
       "$broker_state/audit-checkpoints" \
       "$signer_state/audit-checkpoints" \
       "$runtime_root/machine-broker" \
@@ -679,6 +688,7 @@ case "$action" in
       "$config_root" \
       "$broker_config_root" \
       "$signer_config_root" \
+      "$session_config_root" \
       "$broker_state" \
       "$signer_state" \
       "$broker_state/audit-checkpoints" \
@@ -700,6 +710,7 @@ case "$action" in
     chmod 0700 \
       "$broker_config_root" \
       "$signer_config_root" \
+      "$session_config_root" \
       "$broker_state" \
       "$signer_state" \
       "$broker_state/audit-checkpoints" \
@@ -721,6 +732,10 @@ case "$action" in
     atomic_install \
       "$payload/config/signer-identity.json" \
       "$signer_config_root/identity.json" \
+      0600
+    atomic_install \
+      "$payload/config/session-identity.json" \
+      "$session_config_root/identity.json" \
       0600
 
     enrollment_new="$enrollment.new.$$"
