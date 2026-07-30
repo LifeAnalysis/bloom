@@ -46,6 +46,20 @@ record, LaunchDaemon definitions, session LaunchAgent, and packet-filter
 anchor. Broker and Signer state/checkpoint roots remain owned by their
 respective service UIDs and mode `0700`.
 
+Version upgrades are global because every enrollment executes through the one
+root-owned `current` link. The installer first publishes a complete immutable
+release directory, then writes a root-only transaction containing exact
+backups and staged Broker/Signer configurations, LaunchDaemon definitions,
+and packet-filter anchors for every enrollment, plus the global session
+LaunchAgent. It stops all loaded instances, swaps the complete set, repoints
+`current`, reloads the root packet-filter ruleset, and restores only the jobs
+that were loaded beforehand.
+Machine's private installer health mode asks Broker for the existing
+`broker.readiness`; Broker in turn requires the existing `signer.readiness` to
+report `ready` on the same build. A failed check restores the complete old set.
+An installer invocation that finds a non-committed transaction performs that
+same rollback before doing new work.
+
 Production enrollment invokes the installed Machine binary's root-only
 enrollment-material mode against the signed public templates in `config/`.
 Five application identities and the Broker/Signer signing authorities are

@@ -159,11 +159,14 @@ async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
 
     let expected_build =
         Digest32::new(expected_build.to_owned()).context("parse expected release digest")?;
-    let readiness = match configured_broker_client()?
-        .request(MachineBrokerRequest::BrokerReadiness(Empty {}))
-        .await
-        .context("request authenticated Broker readiness")?
-    {
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        configured_broker_client()?.request(MachineBrokerRequest::BrokerReadiness(Empty {})),
+    )
+    .await
+    .context("authenticated Broker readiness timed out")?
+    .context("request authenticated Broker readiness")?;
+    let readiness = match response {
         MachineBrokerResponse::BrokerReadiness(readiness) => readiness,
         _ => bail!("Broker returned the wrong response to broker.readiness"),
     };
