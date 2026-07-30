@@ -693,7 +693,7 @@ sudo -u "$login_user" \
 }
 
 if sudo -u "bloom-signer-$login_uid" \
-  /usr/bin/nc -z -w 2 127.0.0.1 18734
+  /usr/bin/nc -z -G 2 -w 2 127.0.0.1 18734
 then
   echo "Signer opened a forbidden IPv4 loopback TCP connection" >&2
   exit 1
@@ -704,7 +704,7 @@ network_listener_pid=$!
 sleep 0.2
 kill -0 "$network_listener_pid"
 if sudo -u "bloom-signer-$login_uid" \
-  /usr/bin/nc -6 -z -w 2 ::1 18735
+  /usr/bin/nc -6 -z -G 2 -w 2 ::1 18735
 then
   echo "Signer opened a forbidden IPv6 loopback TCP connection" >&2
   exit 1
@@ -728,7 +728,7 @@ sleep 0.2
 kill -0 "$network_listener_pid"
 for service_user in "bloom-broker-$login_uid" "bloom-signer-$login_uid"; do
   if sudo -u "$service_user" \
-    /usr/bin/nc -z -w 2 "$host_ipv4" 18736
+    /usr/bin/nc -z -G 2 -w 2 "$host_ipv4" 18736
   then
     echo "$service_user opened a forbidden non-loopback IPv4 TCP connection" >&2
     exit 1
