@@ -168,6 +168,7 @@ jobs:
           cargo nextest run --archive-file target/nextest-archive.tar.zst
           -E 'package(bloom-it) or package(bloom-watch)'
           --run-ignored ignored-only
+          --no-tests=pass
           --no-fail-fast
 
   macos_w0_launchd:
