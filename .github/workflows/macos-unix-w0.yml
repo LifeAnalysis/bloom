@@ -228,6 +228,15 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Upload W0 failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-w0-failure-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-w0-evidence/*
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Remove W0 host markers
         if: always()
         shell: bash

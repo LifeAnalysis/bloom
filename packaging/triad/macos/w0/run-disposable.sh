@@ -71,8 +71,31 @@ hostile_session_pid=""
 edge_manifest=""
 edge_backup=""
 
+capture_failure_evidence() {
+  evidence_dir="${BLOOM_MACOS_W0_EVIDENCE_DIR:-}"
+  [[ -n "$evidence_dir" && -d "$evidence_dir" ]] || return 0
+  for service in broker signer; do
+    source_log="/private/var/db/bloom/$login_uid/$service/$service.log"
+    if [[ -f "$source_log" && ! -L "$source_log" ]]; then
+      install -m 0644 "$source_log" "$evidence_dir/$service.log" || true
+    fi
+    launchctl print "system/com.bloom.$service.$login_uid" \
+      > "$evidence_dir/$service-launchctl.txt" 2>&1 || true
+    chmod 0644 "$evidence_dir/$service-launchctl.txt" 2>/dev/null || true
+  done
+  launchctl print "gui/$login_uid/com.bloom.session" \
+    > "$evidence_dir/session-launchctl.txt" 2>&1 || true
+  chmod 0644 "$evidence_dir/session-launchctl.txt" 2>/dev/null || true
+  find "/private/var/run/bloom/$login_uid" -xdev -ls \
+    > "$evidence_dir/runtime-tree.txt" 2>&1 || true
+  chmod 0644 "$evidence_dir/runtime-tree.txt" 2>/dev/null || true
+}
+
 cleanup() {
   status=$?
+  if [[ "$status" -ne 0 ]]; then
+    capture_failure_evidence
+  fi
   if [[ -n "$hostile_session_pid" ]]; then
     kill "$hostile_session_pid" 2>/dev/null || true
     wait "$hostile_session_pid" 2>/dev/null || true
