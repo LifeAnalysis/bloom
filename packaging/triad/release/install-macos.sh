@@ -1155,10 +1155,11 @@ recover_interrupted_upgrade() {
   upgrade_in_progress=true
   echo "recovering an interrupted Bloom macOS upgrade" >&2
   rollback_upgrade
-  $upgrade_in_progress && {
+  if $upgrade_in_progress; then
     echo "Bloom macOS upgrade rollback remains incomplete" >&2
     exit 70
-  }
+  fi
+  return 0
 }
 
 prepare_upgrade_transaction() {
@@ -1861,10 +1862,11 @@ recover_interrupted_rotation() {
   rotation_in_progress=true
   echo "recovering an interrupted Bloom macOS config/identity rotation" >&2
   rollback_rotation
-  $rotation_in_progress && {
+  if $rotation_in_progress; then
     echo "Bloom macOS config/identity rotation rollback remains incomplete" >&2
     exit 70
-  }
+  fi
+  return 0
 }
 
 require_same_config_field() {

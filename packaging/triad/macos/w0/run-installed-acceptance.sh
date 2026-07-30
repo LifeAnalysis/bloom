@@ -58,7 +58,11 @@ enrollment="/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
 [[ "$(stat -f '%u:%g:%Lp:%l' "$enrollment")" == "0:0:644:1" ]]
 [[ "$(plutil -extract state raw -o - "$enrollment")" == "active" ]]
 release_digest="$(plutil -extract release_digest raw -o - "$enrollment")"
-[[ "$release_digest" == "$(<"$payload/RELEASE_DIGEST")" ]]
+payload_release_digest="$(
+  shasum -a 256 "$payload/SHA256SUMS" |
+    awk '{print $1}'
+)"
+[[ "$release_digest" == "$payload_release_digest" ]]
 release_root="/usr/local/libexec/bloom/releases/$release_digest"
 [[ "$(readlink /usr/local/libexec/bloom/current)" == "releases/$release_digest" ]]
 for binary in bloom bloom-broker bloom-signer; do
@@ -162,11 +166,15 @@ assert_source() {
   revision_key="$2"
   expected_revision="$(source_revision "$revision_key")"
   [[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]]
-  [[ "$(git -C "$root" rev-parse HEAD)" == "$expected_revision" ]] || {
+  [[ "$(sudo -H -u "$login_user" /usr/bin/git -C "$root" rev-parse HEAD)" == \
+    "$expected_revision" ]] || {
     echo "$revision_key source does not match the installed payload" >&2
     exit 65
   }
-  [[ -z "$(git -C "$root" status --porcelain --untracked-files=no)" ]] || {
+  [[ -z "$(
+    sudo -H -u "$login_user" \
+      /usr/bin/git -C "$root" status --porcelain --untracked-files=no
+  )" ]] || {
     echo "$revision_key source has tracked modifications" >&2
     exit 65
   }
