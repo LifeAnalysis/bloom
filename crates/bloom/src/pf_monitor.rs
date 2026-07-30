@@ -27,6 +27,8 @@ struct Status {
     build_digest: String,
     anchor_sha256: String,
     trusted_time_source: &'static str,
+    automatic_time_enabled: bool,
+    timed_service_loaded: bool,
     trusted_time_available: bool,
     checked_at_unix_ms: u64,
     available: bool,
@@ -43,7 +45,8 @@ pub fn run_once() -> Result<()> {
     require_directory(enrollment_root, 0o755)?;
     let pf_enabled = command_output("/sbin/pfctl", &["-s", "info"])
         .is_ok_and(|output| output.contains("Status: Enabled"));
-    let trusted_time_available = macos_managed_time_available();
+    let (automatic_time_enabled, timed_service_loaded) = macos_managed_time_status();
+    let trusted_time_available = automatic_time_enabled && timed_service_loaded;
     let checked_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system time precedes the Unix epoch")?
@@ -104,6 +107,8 @@ pub fn run_once() -> Result<()> {
             build_digest,
             anchor_sha256,
             trusted_time_source: TRUSTED_TIME_SOURCE,
+            automatic_time_enabled,
+            timed_service_loaded,
             trusted_time_available,
             checked_at_unix_ms,
             available,
@@ -116,10 +121,12 @@ pub fn run_once() -> Result<()> {
     Ok(())
 }
 
-fn macos_managed_time_available() -> bool {
-    command_output("/usr/sbin/systemsetup", &["-getusingnetworktime"])
-        .is_ok_and(|output| output.lines().any(|line| line.trim() == "Network Time: On"))
-        && command_output("/bin/launchctl", &["print", "system/com.apple.timed"]).is_ok()
+fn macos_managed_time_status() -> (bool, bool) {
+    let automatic_time_enabled = command_output("/usr/sbin/systemsetup", &["-getusingnetworktime"])
+        .is_ok_and(|output| output.lines().any(|line| line.trim() == "Network Time: On"));
+    let timed_service_loaded =
+        command_output("/bin/launchctl", &["print", "system/com.apple.timed"]).is_ok();
+    (automatic_time_enabled, timed_service_loaded)
 }
 
 fn write_status(login_uid: u32, status: &Status) -> Result<()> {

@@ -160,6 +160,10 @@ jobs:
             sudo tee /private/var/db/bloom-w0-disposable-host >/dev/null
           sudo chown root:wheel /private/var/db/bloom-w0-disposable-host
           sudo chmod 0644 /private/var/db/bloom-w0-disposable-host
+          sudo /usr/sbin/systemsetup -setusingnetworktime on
+          sudo /usr/sbin/systemsetup -getusingnetworktime |
+            grep -Fx "Network Time: On"
+          sudo /bin/launchctl print system/com.apple.timed >/dev/null
           sudo install \
             -o root \
             -g wheel \

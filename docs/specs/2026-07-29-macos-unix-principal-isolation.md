@@ -330,6 +330,9 @@ time only while that status remains valid; they still fail closed on a missing
 attestation, rollback, or an unconfirmed repair. macOS `timed` merges multiple
 reference-clock technologies and is not represented by the kernel NTP state
 returned from `ntp_adjtime`, so that Linux-style query is not used on macOS.
+The disposable W0 host setup enables automatic network time as an explicit VM
+prerequisite. The production installer never changes that administrator
+setting; it reports and rolls back when the prerequisite is disabled.
 
 ## 10. Installation and enrollment
 
