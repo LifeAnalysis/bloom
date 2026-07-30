@@ -29,9 +29,13 @@ harness, and removes those markers in an unconditional cleanup step. The
 workflow does not produce or advertise a production platform claim.
 
 The lane currently proves account/group shape, non-transitive membership,
-root/service filesystem ownership, negative private-state reads, system-domain
-LaunchDaemon registration, numeric launchd socket ownership, and loaded
-UID-scoped `pf` rules. It also requires the authenticated session socket to
+root/service filesystem ownership, explicit checkpoint/config/database
+negative reads, immutable release/plist/manifest/packet-filter replacement
+denial for every product principal, process task/sample denial, system-domain
+LaunchDaemon registration, numeric launchd socket ownership, unrelated-UID
+endpoint denial, Machine denial on the Broker-to-Signer edge, and loaded
+UID-scoped `pf` rules. Authenticated triad health also proves both service UIDs
+can sample the pinned `macos-managed-timed` source. The lane requires the authenticated session socket to
 appear with the login UID and revoke group, then verifies the canonical
 listener's Broker marker. It pre-binds the canonical port with a foreign
 process, verifies Broker's specific fatal/no-fallback diagnostic and Machine

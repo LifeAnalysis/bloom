@@ -57,6 +57,7 @@ triad_source="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 installer="$triad_source/release/install-macos.sh"
 enrollment="/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
 rotation_fixtures="$(mktemp -d /private/tmp/bloom-w0-rotation.XXXXXX)"
+process_probe_dir="$(mktemp -d /private/tmp/bloom-w0-process.XXXXXX)"
 foreign_listener_pid=""
 network_listener_pid=""
 hostile_session_pid=""
@@ -78,7 +79,7 @@ cleanup() {
   if [[ -f "$enrollment" ]]; then
     "$installer" uninstall / "$login_uid" "delete-bloom-login-$login_uid" || true
   fi
-  rm -rf -- "$rotation_fixtures"
+  rm -rf -- "$rotation_fixtures" "$process_probe_dir"
   exit "$status"
 }
 trap cleanup EXIT
@@ -223,13 +224,44 @@ assert_metadata \
 
 broker_probe="/private/var/db/bloom/$login_uid/broker/w0-private"
 signer_probe="/private/var/db/bloom/$login_uid/signer/w0-private"
+broker_checkpoint_probe="/private/var/db/bloom/$login_uid/broker/audit-checkpoints/w0-private"
+signer_checkpoint_probe="/private/var/db/bloom/$login_uid/signer/audit-checkpoints/w0-private"
 install -o "bloom-broker-$login_uid" -g "bloom-broker-$login_uid" -m 0600 /dev/null "$broker_probe"
 install -o "bloom-signer-$login_uid" -g "bloom-signer-$login_uid" -m 0600 /dev/null "$signer_probe"
+install \
+  -o "bloom-broker-$login_uid" \
+  -g "bloom-broker-$login_uid" \
+  -m 0600 \
+  /dev/null \
+  "$broker_checkpoint_probe"
+install \
+  -o "bloom-signer-$login_uid" \
+  -g "bloom-signer-$login_uid" \
+  -m 0600 \
+  /dev/null \
+  "$signer_checkpoint_probe"
 sudo -u "$login_user" test ! -r "$broker_probe"
 sudo -u "$login_user" test ! -r "$signer_probe"
+sudo -u "$login_user" test ! -r "$broker_checkpoint_probe"
+sudo -u "$login_user" test ! -r "$signer_checkpoint_probe"
 sudo -u "bloom-broker-$login_uid" test ! -r "$signer_probe"
+sudo -u "bloom-broker-$login_uid" test ! -r "$signer_checkpoint_probe"
+sudo -u "bloom-signer-$login_uid" test ! -r "$broker_probe"
+sudo -u "bloom-signer-$login_uid" test ! -r "$broker_checkpoint_probe"
 sudo -u "$login_user" test ! -r \
   "/Library/Application Support/BloomTriad/config/$login_uid/installer/identity.json"
+sudo -u "$login_user" test ! -r \
+  "/Library/Application Support/BloomTriad/config/$login_uid/broker/identity.json"
+sudo -u "$login_user" test ! -r \
+  "/Library/Application Support/BloomTriad/config/$login_uid/signer/identity.json"
+sudo -u "$login_user" test ! -r \
+  "/private/var/db/bloom/$login_uid/signer/signer.db"
+sudo -u "bloom-broker-$login_uid" test ! -r \
+  "/Library/Application Support/BloomTriad/config/$login_uid/signer/config.json"
+sudo -u "bloom-broker-$login_uid" test ! -r \
+  "/private/var/db/bloom/$login_uid/signer/signer.db"
+sudo -u "bloom-signer-$login_uid" test ! -r \
+  "/Library/Application Support/BloomTriad/config/$login_uid/broker/config.json"
 
 launchctl print "system/com.bloom.broker.$login_uid" >/dev/null
 launchctl print "system/com.bloom.signer.$login_uid" >/dev/null
@@ -279,6 +311,101 @@ session_label="gui/$login_uid/com.bloom.session"
 session_plist="/Library/LaunchAgents/com.bloom.session.plist"
 broker_label="system/com.bloom.broker.$login_uid"
 signer_label="system/com.bloom.signer.$login_uid"
+
+unrelated_user="nobody"
+id "$unrelated_user" >/dev/null 2>&1 || {
+  echo "W0 cannot resolve the unrelated local nobody principal" >&2
+  exit 69
+}
+for socket in \
+  "/private/var/run/bloom/$login_uid/machine-broker/broker.sock" \
+  "/private/var/run/bloom/$login_uid/broker-signer/signer.sock" \
+  "/private/var/run/bloom/$login_uid/revoke/broker-control.sock" \
+  "/private/var/run/bloom/$login_uid/revoke/signer-control.sock"
+do
+  if sudo -u "$unrelated_user" /usr/bin/nc -z -w 1 -U "$socket"; then
+    echo "unrelated local UID opened protected Unix endpoint $socket" >&2
+    exit 1
+  fi
+done
+if sudo -u "$login_user" \
+  /usr/bin/nc -z -w 1 -U \
+  "/private/var/run/bloom/$login_uid/broker-signer/signer.sock"
+then
+  echo "Machine login opened the Broker-to-Signer data endpoint" >&2
+  exit 1
+fi
+
+assert_principal_cannot_replace() {
+  principal="$1"
+  protected_path="$2"
+  sudo -u "$principal" test ! -w "$protected_path"
+  sudo -u "$principal" test ! -w "$(dirname "$protected_path")"
+}
+
+for protected_path in \
+  "$machine_binary" \
+  "/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist" \
+  "/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist" \
+  "$session_plist" \
+  "/Library/Application Support/BloomTriad/config/$login_uid/edge-manifest.json" \
+  "/etc/pf.anchors/com.bloom.triad.$login_uid"
+do
+  for principal in \
+    "$login_user" \
+    "bloom-broker-$login_uid" \
+    "bloom-signer-$login_uid"
+  do
+    assert_principal_cannot_replace "$principal" "$protected_path"
+  done
+done
+
+chmod 0755 "$process_probe_dir"
+/usr/bin/xcrun --sdk macosx clang \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  "$triad_source/macos/w0/task-access-probe.c" \
+  -o "$process_probe_dir/task-access-probe"
+chmod 0755 "$process_probe_dir/task-access-probe"
+for service_and_uid in \
+  "broker $broker_uid" \
+  "signer $signer_uid"
+do
+  service="${service_and_uid%% *}"
+  service_uid="${service_and_uid#* }"
+  service_pid="$(pgrep -u "$service_uid" -x "bloom-$service" | head -n 1)"
+  [[ "$service_pid" =~ ^[1-9][0-9]*$ ]] || {
+    echo "W0 could not resolve the live $service PID" >&2
+    exit 1
+  }
+  if sudo -u "$login_user" \
+    "$process_probe_dir/task-access-probe" "$service_pid"
+  then
+    echo "Machine login obtained task access to $service" >&2
+    exit 1
+  fi
+  sample_output="$process_probe_dir/sample-$service_pid.txt"
+  install \
+    -o "$login_user" \
+    -g "$(id -gn "$login_user")" \
+    -m 0600 \
+    /dev/null \
+    "$sample_output"
+  set +e
+  sudo -u "$login_user" \
+    /usr/bin/sample "$service_pid" 1 1 -file "$sample_output" \
+    >/dev/null 2>&1
+  sample_status=$?
+  set -e
+  if [[ "$sample_status" -eq 0 ]] ||
+    grep -F 'Call graph:' "$sample_output" >/dev/null 2>&1
+  then
+    echo "Machine login sampled $service process memory" >&2
+    exit 1
+  fi
+done
 
 sudo -u "$login_user" \
   /usr/bin/nc -d -U "$session_socket" >/dev/null 2>&1 &
