@@ -7,15 +7,17 @@ downgrade combination fails closed.
 `build-bundle.sh` accepts three already-built production binaries and a
 reviewed Ed25519 release key. It verifies semantic versions, scans every
 staged and generated bundle file for release-blocking markers, records all
-three Git revisions, embeds both platform installers, normalizes metadata, and
+three Git revisions, embeds both platform installers, signs the internal
+payload manifest for post-elevation verification, normalizes metadata, and
 emits a deterministic archive with checksum, signature, and public key.
 
 `verify-bundle.sh` verifies the detached signature and both the outer and
 internal checksums before accepting the compatibility matrix or installers.
-Production verification accepts Linux ELF bundles only. The
-`test-unclaimed` marker requires the explicit
+Production verification currently accepts Linux ELF bundles. The
+non-production `macos-unix-principals-w0` claim accepts Mach-O binaries only
+in its explicitly enabled disposable Darwin lane. The `test-unclaimed` marker requires the explicit
 `BLOOM_ALLOW_TEST_UNCLAIMED=true` override at build, verification, and install;
-macOS cannot be asserted by these scripts.
+neither test claim can be advertised as production.
 
 `triad-release-gate.sh` rejects modified or untracked release inputs, runs
 locked fmt, clippy, and tests in all three sibling workspaces, builds release
@@ -49,7 +51,9 @@ The Linux AWS KMS profile requires credentials and a non-wildcard reviewed
 CIDR allowlist together; reinstall without that pair removes any prior
 instance credential and egress drop-in.
 
-The macOS templates remain conformance inputs, not a production platform
-claim. A release may claim macOS only after the three binaries are signed with
-the rendered App Sandbox entitlements and the disposable launchd lane proves
-the effective boundaries. Raw Cargo binaries do not satisfy that gate.
+The root-requiring macOS Unix-principal templates remain conformance inputs,
+not a production platform claim. A release may claim
+`macos-unix-principals` only after the disposable W0 lane proves the effective
+UID/group, filesystem, launchd, listener, network, lifecycle, and rollback
+boundaries and a digest-bound conformance report is included. The rootless
+code-identity architecture remains a separate future profile.

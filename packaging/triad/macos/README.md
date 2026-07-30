@@ -50,3 +50,4 @@ Signer is the only initial backend.
 Static template and staged-root tests are conformance inputs, not proof of an
 operating-system boundary. Tests that create accounts, load LaunchDaemons,
 change `pf`, or exercise multiple GUI users run only on disposable macOS VMs.
+The guarded harness and its current coverage are documented under `w0/`.

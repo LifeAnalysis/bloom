@@ -22,8 +22,21 @@ wire detail. It does not amend that specification.
   real direct-bind child, not launchd TCP handover.
 - Until a disposable W0 VM proves account creation/rollback, system-domain
   launchd ownership, socket modes, `pf` behavior, and uninstall, the installer
-  renders only staged roots and refuses live `/` activation. This is an
-  implementation gate, not a weaker production mode or platform claim.
+  accepts live test activation only for the non-production
+  `macos-unix-principals-w0` claim on a root-marked disposable host. Production
+  `macos-unix-principals` release generation remains disabled until the lane
+  passes. This is an implementation gate, not a weaker production mode.
+- Live account allocation is serialized by an exclusive installer lock and
+  selects the next unused Directory Service numeric ID from the actual user or
+  group database rather than assuming a platform range. A pre-existing Bloom
+  name without the exact root-owned enrollment record is never adopted.
+  Failures before a fresh enrollment is committed remove only records created
+  by that invocation and its exact per-login paths.
+- macOS exposes `/var` through the platform-managed `/private/var` link. Live
+  packaging resolves mutable state and runtime roots to canonical
+  `/private/var/...` paths so its own no-symlink checks do not make an exception
+  for a path component. The documented `/var/...` layout remains the standard
+  logical alias.
 
 ## 2026-07-29
 

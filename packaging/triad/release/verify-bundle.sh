@@ -15,7 +15,7 @@ openssl pkeyutl -verify -rawin -pubin -inkey "$public_key" \
   -in "$checksum" -sigfile "$signature" >/dev/null
 (
   cd "$(dirname "$archive")"
-  sha256sum -c "$(basename "$checksum")"
+  shasum -a 256 -c "$(basename "$checksum")"
 )
 
 work="$(mktemp -d)"
@@ -31,6 +31,8 @@ for required in \
   installer/release/install-linux.sh \
   installer/release/install-macos.sh \
   SOURCE_REVISIONS \
+  RELEASE_PUBLIC_KEY.pem \
+  RELEASE_SIGNATURE \
   SHA256SUMS
 do
   test -f "$payload/$required" || {
@@ -38,25 +40,50 @@ do
     exit 65
   }
 done
+openssl pkeyutl \
+  -verify \
+  -rawin \
+  -pubin \
+  -inkey "$payload/RELEASE_PUBLIC_KEY.pem" \
+  -in "$payload/SHA256SUMS" \
+  -sigfile "$payload/RELEASE_SIGNATURE" >/dev/null
 (
   cd "$payload"
-  sha256sum -c SHA256SUMS
+  shasum -a 256 -c SHA256SUMS
 )
 grep -Fx 'downgrade = "forbidden"' "$payload/compatibility-v1.toml" >/dev/null
 grep -Fx 'adjacent_versions_supported = false' "$payload/compatibility-v1.toml" >/dev/null
 platform_claim="$(<"$payload/PLATFORM_CLAIM")"
-if [[ "$platform_claim" != "linux" ]] &&
-  [[ ! ("$platform_claim" == "test-unclaimed" &&
-    "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == "true") ]]
-then
-  echo "bundle has no verifiable production platform claim" >&2
-  exit 65
-fi
-if [[ "$platform_claim" == "linux" ]]; then
-  for binary in bloom bloom-broker bloom-signer; do
-    file -b "$payload/bin/$binary" | grep -F 'ELF ' >/dev/null || {
-      echo "Linux bundle contains a non-ELF production binary" >&2
+case "$platform_claim" in
+  linux)
+    for binary in bloom bloom-broker bloom-signer; do
+      file -b "$payload/bin/$binary" | grep -F 'ELF ' >/dev/null || {
+        echo "Linux bundle contains a non-ELF production binary" >&2
+        exit 65
+      }
+    done
+    ;;
+  macos-unix-principals-w0)
+    [[ "$(uname -s)" == "Darwin" ]] &&
+      [[ "${BLOOM_ALLOW_MACOS_UNIX_W0:-}" == "true" ]] || {
+      echo "macOS W0 bundle requires its disposable Darwin verification lane" >&2
       exit 65
     }
-  done
-fi
+    for binary in bloom bloom-broker bloom-signer; do
+      file -b "$payload/bin/$binary" | grep -F 'Mach-O ' >/dev/null || {
+        echo "macOS W0 bundle contains a non-Mach-O production binary" >&2
+        exit 65
+      }
+    done
+    ;;
+  test-unclaimed)
+    [[ "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == "true" ]] || {
+      echo "test-unclaimed bundle verification was not explicitly enabled" >&2
+      exit 65
+    }
+    ;;
+  *)
+    echo "bundle has no verifiable production platform claim" >&2
+    exit 65
+    ;;
+esac
