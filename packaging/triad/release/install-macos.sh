@@ -45,6 +45,11 @@ rotation_transaction=""
 rotation_transaction_staging=""
 uninstall_transaction=""
 uninstall_transaction_staging=""
+uninstall_mode=""
+retained_restore_in_progress=false
+retained_record=""
+restoring_retained=false
+deleting_retained=false
 
 validate_root_uid() {
   root="$1"
@@ -210,6 +215,9 @@ rollback_provisioning() {
   fi
   if $rotation_in_progress; then
     rollback_rotation
+  fi
+  if $retained_restore_in_progress; then
+    rollback_retained_restore
   fi
   if $live_install && $provision_started && ! $provision_committed; then
     if [[ -n "$enrollment_transaction" && -d "$enrollment_transaction" ]]; then
@@ -443,8 +451,9 @@ require_network_containment_config() {
 }
 
 verify_existing_enrollment() {
+  expected_enrollment_state="${1:-active}"
   [[ "$(read_enrollment_field "$enrollment" schema)" == "bloom.macos-enrollment.1" ]]
-  [[ "$(read_enrollment_field "$enrollment" state)" == "active" ]]
+  [[ "$(read_enrollment_field "$enrollment" state)" == "$expected_enrollment_state" ]]
   [[ "$(read_enrollment_field "$enrollment" login_uid)" == "$login_uid" ]]
   [[ "$(read_enrollment_field "$enrollment" login_user)" == "$login_user" ]]
   [[ "$(read_enrollment_field "$enrollment" broker_user)" == "$broker_user" ]]
@@ -1788,21 +1797,29 @@ write_uninstall_phase() {
 load_uninstall_identity() {
   [[ -d "$uninstall_transaction" && ! -L "$uninstall_transaction" ]] || return 65
   [[ "$(stat -f '%u:%Lp' "$uninstall_transaction")" == "0:700" ]] || return 65
-  for required in schema login-uid phase enrollment.json; do
+  for required in schema login-uid mode phase enrollment.json; do
     [[ -f "$uninstall_transaction/$required" &&
       ! -L "$uninstall_transaction/$required" ]] || return 65
     observed="$(stat -f '%u:%g:%Lp:%l' "$uninstall_transaction/$required")"
     [[ "$observed" == "0:0:600:1" ]] || return 65
   done
-  grep -Fx 'bloom.macos-uninstall-transaction.1' \
+  grep -Fx 'bloom.macos-uninstall-transaction.2' \
     "$uninstall_transaction/schema" >/dev/null || return 65
   transaction_uid="$(<"$uninstall_transaction/login-uid")"
   [[ "$transaction_uid" =~ ^[1-9][0-9]*$ ]] || return 65
   [[ "${uninstall_transaction##*/}" == "$transaction_uid" ]] || return 65
   login_uid="$transaction_uid"
+  uninstall_mode="$(<"$uninstall_transaction/mode")"
+  [[ "$uninstall_mode" == "permanent" || "$uninstall_mode" == "retain" ]] || return 65
   enrollment="$uninstall_transaction/enrollment.json"
   [[ "$(read_enrollment_field "$enrollment" schema)" == "bloom.macos-enrollment.1" ]]
   [[ "$(read_enrollment_field "$enrollment" login_uid)" == "$login_uid" ]]
+  snapshot_state="$(read_enrollment_field "$enrollment" state)"
+  if [[ "$uninstall_mode" == "retain" ]]; then
+    [[ "$snapshot_state" == "active" ]]
+  else
+    [[ "$snapshot_state" == "active" || "$snapshot_state" == "retained" ]]
+  fi
   login_user="$(read_enrollment_field "$enrollment" login_user)"
   broker_user="bloom-broker-$login_uid"
   broker_group="$broker_user"
@@ -1811,6 +1828,15 @@ load_uninstall_identity() {
   machine_broker_group="bloom-machine-broker-$login_uid"
   broker_signer_group="bloom-broker-signer-$login_uid"
   revoke_group="bloom-revoke-$login_uid"
+  [[ "$(read_enrollment_field "$enrollment" broker_user)" == "$broker_user" ]]
+  [[ "$(read_enrollment_field "$enrollment" broker_group)" == "$broker_group" ]]
+  [[ "$(read_enrollment_field "$enrollment" signer_user)" == "$signer_user" ]]
+  [[ "$(read_enrollment_field "$enrollment" signer_group)" == "$signer_group" ]]
+  observed_group="$(read_enrollment_field "$enrollment" machine_broker_group)"
+  [[ "$observed_group" == "$machine_broker_group" ]]
+  observed_group="$(read_enrollment_field "$enrollment" broker_signer_group)"
+  [[ "$observed_group" == "$broker_signer_group" ]]
+  [[ "$(read_enrollment_field "$enrollment" revoke_group)" == "$revoke_group" ]]
   BLOOM_MACOS_BROKER_UID="$(read_enrollment_field "$enrollment" broker_uid)"
   BLOOM_MACOS_SIGNER_UID="$(read_enrollment_field "$enrollment" signer_uid)"
   BLOOM_MACOS_BROKER_GID="$(read_enrollment_field "$enrollment" broker_gid)"
@@ -1861,9 +1887,10 @@ prepare_uninstall_transaction() {
   mkdir "$uninstall_transaction_staging"
   chown root:wheel "$uninstall_transaction_staging"
   chmod 0700 "$uninstall_transaction_staging"
-  printf '%s\n' 'bloom.macos-uninstall-transaction.1' \
+  printf '%s\n' 'bloom.macos-uninstall-transaction.2' \
     > "$uninstall_transaction_staging/schema"
   printf '%s\n' "$login_uid" > "$uninstall_transaction_staging/login-uid"
+  printf '%s\n' "$uninstall_mode" > "$uninstall_transaction_staging/mode"
   printf '%s\n' prepared > "$uninstall_transaction_staging/phase"
   cp "$enrollment" "$uninstall_transaction_staging/enrollment.json"
   chown root:wheel "$uninstall_transaction_staging"/*
@@ -1873,14 +1900,41 @@ prepare_uninstall_transaction() {
   uninstall_transaction_staging=""
   sync
 
-  temporary="$enrollment.uninstalling.$$"
-  cp -p "$enrollment" "$temporary"
-  plutil -replace state -string uninstalling "$temporary"
-  chown root:wheel "$temporary"
-  chmod 0644 "$temporary"
-  mv -f "$temporary" "$enrollment"
-  sync
+  if ! $deleting_retained; then
+    temporary="$enrollment.uninstalling.$$"
+    cp -p "$enrollment" "$temporary"
+    plutil -replace state -string uninstalling "$temporary"
+    chown root:wheel "$temporary"
+    chmod 0644 "$temporary"
+    mv -f "$temporary" "$enrollment"
+    sync
+  fi
   write_uninstall_phase unpublished
+}
+
+publish_retained_record() {
+  retained_root="$product_root/retained"
+  if [[ ! -e "$retained_root" ]]; then
+    mkdir "$retained_root"
+    chown root:wheel "$retained_root"
+    chmod 0700 "$retained_root"
+  fi
+  [[ -d "$retained_root" && ! -L "$retained_root" ]] || return 65
+  [[ "$(stat -f '%u:%Lp' "$retained_root")" == "0:700" ]] || return 65
+  retained_record="$retained_root/$login_uid.json"
+  temporary="$retained_record.new.$$"
+  cp "$uninstall_transaction/enrollment.json" "$temporary"
+  plutil -replace state -string retained "$temporary"
+  chown root:wheel "$temporary"
+  chmod 0600 "$temporary"
+  if [[ -e "$retained_record" ]]; then
+    require_live_file_metadata "$retained_record" 0 0 600
+    cmp "$temporary" "$retained_record" >/dev/null
+    rm -f -- "$temporary"
+    return
+  fi
+  mv "$temporary" "$retained_record"
+  sync
 }
 
 execute_uninstall_transaction() {
@@ -1904,28 +1958,47 @@ execute_uninstall_transaction() {
     "/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist" \
     "/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist" \
     "/etc/pf.anchors/com.bloom.triad.$login_uid"
-  rm -rf -- \
-    "$product_root/config/$login_uid" \
-    "/private/var/db/bloom/$login_uid" \
-    "/private/var/run/bloom/$login_uid"
+  if [[ "$uninstall_mode" == "retain" ]]; then
+    publish_retained_record
+  else
+    rm -rf -- \
+      "$product_root/config/$login_uid" \
+      "/private/var/db/bloom/$login_uid" \
+      "/private/var/run/bloom/$login_uid"
+    rm -f -- "$product_root/retained/$login_uid.json"
+  fi
   rm -f -- "$enrollment_root/$login_uid.json"
   write_uninstall_phase files-removed
 
-  delete_directory_record_if_exact Users "$broker_user" UniqueID "$BLOOM_MACOS_BROKER_UID"
-  delete_directory_record_if_exact Users "$signer_user" UniqueID "$BLOOM_MACOS_SIGNER_UID"
-  delete_directory_record_if_exact Groups "$broker_group" PrimaryGroupID "$BLOOM_MACOS_BROKER_GID"
-  delete_directory_record_if_exact Groups "$signer_group" PrimaryGroupID "$BLOOM_MACOS_SIGNER_GID"
-  delete_directory_record_if_exact \
-    Groups \
-    "$machine_broker_group" \
-    PrimaryGroupID \
-    "$BLOOM_MACOS_MACHINE_BROKER_GID"
-  delete_directory_record_if_exact \
-    Groups \
-    "$broker_signer_group" \
-    PrimaryGroupID \
-    "$BLOOM_MACOS_BROKER_SIGNER_GID"
-  delete_directory_record_if_exact Groups "$revoke_group" PrimaryGroupID "$BLOOM_MACOS_REVOKE_GID"
+  if [[ "$uninstall_mode" == "permanent" ]]; then
+    delete_directory_record_if_exact Users "$broker_user" UniqueID "$BLOOM_MACOS_BROKER_UID"
+    delete_directory_record_if_exact Users "$signer_user" UniqueID "$BLOOM_MACOS_SIGNER_UID"
+    delete_directory_record_if_exact \
+      Groups \
+      "$broker_group" \
+      PrimaryGroupID \
+      "$BLOOM_MACOS_BROKER_GID"
+    delete_directory_record_if_exact \
+      Groups \
+      "$signer_group" \
+      PrimaryGroupID \
+      "$BLOOM_MACOS_SIGNER_GID"
+    delete_directory_record_if_exact \
+      Groups \
+      "$machine_broker_group" \
+      PrimaryGroupID \
+      "$BLOOM_MACOS_MACHINE_BROKER_GID"
+    delete_directory_record_if_exact \
+      Groups \
+      "$broker_signer_group" \
+      PrimaryGroupID \
+      "$BLOOM_MACOS_BROKER_SIGNER_GID"
+    delete_directory_record_if_exact \
+      Groups \
+      "$revoke_group" \
+      PrimaryGroupID \
+      "$BLOOM_MACOS_REVOKE_GID"
+  fi
   write_uninstall_phase principals-removed
 
   if ! find "$enrollment_root" -type f -name '*.json' -mindepth 1 -maxdepth 1 |
@@ -1961,6 +2034,90 @@ recover_interrupted_uninstalls() {
     execute_uninstall_transaction
   done
   uninstall_transaction=""
+}
+
+require_matching_enrollment_state() {
+  source_record="$1"
+  expected_record="$2"
+  expected_state="$3"
+  temporary="$product_root/.enrollment-state-check.$$"
+  cp "$source_record" "$temporary"
+  plutil -replace state -string "$expected_state" "$temporary"
+  records_match=false
+  cmp "$temporary" "$expected_record" >/dev/null && records_match=true
+  rm -f -- "$temporary"
+  $records_match
+}
+
+load_retained_identity() {
+  retained_record="$1"
+  require_live_file_metadata "$retained_record" 0 0 600
+  retained_uid="$(basename "$retained_record" .json)"
+  [[ "$retained_uid" =~ ^[1-9][0-9]*$ ]] || return 65
+  login_uid="$retained_uid"
+  login_user="$(read_enrollment_field "$retained_record" login_user)"
+  broker_user="bloom-broker-$login_uid"
+  broker_group="$broker_user"
+  signer_user="bloom-signer-$login_uid"
+  signer_group="$signer_user"
+  machine_broker_group="bloom-machine-broker-$login_uid"
+  broker_signer_group="bloom-broker-signer-$login_uid"
+  revoke_group="bloom-revoke-$login_uid"
+  enrollment="$retained_record"
+  verify_existing_enrollment retained
+}
+
+rollback_retained_restore() {
+  load_retained_identity "$retained_record" || return
+  launchctl bootout "gui/$login_uid/com.bloom.session" 2>/dev/null || true
+  launchctl bootout "system/com.bloom.broker.$login_uid" 2>/dev/null || true
+  launchctl bootout "system/com.bloom.signer.$login_uid" 2>/dev/null || true
+  rewrite_pf_reference remove || return
+  rm -f -- \
+    "/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist" \
+    "/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist" \
+    "/etc/pf.anchors/com.bloom.triad.$login_uid" \
+    "$enrollment_root/$login_uid.json"
+  if ! find "$enrollment_root" -type f -name '*.json' -mindepth 1 -maxdepth 1 |
+    grep . >/dev/null
+  then
+    launchctl bootout "system/com.bloom.containment" 2>/dev/null || true
+    rm -f -- "/Library/LaunchDaemons/com.bloom.containment.plist"
+    rm -f -- "/Library/LaunchAgents/com.bloom.session.plist"
+    rm -rf -- "/usr/local/libexec/bloom"
+  fi
+  retained_restore_in_progress=false
+}
+
+recover_retained_restores() {
+  retained_root="$product_root/retained"
+  [[ -e "$retained_root" ]] || return
+  [[ -d "$retained_root" && ! -L "$retained_root" ]] || return 65
+  [[ "$(stat -f '%u:%Lp' "$retained_root")" == "0:700" ]] || return 65
+  shopt -s nullglob
+  retained_records=("$retained_root"/*.json)
+  shopt -u nullglob
+  for retained_record in "${retained_records[@]}"; do
+    load_retained_identity "$retained_record"
+    active_record="$enrollment_root/$login_uid.json"
+    [[ -e "$active_record" ]] || continue
+    require_live_file_metadata "$active_record" 0 0 644
+    active_state="$(read_enrollment_field "$active_record" state)"
+    case "$active_state" in
+      active)
+        require_matching_enrollment_state "$retained_record" "$active_record" active
+        rm -f -- "$retained_record"
+        ;;
+      activating)
+        require_matching_enrollment_state "$retained_record" "$active_record" activating
+        retained_restore_in_progress=true
+        rollback_retained_restore
+        $retained_restore_in_progress && return 70
+        ;;
+      *) return 65 ;;
+    esac
+  done
+  retained_record=""
 }
 
 delete_directory_record_exact() {
@@ -2000,6 +2157,7 @@ case "$action" in
       requested_login_uid="$login_uid"
       requested_login_user="$login_user"
       recover_interrupted_uninstalls
+      recover_retained_restores
       recover_interrupted_upgrade
       recover_pending_enrollments
       recover_interrupted_rotation
@@ -2141,6 +2299,32 @@ case "$action" in
         installed_release_digest="$(read_enrollment_field "$enrollment" release_digest)"
         [[ "$installed_release_digest" == "$global_installed_release_digest" ]]
         provision_committed=true
+      elif [[ -e "$product_root/retained/$login_uid.json" ]]; then
+        requested_login_uid="$login_uid"
+        requested_login_user="$login_user"
+        retained_record="$product_root/retained/$login_uid.json"
+        load_retained_identity "$retained_record"
+        [[ "$login_uid" == "$requested_login_uid" &&
+          "$login_user" == "$requested_login_user" ]] || {
+          echo "retained Bloom custody belongs to a different login identity" >&2
+          exit 65
+        }
+        retained_release_digest="$(
+          read_enrollment_field "$retained_record" release_digest
+        )"
+        [[ "$retained_release_digest" == "$BLOOM_RELEASE_DIGEST" ]] || {
+          echo "retained Bloom custody must be restored with its exact signed release" >&2
+          exit 65
+        }
+        if $has_installed_enrollments &&
+          [[ "$retained_release_digest" != "$global_installed_release_digest" ]]
+        then
+          echo "retained Bloom custody release differs from the active global triad release" >&2
+          exit 65
+        fi
+        enrollment="$enrollment_root/$login_uid.json"
+        existing_enrollment=true
+        restoring_retained=true
       else
         fresh_enrollment=true
       fi
@@ -2226,6 +2410,16 @@ case "$action" in
     broker_state="$variable_root/db/bloom/$login_uid/broker"
     signer_state="$variable_root/db/bloom/$login_uid/signer"
     runtime_root="$variable_root/run/bloom/$login_uid"
+    if $live_install && $restoring_retained; then
+      enrollment_temporary="$enrollment.restoring.$$"
+      cp "$retained_record" "$enrollment_temporary"
+      plutil -replace state -string activating "$enrollment_temporary"
+      chown root:wheel "$enrollment_temporary"
+      chmod 0644 "$enrollment_temporary"
+      mv "$enrollment_temporary" "$enrollment"
+      sync
+      retained_restore_in_progress=true
+    fi
     if $live_install && $existing_enrollment; then
       verify_installed_security_files "$config_root" "$enrollment"
     fi
@@ -2350,7 +2544,7 @@ case "$action" in
     fi
 
     enrollment_new="$enrollment.new.$$"
-    if $existing_enrollment; then
+    if $existing_enrollment && ! $restoring_retained; then
       enrollment_state=active
     else
       enrollment_state=activating
@@ -2420,6 +2614,15 @@ case "$action" in
         rm -rf -- "$enrollment_transaction"
         enrollment_transaction=""
       fi
+      if $restoring_retained; then
+        publish_enrollment_active
+        require_matching_enrollment_state "$retained_record" "$enrollment" active
+        rm -f -- "$retained_record"
+        retained_restore_in_progress=false
+        provision_committed=true
+        echo "Bloom macOS retained custody restored with its original service principals"
+        exit 0
+      fi
       provision_committed=true
       echo "Bloom macOS enrollment installed; log out and back in before first use so the login principal receives its new RPC groups"
     fi
@@ -2443,6 +2646,7 @@ case "$action" in
       requested_login_uid="$login_uid"
       requested_principal="$principal"
       recover_interrupted_uninstalls
+      recover_retained_restores
       recover_interrupted_upgrade
       recover_pending_enrollments
       recover_interrupted_rotation
@@ -2486,11 +2690,14 @@ case "$action" in
   uninstall)
     [[ $# -eq 3 ]] || usage
     validate_root_uid "$1" "$2"
-    expected="delete-bloom-login-$login_uid"
-    [[ "$3" == "$expected" ]] || {
-      echo "uninstall confirmation must equal $expected" >&2
-      exit 64
-    }
+    case "$3" in
+      "delete-bloom-login-$login_uid") uninstall_mode=permanent ;;
+      "retain-bloom-login-$login_uid") uninstall_mode=retain ;;
+      *)
+        echo "uninstall confirmation must equal delete-bloom-login-$login_uid or retain-bloom-login-$login_uid" >&2
+        exit 64
+        ;;
+    esac
     product_root="$root_prefix/Library/Application Support/BloomTriad"
     enrollment_root="$product_root/enrollments"
     enrollment="$enrollment_root/$login_uid.json"
@@ -2506,15 +2713,18 @@ case "$action" in
       acquire_installer_lock
       release_base="/usr/local/libexec/bloom"
       requested_login_uid="$login_uid"
+      requested_uninstall_mode="$uninstall_mode"
       requested_uninstall_was_pending=false
       if [[ -d "$product_root/uninstall-transactions/$login_uid" ]]; then
         requested_uninstall_was_pending=true
       fi
       recover_interrupted_uninstalls
+      recover_retained_restores
       recover_interrupted_upgrade
       recover_pending_enrollments
       recover_interrupted_rotation
       login_uid="$requested_login_uid"
+      uninstall_mode="$requested_uninstall_mode"
       enrollment="$enrollment_root/$login_uid.json"
       broker_user="bloom-broker-$login_uid"
       broker_group="$broker_user"
@@ -2523,23 +2733,45 @@ case "$action" in
       machine_broker_group="bloom-machine-broker-$login_uid"
       broker_signer_group="bloom-broker-signer-$login_uid"
       revoke_group="bloom-revoke-$login_uid"
-      if $requested_uninstall_was_pending && [[ ! -e "$enrollment" ]]; then
+      retained_record="$product_root/retained/$login_uid.json"
+      if [[ ! -e "$enrollment" && -e "$retained_record" ]]; then
+        if [[ "$uninstall_mode" == "retain" ]]; then
+          load_retained_identity "$retained_record"
+          echo "Bloom macOS runtime integration is already removed; encrypted custody state remains retained"
+          exit 0
+        fi
+        load_retained_identity "$retained_record"
+        enrollment="$retained_record"
+        deleting_retained=true
+      elif [[ -e "$enrollment" ]]; then
+        [[ -f "$enrollment" && ! -L "$enrollment" ]] || {
+          echo "enrollment record is missing or invalid" >&2
+          exit 66
+        }
+        require_live_file_metadata "$enrollment" 0 0 644
+        login_user="$(read_enrollment_field "$enrollment" login_user)"
+        verify_existing_enrollment
+      elif $requested_uninstall_was_pending; then
         echo "Bloom macOS enrollment uninstall resumed and completed"
         exit 0
-      fi
-      [[ -f "$enrollment" && ! -L "$enrollment" ]] || {
+      else
         echo "enrollment record is missing or invalid" >&2
         exit 66
-      }
-      require_live_file_metadata "$enrollment" 0 0 644
-      login_user="$(read_enrollment_field "$enrollment" login_user)"
-      verify_existing_enrollment
+      fi
       provision_committed=true
       prepare_uninstall_transaction
       execute_uninstall_transaction
-      echo "Bloom macOS enrollment permanently removed; custody state is not recoverable"
+      if [[ "$uninstall_mode" == "retain" ]]; then
+        echo "Bloom macOS runtime integration removed; encrypted custody state is retained and recoverable with the exact signed release"
+      else
+        echo "Bloom macOS enrollment permanently removed; custody state is not recoverable"
+      fi
       exit 0
     else
+      [[ "$uninstall_mode" == "permanent" ]] || {
+        echo "retain-custody uninstall is available only for a live macOS enrollment" >&2
+        exit 69
+      }
       variable_root="$root_prefix/var"
     fi
     rm -f -- \

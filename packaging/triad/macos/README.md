@@ -78,9 +78,21 @@ later installer invocation resumes stopping integration, removing only the
 recorded login's files, deleting Directory Service records only when their
 numeric IDs still match, and finally removing global integration when no
 enrollment remains. The disposable W0 lane kills an uninstall after its
-journal becomes durable and verifies forward recovery. The architecture's
-retain-custody uninstall mode is not yet exposed; the implemented confirmation
-token explicitly selects permanent deletion and reports it as unrecoverable.
+journal becomes durable and verifies forward recovery.
+
+The distinct `retain-bloom-login-LOGIN_UID` confirmation removes the jobs,
+packet-filter integration, and public enrollment while preserving the exact
+service accounts, private configuration, and service-owned custody state. A
+root-only retained record carries the original numeric identities and release
+digest. Reinstalling that exact signed release verifies the retained
+filesystem and Directory Service boundaries, publishes only an `activating`
+record, and removes the retained record only after authenticated Broker and
+Signer health succeeds. Interrupted or failed restoration returns to the
+retained, unavailable state. When other enrollments are active, restoration
+also requires that their one global release already matches the retained
+release; the installer never downgrades or mixes the active set to satisfy a
+restore. `delete-bloom-login-LOGIN_UID` remains the separate irreversible path
+and can permanently delete an already-retained enrollment.
 
 Production enrollment invokes the installed Machine binary's root-only
 enrollment-material mode against the signed public templates in `config/`.

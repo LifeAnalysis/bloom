@@ -65,8 +65,11 @@ input and its root-staged copy against immutable identity and containment
 fields, and rolls back the prior config and loaded-job set on failed health or
 interruption. Permanent macOS uninstall records exact deletion intent before
 unpublishing Machine access and resumes idempotently after interruption; its
-confirmation token is deliberately distinct from the future retain-custody
-mode.
+confirmation token is deliberately distinct from retain-custody uninstall.
+The retain token removes runtime integration while preserving the exact
+service principals, private configuration, and custody state; restoration
+requires the same signed release and publishes Machine access only after
+authenticated health succeeds.
 The Linux AWS KMS profile requires credentials and a non-wildcard reviewed
 CIDR allowlist together; reinstall without that pair removes any prior
 instance credential and egress drop-in.

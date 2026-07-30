@@ -596,6 +596,47 @@ if [[ -n "$failing_upgrade_payload" ]]; then
   assert_active_release "$baseline_digest"
 fi
 
+"$installer" uninstall / "$login_uid" "retain-bloom-login-$login_uid"
+retained_record="/Library/Application Support/BloomTriad/retained/$login_uid.json"
+[[ ! -e "$enrollment" && -f "$retained_record" ]] || {
+  echo "retain-custody uninstall did not unpublish the active enrollment" >&2
+  exit 1
+}
+[[ "$(plutil -extract state raw -o - "$retained_record")" == "retained" ]]
+[[ -f "$broker_probe" && -f "$signer_probe" ]] || {
+  echo "retain-custody uninstall removed service-owned state" >&2
+  exit 1
+}
+if launchctl print "system/com.bloom.broker.$login_uid" >/dev/null 2>&1 ||
+  launchctl print "system/com.bloom.signer.$login_uid" >/dev/null 2>&1
+then
+  echo "retain-custody uninstall left a service job loaded" >&2
+  exit 1
+fi
+for kind_and_name in \
+  "Users bloom-broker-$login_uid" \
+  "Users bloom-signer-$login_uid" \
+  "Groups bloom-broker-$login_uid" \
+  "Groups bloom-signer-$login_uid" \
+  "Groups bloom-machine-broker-$login_uid" \
+  "Groups bloom-broker-signer-$login_uid" \
+  "Groups bloom-revoke-$login_uid"
+do
+  kind="${kind_and_name%% *}"
+  name="${kind_and_name#* }"
+  dscl . -read "/$kind/$name" >/dev/null
+done
+"$installer" install / "$login_uid" "$login_user" "$current_good_payload"
+[[ -f "$enrollment" && ! -e "$retained_record" ]] || {
+  echo "retained custody was not republished after authenticated restoration" >&2
+  exit 1
+}
+assert_active_release "$(field release_digest)"
+[[ -f "$broker_probe" && -f "$signer_probe" ]] || {
+  echo "retained custody state did not survive restoration" >&2
+  exit 1
+}
+
 uninstall_transaction="/Library/Application Support/BloomTriad/uninstall-transactions/$login_uid"
 "$installer" uninstall / "$login_uid" "delete-bloom-login-$login_uid" &
 interrupted_uninstall_pid=$!
