@@ -3,6 +3,18 @@
 This directory is source input for the signed installer. It is not installed
 directly from a source checkout.
 
+These templates implement the Unix-principal profile in
+`docs/specs/2026-07-29-macos-unix-principal-isolation.md`. They do not implement
+the candidate rootless code-identity profile in
+`docs/specs/2026-07-30-macos-rootless-code-identity-isolation.md`.
+
+In particular, the rootless profile intentionally keeps Machine unsandboxed,
+uses Team-ID-prefixed App Groups plus profile-authorized restricted Keychain
+access groups, packages each service as an app-like helper with an embedded
+Developer ID profile, embeds LaunchAgents for `SMAppService`, and has a
+different enrollment/update protocol. A release must not combine these
+templates with a `macos-rootless-code-identity` platform claim.
+
 `com.bloom.broker.plist.in` deliberately gives launchd ownership of the
 Machine→Broker socket, the revocation-control socket, and the canonical
 `127.0.0.1:18734` ceremony listener. The installer renders every `@...@`
