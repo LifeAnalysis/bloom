@@ -277,8 +277,16 @@ async function approve(mode){
   try{
     if(!navigator.credentials||!navigator.credentials.get)throw new Error('WebAuthn is not available in this browser. Try Chrome or Safari on this device.');
     var challengeResponse=await fetch(PATH+'/challenge');
-    if(!challengeResponse.ok)throw new Error('Could not prepare the passkey challenge (HTTP '+challengeResponse.status+').');
-    var opts=await challengeResponse.json();
+    var opts=await challengeResponse.json().catch(function(){return null;});
+    if(!challengeResponse.ok){
+      var fallback=challengeResponse.status===410
+        ?'This approval URL has expired or was already used.'
+        :challengeResponse.status===404
+          ?'Unknown approval URL.'
+          :'Could not prepare the passkey challenge (HTTP '+challengeResponse.status+').';
+      throw new Error(opts&&opts.error?opts.error:fallback);
+    }
+    if(!opts)throw new Error('Bloom returned an empty approval challenge.');
     opts.publicKey.challenge=dec(opts.publicKey.challenge);
     if(opts.publicKey.allowCredentials)opts.publicKey.allowCredentials=opts.publicKey.allowCredentials.map(function(c){return Object.assign({},c,{id:dec(c.id)});});
     if(opts.publicKey.extensions&&opts.publicKey.extensions.prf&&opts.publicKey.extensions.prf.eval&&opts.publicKey.extensions.prf.eval.first)opts.publicKey.extensions.prf.eval.first=dec(opts.publicKey.extensions.prf.eval.first);

@@ -234,7 +234,7 @@ async fn page(State(state): State<CeremonyState>, Path(token): Path<String>) -> 
 async fn plan_json(State(state): State<CeremonyState>, Path(token): Path<String>) -> Response {
     let (challenge, action) = match resolve(&state.daemon.auth_services, &token).await {
         Ok(v) => v,
-        Err(status) => return status.into_response(),
+        Err(status) => return resolution_error_json(status),
     };
     Json(serde_json::json!({
         "wallet": challenge.wallet,
@@ -252,7 +252,7 @@ async fn plan_json(State(state): State<CeremonyState>, Path(token): Path<String>
 async fn challenge_json(State(state): State<CeremonyState>, Path(token): Path<String>) -> Response {
     let (challenge, _action) = match resolve(&state.daemon.auth_services, &token).await {
         Ok(v) => v,
-        Err(status) => return status.into_response(),
+        Err(status) => return resolution_error_json(status),
     };
     let unsigned = unsigned_for(&challenge, None);
     match state
@@ -319,6 +319,14 @@ fn err_json(status: StatusCode, msg: impl Into<String>) -> Response {
         Json(serde_json::json!({ "ok": false, "error": msg.into() })),
     )
         .into_response()
+}
+
+fn resolution_error_json(status: StatusCode) -> Response {
+    match status {
+        StatusCode::GONE => err_json(status, "approval URL expired or already used"),
+        StatusCode::NOT_FOUND => err_json(status, "unknown approval URL"),
+        _ => err_json(status, "could not resolve approval URL"),
+    }
 }
 
 async fn revoke_grant_and_drop_cache(
@@ -696,6 +704,30 @@ mod tests {
         let (services, token) = services_with_challenge("act-1", "p", 2).await;
         let err = resolve(&services, &token).await.unwrap_err();
         assert_eq!(err, StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn resolution_errors_have_json_bodies() {
+        for (status, expected_error) in [
+            (StatusCode::GONE, "approval URL expired or already used"),
+            (StatusCode::NOT_FOUND, "unknown approval URL"),
+        ] {
+            let response = resolution_error_json(status);
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["ok"], false);
+            assert_eq!(value["error"], expected_error);
+        }
+    }
+
+    #[test]
+    fn ceremony_page_handles_empty_or_error_challenge_responses() {
+        assert!(CEREMONY_HTML.contains("challengeResponse.json().catch("));
+        assert!(CEREMONY_HTML.contains("if(!challengeResponse.ok)"));
+        assert!(CEREMONY_HTML.contains("Bloom returned an empty approval challenge."));
     }
 
     /// Endpoint separation: `/ceremony/{token}` serves only resolvable Sealed
