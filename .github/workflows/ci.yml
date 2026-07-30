@@ -186,6 +186,16 @@ jobs:
           --test macos_launchd_retry
           -- --nocapture
 
+  macos_unix_principal_disposable_w0:
+    name: macOS Unix-principal disposable W0
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref_name == 'triad-architecture'
+    uses: ./.github/workflows/macos-unix-w0.yml
+    with:
+      broker_ref: master
+      signer_ref: master
+
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation
     runs-on: ubuntu-latest

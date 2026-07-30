@@ -64,6 +64,11 @@ criterion files after success, and removes those markers in an unconditional
 cleanup step. The workflow does not produce or advertise a production
 platform claim.
 
+The workflow is also reusable. Until its standalone filename reaches the
+default branch, manually dispatching the existing `CI` workflow at
+`triad-architecture` calls the same disposable W0 job from that exact commit.
+Pull requests and ordinary pushes never enter the destructive lane.
+
 The lane currently proves account/group shape, non-transitive membership,
 root/service filesystem ownership, explicit checkpoint/config/database
 negative reads, immutable release/plist/manifest/packet-filter replacement

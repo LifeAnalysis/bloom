@@ -1,6 +1,18 @@
 name: macOS Unix-principal W0
 
 on:
+  workflow_call:
+    inputs:
+      broker_ref:
+        description: Public bloom-broker ref
+        required: false
+        type: string
+        default: master
+      signer_ref:
+        description: Public bloom-signer ref
+        required: false
+        type: string
+        default: master
   workflow_dispatch:
     inputs:
       broker_ref:
