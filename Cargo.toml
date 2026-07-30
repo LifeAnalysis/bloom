@@ -15,7 +15,6 @@ members = [
   "crates/bloom-keystore",
   "crates/bloom-mempool",
   "crates/bloom-machine-client",
-  "crates/bloom-defi",
   "crates/bloom-hyperliquid",
   "crates/bloom-watch",
   "crates/bloom-mount",
@@ -37,7 +36,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -124,7 +123,6 @@ bloom-paid-mpp = { path = "crates/bloom-paid-mpp" }
 bloom-paid-x402 = { path = "crates/bloom-paid-x402" }
 bloom-paid-http = { path = "crates/bloom-paid-http" }
 bloom-tools    = { path = "crates/bloom-tools" }
-bloom-defi     = { path = "crates/bloom-defi" }
 bloom-hyperliquid = { path = "crates/bloom-hyperliquid" }
 bloom-watch    = { path = "crates/bloom-watch" }
 bloom-mount    = { path = "crates/bloom-mount" }

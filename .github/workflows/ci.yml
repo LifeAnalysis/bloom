@@ -241,7 +241,6 @@ jobs:
     env:
       BLOOM_MAINNET_RPC: ${{ secrets.BLOOM_MAINNET_RPC }}
       BLOOM_ETHERSCAN_KEY: ${{ secrets.BLOOM_ETHERSCAN_KEY }}
-      BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
@@ -259,7 +258,7 @@ jobs:
           path: target
       - name: Report external secret availability
         run: |
-          for name in BLOOM_MAINNET_RPC BLOOM_ETHERSCAN_KEY BLOOM_ENSO_KEY; do
+          for name in BLOOM_MAINNET_RPC BLOOM_ETHERSCAN_KEY; do
             if [ -n "${!name:-}" ]; then
               echo "$name=available"
             else
@@ -273,7 +272,7 @@ jobs:
             --run-ignored ignored-only \
             --no-fail-fast
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
-            -E 'kind(lib) and (package(bloom-defi) or package(bloom-etherscan) or package(bloom-prices))' \
+            -E 'kind(lib) and (package(bloom-etherscan) or package(bloom-prices))' \
             --run-ignored ignored-only \
             --no-fail-fast
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
@@ -281,8 +280,7 @@ jobs:
             --run-ignored ignored-only \
             --no-fail-fast
 
-  # Heavy docker suites are opt-in via workflow_dispatch only; each mode
-  # self-skips when its required secrets are absent.
+  # The heavy docker mount suite is opt-in via workflow_dispatch only.
   docker:
     name: docker (${{ matrix.mode }})
     runs-on: ubuntu-latest
@@ -290,15 +288,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [mount, enso, enso-live]
-    env:
-      BLOOM_ENSO_KEY: ${{ secrets.BLOOM_ENSO_KEY }}
-      BLOOM_LIVE_HOME: ${{ secrets.BLOOM_LIVE_HOME }}
-      BLOOM_LIVE_DEST1: ${{ secrets.BLOOM_LIVE_DEST1 }}
-      BLOOM_PASSPHRASE: ${{ secrets.BLOOM_PASSPHRASE }}
-      BLOOM_BASE_RPC_URL: ${{ secrets.BLOOM_BASE_RPC_URL }}
-      BLOOM_SWAP_AMOUNT_ETH: ${{ secrets.BLOOM_SWAP_AMOUNT_ETH }}
-      BLOOM_RUN_LIVE_FUNDS_E2E: ${{ secrets.BLOOM_RUN_LIVE_FUNDS_E2E }}
+        mode: [mount]
     steps:
       - uses: actions/checkout@v6
       - name: Run docker ${{ matrix.mode }} suite
@@ -306,20 +296,6 @@ jobs:
           case "${{ matrix.mode }}" in
             mount)
               bash tests/docker/run.sh --mount
-              ;;
-            enso)
-              if [ -z "${BLOOM_ENSO_KEY:-}" ]; then
-                echo "BLOOM_ENSO_KEY missing; skipping docker --enso e2e."
-                exit 0
-              fi
-              bash tests/docker/run.sh --enso
-              ;;
-            enso-live)
-              if [ "${BLOOM_RUN_LIVE_FUNDS_E2E:-}" != "1" ]; then
-                echo "BLOOM_RUN_LIVE_FUNDS_E2E is not 1; skipping real-funds e2e."
-                exit 0
-              fi
-              bash tests/docker/run.sh --enso-live
               ;;
           esac
 

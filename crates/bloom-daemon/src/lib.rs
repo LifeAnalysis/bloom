@@ -39,7 +39,6 @@ use bloom_auth_api::{
 };
 use bloom_evm::{ChainClient, ChainRegistry};
 
-use bloom_defi::EnsoClient;
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
@@ -72,9 +71,9 @@ use bloom_tx::tx_engine::{Eip1559FeeOverrides, TxEngine};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
-    AddressBookHandler, CentralOutbox, ChainsHandler, DefiHandler, DocsHandler, EnsHandler,
-    HyperliquidHandler, OutboxHandler, PricesHandler, RequestsHandler, SimulateHandler,
-    StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
+    AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, HyperliquidHandler,
+    OutboxHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler, ToolsHandler,
+    WalletsHandler, WatchHandler,
 };
 use bloom_vfs::{AuthServices, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
@@ -2429,6 +2428,9 @@ impl Daemon {
         };
         let petal_app_host = Arc::new(petal_app_host);
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
+        let petals_for_docs = petals.clone();
+        let petals_doc_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
+            Arc::new(move || render_installed_petals_doc(&petals_for_docs));
 
         let mut vfs_builder = Vfs::builder()
             .mount(
@@ -2520,7 +2522,10 @@ impl Daemon {
                 ) as _,
             )
             .mount("status", status_handler.clone() as _)
-            .mount("docs", Arc::new(DocsHandler::new()) as _)
+            .mount(
+                "docs",
+                Arc::new(DocsHandler::new().with_petals_renderer(petals_doc_renderer)) as _,
+            )
             .mount(
                 "simulate",
                 Arc::new(SimulateHandler::new(
@@ -2551,60 +2556,6 @@ impl Daemon {
                         .map_err(|e| DaemonError::Audit(e.to_string()))?,
                 ) as _,
             );
-
-        // DeFi: Enso's public REST works without an API key for chains
-        // they support keyless (currently quote+route on Base mainnet).
-        // Mount whenever an `[enso]` block exists in config; an empty
-        // api_key just means unauthenticated calls (rate-limited).
-        if let Some(enso_cfg) = &config.enso {
-            let mut enso = EnsoClient::new(&enso_cfg.api_key);
-            match url::Url::parse(&enso_cfg.api_url) {
-                Ok(url) => {
-                    debug!(api_url = %url, "daemon.enso_configured");
-                    enso = enso.with_base_url(url);
-                }
-                Err(e) => {
-                    warn!(api_url = %enso_cfg.api_url, error = %e, "daemon.enso_url_invalid_using_default");
-                }
-            }
-            if enso_cfg.api_key.is_empty() {
-                warn!("enso api_key empty; mounting defi/ for keyless access (rate-limited)");
-            }
-            debug!("daemon.defi_mounted");
-            // Hyperliquid deposit goal: bridge address + deposit chain, from
-            // `[hyperliquid]` config when present, else the mainnet defaults.
-            let (hl_bridge, hl_deposit_chain_id) = {
-                let cfg = config.hyperliquid.clone().unwrap_or_default();
-                let bridge = cfg.bridge_address.parse().unwrap_or_else(|_| {
-                    warn!(addr = %cfg.bridge_address, "daemon.hyperliquid_bridge_invalid_using_default");
-                    bloom_proto::hyperliquid::MAINNET_BRIDGE
-                        .parse()
-                        .expect("valid bridge const")
-                });
-                (bridge, cfg.deposit_chain_id)
-            };
-            vfs_builder = vfs_builder.mount(
-                "defi",
-                Arc::new(
-                    DefiHandler::new(
-                        enso,
-                        chains.clone(),
-                        keystore.clone(),
-                        tx_engine.clone(),
-                        address_book_arc.clone(),
-                    )
-                    .with_auth_services(auth_services.clone())
-                    .with_price_oracle(price_oracle.clone())
-                    .with_home_write_permit_opt(home_write_permit.clone())
-                    .with_default_chain(config.default_chain.clone())
-                    .with_store_root(home.root().join("defi"))
-                    .with_revert_decoder(decoder_chain.clone())
-                    .with_hyperliquid(hl_bridge, hl_deposit_chain_id),
-                ) as _,
-            );
-        } else {
-            debug!("daemon.defi_skipped: no [enso] config");
-        }
 
         // /next.md — brutally-scoped next-action aggregator for agents.
         // Answers: what wallets need attention, what confirms are pending,
@@ -2916,7 +2867,6 @@ impl Daemon {
             home = %home.root().display(),
             chains = ?config.chains.keys().collect::<Vec<_>>(),
             etherscan = etherscan_arc.is_some(),
-            enso = config.enso.is_some(),
             ens_resolver = ens_client.is_some(),
             heimdall = cfg!(feature = "bytecode-decompile"),
             "daemon.built"
@@ -3169,6 +3119,61 @@ fn pick_ens_client(chains: &ChainRegistry) -> Option<EnsClient> {
     None
 }
 
+fn render_installed_petals_doc(petals: &PetalRunner) -> Vec<u8> {
+    match petals.installed_petal_discovery() {
+        Ok(installed) => render_petal_discovery_markdown(&installed),
+        Err(error) => {
+            warn!(error = %error, "daemon.petals_docs_render_failed");
+            format!(
+                "# Installed Petals\n\n\
+                 Bloom could not read the installed Petal manifests: `{error}`\n"
+            )
+            .into_bytes()
+        }
+    }
+}
+
+fn render_petal_discovery_markdown(installed: &[bloom_petals::package::PetalDiscovery]) -> Vec<u8> {
+    let mut markdown = String::from(
+        "# Installed Petals\n\n\
+         This file is generated from the immutable `petal.toml` manifests of \
+         the Petals installed in this Bloom home.\n\n",
+    );
+    if installed.is_empty() {
+        markdown.push_str("No Petals are currently installed.\n");
+        return markdown.into_bytes();
+    }
+
+    for petal in installed {
+        let summary = petal
+            .summary
+            .as_deref()
+            .map(|summary| summary.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or_else(|| "No consent summary was declared.".to_string());
+        let capabilities = if petal.capabilities.is_empty() {
+            "none".to_string()
+        } else {
+            petal
+                .capabilities
+                .iter()
+                .map(|capability| format!("`{capability}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        markdown.push_str(&format!(
+            "## `{name}`\n\n\
+             - Directory: `petals/{name}/`\n\
+             - Summary: {summary}\n\
+             - Declared capabilities: {capabilities}\n\
+             - Package documentation: `petals/{name}/README.md`, \
+             `petals/{name}/AGENTS.md`\n\n",
+            name = petal.name,
+        ));
+    }
+    markdown.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3195,6 +3200,21 @@ mod tests {
             bloom_tx::TxEngineError::ApprovalRequired(requirement),
             bloom_tx::TxEngineError::ApprovalRequired(_)
         ));
+    }
+
+    #[test]
+    fn installed_petal_markdown_exposes_mount_summary_and_capabilities() {
+        let markdown = render_petal_discovery_markdown(&[bloom_petals::package::PetalDiscovery {
+            name: "enso".into(),
+            summary: Some("Request routes,\n simulate, and stage swap transactions.".into()),
+            capabilities: vec!["bloom:chain".into(), "bloom:tx.outbox".into()],
+        }]);
+        let markdown = String::from_utf8(markdown).unwrap();
+        assert!(markdown.contains("## `enso`"));
+        assert!(markdown.contains("`petals/enso/`"));
+        assert!(markdown.contains("Request routes, simulate, and stage swap transactions."));
+        assert!(markdown.contains("`bloom:chain`, `bloom:tx.outbox`"));
+        assert!(markdown.contains("`petals/enso/README.md`"));
     }
 
     #[test]

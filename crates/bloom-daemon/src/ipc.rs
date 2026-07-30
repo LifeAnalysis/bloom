@@ -721,7 +721,6 @@ summary = "Demo app used by IPC tests."
         }
 
         for path in [
-            "/defi/intents/minnow/0001/confirm",
             // policy.toml now reaches the VFS handler, which stages a Sealed
             // Approval for passkey wallets rather than being denied at the lane.
             "/wallets/minnow/policy.toml",

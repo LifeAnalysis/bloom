@@ -16,8 +16,9 @@ All paths below are relative to the Bloom VFS root.
 - `defi/intents/` — Enso-mediated DeFi intents (write `quote` / `execute`).
 - `hyperliquid/` — HyperCore reads plus signed exchange and agent-session
   writes; read `hyperliquid/README.md` for the mounted workflow documentation.
-- `petals/<name>/` — installed external Petal surfaces. Polymarket is provided
-  by the default pre-installed package at `petals/polymarket/`, not built in.
+- `petals/<name>/` — installed wallet extensions. Read `docs/petals.md` for
+  the exact installed names, mount directories, consent summaries, and
+  declared capabilities.
 - `watch/` — long-running subscriptions (head, addr, log) executed by the
   daemon and persisted to JSONL.
 - `simulate/` — out-of-band tx simulation with state overrides
@@ -265,34 +266,22 @@ echo replace > /bloom/wallets/alice/chains/ethereum/outbox/pending/<id>/replace
 echo cancel  > /bloom/wallets/alice/chains/ethereum/outbox/pending/<id>/cancel
 ```
 
-DeFi intent (Enso shortcuts) — natural language is the canonical input;
-JSON works too. If `defi/` is present, use it directly:
+The pre-installed Enso Petal accepts natural-language or JSON swap intents at
+its own application mount:
 
 ```sh
 echo 'swap 0.1 eth to USDC on base' \
-  > /bloom/defi/intents/alice/new
-ls /bloom/defi/intents/alice/
-cat /bloom/defi/intents/alice/<sess>/plan.md
-echo y > /bloom/defi/intents/alice/<sess>/confirm
+  > /bloom/petals/enso/intents/alice/new
+ls /bloom/petals/enso/intents/alice/
+cat /bloom/petals/enso/intents/alice/<sess>/plan.md
+cat /bloom/petals/enso/intents/alice/<sess>/simulation.json
+echo confirm > /bloom/petals/enso/intents/alice/<sess>/confirm
 ```
 
-ERC-20 token-in routes auto-prepend an `approve(spender, max)` ahead
-of the swap when the current allowance is insufficient.
-
-Deposit to Hyperliquid is a first-class goal:
-
-```sh
-echo 'deposit 5 USDC to hyperliquid' > /bloom/defi/intents/alice/new
-```
-
-It stages a USDC transfer to the Hyperliquid Bridge2 contract on Arbitrum
-(the deposit primitive). Guardrails, before anything is staged:
-- only **native USDC on Arbitrum** is credited — a non-Arbitrum source is
-  rejected with guidance to consolidate to Arbitrum USDC first (sending
-  Base/Polygon USDC straight to the bridge does **not** credit);
-- deposits **below 5 USDC are refused** (the bridge does not credit them and
-  does not auto-return them);
-- cross-chain dust deposits warn when gas likely exceeds value.
+If an ERC-20 approval is required, the first Petal confirmation stages only
+the exact-amount approval. Broadcast it, wait for a successful receipt, and
+confirm the Petal session again to simulate and stage the swap. Read the
+installed Petal's `/petals/enso/README.md` for its current route contract.
 
 Subscribe + read (TOML body, kinds: `block`, `balance`, `gas_price`,
 `event`):
