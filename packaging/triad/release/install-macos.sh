@@ -92,10 +92,45 @@ require_disposable_w0_host() {
 
 acquire_installer_lock() {
   installer_lock="/private/var/run/bloom-triad-installer.lock"
-  mkdir "$installer_lock" 2>/dev/null || {
-    echo "another Bloom installer is active" >&2
-    exit 75
-  }
+  if ! mkdir -m 0700 "$installer_lock" 2>/dev/null; then
+    [[ -d "$installer_lock" && ! -L "$installer_lock" ]] || {
+      echo "Bloom installer lock has an unsafe type" >&2
+      exit 65
+    }
+    [[ "$(stat -f '%u:%Lp' "$installer_lock")" == "0:700" ]] || {
+      echo "Bloom installer lock has unsafe ownership or mode" >&2
+      exit 65
+    }
+    lock_pid=""
+    if [[ -f "$installer_lock/pid" && ! -L "$installer_lock/pid" ]]; then
+      lock_pid="$(<"$installer_lock/pid")"
+    fi
+    if [[ "$lock_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$lock_pid" 2>/dev/null; then
+      echo "another Bloom installer is active" >&2
+      exit 75
+    fi
+    if [[ -n "$(find "$installer_lock" -mindepth 1 -maxdepth 1 \
+      ! -name pid -print -quit)" ]]
+    then
+      echo "stale Bloom installer lock contains unexpected files" >&2
+      exit 65
+    fi
+    rm -f -- "$installer_lock/pid"
+    rmdir "$installer_lock" || {
+      echo "could not reclaim the stale Bloom installer lock" >&2
+      exit 75
+    }
+    mkdir -m 0700 "$installer_lock" || {
+      echo "another Bloom installer acquired the lock" >&2
+      exit 75
+    }
+  fi
+  chown root:wheel "$installer_lock"
+  chmod 0700 "$installer_lock"
+  printf '%s\n' "$$" > "$installer_lock/pid"
+  chown root:wheel "$installer_lock/pid"
+  chmod 0600 "$installer_lock/pid"
+  sync
 }
 
 release_installer_lock() {
@@ -133,6 +168,7 @@ release_installer_lock() {
     generated_material=""
   fi
   if [[ -n "$installer_lock" && -d "$installer_lock" ]]; then
+    rm -f -- "$installer_lock/pid"
     rmdir "$installer_lock"
   fi
   installer_lock=""

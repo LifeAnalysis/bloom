@@ -2,14 +2,22 @@
 set -Eeuo pipefail
 
 usage() {
-  echo "usage: run-disposable.sh PAYLOAD_DIR LOGIN_UID LOGIN_USER" >&2
+  echo "usage: run-disposable.sh PAYLOAD_DIR LOGIN_UID LOGIN_USER [UPGRADE_PAYLOAD [FAILING_UPGRADE_PAYLOAD]]" >&2
   exit 64
 }
 
-[[ $# -eq 3 ]] || usage
+[[ $# -ge 3 && $# -le 5 ]] || usage
 payload="$(cd "$1" && pwd -P)"
 login_uid="$2"
 login_user="$3"
+upgrade_payload=""
+failing_upgrade_payload=""
+if [[ $# -ge 4 ]]; then
+  upgrade_payload="$(cd "$4" && pwd -P)"
+fi
+if [[ $# -eq 5 ]]; then
+  failing_upgrade_payload="$(cd "$5" && pwd -P)"
+fi
 [[ "$login_uid" =~ ^[1-9][0-9]*$ ]] || usage
 [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || usage
 
@@ -29,6 +37,13 @@ fi
   echo "W0 payload has the wrong platform claim" >&2
   exit 65
 }
+for additional_payload in "$upgrade_payload" "$failing_upgrade_payload"; do
+  [[ -z "$additional_payload" ]] && continue
+  [[ "$(<"$additional_payload/PLATFORM_CLAIM")" == "macos-unix-principals-w0" ]] || {
+    echo "W0 upgrade payload has the wrong platform claim" >&2
+    exit 65
+  }
+done
 [[ "$(id -u "$login_user")" == "$login_uid" ]] || {
   echo "W0 login name and UID do not match" >&2
   exit 65
@@ -283,5 +298,84 @@ sudo -u "$login_user" \
   "$machine_binary" \
   --triad-health-check \
   "$release_digest"
+
+assert_active_release() {
+  expected_digest="$1"
+  [[ "$(field state)" == "active" ]]
+  [[ "$(field release_digest)" == "$expected_digest" ]]
+  current_target="$(readlink /usr/local/libexec/bloom/current)"
+  [[ "$current_target" == "releases/$expected_digest" ]]
+  sudo -u "$login_user" \
+    /usr/local/libexec/bloom/current/bloom \
+    --triad-health-check \
+    "$expected_digest"
+}
+
+current_good_payload="$payload"
+if [[ -n "$upgrade_payload" ]]; then
+  prior_digest="$(field release_digest)"
+  "$installer" install / "$login_uid" "$login_user" "$upgrade_payload"
+  upgraded_digest="$(field release_digest)"
+  [[ "$upgraded_digest" != "$prior_digest" ]] || {
+    echo "W0 upgrade payload did not produce a new release digest" >&2
+    exit 65
+  }
+  assert_active_release "$upgraded_digest"
+  current_good_payload="$upgrade_payload"
+fi
+
+if [[ -n "$failing_upgrade_payload" ]]; then
+  baseline_digest="$(field release_digest)"
+  set +e
+  "$installer" install / "$login_uid" "$login_user" "$failing_upgrade_payload"
+  failed_status=$?
+  set -e
+  [[ "$failed_status" -ne 0 ]] || {
+    echo "failing W0 upgrade unexpectedly activated" >&2
+    exit 1
+  }
+  assert_active_release "$baseline_digest"
+
+  "$installer" \
+    install \
+    / \
+    "$login_uid" \
+    "$login_user" \
+    "$failing_upgrade_payload" &
+  interrupted_pid=$!
+  upgrade_phase="/Library/Application Support/BloomTriad/upgrade-transaction/phase"
+  deadline=$((SECONDS + 30))
+  while [[ $SECONDS -lt $deadline ]]; do
+    if [[ -f "$upgrade_phase" ]] &&
+      [[ "$(<"$upgrade_phase")" == "activating" ]]
+    then
+      break
+    fi
+    if ! kill -0 "$interrupted_pid" 2>/dev/null; then
+      echo "W0 upgrade exited before its interruption point" >&2
+      wait "$interrupted_pid" || true
+      exit 1
+    fi
+    sleep 0.05
+  done
+  [[ -f "$upgrade_phase" && "$(<"$upgrade_phase")" == "activating" ]] || {
+    echo "W0 did not observe the upgrade activation phase" >&2
+    kill "$interrupted_pid" 2>/dev/null || true
+    wait "$interrupted_pid" || true
+    exit 1
+  }
+  kill -9 "$interrupted_pid"
+  wait "$interrupted_pid" 2>/dev/null || true
+  [[ -d "/Library/Application Support/BloomTriad/upgrade-transaction" ]] || {
+    echo "interrupted W0 upgrade did not leave a recovery journal" >&2
+    exit 1
+  }
+  "$installer" install / "$login_uid" "$login_user" "$current_good_payload"
+  [[ ! -e "/Library/Application Support/BloomTriad/upgrade-transaction" ]] || {
+    echo "W0 upgrade recovery did not consume its journal" >&2
+    exit 1
+  }
+  assert_active_release "$baseline_digest"
+fi
 
 echo "Bloom macOS Unix-principal disposable W0 isolation checks passed"

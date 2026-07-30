@@ -1,6 +1,7 @@
 # Disposable macOS W0 lane
 
-`run-disposable.sh` is destructive integration testing for the
+`run-disposable.sh PAYLOAD UID USER [UPGRADE_PAYLOAD
+[FAILING_UPGRADE_PAYLOAD]]` is destructive integration testing for the
 `macos-unix-principals-w0` bundle claim. It creates Directory Service users and
 groups, installs system LaunchDaemons, modifies the dedicated Bloom block in
 `/etc/pf.conf`, and removes them afterward.
@@ -29,7 +30,9 @@ containment attestation to turn unavailable, proves authenticated triad health
 fails, and then restores and re-verifies the anchor. It also constructs a
 durable interrupted-enrollment intent plus its exact partial Directory Service
 record and proves the next installer invocation removes both without adopting
-the record. Foreign/cross-login listener conflict, actual logout handoff,
-network attempts, hostile session authentication, release-upgrade
-interruption, and destructive upgrade rollback cases remain required before
-the W0 claim can graduate.
+the record. When the optional bundles are supplied, it also proves a
+complete-version upgrade, activation-failure rollback, `SIGKILL` during the
+activating phase, stale PID-lock reclamation, journal recovery, and restoration
+of the exact prior healthy digest. Foreign/cross-login listener conflict,
+actual logout handoff, network attempts, and hostile session authentication
+remain required before the W0 claim can graduate.
