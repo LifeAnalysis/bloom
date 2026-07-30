@@ -322,10 +322,14 @@ No Keychain access group is required.
 - secrets never appear in plist files, process arguments, logs, status files,
   or the release bundle.
 
-The edge manifest pins `macos-managed-timed`. Broker and Signer use the
-existing trusted-time backstop and fail closed on untrusted synchronization,
-rollback, or an unconfirmed repair. The disposable test lane must prove the
-required time query is available to both service UIDs.
+The edge manifest pins `macos-managed-timed`. The root platform monitor
+verifies that automatic network time is enabled and the system
+`com.apple.timed` service is loaded, and includes that result in its fresh,
+root-owned, exact-build platform status. Broker and Signer accept macOS wall
+time only while that status remains valid; they still fail closed on a missing
+attestation, rollback, or an unconfirmed repair. macOS `timed` merges multiple
+reference-clock technologies and is not represented by the kernel NTP state
+returned from `ntp_adjtime`, so that Linux-style query is not used on macOS.
 
 ## 10. Installation and enrollment
 

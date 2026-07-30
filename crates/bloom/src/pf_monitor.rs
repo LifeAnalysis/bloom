@@ -17,7 +17,8 @@ use rustix::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-const STATUS_SCHEMA: &str = "bloom.macos-network-containment.1";
+const STATUS_SCHEMA: &str = "bloom.macos-platform-status.2";
+const TRUSTED_TIME_SOURCE: &str = "macos-managed-timed";
 
 #[derive(Serialize)]
 struct Status {
@@ -25,6 +26,8 @@ struct Status {
     login_uid: u32,
     build_digest: String,
     anchor_sha256: String,
+    trusted_time_source: &'static str,
+    trusted_time_available: bool,
     checked_at_unix_ms: u64,
     available: bool,
 }
@@ -40,6 +43,7 @@ pub fn run_once() -> Result<()> {
     require_directory(enrollment_root, 0o755)?;
     let pf_enabled = command_output("/sbin/pfctl", &["-s", "info"])
         .is_ok_and(|output| output.contains("Status: Enabled"));
+    let trusted_time_available = macos_managed_time_available();
     let checked_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system time precedes the Unix epoch")?
@@ -99,15 +103,23 @@ pub fn run_once() -> Result<()> {
             login_uid,
             build_digest,
             anchor_sha256,
+            trusted_time_source: TRUSTED_TIME_SOURCE,
+            trusted_time_available,
             checked_at_unix_ms,
             available,
         };
         write_status(login_uid, &status)?;
     }
-    if !all_available {
-        bail!("one or more Bloom packet-filter anchors is unavailable");
+    if !all_available || !trusted_time_available {
+        bail!("Bloom packet-filter or managed-time platform status is unavailable");
     }
     Ok(())
+}
+
+fn macos_managed_time_available() -> bool {
+    command_output("/usr/sbin/systemsetup", &["-getusingnetworktime"])
+        .is_ok_and(|output| output.lines().any(|line| line.trim() == "Network Time: On"))
+        && command_output("/bin/launchctl", &["print", "system/com.apple.timed"]).is_ok()
 }
 
 fn write_status(login_uid: u32, status: &Status) -> Result<()> {

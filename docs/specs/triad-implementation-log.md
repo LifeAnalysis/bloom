@@ -143,9 +143,13 @@ wire detail. It does not amend that specification.
   daemon. The edge manifest pins one reviewed source ID per platform:
   `linux-chrony-nts` or `macos-managed-timed`. Linux packaging requires two
   NTS sources under chrony's `authselectmode require`; the runtime accepts UTC
-  only while the kernel reports a synchronized clock. A missing, cross-platform,
-  or peer-supplied source ID fails closed, and the compiled forward-step bound
-  is the normative one hour.
+  only while the kernel reports a synchronized clock. macOS `timed` merges
+  multiple reference-clock technologies and does not publish its trust state
+  through `ntp_adjtime`; the root platform monitor instead attests automatic
+  network time plus the loaded system `com.apple.timed` service in the same
+  fresh exact-build status that gates every service operation. A missing,
+  cross-platform, or peer-supplied source ID fails closed, and the compiled
+  forward-step bound is the normative one hour.
   Sampling and durable observation are serialized per service so concurrent
   requests cannot persist monotonic anchors out of order. SQLite upgrades add
   the UTC, monotonic, and boot-epoch columns in place; historical reservation
