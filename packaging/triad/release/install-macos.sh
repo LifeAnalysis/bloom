@@ -2327,8 +2327,10 @@ require_matching_enrollment_state() {
   temporary="$product_root/.enrollment-state-check.$$"
   cp "$source_record" "$temporary"
   plutil -replace state -string "$expected_state" "$temporary"
+  source_normalized="$(plutil -convert xml1 -o - "$temporary")"
+  expected_normalized="$(plutil -convert xml1 -o - "$expected_record")"
   records_match=false
-  cmp "$temporary" "$expected_record" >/dev/null && records_match=true
+  [[ "$source_normalized" == "$expected_normalized" ]] && records_match=true
   rm -f -- "$temporary"
   $records_match
 }
