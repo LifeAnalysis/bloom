@@ -1,0 +1,6 @@
+# Generated Bloom triad containment rules for login UID @LOGIN_UID@.
+# The Signer has no IP authority. Broker may only emit packets belonging to
+# connections accepted by an earlier host rule/state; new outbound flows are
+# denied here. The disposable W0 lane must prove reply and deny behavior.
+block return out quick proto { tcp, udp } all user @BLOOM_SIGNER_UID@
+block return out quick proto { tcp, udp } all user @BLOOM_BROKER_UID@

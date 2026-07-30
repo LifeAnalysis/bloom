@@ -4,6 +4,27 @@ This file records fail-closed choices only where the normative
 `2026-07-23-triad-process-architecture.md` is silent or internally omits a
 wire detail. It does not amend that specification.
 
+## 2026-07-30
+
+- The root-requiring macOS Unix-principal profile is the active implementation
+  path. The rootless code-identity profile remains a documented future goal
+  and its App Group, same-UID LaunchAgent, Keychain-group, and platform-claim
+  inputs are not mixed into Unix-principal packaging.
+- macOS launchd supports numeric `SockPathOwner` and `SockPathGroup` fields per
+  Unix socket. Packaging uses them so one Broker LaunchDaemon can expose the
+  Machine--Broker and revoke sockets under different non-transitive groups,
+  and the Signer LaunchDaemon can do the same for Broker--Signer and revoke
+  edges. This resolves the otherwise underspecified multi-group socket
+  ownership detail without adding services or RPC methods.
+- The Unix-principal Broker uses its existing direct exclusive canonical bind;
+  its LaunchDaemon owns only Unix RPC listeners. Failure-only `KeepAlive`
+  retries a fatal `127.0.0.1:18734` conflict. The disposable macOS test uses a
+  real direct-bind child, not launchd TCP handover.
+- Until a disposable W0 VM proves account creation/rollback, system-domain
+  launchd ownership, socket modes, `pf` behavior, and uninstall, the installer
+  renders only staged roots and refuses live `/` activation. This is an
+  implementation gate, not a weaker production mode or platform claim.
+
 ## 2026-07-29
 
 - Section 6 already treats a second local login as an availability case, and

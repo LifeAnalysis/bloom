@@ -4,7 +4,14 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.bloom.signer</string>
+  <string>com.bloom.signer.@LOGIN_UID@</string>
+
+  <key>UserName</key>
+  <string>@BLOOM_SIGNER_USER@</string>
+  <key>GroupName</key>
+  <string>@BLOOM_SIGNER_GROUP@</string>
+  <key>Umask</key>
+  <integer>63</integer>
 
   <key>ProgramArguments</key>
   <array>
@@ -33,8 +40,12 @@
     <dict>
       <key>SockPathName</key>
       <string>@BLOOM_SIGNER_SOCKET@</string>
+      <key>SockPathOwner</key>
+      <integer>@BLOOM_SIGNER_UID@</integer>
+      <key>SockPathGroup</key>
+      <integer>@BROKER_SIGNER_GID@</integer>
       <key>SockPathMode</key>
-      <integer>384</integer>
+      <integer>432</integer>
       <key>SockType</key>
       <string>stream</string>
     </dict>
@@ -42,8 +53,12 @@
     <dict>
       <key>SockPathName</key>
       <string>@BLOOM_SIGNER_CONTROL_SOCKET@</string>
+      <key>SockPathOwner</key>
+      <integer>@BLOOM_SIGNER_UID@</integer>
+      <key>SockPathGroup</key>
+      <integer>@REVOKE_GID@</integer>
       <key>SockPathMode</key>
-      <integer>384</integer>
+      <integer>432</integer>
       <key>SockType</key>
       <string>stream</string>
     </dict>
@@ -58,11 +73,26 @@
   <integer>5</integer>
   <key>ProcessType</key>
   <string>Background</string>
-  <key>LimitLoadToSessionType</key>
-  <array>
-    <string>Aqua</string>
-    <string>Background</string>
-  </array>
+  <key>WorkingDirectory</key>
+  <string>@BLOOM_SIGNER_STATE_DIR@</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+    <key>NumberOfFiles</key>
+    <integer>1024</integer>
+    <key>NumberOfProcesses</key>
+    <integer>64</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+    <key>NumberOfFiles</key>
+    <integer>1024</integer>
+    <key>NumberOfProcesses</key>
+    <integer>64</integer>
+  </dict>
   <key>StandardOutPath</key>
   <string>@BLOOM_SIGNER_LOG@</string>
   <key>StandardErrorPath</key>

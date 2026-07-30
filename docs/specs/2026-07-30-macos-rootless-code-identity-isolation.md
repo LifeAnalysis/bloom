@@ -1,7 +1,9 @@
 # macOS rootless code-identity isolation profile
 
-**Status:** Candidate architecture; production claim prohibited until the
-mandatory disposable-host gates pass
+**Status:** Deferred future development goal; architecture retained, but the
+root-requiring Unix-principal profile is the active macOS implementation.
+Production claim remains prohibited until the mandatory disposable-host gates
+pass.
 
 **Applies to:** Bloom triad architecture, local macOS placement
 
