@@ -39,12 +39,14 @@ failure, proves Broker opened no fallback listener, then verifies failure-only
 KeepAlive acquires the port after it is released. It removes the live anchor,
 waits for the root-owned containment attestation to turn unavailable, proves
 authenticated triad health fails, and then restores and re-verifies the
-anchor. It also constructs a durable interrupted-enrollment intent plus its
-exact partial Directory Service record and proves the next installer invocation
-removes both without adopting the record. When the optional bundles are
-supplied, it also proves a complete-version upgrade, activation-failure
+anchor. Real service-UID probes prove Signer cannot emit IPv4 or IPv6 loopback
+TCP/UDP, and that neither Broker nor Signer can create non-loopback IPv4
+TCP/UDP flows; authenticated Broker responses remain covered by the triad
+health check. It also constructs a durable interrupted-enrollment intent plus
+its exact partial Directory Service record and proves the next installer
+invocation removes both without adopting the record. When the optional bundles
+are supplied, it also proves a complete-version upgrade, activation-failure
 rollback, `SIGKILL` during the activating phase, stale PID-lock reclamation,
 journal recovery, and restoration of the exact prior healthy digest.
-Cross-login listener conflict, actual logout handoff, network attempts, and
-hostile session authentication remain required before the W0 claim can
-graduate.
+Cross-login listener conflict, actual logout handoff, and hostile session
+authentication remain required before the W0 claim can graduate.

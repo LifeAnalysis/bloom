@@ -58,9 +58,14 @@ installer="$triad_source/release/install-macos.sh"
 enrollment="/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
 rotation_fixtures="$(mktemp -d /private/tmp/bloom-w0-rotation.XXXXXX)"
 foreign_listener_pid=""
+network_listener_pid=""
 
 cleanup() {
   status=$?
+  if [[ -n "$network_listener_pid" ]]; then
+    kill "$network_listener_pid" 2>/dev/null || true
+    wait "$network_listener_pid" 2>/dev/null || true
+  fi
   if [[ -n "$foreign_listener_pid" ]]; then
     kill "$foreign_listener_pid" 2>/dev/null || true
     wait "$foreign_listener_pid" 2>/dev/null || true
@@ -325,6 +330,81 @@ sudo -u "$login_user" \
   "$machine_binary" \
   --triad-health-check \
   "$release_digest"
+
+if sudo -u "bloom-signer-$login_uid" \
+  /usr/bin/nc -z -w 2 127.0.0.1 18734
+then
+  echo "Signer opened a forbidden IPv4 loopback TCP connection" >&2
+  exit 1
+fi
+
+/usr/bin/nc -6 -l ::1 18735 >/dev/null 2>&1 &
+network_listener_pid=$!
+sleep 0.2
+kill -0 "$network_listener_pid"
+if sudo -u "bloom-signer-$login_uid" \
+  /usr/bin/nc -6 -z -w 2 ::1 18735
+then
+  echo "Signer opened a forbidden IPv6 loopback TCP connection" >&2
+  exit 1
+fi
+kill "$network_listener_pid"
+wait "$network_listener_pid" 2>/dev/null || true
+network_listener_pid=""
+
+default_interface="$(
+  route -n get default |
+    awk '$1 == "interface:" { print $2; exit }'
+)"
+host_ipv4="$(ipconfig getifaddr "$default_interface")"
+[[ -n "$host_ipv4" && "$host_ipv4" != 127.* ]] || {
+  echo "W0 could not resolve a non-loopback IPv4 test address" >&2
+  exit 69
+}
+/usr/bin/nc -l "$host_ipv4" 18736 >/dev/null 2>&1 &
+network_listener_pid=$!
+sleep 0.2
+kill -0 "$network_listener_pid"
+for service_user in "bloom-broker-$login_uid" "bloom-signer-$login_uid"; do
+  if sudo -u "$service_user" \
+    /usr/bin/nc -z -w 2 "$host_ipv4" 18736
+  then
+    echo "$service_user opened a forbidden non-loopback IPv4 TCP connection" >&2
+    exit 1
+  fi
+done
+kill "$network_listener_pid"
+wait "$network_listener_pid" 2>/dev/null || true
+network_listener_pid=""
+
+assert_udp_blocked() {
+  service_user="$1"
+  address_family="$2"
+  address="$3"
+  port="$4"
+  probe="$rotation_fixtures/udp-$port"
+  : > "$probe"
+  /usr/bin/nc "$address_family" -u -l "$address" "$port" > "$probe" 2>/dev/null &
+  network_listener_pid=$!
+  sleep 0.2
+  kill -0 "$network_listener_pid"
+  printf 'bloom-w0-udp-probe\n' |
+    sudo -u "$service_user" \
+      /usr/bin/nc "$address_family" -u -w 1 "$address" "$port" \
+      >/dev/null 2>&1 || true
+  sleep 0.2
+  kill "$network_listener_pid" 2>/dev/null || true
+  wait "$network_listener_pid" 2>/dev/null || true
+  network_listener_pid=""
+  [[ ! -s "$probe" ]] || {
+    echo "$service_user emitted a forbidden UDP packet to $address" >&2
+    exit 1
+  }
+}
+
+assert_udp_blocked "bloom-signer-$login_uid" -4 127.0.0.1 18737
+assert_udp_blocked "bloom-signer-$login_uid" -6 ::1 18738
+assert_udp_blocked "bloom-broker-$login_uid" -4 "$host_ipv4" 18739
 
 containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
 assert_metadata "$containment_status" "0:0:644"
