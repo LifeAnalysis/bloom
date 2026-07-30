@@ -64,6 +64,7 @@ ssh_options=(
   -o PreferredAuthentications=password
   -o PubkeyAuthentication=no
   -o IdentitiesOnly=yes
+  -o NumberOfPasswordPrompts=1
   -o ServerAliveInterval=15
   -o ServerAliveCountMax=4
 )
@@ -121,7 +122,12 @@ start_vm() {
   guest_ip=""
   for _ in {1..90}; do
     guest_ip="$(tart ip "$vm_name" 2>/dev/null || true)"
-    if [[ -n "$guest_ip" ]] && nc -z -w 1 "$guest_ip" 22 >/dev/null 2>&1; then
+    if [[ -n "$guest_ip" ]] &&
+      nc -z -w 1 "$guest_ip" 22 >/dev/null 2>&1 &&
+      sshpass -p "$guest_password" \
+        ssh "${ssh_options[@]}" "admin@$guest_ip" /usr/bin/true \
+        >/dev/null 2>&1
+    then
       return 0
     fi
     sleep 2
