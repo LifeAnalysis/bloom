@@ -1028,13 +1028,24 @@ mod tests {
     #[test]
     fn built_in_entries_are_immutable_and_catalogued() {
         let defaults = bloom_proto::Config::local_default().petals.preinstalled;
-        assert_eq!(defaults, ["polymarket", "hyperliquid"]);
+        assert_eq!(
+            defaults,
+            ["polymarket", "near-intents", "enso", "hyperliquid"]
+        );
         for name in defaults {
             let entry = preinstalled_petal(&name).unwrap();
             assert_eq!(entry.name, name);
             assert_eq!(entry.commit.len(), 40);
             assert!(entry.commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
-            assert!(entry.repository.ends_with(&format!("/bloom-petal-{name}")));
+            let repo_segment = match name.as_str() {
+                "near-intents" => "near",
+                other => other,
+            };
+            assert!(
+                entry
+                    .repository
+                    .ends_with(&format!("/bloom-petal-{repo_segment}"))
+            );
             assert!(entry.archive.starts_with(&format!("{name}-")));
             assert!(entry.archive.ends_with(".petal.tar.gz"));
             assert_eq!(
