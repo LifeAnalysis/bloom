@@ -31,8 +31,6 @@ jobs:
   disposable-w0:
     runs-on: macos-15
     timeout-minutes: 60
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/bloom-w0-target
     steps:
       - name: Check out Machine
         uses: actions/checkout@v4
@@ -51,6 +49,9 @@ jobs:
           ref: ${{ inputs.signer_ref || 'master' }}
           path: bloom-signer
       - uses: dtolnay/rust-toolchain@stable
+      - name: Configure shared W0 build directory
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/bloom-w0-target" >> "$GITHUB_ENV"
 
       - name: Build W0 triad payload
         shell: bash
