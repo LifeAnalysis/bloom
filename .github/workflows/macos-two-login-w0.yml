@@ -66,6 +66,11 @@ jobs:
   two-login:
     runs-on: [self-hosted, macOS, bloom-two-login-disposable]
     timeout-minutes: 90
+    env:
+      BLOOM_W0_LOGIN_UID_A: ${{ inputs.login_uid_a }}
+      BLOOM_W0_LOGIN_USER_A: ${{ inputs.login_user_a }}
+      BLOOM_W0_LOGIN_UID_B: ${{ inputs.login_uid_b }}
+      BLOOM_W0_LOGIN_USER_B: ${{ inputs.login_user_b }}
     steps:
       - name: Check out candidate Machine
         uses: actions/checkout@v4
@@ -178,10 +183,10 @@ jobs:
         run: |
           set -Eeuo pipefail
           test ! -e /private/var/db/bloom-w0-disposable-host
-          test "$(id -u)" != "${{ inputs.login_uid_a }}"
-          test "$(id -u)" != "${{ inputs.login_uid_b }}"
-          sudo launchctl print "gui/${{ inputs.login_uid_a }}" >/dev/null
-          sudo launchctl print "gui/${{ inputs.login_uid_b }}" >/dev/null
+          test "$(id -u)" != "$BLOOM_W0_LOGIN_UID_A"
+          test "$(id -u)" != "$BLOOM_W0_LOGIN_UID_B"
+          sudo launchctl print "gui/$BLOOM_W0_LOGIN_UID_A" >/dev/null
+          sudo launchctl print "gui/$BLOOM_W0_LOGIN_UID_B" >/dev/null
           printf '%s\n' bloom-macos-unix-w0-disposable-v1 |
             sudo tee /private/var/db/bloom-w0-disposable-host >/dev/null
           sudo chown root:wheel /private/var/db/bloom-w0-disposable-host
@@ -204,10 +209,10 @@ jobs:
             BLOOM_MACOS_W0_EVIDENCE_DIR="$RUNNER_TEMP/macos-two-login-evidence" \
             bloom/packaging/triad/macos/w0/run-two-login.sh \
             "$RUNNER_TEMP/baseline-verified/bloom-triad" \
-            "${{ inputs.login_uid_a }}" \
-            "${{ inputs.login_user_a }}" \
-            "${{ inputs.login_uid_b }}" \
-            "${{ inputs.login_user_b }}" \
+            "$BLOOM_W0_LOGIN_UID_A" \
+            "$BLOOM_W0_LOGIN_USER_A" \
+            "$BLOOM_W0_LOGIN_UID_B" \
+            "$BLOOM_W0_LOGIN_USER_B" \
             "$RUNNER_TEMP/candidate-verified/bloom-triad" \
             "$RUNNER_TEMP/failing-verified/bloom-triad"
 
