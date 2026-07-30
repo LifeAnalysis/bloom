@@ -899,7 +899,7 @@ set_live_ownership() {
     "$installer_config_root" \
     "$installer_config_root/identity.json" \
     "$config_root/provenance-catalog.json"
-  chown root:wheel "$runtime_root/containment"
+  chown root:wheel "$runtime_root" "$runtime_root/containment"
   chown "$broker_user:$machine_broker_group" "$runtime_root/machine-broker"
   chown "$signer_user:$broker_signer_group" "$runtime_root/broker-signer"
   chown root:wheel "$runtime_root/revoke"
