@@ -66,6 +66,7 @@ mkdir -p "$evidence_dir"
   BLOOM_MACOS_ACCEPTANCE_CARGO="$HOME/.cargo/bin/cargo" \
   BLOOM_MACOS_ACCEPTANCE_CARGO_HOME="$HOME/.cargo" \
   BLOOM_MACOS_ACCEPTANCE_RUSTUP_HOME="$HOME/.rustup" \
+  BLOOM_MACOS_ACCEPTANCE_CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   "$main_root/packaging/triad/macos/w0/run-disposable.sh" \
   "$payload" \

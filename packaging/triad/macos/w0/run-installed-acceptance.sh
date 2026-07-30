@@ -192,8 +192,10 @@ cargo_binary="${BLOOM_MACOS_ACCEPTANCE_CARGO:-}"
 }
 cargo_home="${BLOOM_MACOS_ACCEPTANCE_CARGO_HOME:-}"
 rustup_home="${BLOOM_MACOS_ACCEPTANCE_RUSTUP_HOME:-}"
+cargo_target_dir="${BLOOM_MACOS_ACCEPTANCE_CARGO_TARGET_DIR:-}"
 [[ -z "$cargo_home" || "$cargo_home" == /* ]] || exit 65
 [[ -z "$rustup_home" || "$rustup_home" == /* ]] || exit 65
+[[ -z "$cargo_target_dir" || "$cargo_target_dir" == /* ]] || exit 65
 run_as_login() {
   tool_environment=(
     "BLOOM_ACCEPTANCE_BUNDLE_ROOT=$payload"
@@ -201,6 +203,8 @@ run_as_login() {
   )
   [[ -z "$cargo_home" ]] || tool_environment+=("CARGO_HOME=$cargo_home")
   [[ -z "$rustup_home" ]] || tool_environment+=("RUSTUP_HOME=$rustup_home")
+  [[ -z "$cargo_target_dir" ]] ||
+    tool_environment+=("CARGO_TARGET_DIR=$cargo_target_dir")
   sudo -H -u "$login_user" \
     env \
     "${tool_environment[@]}" \
