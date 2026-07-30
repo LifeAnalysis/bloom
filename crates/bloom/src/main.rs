@@ -152,6 +152,30 @@ fn configured_broker_client() -> Result<bloom_machine_client::MachineBrokerClien
     .context("load authenticated Machine-to-Broker edge")
 }
 
+async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
+    use bloom_triad_protocol::{
+        Digest32, Empty, MachineBrokerRequest, MachineBrokerResponse, ReadinessState,
+    };
+
+    let expected_build =
+        Digest32::new(expected_build.to_owned()).context("parse expected release digest")?;
+    let readiness = match configured_broker_client()?
+        .request(MachineBrokerRequest::BrokerReadiness(Empty {}))
+        .await
+        .context("request authenticated Broker readiness")?
+    {
+        MachineBrokerResponse::BrokerReadiness(readiness) => readiness,
+        _ => bail!("Broker returned the wrong response to broker.readiness"),
+    };
+    if readiness.service_id.as_str() != "bloom-broker"
+        || readiness.build_digest != expected_build
+        || readiness.state != ReadinessState::Ready
+    {
+        bail!("Broker/Signer triad is not ready on the exact installed build");
+    }
+    Ok(())
+}
+
 fn configured_broker_connection() -> Result<(
     bloom_machine_client::MachineBrokerClient,
     bloom_triad_protocol::ProvenanceCatalog,
@@ -1162,6 +1186,28 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("Bloom macOS enrollment generation failed: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if std::env::args_os().len() == 3
+        && std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new("--triad-health-check"))
+    {
+        let expected_build = match std::env::args_os().nth(2) {
+            Some(value) => match value.into_string() {
+                Ok(value) => value,
+                Err(_) => {
+                    eprintln!("Bloom triad health check failed: build digest is not UTF-8");
+                    return ExitCode::FAILURE;
+                }
+            },
+            None => return ExitCode::FAILURE,
+        };
+        return match installed_triad_health_check(&expected_build).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Bloom triad health check failed: {error:#}");
                 ExitCode::FAILURE
             }
         };
