@@ -45,7 +45,10 @@ declared revoke group, whose membership contains the login, Broker, and
 Signer, while mutual application-key authentication distinguishes the two
 service channels. Broker authenticates before binding the canonical ceremony
 listener; Signer authenticates before accepting RPC. Both drain and exit
-successfully on disconnect.
+successfully on disconnect. The root containment monitor validates a returning
+session socket's enrolled UID, group, mode, and type and kickstarts only that
+enrollment's stopped Signer and Broker jobs. It does nothing while the
+sentinel is absent; the LaunchAgent itself has no system-job control authority.
 
 ## Filesystem and network boundaries
 

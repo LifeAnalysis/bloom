@@ -3,7 +3,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write as _,
-    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -82,6 +82,7 @@ pub fn run_once() -> Result<()> {
         }
         let broker_uid = required_u32(&enrollment, "broker_uid")?;
         let signer_uid = required_u32(&enrollment, "signer_uid")?;
+        let revoke_gid = required_u32(&enrollment, "revoke_gid")?;
         let build_digest = required_digest(&enrollment, "release_digest")?;
         let anchor = PathBuf::from(format!("/etc/pf.anchors/com.bloom.triad.{login_uid}"));
         require_file_mode(&anchor, 0o600)?;
@@ -114,9 +115,45 @@ pub fn run_once() -> Result<()> {
             available,
         };
         write_status(login_uid, &status)?;
+        restart_services_for_live_session(login_uid, revoke_gid)?;
     }
     if !all_available || !trusted_time_available {
         bail!("Bloom packet-filter or managed-time platform status is unavailable");
+    }
+    Ok(())
+}
+
+fn restart_services_for_live_session(login_uid: u32, revoke_gid: u32) -> Result<()> {
+    let session_directory = PathBuf::from(format!("/private/var/run/bloom/{login_uid}/session"));
+    require_service_directory(&session_directory, login_uid, revoke_gid, 0o710)?;
+    let session_socket = session_directory.join("session.sock");
+    let metadata = match fs::symlink_metadata(&session_socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", session_socket.display()));
+        }
+    };
+    if !metadata.file_type().is_socket()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != login_uid
+        || metadata.gid() != revoke_gid
+        || metadata.mode() & 0o7777 != 0o660
+    {
+        bail!(
+            "unsafe login-session sentinel socket {}",
+            session_socket.display()
+        );
+    }
+
+    for service in ["signer", "broker"] {
+        let target = format!("system/com.bloom.{service}.{login_uid}");
+        let state = command_output("/bin/launchctl", &["print", &target])
+            .with_context(|| format!("inspect loaded {service} job for login {login_uid}"))?;
+        if !state.lines().any(|line| line.trim() == "state = running") {
+            command_output("/bin/launchctl", &["kickstart", &target])
+                .with_context(|| format!("restart {service} for live login {login_uid}"))?;
+        }
     }
     Ok(())
 }
@@ -236,4 +273,21 @@ fn require_file(path: &Path, mode: u32) -> Result<()> {
 
 fn require_file_mode(path: &Path, mode: u32) -> Result<()> {
     require_file(path, mode)
+}
+
+fn require_service_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid
+        || metadata.gid() != gid
+        || metadata.mode() & 0o7777 != mode
+    {
+        bail!(
+            "unsafe root packet-filter monitor service directory {}",
+            path.display()
+        );
+    }
+    Ok(())
 }

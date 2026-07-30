@@ -248,6 +248,15 @@ Signer drains accepted operations according to the normal durable-effect rules
 and then exits successfully. A missing sentinel causes a clean no-service
 state, not a restart loop.
 
+The root containment monitor is the restart bridge for a returning GUI
+session. On each one-shot pass it validates the exact login-owned session
+directory and `0660` sentinel socket against the enrolled login UID and revoke
+group. If that socket exists and either fixed per-enrollment system job is
+loaded but stopped, the monitor kickstarts Signer and then Broker. The services
+still mutually authenticate the sentinel before serving. An absent sentinel
+causes no kickstart, and the login LaunchAgent receives no system-job control
+authority.
+
 The sentinel cannot start arbitrary jobs, write service configuration, read
 service state, or request signatures.
 
