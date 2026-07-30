@@ -729,4 +729,81 @@ mod tests {
             StatusCode::NOT_FOUND
         );
     }
+
+    #[test]
+    fn sealed_approval_page_reuses_wallet_registration_design_system() {
+        let normalized_html = CEREMONY_HTML
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for shared_asset in [
+            "/wallet-registration-assets/favicon-light.svg",
+            "/wallet-registration-assets/fonts/instrument-serif-normal-latin.woff2",
+            "/wallet-registration-assets/fonts/instrument-serif-italic-latin.woff2",
+            "/wallet-registration-assets/fonts/inter-tight-latin.woff2",
+            "/wallet-registration-assets/fonts/jetbrains-mono-latin.woff2",
+        ] {
+            assert!(
+                CEREMONY_HTML.contains(shared_asset),
+                "sealed approval page must reuse wallet registration asset {shared_asset}"
+            );
+        }
+
+        for shared_design_token in [
+            "--paper:#f4efe6",
+            "--ink:#15130f",
+            "--leaf:#526f51",
+            "--accent:#8a2a3a",
+            "--serif:\"Instrument Serif\"",
+            "--sans:\"Inter Tight\"",
+            "--mono:\"JetBrains Mono\"",
+        ] {
+            assert!(
+                CEREMONY_HTML.contains(shared_design_token),
+                "sealed approval page must reuse wallet registration token {shared_design_token}"
+            );
+        }
+
+        assert!(CEREMONY_HTML.contains("viewport-fit=cover"));
+        assert!(CEREMONY_HTML.contains("<strong>/bloom</strong> walletFS"));
+        assert!(CEREMONY_HTML.contains("@media(max-width:940px)"));
+        assert!(CEREMONY_HTML.contains("@media(max-width:560px)"));
+        assert!(CEREMONY_HTML.contains("id=\"grant\""));
+        assert!(CEREMONY_HTML.contains("id=\"grantExecute\""));
+        assert!(CEREMONY_HTML.contains("role=\"status\""));
+        assert!(CEREMONY_HTML.contains("<h1 id=\"page-title\">Approve this action?</h1>"));
+        assert!(normalized_html.contains("Approve </button>"));
+        assert!(!CEREMONY_HTML.contains("Approve with confidence"));
+        assert!(!CEREMONY_HTML.contains("Approve grant"));
+        assert!(!CEREMONY_HTML.contains("addMeta('Wallet'"));
+        assert!(!CEREMONY_HTML.contains("addMeta('Surface'"));
+        assert!(!CEREMONY_HTML.contains("addMeta('Assurance'"));
+        assert!(!CEREMONY_HTML.contains("addMeta('Valid until'"));
+        assert!(
+            CEREMONY_HTML.contains("setText('state-badge','Valid until '+expiryText(p.expiry_ms))")
+        );
+        assert!(!CEREMONY_HTML.contains("Ready to approve"));
+        assert!(!CEREMONY_HTML.contains("choice-notes"));
+        assert!(CEREMONY_HTML.contains("typeof COLOR_SCHEME_MEDIA.addEventListener==='function'"));
+        assert!(CEREMONY_HTML.contains("typeof COLOR_SCHEME_MEDIA.addListener==='function'"));
+        for protocol_hook in [
+            "PATH+'/plan.json'",
+            "PATH+'/challenge'",
+            "PATH+'/complete'",
+            "approve('grant')",
+            "approve('grant_execute')",
+            "prf_output_b64",
+            "prf_client_data_json_b64",
+        ] {
+            assert!(
+                CEREMONY_HTML.contains(protocol_hook),
+                "visual refresh must preserve ceremony protocol hook {protocol_hook}"
+            );
+        }
+        assert!(
+            !CEREMONY_HTML.contains(".innerHTML"),
+            "daemon plan metadata must be rendered as text, never parsed as markup"
+        );
+    }
 }
