@@ -28,42 +28,12 @@
     <string>@BLOOM_EDGE_MANIFEST@</string>
     <key>BLOOM_AUDIT_CHECKPOINT_DIR</key>
     <string>@BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR@</string>
-    <key>BLOOM_SIGNER_ACTIVATION_NAME</key>
-    <string>signer</string>
-    <key>BLOOM_SIGNER_CONTROL_ACTIVATION_NAME</key>
-    <string>signer-control</string>
+    <key>BLOOM_SIGNER_SOCKET</key>
+    <string>@BLOOM_SIGNER_SOCKET@</string>
+    <key>BLOOM_SIGNER_CONTROL_SOCKET</key>
+    <string>@BLOOM_SIGNER_CONTROL_SOCKET@</string>
     <key>BLOOM_SESSION_SOCKET</key>
     <string>@BLOOM_SESSION_SOCKET@</string>
-  </dict>
-
-  <key>Sockets</key>
-  <dict>
-    <key>signer</key>
-    <dict>
-      <key>SockPathName</key>
-      <string>@BLOOM_SIGNER_SOCKET@</string>
-      <key>SockPathOwner</key>
-      <integer>@BLOOM_SIGNER_UID@</integer>
-      <key>SockPathGroup</key>
-      <integer>@BROKER_SIGNER_GID@</integer>
-      <key>SockPathMode</key>
-      <integer>432</integer>
-      <key>SockType</key>
-      <string>stream</string>
-    </dict>
-    <key>signer-control</key>
-    <dict>
-      <key>SockPathName</key>
-      <string>@BLOOM_SIGNER_CONTROL_SOCKET@</string>
-      <key>SockPathOwner</key>
-      <integer>@BLOOM_SIGNER_UID@</integer>
-      <key>SockPathGroup</key>
-      <integer>@REVOKE_GID@</integer>
-      <key>SockPathMode</key>
-      <integer>432</integer>
-      <key>SockType</key>
-      <string>stream</string>
-    </dict>
   </dict>
 
   <key>KeepAlive</key>

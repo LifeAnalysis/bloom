@@ -18,10 +18,14 @@ LaunchDaemons:
 - `com.bloom.broker.LOGIN_UID`, running as `bloom-broker-LOGIN_UID`;
 - `com.bloom.signer.LOGIN_UID`, running as `bloom-signer-LOGIN_UID`.
 
-The daemon templates use numeric `SockPathOwner` and `SockPathGroup` values for
-each launchd-owned Unix socket. This permits the Broker data, Broker-Signer,
-and revocation edges to use different groups without making either service
-group transitive. Socket mode is decimal `432`, equivalent to octal `0660`.
+Each daemon explicitly binds its Unix sockets inside endpoint directories
+owned by that service UID. The directories use distinct edge groups and mode
+`0710`; a service validates this metadata before publishing a `0660` socket.
+Broker and Signer have separate revocation subdirectories. This construction
+is required because a launchd-created Unix socket reports launchd's UID to the
+connecting peer on macOS, which cannot satisfy the protocol's mutual kernel
+peer-UID check. It does not fall back from failed launchd activation or create
+endpoints outside the signed profile.
 
 Broker owns the canonical ceremony listener by direct exclusive bind to
 `127.0.0.1:18734`. The LaunchDaemon does not declare or pre-bind that TCP

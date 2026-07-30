@@ -28,44 +28,14 @@
     <string>@BLOOM_EDGE_MANIFEST@</string>
     <key>BLOOM_AUDIT_CHECKPOINT_DIR</key>
     <string>@BLOOM_BROKER_AUDIT_CHECKPOINT_DIR@</string>
-    <key>BLOOM_BROKER_ACTIVATION_NAME</key>
-    <string>broker</string>
-    <key>BLOOM_BROKER_CONTROL_ACTIVATION_NAME</key>
-    <string>broker-control</string>
+    <key>BLOOM_BROKER_SOCKET</key>
+    <string>@BLOOM_BROKER_SOCKET@</string>
+    <key>BLOOM_BROKER_CONTROL_SOCKET</key>
+    <string>@BLOOM_BROKER_CONTROL_SOCKET@</string>
     <key>BLOOM_SESSION_SOCKET</key>
     <string>@BLOOM_SESSION_SOCKET@</string>
     <key>BLOOM_BROKER_STARTUP_STATUS</key>
     <string>@BLOOM_BROKER_STARTUP_STATUS@</string>
-  </dict>
-
-  <key>Sockets</key>
-  <dict>
-    <key>broker</key>
-    <dict>
-      <key>SockPathName</key>
-      <string>@BLOOM_BROKER_SOCKET@</string>
-      <key>SockPathOwner</key>
-      <integer>@BLOOM_BROKER_UID@</integer>
-      <key>SockPathGroup</key>
-      <integer>@MACHINE_BROKER_GID@</integer>
-      <key>SockPathMode</key>
-      <integer>432</integer>
-      <key>SockType</key>
-      <string>stream</string>
-    </dict>
-    <key>broker-control</key>
-    <dict>
-      <key>SockPathName</key>
-      <string>@BLOOM_BROKER_CONTROL_SOCKET@</string>
-      <key>SockPathOwner</key>
-      <integer>@BLOOM_BROKER_UID@</integer>
-      <key>SockPathGroup</key>
-      <integer>@REVOKE_GID@</integer>
-      <key>SockPathMode</key>
-      <integer>432</integer>
-      <key>SockType</key>
-      <string>stream</string>
-    </dict>
   </dict>
 
   <key>KeepAlive</key>

@@ -15,16 +15,18 @@ wire detail. It does not amend that specification.
   The elevated installer verifies through the root-owned macOS
   `/usr/bin/ssh-keygen`; it never trusts Homebrew OpenSSL from a login-user
   writable prefix.
-- macOS launchd supports numeric `SockPathOwner` and `SockPathGroup` fields per
-  Unix socket. Packaging uses them so one Broker LaunchDaemon can expose the
-  Machine--Broker and revoke sockets under different non-transitive groups,
-  and the Signer LaunchDaemon can do the same for Broker--Signer and revoke
-  edges. This resolves the otherwise underspecified multi-group socket
-  ownership detail without adding services or RPC methods.
+- Disposable W0 proved that a launchd-created Unix socket exposes
+  launchd/root, not the explicit `UserName` acceptor, through the connecting
+  peer's kernel credentials. That construction cannot satisfy mutual UID
+  authentication. The macOS profile therefore gives each service a `0710`
+  endpoint directory under the appropriate non-transitive edge group; the
+  service validates the directory and publishes its own `0660` socket.
+  Broker and Signer use separate service-owned revoke subdirectories. This
+  preserves the RPC and mutual authentication model without a fallback path.
 - The Unix-principal Broker uses its existing direct exclusive canonical bind;
-  its LaunchDaemon owns only Unix RPC listeners. Failure-only `KeepAlive`
-  retries a fatal `127.0.0.1:18734` conflict. The disposable macOS test uses a
-  real direct-bind child, not launchd TCP handover.
+  its LaunchDaemon supplies only reviewed endpoint paths. Failure-only
+  `KeepAlive` retries a fatal `127.0.0.1:18734` conflict. The disposable macOS
+  test uses a real direct-bind child, not launchd TCP handover.
 - A complete-version upgrade may have several recorded Broker LaunchDaemons
   but only one Broker can pass readiness while owning the host-wide canonical
   listener. Upgrade and rollback therefore restore every session and Signer

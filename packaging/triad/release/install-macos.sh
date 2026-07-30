@@ -598,17 +598,23 @@ verify_installed_security_files() {
   require_live_directory_metadata "$enrolled_runtime_root/containment" 0 0 755
   require_live_directory_metadata \
     "$enrolled_runtime_root/machine-broker" \
-    0 \
+    "$BLOOM_MACOS_BROKER_UID" \
     "$BLOOM_MACOS_MACHINE_BROKER_GID" \
     710
   require_live_directory_metadata \
     "$enrolled_runtime_root/broker-signer" \
-    0 \
+    "$BLOOM_MACOS_SIGNER_UID" \
     "$BLOOM_MACOS_BROKER_SIGNER_GID" \
     710
+  require_live_directory_metadata "$enrolled_runtime_root/revoke" 0 0 711
   require_live_directory_metadata \
-    "$enrolled_runtime_root/revoke" \
-    0 \
+    "$enrolled_runtime_root/revoke/broker" \
+    "$BLOOM_MACOS_BROKER_UID" \
+    "$BLOOM_MACOS_REVOKE_GID" \
+    710
+  require_live_directory_metadata \
+    "$enrolled_runtime_root/revoke/signer" \
+    "$BLOOM_MACOS_SIGNER_UID" \
     "$BLOOM_MACOS_REVOKE_GID" \
     710
   require_live_directory_metadata \
@@ -789,8 +795,8 @@ render_template() {
     -e "s|@BLOOM_SIGNER_STATE_DIR@|$signer_state|g" \
     -e "s|@BLOOM_BROKER_SOCKET@|$runtime_root/machine-broker/broker.sock|g" \
     -e "s|@BLOOM_SIGNER_SOCKET@|$runtime_root/broker-signer/signer.sock|g" \
-    -e "s|@BLOOM_BROKER_CONTROL_SOCKET@|$runtime_root/revoke/broker-control.sock|g" \
-    -e "s|@BLOOM_SIGNER_CONTROL_SOCKET@|$runtime_root/revoke/signer-control.sock|g" \
+    -e "s|@BLOOM_BROKER_CONTROL_SOCKET@|$runtime_root/revoke/broker/control.sock|g" \
+    -e "s|@BLOOM_SIGNER_CONTROL_SOCKET@|$runtime_root/revoke/signer/control.sock|g" \
     -e "s|@BLOOM_SESSION_SOCKET@|$runtime_root/session/session.sock|g" \
     -e "s|@BLOOM_BROKER_STARTUP_STATUS@|$runtime_root/status/broker-startup.json|g" \
     -e "s|@BLOOM_CONTAINMENT_STATUS@|$runtime_root/containment/status.json|g" \
@@ -833,9 +839,11 @@ set_live_ownership() {
     "$installer_config_root/identity.json" \
     "$config_root/provenance-catalog.json"
   chown root:wheel "$runtime_root/containment"
-  chown "root:$machine_broker_group" "$runtime_root/machine-broker"
-  chown "root:$broker_signer_group" "$runtime_root/broker-signer"
-  chown "root:$revoke_group" "$runtime_root/revoke"
+  chown "$broker_user:$machine_broker_group" "$runtime_root/machine-broker"
+  chown "$signer_user:$broker_signer_group" "$runtime_root/broker-signer"
+  chown root:wheel "$runtime_root/revoke"
+  chown "$broker_user:$revoke_group" "$runtime_root/revoke/broker"
+  chown "$signer_user:$revoke_group" "$runtime_root/revoke/signer"
   chown "$broker_user:$machine_broker_group" "$runtime_root/status"
   chown root:wheel \
     "$broker_plist" \
@@ -2648,6 +2656,8 @@ case "$action" in
       "$runtime_root/machine-broker" \
       "$runtime_root/broker-signer" \
       "$runtime_root/revoke" \
+      "$runtime_root/revoke/broker" \
+      "$runtime_root/revoke/signer" \
       "$runtime_root/session" \
       "$runtime_root/containment" \
       "$runtime_root/status"
@@ -2668,6 +2678,8 @@ case "$action" in
       "$runtime_root/machine-broker" \
       "$runtime_root/broker-signer" \
       "$runtime_root/revoke" \
+      "$runtime_root/revoke/broker" \
+      "$runtime_root/revoke/signer" \
       "$runtime_root/session" \
       "$runtime_root/containment" \
       "$runtime_root/status"
@@ -2678,7 +2690,7 @@ case "$action" in
       }
     done
     chmod 0755 "$product_root" "$enrollment_root"
-    chmod 0711 "$config_root" "$runtime_root"
+    chmod 0711 "$config_root" "$runtime_root" "$runtime_root/revoke"
     chmod 0700 \
       "$broker_config_root" \
       "$signer_config_root" \
@@ -2692,7 +2704,8 @@ case "$action" in
     chmod 0710 \
       "$runtime_root/machine-broker" \
       "$runtime_root/broker-signer" \
-      "$runtime_root/revoke" \
+      "$runtime_root/revoke/broker" \
+      "$runtime_root/revoke/signer" \
       "$runtime_root/session"
     chmod 0755 "$runtime_root/containment"
     chmod 0750 "$runtime_root/status"

@@ -133,8 +133,8 @@ Runtime endpoints:
 ```text
 /var/run/bloom/U/machine-broker/broker.sock
 /var/run/bloom/U/broker-signer/signer.sock
-/var/run/bloom/U/revoke/broker-control.sock
-/var/run/bloom/U/revoke/signer-control.sock
+/var/run/bloom/U/revoke/broker/control.sock
+/var/run/bloom/U/revoke/signer/control.sock
 /var/run/bloom/U/session/session.sock
 /var/run/bloom/U/status/broker-startup.json
 ```
@@ -148,9 +148,11 @@ Required ownership and modes:
 | Signer config and identity | `bloom-signer-U` | same | `0700` directory, `0600` files |
 | Broker state/checkpoints | `bloom-broker-U` | same | `0700`; checkpoint entries `0600` |
 | Signer state/checkpoints | `bloom-signer-U` | same | `0700`; checkpoint entries `0600` |
-| Machine-to-Broker socket directory | root | `bloom-machine-broker-U` | `0710`; socket `0660` |
-| Broker-to-Signer socket directory | root | `bloom-broker-signer-U` | `0710`; socket `0660` |
-| revocation socket directory | root | `bloom-revoke-U` | `0710`; sockets `0660` |
+| Machine-to-Broker socket directory | `bloom-broker-U` | `bloom-machine-broker-U` | `0710`; socket `0660` |
+| Broker-to-Signer socket directory | `bloom-signer-U` | `bloom-broker-signer-U` | `0710`; socket `0660` |
+| revocation parent directory | root | wheel | `0711`; no sockets |
+| Broker revocation socket directory | `bloom-broker-U` | `bloom-revoke-U` | `0710`; socket `0660` |
+| Signer revocation socket directory | `bloom-signer-U` | `bloom-revoke-U` | `0710`; socket `0660` |
 | startup status directory | `bloom-broker-U` | `bloom-machine-broker-U` | `0750`; status `0640` |
 
 Parent directories must permit traversal only where required and must not
@@ -166,8 +168,19 @@ root.
 
 ## 5. Local RPC topology
 
-launchd pre-creates and hands off the four Unix RPC sockets. The socket path
-and containing-directory ACL must both match the table in section 4.
+Broker and Signer explicitly bind and publish their Unix RPC sockets inside
+the service-owned endpoint directories from section 4. Before binding, each
+service verifies the directory owner, group, mode, type, and non-symlink
+status. It rejects live or substituted endpoint entries and replaces only a
+singly-linked stale socket owned by its effective UID. It publishes each new
+socket with its edge group and mode `0660` before accepting traffic.
+
+launchd socket activation is intentionally not used for these Unix endpoints.
+Disposable W0 showed that the connecting process observes launchd/root as the
+peer owner of a launchd-created socket, rather than the explicit `UserName`
+service that accepts it. Service-owned binding preserves mutual kernel
+peer-UID verification. This is an explicit platform construction, never a
+fallback from failed activation.
 
 Filesystem access is necessary but insufficient. Every RPC connection still
 uses:
@@ -198,7 +211,8 @@ LaunchAgents. Machine remains an interactive process.
 
 Each daemon:
 
-- receives its Unix listeners from launchd;
+- receives exact Unix socket paths from its signed LaunchDaemon profile and
+  binds only in its verified service-owned endpoint directories;
 - has `ProcessType=Background`;
 - uses `KeepAlive` only for abnormal exit;
 - exits successfully when its enrolled login session ends;
@@ -208,8 +222,8 @@ Each daemon:
 - writes logs only to its principal-owned state directory;
 - has no writable current directory containing installed code.
 
-Core dumps are disabled. Environment variables contain paths and activation
-names only, never key material or backend credentials.
+Core dumps are disabled. Environment variables contain paths only, never key
+material or backend credentials.
 
 ### 6.1 Login-session sentinel
 
@@ -344,7 +358,8 @@ services unavailable. It never exposes a mixed-version live triad.
 6. Render the per-login LaunchDaemon plists and verify the global session
    LaunchAgent is installed.
 7. Render and load UID-scoped packet-filter rules.
-8. Bootstrap socket activation and run a read-only health handshake.
+8. Bootstrap the services and run a read-only health handshake over their
+   service-owned sockets.
 9. Publish Machine configuration only after the handshake succeeds.
 
 No identity seed or backend secret is reused across login enrollments.
@@ -485,9 +500,10 @@ executables and are never installed as production services.
 ## 15. Implementation sequence
 
 1. Run a disposable-VM W0 spike proving macOS `pf` can enforce outbound rules
-   by service UID, launchd hands Unix sockets to explicit-`UserName` daemons
-   with the required ownership, and logout can terminate the session sentinel.
-   Failure blocks this profile before installer implementation.
+   by service UID, service-owned Unix sockets preserve explicit-`UserName`
+   daemon peer credentials and required ownership, and logout can terminate
+   the session sentinel. Failure blocks this profile before installer
+   implementation.
 2. Replace macOS App Group templates with account, group, ACL, LaunchDaemon,
    session-sentinel, and `pf` templates.
 3. Add Broker's macOS exclusive direct-bind listener path and durable startup
