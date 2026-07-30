@@ -660,9 +660,18 @@ then
   echo "Machine reported healthy while a foreign process owned the ceremony port" >&2
   exit 1
 fi
-grep -F \
+if ! grep -F \
   'Bloom Broker startup failed: a foreign or unverifiable process owns the Bloom ceremony listener' \
   <<<"$foreign_machine_failure" >/dev/null
+then
+  echo "Machine did not report the authenticated foreign-listener diagnostic:" >&2
+  printf '%s\n' "$foreign_machine_failure" >&2
+  stat -f 'startup diagnostic metadata: %u:%g:%Lp links=%l bytes=%z' \
+    "$broker_startup_status" >&2
+  echo "startup diagnostic content:" >&2
+  sudo -u "$login_user" cat "$broker_startup_status" >&2 || true
+  exit 1
+fi
 if lsof -nP -a -u "bloom-broker-$login_uid" -iTCP -sTCP:LISTEN |
   grep . >/dev/null
 then
@@ -672,7 +681,10 @@ fi
 kill "$foreign_listener_pid"
 wait "$foreign_listener_pid" 2>/dev/null || true
 foreign_listener_pid=""
-deadline=$((SECONDS + 20))
+# Multiple fatal starts while the port is occupied can put launchd into a
+# failure-backoff interval. Prove failure-only KeepAlive recovery without
+# imposing a shorter deadline than launchd's scheduler.
+deadline=$((SECONDS + 60))
 while [[ $SECONDS -lt $deadline ]]; do
   if sudo -u "$login_user" \
     "$machine_binary" \
