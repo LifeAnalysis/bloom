@@ -28,12 +28,11 @@ wire detail. It does not amend that specification.
   bootstrapped. Both service LaunchDaemons explicitly set `InitGroups=true`;
   relying on an implicit/default supplementary-group state made immediate
   post-enrollment activation fail closed at the session socket.
-- The service accounts retain distinct primary groups, but their LaunchDaemons
-  explicitly select the already-authorized `bloom-revoke-U` group as the
-  runtime primary GID. This makes access to the shared authenticated
-  login-session/control edge independent of launchd supplementary-group
-  credential behavior. Owner-only `0700`/`0600` service state is unaffected,
-  and no service gains a new filesystem or RPC edge.
+- The session sentinel sets group ownership on the bound filesystem socket
+  pathname and then verifies its exact type, UID, GID, mode, and link count.
+  `fchown` on the listening descriptor did not update the pathname node on
+  macOS and caused the sentinel to fail closed with a stale inaccessible
+  socket.
 - The Unix-principal Broker uses its existing direct exclusive canonical bind;
   its LaunchDaemon supplies only reviewed endpoint paths. Failure-only
   `KeepAlive` retries a fatal `127.0.0.1:18734` conflict. The disposable macOS

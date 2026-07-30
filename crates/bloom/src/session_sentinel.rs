@@ -15,10 +15,7 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use bloom_triad_local_transport::{PeerAcl, authenticate_server, load_identity_and_manifest};
-use rustix::{
-    fs::{Gid, fchown},
-    process::geteuid,
-};
+use rustix::process::geteuid;
 use tokio::{io::AsyncReadExt as _, net::UnixListener, sync::Semaphore};
 
 const SESSION_SERVICE_ID: &str = "bloom-session";
@@ -75,7 +72,7 @@ pub async fn run() -> Result<()> {
 
     let listener = StdUnixListener::bind(&socket_path)
         .with_context(|| format!("bind session sentinel {}", socket_path.display()))?;
-    fchown(&listener, None, Some(Gid::from_raw(socket_gid)))
+    std::os::unix::fs::chown(&socket_path, None, Some(socket_gid))
         .context("set session sentinel socket group")?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660))
         .context("set session sentinel socket mode")?;
