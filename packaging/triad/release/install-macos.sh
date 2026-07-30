@@ -233,6 +233,9 @@ rollback_provisioning() {
   trap - ERR
   set +e
   echo "macOS installer failed at line $failed_line (status $status)" >&2
+  if $live_install && $provision_started && ! $provision_committed; then
+    emit_live_activation_diagnostics
+  fi
   if $upgrade_in_progress; then
     rollback_upgrade
   fi
@@ -251,6 +254,26 @@ rollback_provisioning() {
   fi
   release_installer_lock
   exit "$status"
+}
+
+emit_live_activation_diagnostics() {
+  [[ "${login_uid:-}" =~ ^[1-9][0-9]*$ ]] || return 0
+  for service in broker signer; do
+    service_log="/private/var/db/bloom/$login_uid/$service/$service.log"
+    case "$service" in
+      broker) expected_owner="${BLOOM_MACOS_BROKER_UID:-}" ;;
+      signer) expected_owner="${BLOOM_MACOS_SIGNER_UID:-}" ;;
+    esac
+    if [[ "$expected_owner" =~ ^[1-9][0-9]*$ ]] &&
+      [[ -f "$service_log" && ! -L "$service_log" ]] &&
+      [[ "$(stat -f '%u:%Lp' "$service_log" 2>/dev/null)" == "$expected_owner:600" ]]
+    then
+      echo "----- Bloom $service activation log (last 100 lines) -----" >&2
+      tail -n 100 "$service_log" >&2
+    fi
+    echo "----- Bloom $service launchd state -----" >&2
+    launchctl print "system/com.bloom.$service.$login_uid" >&2 || true
+  done
 }
 
 trap 'rollback_provisioning "$LINENO"' ERR
