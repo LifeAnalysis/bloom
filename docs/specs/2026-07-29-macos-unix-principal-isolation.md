@@ -375,11 +375,19 @@ The bundle verifier checks:
 - root-install manifest and expected executable inventory;
 - absence of forbidden production symbols and credentials;
 - hashes of LaunchDaemon, LaunchAgent, ACL, and `pf` templates;
-- the signed disposable-host conformance report schema and release digest.
+- the signed disposable-host conformance report schema and canonical release
+  subject digest.
 
 The conformance report is evidence for a release candidate, not a reusable
-waiver. It is bound to the exact bundle digest and expires when any packaged
-binary, plist, installer, ACL template, or packet-filter template changes.
+waiver. A report cannot literally contain the digest of an archive that
+contains that same report. Packaging therefore defines a canonical release
+subject digest over every binary, source revision, compatibility input,
+installer, ACL template, plist, and packet-filter template, excluding only the
+platform-claim value and the release/conformance signature envelope. The W0
+candidate records both that subject digest and its archive digest. Production
+may change only the claim/envelope, embeds the signed report, and signs the
+final archive. Any change to a security-relevant packaged input changes the
+subject digest and invalidates the report.
 
 ## 12. Mandatory disposable-host tests
 

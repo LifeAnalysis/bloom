@@ -2327,6 +2327,12 @@ case "$action" in
       exit 64
     }
     platform_claim="$(<"$payload/PLATFORM_CLAIM")"
+    generated_macos_enrollment=false
+    if [[ "$platform_claim" == "macos-unix-principals" ||
+      "$platform_claim" == "macos-unix-principals-w0" ]]
+    then
+      generated_macos_enrollment=true
+    fi
     if $live_install; then
       require_live_macos_root
       case "$platform_claim" in
@@ -2374,7 +2380,7 @@ case "$action" in
         exit 66
       }
     done
-    if [[ "$platform_claim" != "macos-unix-principals" ]]; then
+    if ! $generated_macos_enrollment; then
       for required in \
         config/edge-manifest.json \
         config/broker.json \
@@ -2416,7 +2422,7 @@ case "$action" in
           exit 66
         }
       done
-      if [[ "$platform_claim" == "macos-unix-principals" ]]; then
+      if $generated_macos_enrollment; then
         pinned_key="${BLOOM_RELEASE_PUBLIC_KEY:-}"
         [[ -f "$pinned_key" && ! -L "$pinned_key" ]] || {
           echo "BLOOM_RELEASE_PUBLIC_KEY must name the pinned root-owned key" >&2
@@ -2672,7 +2678,7 @@ case "$action" in
     chmod 0750 "$runtime_root/status"
 
     if ! $existing_enrollment; then
-      if [[ "$platform_claim" == "macos-unix-principals" ]]; then
+      if $generated_macos_enrollment; then
         generated_material="$(mktemp -d "$product_root/.enrollment-material.XXXXXX")"
         chmod 0700 "$generated_material"
         chown root:wheel "$generated_material"

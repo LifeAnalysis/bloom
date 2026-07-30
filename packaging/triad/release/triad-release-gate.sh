@@ -64,8 +64,18 @@ else
   case "$(uname -s)" in
     Linux) export BLOOM_PLATFORM_CLAIM="linux" ;;
     Darwin)
-      echo "macOS production release requires the signed App Sandbox conformance lane" >&2
-      exit 69
+      export BLOOM_PLATFORM_CLAIM="macos-unix-principals"
+      for evidence_name in \
+        BLOOM_MACOS_CONFORMANCE_REPORT \
+        BLOOM_MACOS_CONFORMANCE_SIGNATURE \
+        BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY \
+        BLOOM_MACOS_CONFORMANCE_KEY_SHA256
+      do
+        [[ -n "${!evidence_name:-}" ]] || {
+          echo "$evidence_name is required for a production macOS release" >&2
+          exit 66
+        }
+      done
       ;;
     *)
       echo "unsupported release host" >&2
@@ -106,24 +116,28 @@ for root in "$main_root" "$broker_root" "$signer_root"; do
 done
 install_payload="$work/install-payload"
 cp -R "$bundle" "$install_payload"
-mkdir -p "$install_payload/config"
-for config in \
-  edge-manifest.json \
-  broker.json \
-  signer.json \
-  broker-identity.json \
-  signer-identity.json
-do
-  printf '{}\n' > "$install_payload/config/$config"
-done
-printf 'time.cloudflare.com\ntime.nist.gov\n' \
-  > "$install_payload/config/nts-servers.conf"
-mkdir -p "$work/linux-root"
-"$install_payload/installer/release/install-linux.sh" \
-  install "$work/linux-root" 1000 releaseuser "$install_payload"
-test -x "$work/linux-root/usr/libexec/bloom/bloom-broker"
-test -f "$work/linux-root/etc/bloom/1000/signer/config.json"
-"$install_payload/installer/release/install-linux.sh" \
-  uninstall "$work/linux-root" 1000 delete-bloom-login-1000
-test ! -e "$work/linux-root/etc/bloom/1000"
+if [[ "$BLOOM_PLATFORM_CLAIM" == "macos-unix-principals" ]]; then
+  "$bundle/installer/release/verify-macos-conformance.sh" "$bundle"
+else
+  mkdir -p "$install_payload/config"
+  for config in \
+    edge-manifest.json \
+    broker.json \
+    signer.json \
+    broker-identity.json \
+    signer-identity.json
+  do
+    printf '{}\n' > "$install_payload/config/$config"
+  done
+  printf 'time.cloudflare.com\ntime.nist.gov\n' \
+    > "$install_payload/config/nts-servers.conf"
+  mkdir -p "$work/linux-root"
+  "$install_payload/installer/release/install-linux.sh" \
+    install "$work/linux-root" 1000 releaseuser "$install_payload"
+  test -x "$work/linux-root/usr/libexec/bloom/bloom-broker"
+  test -f "$work/linux-root/etc/bloom/1000/signer/config.json"
+  "$install_payload/installer/release/install-linux.sh" \
+    uninstall "$work/linux-root" 1000 delete-bloom-login-1000
+  test ! -e "$work/linux-root/etc/bloom/1000"
+fi
 echo "Bloom triad release gate passed for $BLOOM_MACHINE_SHA / $BLOOM_BROKER_SHA / $BLOOM_SIGNER_SHA"

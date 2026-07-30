@@ -30,6 +30,9 @@ for required in \
   compatibility-v1.toml \
   installer/release/install-linux.sh \
   installer/release/install-macos.sh \
+  installer/release/macos-conformance-subject.sh \
+  installer/release/sign-macos-conformance-report.sh \
+  installer/release/verify-macos-conformance.sh \
   SOURCE_REVISIONS \
   RELEASE_PUBLIC_KEY.pem \
   RELEASE_SIGNATURE \
@@ -76,6 +79,19 @@ case "$platform_claim" in
       }
     done
     ;;
+  macos-unix-principals)
+    [[ "$(uname -s)" == "Darwin" ]] || {
+      echo "production macOS bundles are verified only on Darwin" >&2
+      exit 69
+    }
+    for binary in bloom bloom-broker bloom-signer; do
+      file -b "$payload/bin/$binary" | grep -F 'Mach-O ' >/dev/null || {
+        echo "production macOS bundle contains a non-Mach-O binary" >&2
+        exit 65
+      }
+    done
+    "$payload/installer/release/verify-macos-conformance.sh" "$payload"
+    ;;
   test-unclaimed)
     [[ "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == "true" ]] || {
       echo "test-unclaimed bundle verification was not explicitly enabled" >&2
@@ -87,19 +103,21 @@ case "$platform_claim" in
     exit 65
     ;;
 esac
-if [[ "$platform_claim" == "macos-unix-principals" ]]; then
+if [[ "$platform_claim" == "macos-unix-principals" ||
+  "$platform_claim" == "macos-unix-principals-w0" ]]
+then
   if find "$payload" -type f \
     \( -name '*identity*.json' -o -name '*credentials*' \) |
     grep . >/dev/null
   then
-    echo "production macOS bundle contains a private identity-shaped file" >&2
+    echo "macOS Unix-principal bundle contains a private identity-shaped file" >&2
     exit 65
   fi
   if LC_ALL=C grep -aER \
     '"[^"]*(private_key_seed_hex|signing_seed_hex|state_authentication_key_hex)"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"' \
     "$payload" >/dev/null
   then
-    echo "production macOS bundle contains private key material" >&2
+    echo "macOS Unix-principal bundle contains private key material" >&2
     exit 65
   fi
 fi

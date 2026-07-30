@@ -86,6 +86,33 @@ case "$platform_claim" in
       }
     done
     ;;
+  macos-unix-principals)
+    [[ "$(uname -s)" == "Darwin" ]] || {
+      echo "production macOS claim requires a Darwin release builder" >&2
+      exit 69
+    }
+    for binary in bloom bloom-broker bloom-signer; do
+      file -b "$staging/bin/$binary" | grep -F 'Mach-O ' >/dev/null || {
+        echo "production macOS claim requires Mach-O production binaries" >&2
+        exit 65
+      }
+    done
+    for evidence_name in \
+      BLOOM_MACOS_CONFORMANCE_REPORT \
+      BLOOM_MACOS_CONFORMANCE_SIGNATURE \
+      BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY
+    do
+      evidence_path="${!evidence_name:-}"
+      [[ -f "$evidence_path" && ! -L "$evidence_path" ]] || {
+        echo "$evidence_name must name a regular conformance input" >&2
+        exit 66
+      }
+    done
+    [[ "${BLOOM_MACOS_CONFORMANCE_KEY_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || {
+      echo "BLOOM_MACOS_CONFORMANCE_KEY_SHA256 must pin the reviewed conformance key" >&2
+      exit 66
+    }
+    ;;
   test-unclaimed)
     [[ "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == "true" ]] || {
       echo "test-unclaimed bundles require BLOOM_ALLOW_TEST_UNCLAIMED=true" >&2
@@ -105,22 +132,39 @@ cp -R "$script_dir/../macos" "$payload/installer/macos"
 install -m 0755 \
   "$script_dir/install-linux.sh" \
   "$script_dir/install-macos.sh" \
+  "$script_dir/macos-conformance-subject.sh" \
+  "$script_dir/sign-macos-conformance-report.sh" \
+  "$script_dir/verify-macos-conformance.sh" \
   "$payload/installer/release/"
 install -m 0755 "$script_dir/verify-bundle.sh" "$payload/installer/release/"
 
 if [[ "$platform_claim" == "macos-unix-principals" ]]; then
+  install -m 0644 \
+    "$BLOOM_MACOS_CONFORMANCE_REPORT" \
+    "$payload/MACOS_CONFORMANCE_REPORT.json"
+  install -m 0644 \
+    "$BLOOM_MACOS_CONFORMANCE_SIGNATURE" \
+    "$payload/MACOS_CONFORMANCE_REPORT.sig"
+  install -m 0644 \
+    "$BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY" \
+    "$payload/MACOS_CONFORMANCE_REPORT.pub"
+fi
+
+if [[ "$platform_claim" == "macos-unix-principals" ||
+  "$platform_claim" == "macos-unix-principals-w0" ]]
+then
   if find "$payload" -type f \
     \( -name '*identity*.json' -o -name '*credentials*' \) |
     grep . >/dev/null
   then
-    echo "production macOS bundle contains a private identity-shaped file" >&2
+    echo "macOS Unix-principal bundle contains a private identity-shaped file" >&2
     exit 65
   fi
   if LC_ALL=C grep -aER \
     '"[^"]*(private_key_seed_hex|signing_seed_hex|state_authentication_key_hex)"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"' \
     "$payload" >/dev/null
   then
-    echo "production macOS bundle contains private key material" >&2
+    echo "macOS Unix-principal bundle contains private key material" >&2
     exit 65
   fi
 fi
@@ -148,6 +192,12 @@ for revision_name in BLOOM_MACHINE_SHA BLOOM_BROKER_SHA BLOOM_SIGNER_SHA; do
   }
   printf '%s=%s\n' "$revision_name" "$revision"
 done | LC_ALL=C sort > "$payload/SOURCE_REVISIONS"
+
+if [[ "$platform_claim" == "macos-unix-principals" ]]; then
+  "$script_dir/verify-macos-conformance.sh" \
+    "$payload" \
+    "$BLOOM_MACOS_CONFORMANCE_KEY_SHA256"
+fi
 
 openssl pkey -in "$signing_key" -pubout -out "$payload/RELEASE_PUBLIC_KEY.pem" 2>/dev/null
 (

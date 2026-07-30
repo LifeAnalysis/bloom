@@ -106,6 +106,36 @@ jobs:
             "$login_uid" \
             "$login_user"
 
+      - name: Record tested release subject
+        if: success()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          payload="$RUNNER_TEMP/verified/bloom-triad"
+          subject="$(
+            bloom/packaging/triad/release/macos-conformance-subject.sh \
+              "$payload"
+          )"
+          archive_sha="$(
+            shasum -a 256 "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz" |
+              awk '{print $1}'
+          )"
+          {
+            printf 'schema=bloom.macos-w0-subject.1\n'
+            printf 'release_subject_digest=%s\n' "$subject"
+            printf 'w0_candidate_archive_sha256=%s\n' "$archive_sha"
+            cat "$payload/SOURCE_REVISIONS"
+          } > "$RUNNER_TEMP/macos-w0-subject.txt"
+
+      - name: Upload W0 subject evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-w0-subject-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-w0-subject.txt
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Remove W0 host markers
         if: always()
         shell: bash

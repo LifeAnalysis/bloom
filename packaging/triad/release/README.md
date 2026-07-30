@@ -19,6 +19,28 @@ in its explicitly enabled disposable Darwin lane. The `test-unclaimed` marker re
 `BLOOM_ALLOW_TEST_UNCLAIMED=true` override at build, verification, and install;
 neither test claim can be advertised as production.
 
+Production `macos-unix-principals` bundles are accepted only on Darwin and
+only with a signed `bloom.macos-unix-conformance.1` report. The builder
+requires an out-of-band SHA-256 pin for the conformance public key; the report
+must bind the canonical release-subject digest, all three source revisions,
+MUI-01 through MUI-12, installed AC-01 through AC-35, negative-access tests,
+and the two-login lifecycle suite. The subject digest covers every packaged
+binary, installer, compatibility input, plist, ACL, and packet-filter source
+while excluding only the platform-claim value and the release/conformance
+signature envelope. This avoids a self-referential archive digest while still
+invalidating evidence after any security-relevant packaged input changes.
+The final archive and internal release signature then bind the report and its
+public key into the distributed artifact.
+
+`macos-conformance-subject.sh` computes the canonical subject.
+`sign-macos-conformance-report.sh` refuses to sign until each required
+criterion has a regular `CRITERION.pass` evidence file containing that exact
+subject digest; it never overwrites an existing report. The release operator
+reviews those suite outputs and signs with the separately controlled
+conformance key. `verify-macos-conformance.sh` verifies that signature,
+criterion completeness, source revisions, subject binding, and—during
+production assembly—the out-of-band conformance-key fingerprint.
+
 `triad-release-gate.sh` rejects modified or untracked release inputs, runs
 locked fmt, clippy, and tests in all three sibling workspaces, builds release
 binaries, assembles the bundle twice, verifies both, requires byte-identical
@@ -34,14 +56,16 @@ post-extraction rerun is bound to the exact clean source revisions recorded in
 the signed bundle; process/artifact acceptance additionally executes and
 inspects the extracted production binaries.
 
-Linux instance configuration and the disposable macOS W0 fixtures are
-site-specific security inputs and are deliberately not reusable release
-credentials. The W0 fixture uses the following `config/` layout beside the
-extracted binaries:
+Linux instance configuration fixtures are site-specific security inputs and
+are deliberately not reusable release credentials. Test-only staged
+installer fixtures use the following `config/` layout beside the extracted binaries:
 `edge-manifest.json`, `broker.json`, `signer.json`,
 `machine-identity.json`, `broker-identity.json`, `signer-identity.json`,
 `revoke-identity.json`, `session-identity.json`, `installer-identity.json`,
-and `provenance-catalog.json`. On Linux,
+and `provenance-catalog.json`. The macOS W0 bundle deliberately contains none
+of these private files: its guarded live installer uses the same fresh
+root-owned identity-generation path as the production Unix-principal claim.
+On Linux,
 `nts-servers.conf`. The last file contains at least two distinct reviewed NTS
 host names, one per line. AWS credentials and `aws-kms-ip-allow.conf` are an
 optional paired site overlay.
