@@ -414,11 +414,15 @@ require_directory_value() {
   attribute="$3"
   expected="$4"
   observed="$(
-    dscl . -read "/$kind/$name" "$attribute" |
-      sed -n "s/^$attribute: //p"
+    dscl -plist . -read "/$kind/$name" "$attribute" |
+      plutil \
+        -extract "dsAttrTypeStandard:$attribute".0 \
+        raw \
+        -o - \
+        -
   )"
   [[ "$observed" == "$expected" ]] || {
-    echo "$kind/$name has unexpected $attribute" >&2
+    echo "$kind/$name has unexpected $attribute: expected $expected, observed $observed" >&2
     exit 65
   }
 }

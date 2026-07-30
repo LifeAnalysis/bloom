@@ -214,8 +214,12 @@ assert_record() {
   attribute="$3"
   expected="$4"
   observed="$(
-    dscl . -read "/$kind/$name" "$attribute" |
-      sed -n "s/^$attribute: //p"
+    dscl -plist . -read "/$kind/$name" "$attribute" |
+      plutil \
+        -extract "dsAttrTypeStandard:$attribute".0 \
+        raw \
+        -o - \
+        -
   )"
   [[ "$observed" == "$expected" ]] || {
     echo "$kind/$name $attribute: expected $expected, observed $observed" >&2
