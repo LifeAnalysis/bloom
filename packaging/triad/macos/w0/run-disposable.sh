@@ -517,6 +517,50 @@ sudo -u "$login_user" \
   --triad-health-check \
   "$release_digest"
 
+config_root="/Library/Application Support/BloomTriad/config/$login_uid"
+old_edge_digest="$(shasum -a 256 "$config_root/edge-manifest.json" | awk '{print $1}')"
+old_broker_config_digest="$(
+  shasum -a 256 "$config_root/broker/config.json" |
+    awk '{print $1}'
+)"
+old_signer_config_digest="$(
+  shasum -a 256 "$config_root/signer/config.json" |
+    awk '{print $1}'
+)"
+declare -a transport_identity_paths=(
+  machine/identity.json
+  machine/revoke-identity.json
+  broker/identity.json
+  signer/identity.json
+  session/identity.json
+)
+declare -a old_transport_identity_digests=()
+for relative in "${transport_identity_paths[@]}"; do
+  old_transport_identity_digests+=("$(
+    shasum -a 256 "$config_root/$relative" |
+      awk '{print $1}'
+  )")
+done
+"$installer" rotate-identities / "$login_uid"
+[[ "$(shasum -a 256 "$config_root/edge-manifest.json" | awk '{print $1}')" !=
+  "$old_edge_digest" ]]
+[[ "$(shasum -a 256 "$config_root/broker/config.json" | awk '{print $1}')" ==
+  "$old_broker_config_digest" ]]
+[[ "$(shasum -a 256 "$config_root/signer/config.json" | awk '{print $1}')" ==
+  "$old_signer_config_digest" ]]
+for index in "${!transport_identity_paths[@]}"; do
+  relative="${transport_identity_paths[$index]}"
+  new_digest="$(shasum -a 256 "$config_root/$relative" | awk '{print $1}')"
+  [[ "$new_digest" != "${old_transport_identity_digests[$index]}" ]] || {
+    echo "transport identity rotation did not replace $relative" >&2
+    exit 1
+  }
+done
+sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
+
 assert_active_release() {
   expected_digest="$1"
   [[ "$(field state)" == "active" ]]

@@ -6,6 +6,7 @@ usage() {
 usage:
   install-macos.sh install ROOT LOGIN_UID LOGIN_USER PAYLOAD_DIR
   install-macos.sh rotate-config ROOT LOGIN_UID PRINCIPAL CONFIG_JSON
+  install-macos.sh rotate-identities ROOT LOGIN_UID
   install-macos.sh uninstall ROOT LOGIN_UID CONFIRM_TOKEN
 
 Staged-root tests must supply:
@@ -1381,6 +1382,24 @@ install_immutable_release() {
   sync
 }
 
+require_current_release() {
+  expected_digest="$1"
+  current="$release_base/current"
+  [[ -L "$current" && "$(stat -f '%u:%g' "$current")" == "0:0" ]] || {
+    echo "Bloom current link has unsafe ownership or type" >&2
+    return 65
+  }
+  [[ "$(readlink "$current")" == "releases/$expected_digest" ]] || {
+    echo "Bloom current link does not match the enrolled release" >&2
+    return 65
+  }
+  expected_root="$release_base/releases/$expected_digest"
+  require_live_directory_metadata "$expected_root" 0 0 755
+  for binary in bloom bloom-broker bloom-signer; do
+    require_live_file_metadata "$expected_root/$binary" 0 0 755
+  done
+}
+
 bootstrap_live_jobs() {
   plutil -lint \
     "$broker_plist" \
@@ -1567,20 +1586,108 @@ write_rotation_phase() {
   sync
 }
 
+transport_rotation_files=(
+  edge-manifest.json
+  machine/identity.json
+  machine/revoke-identity.json
+  broker/identity.json
+  signer/identity.json
+  session/identity.json
+)
+
+verify_transport_rotation_tree() {
+  tree="$1"
+  [[ -d "$tree" && ! -L "$tree" ]] || return 65
+  for relative in "${transport_rotation_files[@]}"; do
+    [[ -f "$tree/$relative" && ! -L "$tree/$relative" ]] || return 65
+  done
+}
+
+copy_installed_transport_tree() {
+  destination_tree="$1"
+  installed_root="$product_root/config/$login_uid"
+  mkdir -p \
+    "$destination_tree/machine" \
+    "$destination_tree/broker" \
+    "$destination_tree/signer" \
+    "$destination_tree/session"
+  for relative in "${transport_rotation_files[@]}"; do
+    cp -p "$installed_root/$relative" "$destination_tree/$relative"
+  done
+}
+
+copy_generated_transport_tree() {
+  generated="$1"
+  destination_tree="$2"
+  mkdir -p \
+    "$destination_tree/machine" \
+    "$destination_tree/broker" \
+    "$destination_tree/signer" \
+    "$destination_tree/session"
+  cp "$generated/edge-manifest.json" "$destination_tree/edge-manifest.json"
+  cp "$generated/machine-identity.json" "$destination_tree/machine/identity.json"
+  cp \
+    "$generated/revoke-identity.json" \
+    "$destination_tree/machine/revoke-identity.json"
+  cp "$generated/broker-identity.json" "$destination_tree/broker/identity.json"
+  cp "$generated/signer-identity.json" "$destination_tree/signer/identity.json"
+  cp "$generated/session-identity.json" "$destination_tree/session/identity.json"
+  chown root:wheel "$destination_tree/edge-manifest.json"
+  chown "$login_uid:$BLOOM_MACOS_MACHINE_BROKER_GID" \
+    "$destination_tree/machine/identity.json" \
+    "$destination_tree/machine/revoke-identity.json"
+  chown "$BLOOM_MACOS_BROKER_UID:$BLOOM_MACOS_BROKER_GID" \
+    "$destination_tree/broker/identity.json"
+  chown "$BLOOM_MACOS_SIGNER_UID:$BLOOM_MACOS_SIGNER_GID" \
+    "$destination_tree/signer/identity.json"
+  chown "$login_uid:$BLOOM_MACOS_REVOKE_GID" \
+    "$destination_tree/session/identity.json"
+  chmod 0644 "$destination_tree/edge-manifest.json"
+  chmod 0600 \
+    "$destination_tree/machine/identity.json" \
+    "$destination_tree/machine/revoke-identity.json" \
+    "$destination_tree/broker/identity.json" \
+    "$destination_tree/signer/identity.json" \
+    "$destination_tree/session/identity.json"
+}
+
+swap_transport_rotation_tree() {
+  source_tree="$1"
+  installed_root="$product_root/config/$login_uid"
+  for relative in "${transport_rotation_files[@]}"; do
+    atomic_copy_preserving_metadata \
+      "$source_tree/$relative" \
+      "$installed_root/$relative"
+  done
+}
+
 load_rotation_identity() {
   rotation_transaction="$product_root/rotation-transaction"
   [[ -d "$rotation_transaction" && ! -L "$rotation_transaction" ]] || return 65
   [[ "$(stat -f '%u:%Lp' "$rotation_transaction")" == "0:700" ]] || return 65
-  for required in schema login-uid principal phase backup.json staged.json jobs; do
+  for required in schema login-uid principal phase jobs; do
     [[ -f "$rotation_transaction/$required" &&
       ! -L "$rotation_transaction/$required" ]] || return 65
   done
-  grep -Fx 'bloom.macos-config-rotation.1' \
-    "$rotation_transaction/schema" >/dev/null || return 65
+  rotation_schema="$(<"$rotation_transaction/schema")"
   login_uid="$(<"$rotation_transaction/login-uid")"
   principal="$(<"$rotation_transaction/principal")"
   [[ "$login_uid" =~ ^[1-9][0-9]*$ ]] || return 65
-  [[ "$principal" == "broker" || "$principal" == "signer" ]] || return 65
+  case "$rotation_schema" in
+    bloom.macos-config-rotation.1)
+      [[ "$principal" == "broker" || "$principal" == "signer" ]] || return 65
+      for required in backup.json staged.json; do
+        [[ -f "$rotation_transaction/$required" &&
+          ! -L "$rotation_transaction/$required" ]] || return 65
+      done
+      ;;
+    bloom.macos-transport-rotation.1)
+      [[ "$principal" == "transport" ]] || return 65
+      verify_transport_rotation_tree "$rotation_transaction/backup"
+      verify_transport_rotation_tree "$rotation_transaction/staged"
+      ;;
+    *) return 65 ;;
+  esac
   enrollment_root="$product_root/enrollments"
   enrollment="$enrollment_root/$login_uid.json"
   [[ -f "$enrollment" && ! -L "$enrollment" ]] || return 65
@@ -1592,6 +1699,11 @@ load_rotation_identity() {
 restore_rotation_jobs() {
   while IFS= read -r job; do
     case "$job" in
+      session)
+        launchctl bootstrap \
+          "gui/$login_uid" \
+          "/Library/LaunchAgents/com.bloom.session.plist"
+        ;;
       signer)
         launchctl bootstrap \
           system \
@@ -1616,11 +1728,18 @@ rollback_rotation() {
     rotation_in_progress=false
     return
   fi
+  if [[ "$principal" == "transport" ]]; then
+    launchctl bootout "gui/$login_uid/com.bloom.session" 2>/dev/null || true
+  fi
   launchctl bootout "system/com.bloom.broker.$login_uid" 2>/dev/null || true
   launchctl bootout "system/com.bloom.signer.$login_uid" 2>/dev/null || true
-  destination="$product_root/config/$login_uid/$principal/config.json"
-  atomic_copy_preserving_metadata "$rotation_transaction/backup.json" "$destination" ||
-    return
+  if [[ "$principal" == "transport" ]]; then
+    swap_transport_rotation_tree "$rotation_transaction/backup" || return
+  else
+    destination="$product_root/config/$login_uid/$principal/config.json"
+    atomic_copy_preserving_metadata "$rotation_transaction/backup.json" "$destination" ||
+      return
+  fi
   restore_rotation_jobs || return
   if grep -Fx broker "$rotation_transaction/jobs" >/dev/null; then
     health_check_enrollment || return
@@ -1641,10 +1760,10 @@ recover_interrupted_rotation() {
   done
   [[ -e "$rotation_transaction" ]] || return
   rotation_in_progress=true
-  echo "recovering an interrupted Bloom macOS config rotation" >&2
+  echo "recovering an interrupted Bloom macOS config/identity rotation" >&2
   rollback_rotation
   $rotation_in_progress && {
-    echo "Bloom macOS config rotation rollback remains incomplete" >&2
+    echo "Bloom macOS config/identity rotation rollback remains incomplete" >&2
     exit 70
   }
 }
@@ -1768,12 +1887,80 @@ prepare_rotation() {
   rotation_in_progress=true
 }
 
+prepare_transport_rotation() {
+  generated="$1"
+  rotation_transaction="$product_root/rotation-transaction"
+  [[ ! -e "$rotation_transaction" ]] || return 75
+  rotation_transaction_staging="$product_root/.rotation-transaction.new.$$"
+  [[ ! -e "$rotation_transaction_staging" ]] || return 75
+  mkdir "$rotation_transaction_staging"
+  chown root:wheel "$rotation_transaction_staging"
+  chmod 0700 "$rotation_transaction_staging"
+  printf '%s\n' 'bloom.macos-transport-rotation.1' \
+    > "$rotation_transaction_staging/schema"
+  printf '%s\n' "$login_uid" > "$rotation_transaction_staging/login-uid"
+  printf '%s\n' transport > "$rotation_transaction_staging/principal"
+  printf '%s\n' prepared > "$rotation_transaction_staging/phase"
+  : > "$rotation_transaction_staging/jobs"
+  copy_installed_transport_tree "$rotation_transaction_staging/backup"
+  copy_generated_transport_tree \
+    "$generated" \
+    "$rotation_transaction_staging/staged"
+  for required_job in session signer broker; do
+    case "$required_job" in
+      session)
+        job_target="gui/$login_uid/com.bloom.session"
+        ;;
+      *)
+        job_target="system/com.bloom.$required_job.$login_uid"
+        ;;
+    esac
+    launchctl print "$job_target" >/dev/null 2>&1 || {
+      echo "transport identity rotation requires loaded $required_job integration" >&2
+      return 69
+    }
+    printf '%s\n' "$required_job" >> "$rotation_transaction_staging/jobs"
+  done
+  chmod 0700 \
+    "$rotation_transaction_staging/backup" \
+    "$rotation_transaction_staging/backup/machine" \
+    "$rotation_transaction_staging/backup/broker" \
+    "$rotation_transaction_staging/backup/signer" \
+    "$rotation_transaction_staging/backup/session" \
+    "$rotation_transaction_staging/staged" \
+    "$rotation_transaction_staging/staged/machine" \
+    "$rotation_transaction_staging/staged/broker" \
+    "$rotation_transaction_staging/staged/signer" \
+    "$rotation_transaction_staging/staged/session"
+  chmod 0600 \
+    "$rotation_transaction_staging/schema" \
+    "$rotation_transaction_staging/login-uid" \
+    "$rotation_transaction_staging/principal" \
+    "$rotation_transaction_staging/phase" \
+    "$rotation_transaction_staging/jobs"
+  verify_transport_rotation_tree "$rotation_transaction_staging/backup"
+  verify_transport_rotation_tree "$rotation_transaction_staging/staged"
+  sync
+  mv "$rotation_transaction_staging" "$rotation_transaction"
+  rotation_transaction_staging=""
+  sync
+  principal=transport
+  rotation_in_progress=true
+}
+
 activate_rotation() {
+  if [[ "$principal" == "transport" ]]; then
+    launchctl bootout "gui/$login_uid/com.bloom.session" 2>/dev/null || true
+  fi
   launchctl bootout "system/com.bloom.broker.$login_uid" 2>/dev/null || true
   launchctl bootout "system/com.bloom.signer.$login_uid" 2>/dev/null || true
   write_rotation_phase switching
-  destination="$product_root/config/$login_uid/$principal/config.json"
-  atomic_copy_preserving_metadata "$rotation_transaction/staged.json" "$destination"
+  if [[ "$principal" == "transport" ]]; then
+    swap_transport_rotation_tree "$rotation_transaction/staged"
+  else
+    destination="$product_root/config/$login_uid/$principal/config.json"
+    atomic_copy_preserving_metadata "$rotation_transaction/staged.json" "$destination"
+  fi
   write_rotation_phase switched
   restore_rotation_jobs
   write_rotation_phase activating
@@ -2686,6 +2873,56 @@ case "$action" in
       chown "bloom-$principal-$login_uid:bloom-$principal-$login_uid" "$destination"
       launchctl kickstart -k "system/com.bloom.$principal.$login_uid"
     fi
+    ;;
+  rotate-identities)
+    [[ $# -eq 2 ]] || usage
+    validate_root_uid "$1" "$2"
+    $live_install || {
+      echo "transport identity rotation requires a live macOS enrollment" >&2
+      exit 69
+    }
+    require_live_macos_root
+    acquire_installer_lock
+    product_root="/Library/Application Support/BloomTriad"
+    enrollment_root="$product_root/enrollments"
+    release_base="/usr/local/libexec/bloom"
+    requested_login_uid="$login_uid"
+    recover_interrupted_uninstalls
+    recover_retained_restores
+    recover_interrupted_upgrade
+    recover_pending_enrollments
+    recover_interrupted_rotation
+    login_uid="$requested_login_uid"
+    enrollment="$enrollment_root/$login_uid.json"
+    broker_user="bloom-broker-$login_uid"
+    broker_group="$broker_user"
+    signer_user="bloom-signer-$login_uid"
+    signer_group="$signer_user"
+    machine_broker_group="bloom-machine-broker-$login_uid"
+    broker_signer_group="bloom-broker-signer-$login_uid"
+    revoke_group="bloom-revoke-$login_uid"
+    [[ -f "$enrollment" && ! -L "$enrollment" ]] || {
+      echo "enrollment record is missing or invalid" >&2
+      exit 66
+    }
+    require_live_file_metadata "$enrollment" 0 0 644
+    login_user="$(read_enrollment_field "$enrollment" login_user)"
+    verify_existing_enrollment
+    BLOOM_RELEASE_DIGEST="$(read_enrollment_field "$enrollment" release_digest)"
+    require_current_release "$BLOOM_RELEASE_DIGEST"
+    machine_binary="$release_base/current/bloom"
+    verify_installed_security_files "$product_root/config/$login_uid" "$enrollment"
+    generated_material="$(mktemp -d "$product_root/.enrollment-material.XXXXXX")"
+    chmod 0700 "$generated_material"
+    chown root:wheel "$generated_material"
+    "$machine_binary" \
+      --triad-render-macos-identity-rotation \
+      "$product_root/config/$login_uid/edge-manifest.json" \
+      "$generated_material"
+    provision_committed=true
+    prepare_transport_rotation "$generated_material"
+    activate_rotation
+    echo "Bloom macOS transport identities rotated atomically"
     ;;
   uninstall)
     [[ $# -eq 3 ]] || usage

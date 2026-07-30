@@ -47,6 +47,20 @@ pub fn run_from_process_args() -> Result<()> {
     })
 }
 
+pub fn run_identity_rotation_from_process_args() -> Result<()> {
+    if rustix::process::geteuid().as_raw() != 0 {
+        bail!("macOS identity rotation generation requires root");
+    }
+    if std::env::consts::OS != "macos" {
+        bail!("macOS identity rotation generation requires Darwin");
+    }
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if args.len() != 4 {
+        bail!("invalid macOS identity rotation invocation");
+    }
+    generate_identity_rotation_for_owner(Path::new(&args[2]), Path::new(&args[3]), 0)
+}
+
 #[derive(Clone, Debug)]
 struct EnrollmentPlan {
     template_dir: PathBuf,
@@ -182,6 +196,124 @@ fn generate_for_owner(plan: &EnrollmentPlan, expected_owner: u32) -> Result<()> 
     Ok(())
 }
 
+fn generate_identity_rotation_for_owner(
+    current_manifest_path: &Path,
+    output_dir: &Path,
+    expected_owner: u32,
+) -> Result<()> {
+    require_public_template(current_manifest_path, expected_owner)?;
+    require_empty_private_output(output_dir, expected_owner)?;
+    let mut manifest_bytes = read_public_template(current_manifest_path)?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).context("parse installed edge manifest")?;
+    manifest_bytes.zeroize();
+    if manifest.get("schema").and_then(|value| value.as_str()) != Some("bloom.edge-manifest.1") {
+        bail!("installed edge manifest has the wrong schema");
+    }
+    let login_uid = manifest_uid(&manifest, "machine")?;
+    if manifest_uid(&manifest, "revoke_client")? != login_uid
+        || manifest_uid(&manifest, "session")? != login_uid
+    {
+        bail!("installed edge manifest has inconsistent login identities");
+    }
+    let broker_uid = manifest_uid(&manifest, "broker")?;
+    let signer_uid = manifest_uid(&manifest, "signer")?;
+    if broker_uid == login_uid || signer_uid == login_uid || signer_uid == broker_uid {
+        bail!("installed edge manifest does not use distinct service UIDs");
+    }
+    let _session_gid = manifest
+        .get("session_socket_gid")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != 0)
+        .context("installed edge manifest session socket GID is invalid")?;
+    let identities = [
+        (
+            "machine",
+            ApplicationIdentity::generate("bloom-machine", login_uid),
+        ),
+        (
+            "broker",
+            ApplicationIdentity::generate("bloom-broker", login_uid),
+        ),
+        (
+            "signer",
+            ApplicationIdentity::generate("bloom-signer", login_uid),
+        ),
+        (
+            "revoke_client",
+            ApplicationIdentity::generate("bloom-revoke-client", login_uid),
+        ),
+        (
+            "session",
+            ApplicationIdentity::generate("bloom-session", login_uid),
+        ),
+    ];
+    for (edge_name, identity) in &identities {
+        replace_manifest_identity(&mut manifest, edge_name, identity)?;
+    }
+    let mut edge_bytes = serde_json::to_vec_pretty(&manifest)?;
+    edge_bytes.push(b'\n');
+    let result = write_new_private(&output_dir.join("edge-manifest.json"), &edge_bytes);
+    edge_bytes.zeroize();
+    result?;
+    for (edge_name, identity) in &identities {
+        let file_name = match *edge_name {
+            "revoke_client" => "revoke-identity.json",
+            other => {
+                let mut name = other.to_owned();
+                name.push_str("-identity.json");
+                write_identity(&output_dir.join(name), identity)?;
+                continue;
+            }
+        };
+        write_identity(&output_dir.join(file_name), identity)?;
+    }
+    Ok(())
+}
+
+fn manifest_uid(manifest: &serde_json::Value, edge_name: &str) -> Result<u32> {
+    let edge = manifest
+        .get(edge_name)
+        .and_then(|value| value.as_object())
+        .with_context(|| format!("installed edge manifest omits {edge_name}"))?;
+    let uid = edge
+        .get("effective_uid")
+        .and_then(|value| value.as_u64())
+        .with_context(|| format!("installed edge manifest {edge_name} UID is invalid"))?;
+    u32::try_from(uid)
+        .ok()
+        .filter(|uid| *uid != 0)
+        .with_context(|| format!("installed edge manifest {edge_name} UID is invalid"))
+}
+
+fn replace_manifest_identity(
+    manifest: &mut serde_json::Value,
+    edge_name: &str,
+    identity: &ApplicationIdentity,
+) -> Result<()> {
+    let edge = manifest
+        .get_mut(edge_name)
+        .and_then(|value| value.as_object_mut())
+        .with_context(|| format!("installed edge manifest omits {edge_name}"))?;
+    if edge.get("service_id").and_then(|value| value.as_str()) != Some(&identity.service_id) {
+        bail!("installed edge manifest {edge_name} service identity is invalid");
+    }
+    edge.insert(
+        "boot_epoch".to_owned(),
+        serde_json::Value::String(identity.boot_epoch.clone()),
+    );
+    edge.insert(
+        "application_key_id".to_owned(),
+        serde_json::Value::String(identity.application_key_id.clone()),
+    );
+    edge.insert(
+        "application_public_key_hex".to_owned(),
+        serde_json::Value::String(identity.key.public_hex()),
+    );
+    Ok(())
+}
+
 fn validate_plan(plan: &EnrollmentPlan, expected_owner: u32) -> Result<()> {
     if plan.login_uid == 0
         || plan.broker_uid == 0
@@ -195,25 +327,30 @@ fn validate_plan(plan: &EnrollmentPlan, expected_owner: u32) -> Result<()> {
     {
         bail!("macOS enrollment generation plan has invalid IDs or release digest");
     }
-    let metadata = fs::symlink_metadata(&plan.output_dir).with_context(|| {
+    require_empty_private_output(&plan.output_dir, expected_owner)?;
+    for name in PUBLIC_TEMPLATE_FILES
+        .into_iter()
+        .chain(["provenance-catalog.unsigned.json"])
+    {
+        require_public_template(&plan.template_dir.join(name), expected_owner)?;
+    }
+    Ok(())
+}
+
+fn require_empty_private_output(output_dir: &Path, expected_owner: u32) -> Result<()> {
+    let metadata = fs::symlink_metadata(output_dir).with_context(|| {
         format!(
             "inspect enrollment output directory {}",
-            plan.output_dir.display()
+            output_dir.display()
         )
     })?;
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != expected_owner
         || metadata.mode() & 0o7777 != 0o700
-        || fs::read_dir(&plan.output_dir)?.next().is_some()
+        || fs::read_dir(output_dir)?.next().is_some()
     {
         bail!("enrollment output must be an empty root-owned mode-0700 directory");
-    }
-    for name in PUBLIC_TEMPLATE_FILES
-        .into_iter()
-        .chain(["provenance-catalog.unsigned.json"])
-    {
-        require_public_template(&plan.template_dir.join(name), expected_owner)?;
     }
     Ok(())
 }
@@ -365,10 +502,11 @@ impl ApplicationIdentity {
     fn generate(service_id: &str, login_uid: u32) -> Self {
         let mut epoch = [0_u8; 16];
         OsRng.fill_bytes(&mut epoch);
+        let boot_epoch = hex::encode(epoch);
         Self {
             service_id: service_id.to_owned(),
-            boot_epoch: hex::encode(epoch),
-            application_key_id: format!("{service_id}-app-{login_uid}"),
+            application_key_id: format!("{service_id}-app-{login_uid}-{}", &boot_epoch[..16]),
+            boot_epoch,
             key: GeneratedKey::new(),
         }
     }
@@ -523,5 +661,65 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn transport_rotation_replaces_every_application_identity_and_cross_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let initial = directory.path().join("initial");
+        let rotated = directory.path().join("rotated");
+        for output in [&initial, &rotated] {
+            fs::create_dir(output).unwrap();
+            fs::set_permissions(output, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let plan = EnrollmentPlan {
+            template_dir: template_dir(),
+            output_dir: initial.clone(),
+            login_uid: 501,
+            broker_uid: 250_501,
+            signer_uid: 250_502,
+            session_socket_gid: 260_503,
+            release_digest: "11".repeat(32),
+        };
+        let owner = rustix::process::geteuid().as_raw();
+        generate_for_owner(&plan, owner).unwrap();
+        generate_identity_rotation_for_owner(&initial.join("edge-manifest.json"), &rotated, owner)
+            .unwrap();
+
+        let old_edge: serde_json::Value =
+            serde_json::from_slice(&fs::read(initial.join("edge-manifest.json")).unwrap()).unwrap();
+        let new_edge: serde_json::Value =
+            serde_json::from_slice(&fs::read(rotated.join("edge-manifest.json")).unwrap()).unwrap();
+        for (edge_name, file_name) in [
+            ("machine", "machine-identity.json"),
+            ("broker", "broker-identity.json"),
+            ("signer", "signer-identity.json"),
+            ("revoke_client", "revoke-identity.json"),
+            ("session", "session-identity.json"),
+        ] {
+            assert_ne!(
+                old_edge[edge_name]["boot_epoch"],
+                new_edge[edge_name]["boot_epoch"]
+            );
+            let identity: serde_json::Value =
+                serde_json::from_slice(&fs::read(rotated.join(file_name)).unwrap()).unwrap();
+            let seed: [u8; 32] = hex::decode(
+                identity["private_key_seed_hex"]
+                    .as_str()
+                    .expect("identity seed"),
+            )
+            .unwrap()
+            .try_into()
+            .unwrap();
+            assert_eq!(
+                new_edge[edge_name]["application_public_key_hex"]
+                    .as_str()
+                    .unwrap(),
+                hex::encode(SigningKey::from_bytes(&seed).verifying_key().to_bytes())
+            );
+        }
+        assert!(!rotated.join("broker.json").exists());
+        assert!(!rotated.join("signer.json").exists());
+        assert!(!rotated.join("installer-identity.json").exists());
     }
 }

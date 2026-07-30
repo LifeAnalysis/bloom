@@ -71,6 +71,16 @@ invocation after interruption restores the byte-identical prior config and
 job set. The disposable W0 lane exercises valid rotation, immutable-field
 rejection, and SIGKILL recovery.
 
+`rotate-identities` rotates only the five application identities used on the
+authenticated Unix edges (Machine, Broker, Signer, revoke client, and session)
+and their root-owned edge manifest. The installed, digest-bound Machine binary
+generates the replacement set from the OS CSPRNG; the root installer journals
+the complete old/new sets, stops the session agent and both services, swaps all
+cross-pins while they are unavailable, then restores them and requires
+authenticated health. It deliberately does not rotate Broker or Signer
+custody/signing authorities embedded in service config, whose persisted-key
+rollover is a separate semantic operation.
+
 Permanent per-login uninstall is also a root-journaled operation. The exact
 verified enrollment record is copied into a durable transaction before the
 public enrollment state becomes `uninstalling`. Teardown is idempotent: a

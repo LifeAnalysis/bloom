@@ -48,5 +48,8 @@ invocation removes both without adopting the record. When the optional bundles
 are supplied, it also proves a complete-version upgrade, activation-failure
 rollback, `SIGKILL` during the activating phase, stale PID-lock reclamation,
 journal recovery, and restoration of the exact prior healthy digest.
+It also rotates the complete transport-identity/edge-manifest set, verifies
+that service configs are unchanged, and requires authenticated health with the
+new cross-pins.
 Cross-login listener conflict, actual logout handoff, and hostile session
 authentication remain required before the W0 claim can graduate.

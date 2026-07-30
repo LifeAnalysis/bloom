@@ -266,14 +266,14 @@ fn installed_macos_triad_paths_with_activation(
         let config = PathBuf::from(format!(
             "/Library/Application Support/BloomTriad/config/{uid}"
         ));
-        return Ok(Some(InstalledMacosTriadPaths {
+        Ok(Some(InstalledMacosTriadPaths {
             broker_socket: PathBuf::from(format!(
                 "/private/var/run/bloom/{uid}/machine-broker/broker.sock"
             )),
             machine_identity: config.join("machine/identity.json"),
             edge_manifest: config.join("edge-manifest.json"),
             provenance_catalog: config.join("provenance-catalog.json"),
-        }));
+        }))
     }
     #[cfg(not(target_os = "macos"))]
     Ok(None)
@@ -1216,6 +1216,20 @@ fn print_portfolio_table(rows: &[WalletPortfolioRow], network: &str) {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args_os().len() == 4
+        && std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new(
+                "--triad-render-macos-identity-rotation",
+            ))
+    {
+        return match triad_enrollment::run_identity_rotation_from_process_args() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Bloom macOS identity rotation generation failed: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if std::env::args_os().len() == 9
         && std::env::args_os().nth(1).as_deref()
             == Some(std::ffi::OsStr::new("--triad-render-macos-enrollment"))
