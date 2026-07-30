@@ -1,0 +1,115 @@
+name: macOS Unix-principal W0
+
+on:
+  workflow_dispatch:
+    inputs:
+      broker_ref:
+        description: Public bloom-broker ref
+        required: true
+        default: master
+      signer_ref:
+        description: Public bloom-signer ref
+        required: true
+        default: master
+
+permissions:
+  contents: read
+
+jobs:
+  disposable-w0:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out Machine
+        uses: actions/checkout@v4
+        with:
+          path: bloom
+      - name: Check out Broker
+        uses: actions/checkout@v4
+        with:
+          repository: bloom-directory/bloom-broker
+          ref: ${{ inputs.broker_ref }}
+          path: bloom-broker
+      - name: Check out Signer
+        uses: actions/checkout@v4
+        with:
+          repository: bloom-directory/bloom-signer
+          ref: ${{ inputs.signer_ref }}
+          path: bloom-signer
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build W0 triad payload
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cargo build --manifest-path bloom/Cargo.toml --release -p bloom --locked
+          cargo build --manifest-path bloom-broker/Cargo.toml --release -p bloom-broker --locked
+          cargo build --manifest-path bloom-signer/Cargo.toml --release -p bloom-signer --locked
+          mkdir -p "$RUNNER_TEMP/triad-staging/bin" "$RUNNER_TEMP/triad-dist"
+          cp bloom/target/release/bloom "$RUNNER_TEMP/triad-staging/bin/"
+          cp bloom-broker/target/release/bloom-broker "$RUNNER_TEMP/triad-staging/bin/"
+          cp bloom-signer/target/release/bloom-signer "$RUNNER_TEMP/triad-staging/bin/"
+          openssl genpkey \
+            -algorithm ED25519 \
+            -out "$RUNNER_TEMP/w0-release-key.pem"
+          export BLOOM_PLATFORM_CLAIM=macos-unix-principals-w0
+          export BLOOM_ALLOW_MACOS_UNIX_W0=true
+          export BLOOM_MACHINE_SHA
+          export BLOOM_BROKER_SHA
+          export BLOOM_SIGNER_SHA
+          BLOOM_MACHINE_SHA="$(git -C bloom rev-parse HEAD)"
+          BLOOM_BROKER_SHA="$(git -C bloom-broker rev-parse HEAD)"
+          BLOOM_SIGNER_SHA="$(git -C bloom-signer rev-parse HEAD)"
+          bloom/packaging/triad/release/build-bundle.sh \
+            "$RUNNER_TEMP/triad-staging" \
+            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz" \
+            "$RUNNER_TEMP/w0-release-key.pem" \
+            1700000000
+          bloom/packaging/triad/release/verify-bundle.sh \
+            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz" \
+            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz.sha256" \
+            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz.sig" \
+            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz.pub"
+          mkdir "$RUNNER_TEMP/verified"
+          tar -xzf \
+            "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz" \
+            -C "$RUNNER_TEMP/verified"
+
+      - name: Prove disposable host prerequisites
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          login_uid="$(id -u)"
+          sudo launchctl print "gui/$login_uid" >/dev/null
+          printf '%s\n' bloom-macos-unix-w0-disposable-v1 |
+            sudo tee /private/var/db/bloom-w0-disposable-host >/dev/null
+          sudo chown root:wheel /private/var/db/bloom-w0-disposable-host
+          sudo chmod 0644 /private/var/db/bloom-w0-disposable-host
+          sudo install \
+            -o root \
+            -g wheel \
+            -m 0644 \
+            "$RUNNER_TEMP/verified/bloom-triad/RELEASE_PUBLIC_KEY.pem" \
+            /private/var/db/bloom-w0-release-key.pem
+
+      - name: Run destructive W0 isolation checks
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          login_uid="$(id -u)"
+          login_user="$(id -un)"
+          sudo env \
+            BLOOM_RUN_MACOS_UNIX_W0=true \
+            BLOOM_RELEASE_PUBLIC_KEY=/private/var/db/bloom-w0-release-key.pem \
+            bloom/packaging/triad/macos/w0/run-disposable.sh \
+            "$RUNNER_TEMP/verified/bloom-triad" \
+            "$login_uid" \
+            "$login_user"
+
+      - name: Remove W0 host markers
+        if: always()
+        shell: bash
+        run: |
+          sudo rm -f \
+            /private/var/db/bloom-w0-disposable-host \
+            /private/var/db/bloom-w0-release-key.pem

@@ -20,6 +20,14 @@ It refuses to run unless all of the following hold:
 The marker is deliberately not created by this repository. Disposable VM
 provisioning owns it. Never create it on a developer workstation.
 
+The manually dispatched `macOS Unix-principal W0` workflow is the repository's
+disposable-host provisioner. It runs only on a fresh GitHub-hosted macOS VM,
+first proves that the runner login has a GUI launchd domain, builds all three
+public repositories from the selected refs, creates a non-production W0
+bundle, installs an ephemeral root-owned release pin and host marker, runs this
+harness, and removes those markers in an unconditional cleanup step. The
+workflow does not produce or advertise a production platform claim.
+
 The lane currently proves account/group shape, non-transitive membership,
 root/service filesystem ownership, negative private-state reads, system-domain
 LaunchDaemon registration, numeric launchd socket ownership, and loaded
