@@ -25,7 +25,8 @@ EOF
 [[ $# -ge 1 ]] || usage
 action="$1"
 shift
-source_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+release_script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source_root="$(cd "$release_script_root/.." && pwd -P)"
 live_install=false
 provision_committed=false
 provision_started=false
@@ -2452,13 +2453,11 @@ case "$action" in
           exit 65
         }
       fi
-      openssl pkeyutl \
-        -verify \
-        -rawin \
-        -pubin \
-        -inkey "$payload/RELEASE_PUBLIC_KEY.pem" \
-        -in "$payload/SHA256SUMS" \
-        -sigfile "$payload/RELEASE_SIGNATURE" >/dev/null
+      "$release_script_root/ssh-ed25519-verify.sh" \
+        "$payload/RELEASE_PUBLIC_KEY.pem" \
+        bloom-release-payload-v1 \
+        "$payload/SHA256SUMS" \
+        "$payload/RELEASE_SIGNATURE"
       (
         cd "$payload"
         shasum -a 256 -c SHA256SUMS

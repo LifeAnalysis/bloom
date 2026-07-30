@@ -115,15 +115,13 @@ cat > "$report" <<EOF
   }
 }
 EOF
-openssl pkeyutl \
-  -sign \
-  -rawin \
-  -inkey "$private_key" \
-  -in "$report" \
-  -out "$work/MACOS_CONFORMANCE_REPORT.sig"
-openssl pkey \
-  -in "$private_key" \
-  -pubout \
-  -out "$work/MACOS_CONFORMANCE_REPORT.pub" 2>/dev/null
+"$script_dir/ssh-ed25519-sign.sh" \
+  "$private_key" \
+  bloom-macos-conformance-v1 \
+  "$report" \
+  "$work/MACOS_CONFORMANCE_REPORT.sig"
+"$script_dir/ssh-ed25519-public-key.sh" \
+  "$private_key" \
+  "$work/MACOS_CONFORMANCE_REPORT.pub"
 chmod 0644 "$work"/MACOS_CONFORMANCE_REPORT.*
 mv "$work"/MACOS_CONFORMANCE_REPORT.* "$output_dir/"

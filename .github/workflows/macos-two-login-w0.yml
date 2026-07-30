@@ -101,9 +101,11 @@ jobs:
               -p "$package" \
               --locked
           done
-          openssl genpkey \
-            -algorithm ED25519 \
-            -out "$RUNNER_TEMP/w0-release-key.pem"
+          /usr/bin/ssh-keygen \
+            -q \
+            -t ed25519 \
+            -N '' \
+            -f "$RUNNER_TEMP/w0-release-key"
 
           for name in baseline candidate failing; do
             mkdir -p \
@@ -162,7 +164,7 @@ jobs:
             "$source_root/packaging/triad/release/build-bundle.sh" \
               "$RUNNER_TEMP/$name-staging" \
               "$RUNNER_TEMP/$name-dist/bloom-triad.tar.gz" \
-              "$RUNNER_TEMP/w0-release-key.pem" \
+              "$RUNNER_TEMP/w0-release-key" \
               1700000000
             "$source_root/packaging/triad/release/verify-bundle.sh" \
               "$RUNNER_TEMP/$name-dist/bloom-triad.tar.gz" \

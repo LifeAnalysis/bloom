@@ -10,6 +10,11 @@ wire detail. It does not amend that specification.
   path. The rootless code-identity profile remains a documented future goal
   and its App Group, same-UID LaunchAgent, Keychain-group, and platform-claim
   inputs are not mixed into Unix-principal packaging.
+- Release and conformance signatures remain Ed25519 but use the standard
+  SSHSIG envelope with separate archive, payload, and conformance namespaces.
+  The elevated installer verifies through the root-owned macOS
+  `/usr/bin/ssh-keygen`; it never trusts Homebrew OpenSSL from a login-user
+  writable prefix.
 - macOS launchd supports numeric `SockPathOwner` and `SockPathGroup` fields per
   Unix socket. Packaging uses them so one Broker LaunchDaemon can expose the
   Machine--Broker and revoke sockets under different non-transitive groups,

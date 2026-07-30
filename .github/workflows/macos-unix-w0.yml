@@ -64,9 +64,11 @@ jobs:
           cp "$CARGO_TARGET_DIR/release/bloom" "$RUNNER_TEMP/triad-staging/bin/"
           cp "$CARGO_TARGET_DIR/release/bloom-broker" "$RUNNER_TEMP/triad-staging/bin/"
           cp "$CARGO_TARGET_DIR/release/bloom-signer" "$RUNNER_TEMP/triad-staging/bin/"
-          openssl genpkey \
-            -algorithm ED25519 \
-            -out "$RUNNER_TEMP/w0-release-key.pem"
+          /usr/bin/ssh-keygen \
+            -q \
+            -t ed25519 \
+            -N '' \
+            -f "$RUNNER_TEMP/w0-release-key"
           export BLOOM_PLATFORM_CLAIM=macos-unix-principals-w0
           export BLOOM_ALLOW_MACOS_UNIX_W0=true
           export BLOOM_MACHINE_SHA
@@ -78,7 +80,7 @@ jobs:
           bloom/packaging/triad/release/build-bundle.sh \
             "$RUNNER_TEMP/triad-staging" \
             "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz" \
-            "$RUNNER_TEMP/w0-release-key.pem" \
+            "$RUNNER_TEMP/w0-release-key" \
             1700000000
           bloom/packaging/triad/release/verify-bundle.sh \
             "$RUNNER_TEMP/triad-dist/bloom-triad.tar.gz" \

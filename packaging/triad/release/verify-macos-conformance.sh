@@ -34,13 +34,11 @@ if [[ -n "$expected_key_digest" ]]; then
     exit 65
   }
 fi
-openssl pkeyutl \
-  -verify \
-  -rawin \
-  -pubin \
-  -inkey "$public_key" \
-  -in "$report" \
-  -sigfile "$signature" >/dev/null
+"$script_dir/ssh-ed25519-verify.sh" \
+  "$public_key" \
+  bloom-macos-conformance-v1 \
+  "$report" \
+  "$signature"
 
 field() {
   plutil -extract "$1" raw -o - "$report"

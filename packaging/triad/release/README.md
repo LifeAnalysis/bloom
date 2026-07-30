@@ -10,6 +10,11 @@ staged and generated bundle file for release-blocking markers, records all
 three Git revisions, embeds both platform installers, signs the internal
 payload manifest for post-elevation verification, normalizes metadata, and
 emits a deterministic archive with checksum, signature, and public key.
+Release and conformance keys use OpenSSH Ed25519 format. Signatures use the
+standard SSHSIG envelope with distinct `bloom-release-archive-v1`,
+`bloom-release-payload-v1`, and `bloom-macos-conformance-v1` namespaces.
+Verification invokes the OS-owned `/usr/bin/ssh-keygen`; the privileged macOS
+path never executes a Homebrew- or login-user-owned crypto implementation.
 
 `verify-bundle.sh` verifies the detached signature and both the outer and
 internal checksums before accepting the compatibility matrix or installers.

@@ -29,6 +29,9 @@ authorization because it creates local service accounts and system
 LaunchDaemons. Runtime signing and checkpoint writes are unprivileged.
 
 The existing Ed25519 release signature remains the package-authenticity root.
+Keys use OpenSSH Ed25519 format and signatures use domain-separated SSHSIG
+namespaces, allowing the elevated installer to verify with the OS-owned
+`/usr/bin/ssh-keygen` rather than a login-user-owned package-manager binary.
 An unsigned macOS executable is never accepted merely because macOS permits it
 to execute.
 

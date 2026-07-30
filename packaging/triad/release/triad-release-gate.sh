@@ -51,8 +51,8 @@ cp "$main_root/target/release/bloom" "$work/staging/bin/"
 cp "$broker_root/target/release/bloom-broker" "$work/staging/bin/"
 cp "$signer_root/target/release/bloom-signer" "$work/staging/bin/"
 if $test_key; then
-  signing_key="$work/test-only-release-key.pem"
-  openssl genpkey -algorithm ED25519 -out "$signing_key"
+  signing_key="$work/test-only-release-key"
+  /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$signing_key"
   export BLOOM_PLATFORM_CLAIM="test-unclaimed"
   export BLOOM_ALLOW_TEST_UNCLAIMED="true"
 else

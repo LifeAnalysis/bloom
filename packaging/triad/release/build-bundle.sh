@@ -135,6 +135,7 @@ install -m 0755 \
   "$script_dir/macos-conformance-subject.sh" \
   "$script_dir/sign-macos-conformance-report.sh" \
   "$script_dir/verify-macos-conformance.sh" \
+  "$script_dir/ssh-ed25519-verify.sh" \
   "$payload/installer/release/"
 install -m 0755 "$script_dir/verify-bundle.sh" "$payload/installer/release/"
 
@@ -199,7 +200,9 @@ if [[ "$platform_claim" == "macos-unix-principals" ]]; then
     "$BLOOM_MACOS_CONFORMANCE_KEY_SHA256"
 fi
 
-openssl pkey -in "$signing_key" -pubout -out "$payload/RELEASE_PUBLIC_KEY.pem" 2>/dev/null
+"$script_dir/ssh-ed25519-public-key.sh" \
+  "$signing_key" \
+  "$payload/RELEASE_PUBLIC_KEY.pem"
 (
   cd "$payload"
   find . -type f ! -name SHA256SUMS ! -name SHA256SUMS.new ! -name RELEASE_SIGNATURE -print |
@@ -209,12 +212,11 @@ openssl pkey -in "$signing_key" -pubout -out "$payload/RELEASE_PUBLIC_KEY.pem" 2
     done
 ) > "$payload/SHA256SUMS.new"
 mv "$payload/SHA256SUMS.new" "$payload/SHA256SUMS"
-openssl pkeyutl \
-  -sign \
-  -rawin \
-  -inkey "$signing_key" \
-  -in "$payload/SHA256SUMS" \
-  -out "$payload/RELEASE_SIGNATURE"
+"$script_dir/ssh-ed25519-sign.sh" \
+  "$signing_key" \
+  bloom-release-payload-v1 \
+  "$payload/SHA256SUMS" \
+  "$payload/RELEASE_SIGNATURE"
 # The single-quoted expression is Perl source, not a shell interpolation.
 # shellcheck disable=SC2016
 find "$payload" -print0 |
@@ -243,5 +245,9 @@ gzip -n -9 < "$archive_tmp" > "$output"
   cd "$output_dir"
   shasum -a 256 "$(basename "$output")" > "$(basename "$output").sha256"
 )
-openssl pkeyutl -sign -rawin -inkey "$signing_key" -in "$output.sha256" -out "$output.sig"
-openssl pkey -in "$signing_key" -pubout -out "$output.pub" 2>/dev/null
+"$script_dir/ssh-ed25519-sign.sh" \
+  "$signing_key" \
+  bloom-release-archive-v1 \
+  "$output.sha256" \
+  "$output.sig"
+"$script_dir/ssh-ed25519-public-key.sh" "$signing_key" "$output.pub"

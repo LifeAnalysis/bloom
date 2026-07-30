@@ -10,9 +10,13 @@ archive="$1"
 checksum="$2"
 signature="$3"
 public_key="$4"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
-openssl pkeyutl -verify -rawin -pubin -inkey "$public_key" \
-  -in "$checksum" -sigfile "$signature" >/dev/null
+"$script_dir/ssh-ed25519-verify.sh" \
+  "$public_key" \
+  bloom-release-archive-v1 \
+  "$checksum" \
+  "$signature"
 (
   cd "$(dirname "$archive")"
   shasum -a 256 -c "$(basename "$checksum")"
@@ -32,6 +36,7 @@ for required in \
   installer/release/install-macos.sh \
   installer/release/macos-conformance-subject.sh \
   installer/release/sign-macos-conformance-report.sh \
+  installer/release/ssh-ed25519-verify.sh \
   installer/release/verify-macos-conformance.sh \
   SOURCE_REVISIONS \
   RELEASE_PUBLIC_KEY.pem \
@@ -43,13 +48,11 @@ do
     exit 65
   }
 done
-openssl pkeyutl \
-  -verify \
-  -rawin \
-  -pubin \
-  -inkey "$payload/RELEASE_PUBLIC_KEY.pem" \
-  -in "$payload/SHA256SUMS" \
-  -sigfile "$payload/RELEASE_SIGNATURE" >/dev/null
+"$script_dir/ssh-ed25519-verify.sh" \
+  "$payload/RELEASE_PUBLIC_KEY.pem" \
+  bloom-release-payload-v1 \
+  "$payload/SHA256SUMS" \
+  "$payload/RELEASE_SIGNATURE"
 (
   cd "$payload"
   shasum -a 256 -c SHA256SUMS
