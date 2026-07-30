@@ -57,9 +57,14 @@ triad_source="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 installer="$triad_source/release/install-macos.sh"
 enrollment="/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
 rotation_fixtures="$(mktemp -d /private/tmp/bloom-w0-rotation.XXXXXX)"
+foreign_listener_pid=""
 
 cleanup() {
   status=$?
+  if [[ -n "$foreign_listener_pid" ]]; then
+    kill "$foreign_listener_pid" 2>/dev/null || true
+    wait "$foreign_listener_pid" 2>/dev/null || true
+  fi
   if [[ -f "$enrollment" ]]; then
     "$installer" uninstall / "$login_uid" "delete-bloom-login-$login_uid" || true
   fi
@@ -260,6 +265,66 @@ assert_metadata \
 ceremony_headers="$(curl --silent --show-error --max-time 2 --dump-header - \
   --output /dev/null http://127.0.0.1:18734/)"
 grep -Fi 'x-bloom-ceremony-owner: bloom-broker-v1' <<<"$ceremony_headers" >/dev/null
+
+broker_label="system/com.bloom.broker.$login_uid"
+broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
+broker_log="/private/var/db/bloom/$login_uid/broker/broker.log"
+launchctl bootout "$broker_label"
+/usr/bin/nc -l 127.0.0.1 18734 >/dev/null 2>&1 &
+foreign_listener_pid=$!
+deadline=$((SECONDS + 10))
+while [[ $SECONDS -lt $deadline ]]; do
+  lsof -nP -a -p "$foreign_listener_pid" -iTCP@127.0.0.1:18734 -sTCP:LISTEN |
+    grep 18734 >/dev/null && break
+  sleep 0.05
+done
+kill -0 "$foreign_listener_pid"
+launchctl bootstrap system "$broker_plist"
+deadline=$((SECONDS + 15))
+while [[ $SECONDS -lt $deadline ]]; do
+  if grep -F \
+    'fatal canonical ceremony listener ownership conflict at 127.0.0.1:18734; no fallback port will be used' \
+    "$broker_log" >/dev/null 2>&1
+  then
+    break
+  fi
+  sleep 0.1
+done
+grep -F \
+  'fatal canonical ceremony listener ownership conflict at 127.0.0.1:18734; no fallback port will be used' \
+  "$broker_log" >/dev/null
+if sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
+then
+  echo "Machine reported healthy while a foreign process owned the ceremony port" >&2
+  exit 1
+fi
+if lsof -nP -a -u "bloom-broker-$login_uid" -iTCP -sTCP:LISTEN |
+  grep . >/dev/null
+then
+  echo "Broker opened a fallback TCP listener after the canonical bind conflict" >&2
+  exit 1
+fi
+kill "$foreign_listener_pid"
+wait "$foreign_listener_pid" 2>/dev/null || true
+foreign_listener_pid=""
+deadline=$((SECONDS + 20))
+while [[ $SECONDS -lt $deadline ]]; do
+  if sudo -u "$login_user" \
+    "$machine_binary" \
+    --triad-health-check \
+    "$release_digest"
+  then
+    break
+  fi
+  sleep 1
+done
+sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
 
 containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
 assert_metadata "$containment_status" "0:0:644"

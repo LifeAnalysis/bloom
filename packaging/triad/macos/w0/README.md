@@ -33,14 +33,18 @@ root/service filesystem ownership, negative private-state reads, system-domain
 LaunchDaemon registration, numeric launchd socket ownership, and loaded
 UID-scoped `pf` rules. It also requires the authenticated session socket to
 appear with the login UID and revoke group, then verifies the canonical
-listener's Broker marker. It removes the live anchor, waits for the root-owned
-containment attestation to turn unavailable, proves authenticated triad health
-fails, and then restores and re-verifies the anchor. It also constructs a
-durable interrupted-enrollment intent plus its exact partial Directory Service
-record and proves the next installer invocation removes both without adopting
-the record. When the optional bundles are supplied, it also proves a
-complete-version upgrade, activation-failure rollback, `SIGKILL` during the
-activating phase, stale PID-lock reclamation, journal recovery, and restoration
-of the exact prior healthy digest. Foreign/cross-login listener conflict,
-actual logout handoff, network attempts, and hostile session authentication
-remain required before the W0 claim can graduate.
+listener's Broker marker. It pre-binds the canonical port with a foreign
+process, verifies Broker's specific fatal/no-fallback diagnostic and Machine
+failure, proves Broker opened no fallback listener, then verifies failure-only
+KeepAlive acquires the port after it is released. It removes the live anchor,
+waits for the root-owned containment attestation to turn unavailable, proves
+authenticated triad health fails, and then restores and re-verifies the
+anchor. It also constructs a durable interrupted-enrollment intent plus its
+exact partial Directory Service record and proves the next installer invocation
+removes both without adopting the record. When the optional bundles are
+supplied, it also proves a complete-version upgrade, activation-failure
+rollback, `SIGKILL` during the activating phase, stale PID-lock reclamation,
+journal recovery, and restoration of the exact prior healthy digest.
+Cross-login listener conflict, actual logout handoff, network attempts, and
+hostile session authentication remain required before the W0 claim can
+graduate.
