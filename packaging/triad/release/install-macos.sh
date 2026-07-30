@@ -39,6 +39,7 @@ provision_committed=false
 provision_started=false
 installer_lock=""
 generated_material=""
+template_staging=""
 release_staging=""
 existing_enrollment=false
 fresh_enrollment=false
@@ -185,6 +186,17 @@ release_installer_lock() {
         ;;
     esac
     generated_material=""
+  fi
+  if [[ -n "$template_staging" ]]; then
+    case "$template_staging" in
+      "/Library/Application Support/BloomTriad/.enrollment-templates."*)
+        rm -rf -- "$template_staging"
+        ;;
+      *)
+        echo "refusing to remove unexpected enrollment-template staging path" >&2
+        ;;
+    esac
+    template_staging=""
   fi
   if [[ -n "$rotation_transaction_staging" ]]; then
     case "$rotation_transaction_staging" in
@@ -2690,15 +2702,33 @@ case "$action" in
         generated_material="$(mktemp -d "$product_root/.enrollment-material.XXXXXX")"
         chmod 0700 "$generated_material"
         chown root:wheel "$generated_material"
+        template_staging="$(mktemp -d "$product_root/.enrollment-templates.XXXXXX")"
+        chmod 0700 "$template_staging"
+        chown root:wheel "$template_staging"
+        for public_template in \
+          broker.json.in \
+          edge-manifest.json.in \
+          provenance-catalog.unsigned.json \
+          signer.json.in
+        do
+          install \
+            -o root \
+            -g wheel \
+            -m 0644 \
+            "$payload/installer/macos/config/$public_template" \
+            "$template_staging/$public_template"
+        done
         "$machine_binary" \
           --triad-render-macos-enrollment \
-          "$source_root/macos/config" \
+          "$template_staging" \
           "$generated_material" \
           "$login_uid" \
           "$BLOOM_MACOS_BROKER_UID" \
           "$BLOOM_MACOS_SIGNER_UID" \
           "$BLOOM_MACOS_REVOKE_GID" \
           "$BLOOM_RELEASE_DIGEST"
+        rm -rf -- "$template_staging"
+        template_staging=""
         config_source="$generated_material"
       else
         config_source="$payload/config"
