@@ -590,9 +590,27 @@ sudo -u "$login_user" \
   --triad-health-check \
   "$release_digest"
 
-ceremony_headers="$(curl --silent --show-error --max-time 2 --dump-header - \
-  --output /dev/null http://127.0.0.1:18734/)"
-grep -Fi 'x-bloom-ceremony-owner: bloom-broker-v1' <<<"$ceremony_headers" >/dev/null
+ceremony_headers=""
+deadline=$((SECONDS + 20))
+while [[ $SECONDS -lt $deadline ]]; do
+  if ceremony_headers="$(
+    curl --silent --show-error --max-time 2 --dump-header - \
+      --output /dev/null http://127.0.0.1:18734/ 2>/dev/null
+  )" &&
+    grep -Fi \
+      'x-bloom-ceremony-owner: bloom-broker-v1' \
+      <<<"$ceremony_headers" >/dev/null
+  then
+    break
+  fi
+  sleep 1
+done
+grep -Fi \
+  'x-bloom-ceremony-owner: bloom-broker-v1' \
+  <<<"$ceremony_headers" >/dev/null || {
+  echo "Broker did not publish the canonical ceremony-owner marker" >&2
+  exit 1
+}
 
 broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
 broker_log="/private/var/db/bloom/$login_uid/broker/broker.log"
