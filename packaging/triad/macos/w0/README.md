@@ -50,6 +50,11 @@ rollback, `SIGKILL` during the activating phase, stale PID-lock reclamation,
 journal recovery, and restoration of the exact prior healthy digest.
 It also rotates the complete transport-identity/edge-manifest set, verifies
 that service configs are unchanged, and requires authenticated health with the
-new cross-pins.
-Cross-login listener conflict, actual logout handoff, and hostile session
-authentication remain required before the W0 claim can graduate.
+new cross-pins. An unauthorized connection from the login UID must be rejected
+by the session sentinel without disrupting authenticated health. A guarded
+session-domain bootout/rebootstrap cycle proves Broker and Signer drain, the
+ceremony listener closes, and socket activation restores authenticated health
+without reinstalling or manually restarting either service.
+
+Cross-login listener conflict and actual Fast User Switching/logout on a
+two-login disposable VM remain required before the W0 claim can graduate.

@@ -59,9 +59,14 @@ enrollment="/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
 rotation_fixtures="$(mktemp -d /private/tmp/bloom-w0-rotation.XXXXXX)"
 foreign_listener_pid=""
 network_listener_pid=""
+hostile_session_pid=""
 
 cleanup() {
   status=$?
+  if [[ -n "$hostile_session_pid" ]]; then
+    kill "$hostile_session_pid" 2>/dev/null || true
+    wait "$hostile_session_pid" 2>/dev/null || true
+  fi
   if [[ -n "$network_listener_pid" ]]; then
     kill "$network_listener_pid" 2>/dev/null || true
     wait "$network_listener_pid" 2>/dev/null || true
@@ -267,11 +272,78 @@ assert_metadata \
   "/private/var/run/bloom/$login_uid/session/session.sock" \
   "$login_uid:$revoke_gid:660"
 
+release_digest="$(field release_digest)"
+machine_binary="/usr/local/libexec/bloom/current/bloom"
+session_socket="/private/var/run/bloom/$login_uid/session/session.sock"
+session_label="gui/$login_uid/com.bloom.session"
+session_plist="/Library/LaunchAgents/com.bloom.session.plist"
+broker_label="system/com.bloom.broker.$login_uid"
+signer_label="system/com.bloom.signer.$login_uid"
+
+sudo -u "$login_user" \
+  /usr/bin/nc -d -U "$session_socket" >/dev/null 2>&1 &
+hostile_session_pid=$!
+deadline=$((SECONDS + 5))
+while kill -0 "$hostile_session_pid" 2>/dev/null &&
+  [[ $SECONDS -lt $deadline ]]
+do
+  sleep 0.05
+done
+if kill -0 "$hostile_session_pid" 2>/dev/null; then
+  echo "session sentinel did not reject an unauthorized login-UID peer" >&2
+  exit 1
+fi
+wait "$hostile_session_pid" 2>/dev/null || true
+hostile_session_pid=""
+sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
+
+launchctl bootout "$session_label"
+deadline=$((SECONDS + 15))
+while [[ $SECONDS -lt $deadline ]]; do
+  if ! pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 &&
+    ! pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
+  then
+    break
+  fi
+  sleep 0.1
+done
+if pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 ||
+  pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
+then
+  echo "services did not drain after the login-session sentinel disappeared" >&2
+  exit 1
+fi
+if curl --silent --max-time 1 http://127.0.0.1:18734/ >/dev/null 2>&1; then
+  echo "Broker retained the ceremony listener after session logout" >&2
+  exit 1
+fi
+launchctl print "$broker_label" >/dev/null
+launchctl print "$signer_label" >/dev/null
+launchctl bootstrap "gui/$login_uid" "$session_plist"
+deadline=$((SECONDS + 20))
+while [[ $SECONDS -lt $deadline ]]; do
+  if [[ -S "$session_socket" ]] &&
+    sudo -u "$login_user" \
+      "$machine_binary" \
+      --triad-health-check \
+      "$release_digest"
+  then
+    break
+  fi
+  sleep 1
+done
+sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
+
 ceremony_headers="$(curl --silent --show-error --max-time 2 --dump-header - \
   --output /dev/null http://127.0.0.1:18734/)"
 grep -Fi 'x-bloom-ceremony-owner: bloom-broker-v1' <<<"$ceremony_headers" >/dev/null
 
-broker_label="system/com.bloom.broker.$login_uid"
 broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
 broker_log="/private/var/db/bloom/$login_uid/broker/broker.log"
 launchctl bootout "$broker_label"
@@ -408,8 +480,6 @@ assert_udp_blocked "bloom-broker-$login_uid" -4 "$host_ipv4" 18739
 
 containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
 assert_metadata "$containment_status" "0:0:644"
-release_digest="$(field release_digest)"
-machine_binary="/usr/local/libexec/bloom/current/bloom"
 sudo -u "$login_user" \
   "$machine_binary" \
   --triad-health-check \
@@ -542,12 +612,21 @@ for relative in "${transport_identity_paths[@]}"; do
   )")
 done
 "$installer" rotate-identities / "$login_uid"
-[[ "$(shasum -a 256 "$config_root/edge-manifest.json" | awk '{print $1}')" !=
-  "$old_edge_digest" ]]
-[[ "$(shasum -a 256 "$config_root/broker/config.json" | awk '{print $1}')" ==
-  "$old_broker_config_digest" ]]
-[[ "$(shasum -a 256 "$config_root/signer/config.json" | awk '{print $1}')" ==
-  "$old_signer_config_digest" ]]
+new_edge_digest="$(
+  shasum -a 256 "$config_root/edge-manifest.json" |
+    awk '{print $1}'
+)"
+new_broker_config_digest="$(
+  shasum -a 256 "$config_root/broker/config.json" |
+    awk '{print $1}'
+)"
+new_signer_config_digest="$(
+  shasum -a 256 "$config_root/signer/config.json" |
+    awk '{print $1}'
+)"
+[[ "$new_edge_digest" != "$old_edge_digest" ]]
+[[ "$new_broker_config_digest" == "$old_broker_config_digest" ]]
+[[ "$new_signer_config_digest" == "$old_signer_config_digest" ]]
 for index in "${!transport_identity_paths[@]}"; do
   relative="${transport_identity_paths[$index]}"
   new_digest="$(shasum -a 256 "$config_root/$relative" | awk '{print $1}')"

@@ -221,6 +221,9 @@ fn installed_macos_triad_paths() -> Result<Option<InstalledMacosTriadPaths>> {
 fn installed_macos_triad_paths_with_activation(
     allow_activating: bool,
 ) -> Result<Option<InstalledMacosTriadPaths>> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = allow_activating;
+
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::MetadataExt as _;
