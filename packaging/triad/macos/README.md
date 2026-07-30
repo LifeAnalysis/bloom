@@ -34,7 +34,10 @@ never selects a fallback address or port. Before exiting, Broker atomically
 writes a Broker-owned, Machine-readable `broker-startup.json`. Machine accepts
 only its exact owner, group, mode, schema, address, incident, and message, so a
 bind failure is reported promptly as either another Bloom login or a foreign
-or unverifiable listener. A successful retry removes the stale diagnostic.
+or unverifiable listener. The root packet-filter monitor performs the public
+owner-marker probe and publishes its result in the fresh root-owned platform
+status because the confined Broker cannot initiate even a loopback SYN. A
+successful retry removes the stale diagnostic.
 
 The global `com.bloom.session` LaunchAgent invokes only Machine's
 `--session-sentinel` mode. It exits successfully for an unenrolled login,

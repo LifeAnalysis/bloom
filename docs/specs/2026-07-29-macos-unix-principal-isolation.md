@@ -287,6 +287,13 @@ an absent, malformed, or unresponsive marker is foreign or unverifiable. A
 foreign process can imitate that public marker, so both incidents have the
 same fatal, fail-closed consequence and neither grants authority.
 
+Because the Broker packet-filter profile deliberately denies initiated SYNs,
+the root packet-filter monitor performs this diagnostic-only loopback probe and
+includes its bounded result in the same fresh, root-owned platform-status
+record Broker already verifies. Broker never opens a diagnostic network
+exception, and a false or unavailable observation remains
+`foreign_or_unverifiable_process`.
+
 Failure-only KeepAlive retries a waiting Broker. When the owning login sentinel
 disconnects and its Broker closes the listener, a waiting Broker may acquire
 the canonical port without user action. No fairness guarantee is claimed.

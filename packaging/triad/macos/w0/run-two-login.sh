@@ -182,6 +182,10 @@ done
   exit 1
 }
 
+broker_uid_a="$(field "$login_uid_a" broker_uid)"
+machine_broker_gid_a="$(field "$login_uid_a" machine_broker_gid)"
+startup_status_a="/private/var/run/bloom/$login_uid_a/status/broker-startup.json"
+
 if [[ -n "$upgrade_payload" ]]; then
   prior_digest="$release_digest"
   upgrade_digest="$(<"$upgrade_payload/RELEASE_DIGEST")"
@@ -251,6 +255,15 @@ if [[ -n "$upgrade_payload" ]]; then
   launchctl bootstrap system "$broker_plist_a"
 fi
 
+deadline=$((SECONDS + 15))
+while [[ $SECONDS -lt $deadline && ! -f "$startup_status_a" ]]; do
+  sleep 0.1
+done
+[[ -f "$startup_status_a" ]] || {
+  echo "second Broker did not publish its fatal listener incident" >&2
+  exit 1
+}
+
 if machine_failure="$(
   sudo -u "$login_user_a" \
     "$machine_binary" --triad-health-check "$release_digest" 2>&1
@@ -263,9 +276,6 @@ grep -F \
   'Bloom Broker startup failed: another login session owns the Bloom ceremony listener' \
   <<<"$machine_failure" >/dev/null
 
-broker_uid_a="$(field "$login_uid_a" broker_uid)"
-machine_broker_gid_a="$(field "$login_uid_a" machine_broker_gid)"
-startup_status_a="/private/var/run/bloom/$login_uid_a/status/broker-startup.json"
 [[ "$(stat -f '%u:%g:%Lp' "$startup_status_a")" == \
   "$broker_uid_a:$machine_broker_gid_a:640" ]]
 [[ "$(plutil -extract schema raw -o - "$startup_status_a")" == \

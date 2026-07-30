@@ -2,11 +2,12 @@
 
 use std::{
     fs::{self, OpenOptions},
-    io::Write as _,
+    io::{Read as _, Write as _},
+    net::{SocketAddr, TcpStream},
     os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -17,8 +18,9 @@ use rustix::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-const STATUS_SCHEMA: &str = "bloom.macos-platform-status.2";
+const STATUS_SCHEMA: &str = "bloom.macos-platform-status.3";
 const TRUSTED_TIME_SOURCE: &str = "macos-managed-timed";
+const CEREMONY_OWNER_MARKER: &str = "x-bloom-ceremony-owner: bloom-broker-v1";
 
 #[derive(Serialize)]
 struct Status {
@@ -30,6 +32,7 @@ struct Status {
     automatic_time_enabled: bool,
     timed_service_loaded: bool,
     trusted_time_available: bool,
+    ceremony_listener_bloom_shaped: bool,
     checked_at_unix_ms: u64,
     available: bool,
 }
@@ -47,6 +50,7 @@ pub fn run_once() -> Result<()> {
         .is_ok_and(|output| output.contains("Status: Enabled"));
     let (automatic_time_enabled, timed_service_loaded) = macos_managed_time_status();
     let trusted_time_available = automatic_time_enabled && timed_service_loaded;
+    let ceremony_listener_bloom_shaped = canonical_listener_is_bloom_shaped();
     let checked_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system time precedes the Unix epoch")?
@@ -112,6 +116,7 @@ pub fn run_once() -> Result<()> {
             automatic_time_enabled,
             timed_service_loaded,
             trusted_time_available,
+            ceremony_listener_bloom_shaped,
             checked_at_unix_ms,
             available,
         };
@@ -180,6 +185,49 @@ fn macos_managed_time_status() -> (bool, bool) {
     let timed_service_loaded =
         command_output("/bin/launchctl", &["print", "system/com.apple.timed"]).is_ok();
     (automatic_time_enabled, timed_service_loaded)
+}
+
+fn canonical_listener_is_bloom_shaped() -> bool {
+    let address: SocketAddr = match "127.0.0.1:18734".parse() {
+        Ok(address) => address,
+        Err(_) => return false,
+    };
+    let timeout = Duration::from_secs(1);
+    let mut stream = match TcpStream::connect_timeout(&address, timeout) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    if stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost:18734\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 512];
+    while response.len() < 4096 {
+        let remaining = 4096 - response.len();
+        let read_length = remaining.min(chunk.len());
+        match stream.read(&mut chunk[..read_length]) {
+            Ok(0) => break,
+            Ok(count) => {
+                response.extend_from_slice(&chunk[..count]);
+                if response_has_bloom_owner_marker(&response) {
+                    return true;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn response_has_bloom_owner_marker(response: &[u8]) -> bool {
+    String::from_utf8_lossy(response)
+        .to_ascii_lowercase()
+        .contains(CEREMONY_OWNER_MARKER)
 }
 
 fn write_status(login_uid: u32, status: &Status) -> Result<()> {
@@ -306,4 +354,19 @@ fn require_service_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Resu
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ceremony_owner_marker_is_case_insensitive_but_exact() {
+        assert!(response_has_bloom_owner_marker(
+            b"HTTP/1.1 404 Not Found\r\nX-Bloom-Ceremony-Owner: bloom-broker-v1\r\n\r\n"
+        ));
+        assert!(!response_has_bloom_owner_marker(
+            b"HTTP/1.1 404 Not Found\r\nX-Bloom-Ceremony-Owner: other\r\n\r\n"
+        ));
+    }
 }
