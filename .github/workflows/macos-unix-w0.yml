@@ -31,6 +31,8 @@ jobs:
   disposable-w0:
     runs-on: macos-15
     timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/bloom-w0-target
     steps:
       - name: Check out Machine
         uses: actions/checkout@v4
@@ -58,9 +60,9 @@ jobs:
           cargo build --manifest-path bloom-broker/Cargo.toml --release -p bloom-broker --locked
           cargo build --manifest-path bloom-signer/Cargo.toml --release -p bloom-signer --locked
           mkdir -p "$RUNNER_TEMP/triad-staging/bin" "$RUNNER_TEMP/triad-dist"
-          cp bloom/target/release/bloom "$RUNNER_TEMP/triad-staging/bin/"
-          cp bloom-broker/target/release/bloom-broker "$RUNNER_TEMP/triad-staging/bin/"
-          cp bloom-signer/target/release/bloom-signer "$RUNNER_TEMP/triad-staging/bin/"
+          cp "$CARGO_TARGET_DIR/release/bloom" "$RUNNER_TEMP/triad-staging/bin/"
+          cp "$CARGO_TARGET_DIR/release/bloom-broker" "$RUNNER_TEMP/triad-staging/bin/"
+          cp "$CARGO_TARGET_DIR/release/bloom-signer" "$RUNNER_TEMP/triad-staging/bin/"
           openssl genpkey \
             -algorithm ED25519 \
             -out "$RUNNER_TEMP/w0-release-key.pem"

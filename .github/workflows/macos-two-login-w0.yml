@@ -3,10 +3,6 @@ name: macOS two-login Unix-principal W0
 on:
   workflow_call:
     inputs:
-      baseline_ref:
-        description: Previously passing Bloom baseline ref
-        required: true
-        type: string
       broker_ref:
         description: Public bloom-broker ref
         required: false
@@ -35,9 +31,6 @@ on:
         type: string
   workflow_dispatch:
     inputs:
-      baseline_ref:
-        description: Previously passing Bloom baseline ref
-        required: true
       broker_ref:
         description: Public bloom-broker ref
         required: true
@@ -76,11 +69,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: bloom
-      - name: Check out baseline Machine
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.baseline_ref }}
-          path: bloom-base
       - name: Check out Broker
         uses: actions/checkout@v4
         with:
@@ -99,10 +87,20 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          cargo build --manifest-path bloom-base/Cargo.toml --release -p bloom --locked
-          cargo build --manifest-path bloom/Cargo.toml --release -p bloom --locked
-          cargo build --manifest-path bloom-broker/Cargo.toml --release -p bloom-broker --locked
-          cargo build --manifest-path bloom-signer/Cargo.toml --release -p bloom-signer --locked
+          for manifest_and_package in \
+            "bloom/Cargo.toml bloom" \
+            "bloom-broker/Cargo.toml bloom-broker" \
+            "bloom-signer/Cargo.toml bloom-signer"
+          do
+            manifest="${manifest_and_package%% *}"
+            package="${manifest_and_package#* }"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" \
+              cargo build \
+              --manifest-path "$manifest" \
+              --release \
+              -p "$package" \
+              --locked
+          done
           openssl genpkey \
             -algorithm ED25519 \
             -out "$RUNNER_TEMP/w0-release-key.pem"
@@ -113,20 +111,22 @@ jobs:
               "$RUNNER_TEMP/$name-dist" \
               "$RUNNER_TEMP/$name-verified"
           done
-          cp bloom-base/target/release/bloom \
+          cp "$RUNNER_TEMP/candidate-target/release/bloom" \
             "$RUNNER_TEMP/baseline-staging/bin/bloom"
-          cp bloom/target/release/bloom \
+          cp "$RUNNER_TEMP/candidate-target/release/bloom" \
             "$RUNNER_TEMP/candidate-staging/bin/bloom"
-          cp bloom/target/release/bloom \
+          cp "$RUNNER_TEMP/candidate-target/release/bloom" \
             "$RUNNER_TEMP/failing-staging/bin/bloom"
           for name in baseline candidate; do
-            cp bloom-broker/target/release/bloom-broker \
+            cp "$RUNNER_TEMP/candidate-target/release/bloom-broker" \
               "$RUNNER_TEMP/$name-staging/bin/bloom-broker"
           done
           for name in baseline candidate failing; do
-            cp bloom-signer/target/release/bloom-signer \
+            cp "$RUNNER_TEMP/candidate-target/release/bloom-signer" \
               "$RUNNER_TEMP/$name-staging/bin/bloom-signer"
           done
+          printf '%s\n' bloom-valid-digest-distinct-baseline-v1 \
+            > "$RUNNER_TEMP/baseline-staging/W0_BASELINE_VARIANT"
 
           printf '%s\n' \
             '#include <stdio.h>' \
@@ -174,7 +174,7 @@ jobs:
               -C "$RUNNER_TEMP/$name-verified"
           }
 
-          build_payload baseline bloom-base
+          build_payload baseline bloom
           build_payload candidate bloom
           build_payload failing bloom
 

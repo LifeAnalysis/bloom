@@ -110,7 +110,8 @@ two-login VM remains required before the W0 claim can graduate.
 labelled `bloom-two-login-disposable`. The runner itself must be outside both
 test UIDs, both supplied users must already have genuine active GUI domains,
 and the VM must be destroyed or reverted after the job. The workflow builds a
-previously passing baseline, the candidate, and a candidate-derived
-activation-failing bundle under one ephemeral release key, then invokes the
-two-login harness and uploads only candidate-subject evidence. It never
-creates the two GUI users or treats a synthetic launchd domain as a login.
+digest-distinct valid baseline variant, the candidate, and a candidate-derived
+activation-failing bundle from the same clean source revisions under one
+ephemeral release key. It then invokes the two-login harness and uploads only
+candidate-subject evidence. It never creates the two GUI users or treats a
+synthetic launchd domain as a login.
