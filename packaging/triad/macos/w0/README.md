@@ -31,7 +31,8 @@ workflow does not produce or advertise a production platform claim.
 The lane currently proves account/group shape, non-transitive membership,
 root/service filesystem ownership, explicit checkpoint/config/database
 negative reads, immutable release/plist/manifest/packet-filter replacement
-denial for every product principal, process task/sample denial, system-domain
+denial for every product principal, live installer rejection of mode, owner,
+symlink, and hard-link manifest substitutions, process task/sample denial, system-domain
 LaunchDaemon registration, numeric launchd socket ownership, unrelated-UID
 endpoint denial, Machine denial on the Broker-to-Signer edge, and loaded
 UID-scoped `pf` rules. Authenticated triad health also proves both service UIDs

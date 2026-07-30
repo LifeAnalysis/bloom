@@ -61,6 +61,8 @@ process_probe_dir="$(mktemp -d /private/tmp/bloom-w0-process.XXXXXX)"
 foreign_listener_pid=""
 network_listener_pid=""
 hostile_session_pid=""
+edge_manifest=""
+edge_backup=""
 
 cleanup() {
   status=$?
@@ -75,6 +77,14 @@ cleanup() {
   if [[ -n "$foreign_listener_pid" ]]; then
     kill "$foreign_listener_pid" 2>/dev/null || true
     wait "$foreign_listener_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$edge_backup" && -e "$edge_backup" ]]; then
+    rm -f -- "$edge_manifest"
+    mv "$edge_backup" "$edge_manifest"
+  fi
+  if [[ -n "$edge_manifest" && -f "$edge_manifest" && ! -L "$edge_manifest" ]]; then
+    chown root:wheel "$edge_manifest" 2>/dev/null || true
+    chmod 0644 "$edge_manifest" 2>/dev/null || true
   fi
   if [[ -f "$enrollment" ]]; then
     "$installer" uninstall / "$login_uid" "delete-bloom-login-$login_uid" || true
@@ -311,6 +321,52 @@ session_label="gui/$login_uid/com.bloom.session"
 session_plist="/Library/LaunchAgents/com.bloom.session.plist"
 broker_label="system/com.bloom.broker.$login_uid"
 signer_label="system/com.bloom.signer.$login_uid"
+
+edge_manifest="/Library/Application Support/BloomTriad/config/$login_uid/edge-manifest.json"
+run_reinstall_with_substitution() {
+  set +e
+  "$installer" install / "$login_uid" "$login_user" "$payload"
+  substitution_status=$?
+  set -e
+}
+
+assert_substitution_rejected() {
+  substitution="$1"
+  [[ "$substitution_status" -ne 0 ]] || {
+    echo "installer accepted $substitution edge-manifest tampering" >&2
+    exit 1
+  }
+}
+
+chmod 0666 "$edge_manifest"
+run_reinstall_with_substitution
+chmod 0644 "$edge_manifest"
+assert_substitution_rejected mode
+
+chown "$login_user" "$edge_manifest"
+run_reinstall_with_substitution
+chown root:wheel "$edge_manifest"
+assert_substitution_rejected owner
+
+edge_backup="$rotation_fixtures/edge-manifest.json"
+mv "$edge_manifest" "$edge_backup"
+ln -s "$edge_backup" "$edge_manifest"
+run_reinstall_with_substitution
+rm "$edge_manifest"
+mv "$edge_backup" "$edge_manifest"
+assert_substitution_rejected symlink
+
+mv "$edge_manifest" "$edge_backup"
+ln "$edge_backup" "$edge_manifest"
+run_reinstall_with_substitution
+rm "$edge_manifest"
+mv "$edge_backup" "$edge_manifest"
+assert_substitution_rejected hard-link
+assert_metadata "$edge_manifest" "0:0:644"
+sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
 
 unrelated_user="nobody"
 id "$unrelated_user" >/dev/null 2>&1 || {
