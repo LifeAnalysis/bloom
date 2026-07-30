@@ -11,18 +11,12 @@ on:
         description: Public bloom-signer ref
         required: true
         default: master
-  pull_request:
-    types:
-      - labeled
 
 permissions:
   contents: read
 
 jobs:
   disposable-w0:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.label.name == 'run-macos-w0'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
