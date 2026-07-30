@@ -248,7 +248,7 @@ if [[ -n "${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" ]]; then
   for criterion in mui_05 mui_06 two_login_lifecycle; do
     temporary="$evidence_dir/.$criterion.$$.new"
     printf '%s\n' "$subject_digest" > "$temporary"
-    chmod 0600 "$temporary"
+    chmod 0644 "$temporary"
     mv -f "$temporary" "$evidence_dir/$criterion.pass"
   done
 fi

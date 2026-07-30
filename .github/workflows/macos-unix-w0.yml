@@ -98,9 +98,17 @@ jobs:
           set -Eeuo pipefail
           login_uid="$(id -u)"
           login_user="$(id -un)"
+          mkdir "$RUNNER_TEMP/macos-w0-evidence"
           sudo env \
             BLOOM_RUN_MACOS_UNIX_W0=true \
             BLOOM_RELEASE_PUBLIC_KEY=/private/var/db/bloom-w0-release-key.pem \
+            BLOOM_MACOS_INSTALLED_ACCEPTANCE_MAIN_ROOT="$GITHUB_WORKSPACE/bloom" \
+            BLOOM_MACOS_INSTALLED_ACCEPTANCE_BROKER_ROOT="$GITHUB_WORKSPACE/bloom-broker" \
+            BLOOM_MACOS_INSTALLED_ACCEPTANCE_SIGNER_ROOT="$GITHUB_WORKSPACE/bloom-signer" \
+            BLOOM_MACOS_W0_EVIDENCE_DIR="$RUNNER_TEMP/macos-w0-evidence" \
+            BLOOM_MACOS_ACCEPTANCE_CARGO="$(command -v cargo)" \
+            BLOOM_MACOS_ACCEPTANCE_CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            BLOOM_MACOS_ACCEPTANCE_RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
             bloom/packaging/triad/macos/w0/run-disposable.sh \
             "$RUNNER_TEMP/verified/bloom-triad" \
             "$login_uid" \
@@ -133,6 +141,15 @@ jobs:
         with:
           name: macos-w0-subject-${{ github.sha }}
           path: ${{ runner.temp }}/macos-w0-subject.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload digest-bound W0 criteria
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-w0-criteria-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-w0-evidence/*.pass
           if-no-files-found: error
           retention-days: 30
 

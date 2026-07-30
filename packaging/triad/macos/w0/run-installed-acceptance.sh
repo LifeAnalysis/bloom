@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  echo "usage: run-installed-acceptance.sh PAYLOAD LOGIN_UID LOGIN_USER MAIN_ROOT BROKER_ROOT SIGNER_ROOT EVIDENCE_DIR" >&2
+  exit 64
+}
+
+[[ $# -eq 7 ]] || usage
+payload="$(cd "$1" && pwd -P)"
+login_uid="$2"
+login_user="$3"
+main_root="$(cd "$4" && pwd -P)"
+broker_root="$(cd "$5" && pwd -P)"
+signer_root="$(cd "$6" && pwd -P)"
+evidence_dir="$(cd "$7" && pwd -P)"
+[[ "$login_uid" =~ ^[1-9][0-9]*$ ]] || usage
+[[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || usage
+
+[[ "$EUID" -eq 0 && "$(uname -s)" == "Darwin" ]] || {
+  echo "installed acceptance requires root on a disposable macOS host" >&2
+  exit 77
+}
+marker="/private/var/db/bloom-w0-disposable-host"
+if [[ "${BLOOM_RUN_MACOS_UNIX_W0:-}" != "true" ]] ||
+  [[ ! -f "$marker" || -L "$marker" ]] ||
+  ! grep -Fx 'bloom-macos-unix-w0-disposable-v1' "$marker" >/dev/null
+then
+  echo "installed acceptance host is not explicitly marked disposable" >&2
+  exit 77
+fi
+[[ "$(<"$payload/PLATFORM_CLAIM")" == "macos-unix-principals-w0" ]] || {
+  echo "installed acceptance payload has the wrong platform claim" >&2
+  exit 65
+}
+[[ "$(id -u "$login_user")" == "$login_uid" ]] || {
+  echo "installed acceptance login name and UID do not match" >&2
+  exit 65
+}
+[[ -d "$evidence_dir" && ! -L "$evidence_dir" ]] || {
+  echo "installed acceptance evidence directory is unsafe" >&2
+  exit 65
+}
+
+enrollment="/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
+[[ -f "$enrollment" && ! -L "$enrollment" ]] || {
+  echo "installed acceptance requires an active enrollment" >&2
+  exit 69
+}
+[[ "$(stat -f '%u:%g:%Lp:%l' "$enrollment")" == "0:0:644:1" ]]
+[[ "$(plutil -extract state raw -o - "$enrollment")" == "active" ]]
+release_digest="$(plutil -extract release_digest raw -o - "$enrollment")"
+[[ "$release_digest" == "$(<"$payload/RELEASE_DIGEST")" ]]
+release_root="/usr/local/libexec/bloom/releases/$release_digest"
+[[ "$(readlink /usr/local/libexec/bloom/current)" == "releases/$release_digest" ]]
+for binary in bloom bloom-broker bloom-signer; do
+  installed="$release_root/$binary"
+  [[ "$(stat -f '%u:%g:%Lp:%l' "$installed")" == "0:0:755:1" ]]
+  cmp "$payload/bin/$binary" "$installed" >/dev/null || {
+    echo "installed $binary does not match the tested payload" >&2
+    exit 1
+  }
+done
+
+assert_installed_process() {
+  process_name="$1"
+  service_uid="$2"
+  expected_binary="$3"
+  process_ids="$(pgrep -u "$service_uid" -x "$process_name" || true)"
+  [[ "$(wc -w <<<"$process_ids" | tr -d ' ')" == "1" ]] || {
+    echo "installed acceptance expected one $process_name for UID $service_uid" >&2
+    exit 1
+  }
+  process_id="$process_ids"
+  [[ "$(ps -p "$process_id" -o uid= | tr -d ' ')" == "$service_uid" ]]
+  lsof -nP -a -p "$process_id" -d txt -Fn |
+    grep -Fx \
+      -e "n$expected_binary" \
+      -e "n/usr/local/libexec/bloom/current/$process_name" >/dev/null || {
+    echo "$process_name is not executing the installed release binary" >&2
+    exit 1
+  }
+}
+
+broker_uid="$(plutil -extract broker_uid raw -o - "$enrollment")"
+signer_uid="$(plutil -extract signer_uid raw -o - "$enrollment")"
+assert_installed_process bloom-broker "$broker_uid" "$release_root/bloom-broker"
+assert_installed_process bloom-signer "$signer_uid" "$release_root/bloom-signer"
+sudo -u "$login_user" \
+  "$release_root/bloom" --triad-health-check "$release_digest"
+
+source_revision() {
+  key="$1"
+  sed -n "s/^$key=//p" "$payload/SOURCE_REVISIONS"
+}
+
+assert_source() {
+  root="$1"
+  revision_key="$2"
+  expected_revision="$(source_revision "$revision_key")"
+  [[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]]
+  [[ "$(git -C "$root" rev-parse HEAD)" == "$expected_revision" ]] || {
+    echo "$revision_key source does not match the installed payload" >&2
+    exit 65
+  }
+  [[ -z "$(git -C "$root" status --porcelain --untracked-files=no)" ]] || {
+    echo "$revision_key source has tracked modifications" >&2
+    exit 65
+  }
+}
+
+assert_source "$main_root" BLOOM_MACHINE_SHA
+assert_source "$broker_root" BLOOM_BROKER_SHA
+assert_source "$signer_root" BLOOM_SIGNER_SHA
+
+cargo_binary="${BLOOM_MACOS_ACCEPTANCE_CARGO:-}"
+[[ -n "$cargo_binary" ]] || cargo_binary="$(command -v cargo)"
+[[ "$cargo_binary" == /* && -x "$cargo_binary" ]] || {
+  echo "installed acceptance requires an absolute executable cargo path" >&2
+  exit 69
+}
+cargo_home="${BLOOM_MACOS_ACCEPTANCE_CARGO_HOME:-}"
+rustup_home="${BLOOM_MACOS_ACCEPTANCE_RUSTUP_HOME:-}"
+[[ -z "$cargo_home" || "$cargo_home" == /* ]] || exit 65
+[[ -z "$rustup_home" || "$rustup_home" == /* ]] || exit 65
+run_as_login() {
+  tool_environment=(
+    "BLOOM_ACCEPTANCE_BUNDLE_ROOT=$payload"
+    "BLOOM_ALLOW_MACOS_UNIX_W0=true"
+  )
+  [[ -z "$cargo_home" ]] || tool_environment+=("CARGO_HOME=$cargo_home")
+  [[ -z "$rustup_home" ]] || tool_environment+=("RUSTUP_HOME=$rustup_home")
+  sudo -H -u "$login_user" \
+    env \
+    "${tool_environment[@]}" \
+    "$cargo_binary" "$@"
+}
+
+# These are the exact triad acceptance sources. Fault injection remains linked
+# only into the test executables; installed production services stay running
+# under their real principals throughout the rerun.
+run_as_login test \
+  --manifest-path "$main_root/Cargo.toml" \
+  --locked \
+  -p bloom-triad-protocol \
+  -p bloom-triad-local-transport \
+  -p bloom-service-activation \
+  -p bloom-audit-checkpoint \
+  -p bloom-machine-client
+run_as_login test \
+  --manifest-path "$main_root/Cargo.toml" \
+  --locked \
+  -p bloom-vfs \
+  --test triad_policy_update
+run_as_login test \
+  --manifest-path "$broker_root/Cargo.toml" \
+  --workspace \
+  --locked
+run_as_login test \
+  --manifest-path "$signer_root/Cargo.toml" \
+  --workspace \
+  --locked
+
+# Recheck the installed boundary after all fault-injection executables finish.
+assert_installed_process bloom-broker "$broker_uid" "$release_root/bloom-broker"
+assert_installed_process bloom-signer "$signer_uid" "$release_root/bloom-signer"
+sudo -u "$login_user" \
+  "$release_root/bloom" --triad-health-check "$release_digest"
+
+subject_digest="$(
+  "$main_root/packaging/triad/release/macos-conformance-subject.sh" "$payload"
+)"
+for criterion in installed_ac_01_35 mui_12; do
+  temporary="$evidence_dir/.$criterion.$$.new"
+  printf '%s\n' "$subject_digest" > "$temporary"
+  chmod 0644 "$temporary"
+  mv -f "$temporary" "$evidence_dir/$criterion.pass"
+done
+
+echo "installed AC-01 through AC-35 rerun passed"

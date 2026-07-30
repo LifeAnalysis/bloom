@@ -32,13 +32,26 @@ the canonical listener before another Machine request. If
 successful run writes digest-bound `mui_05.pass`, `mui_06.pass`, and
 `two_login_lifecycle.pass` evidence for the tested payload.
 
+`run-installed-acceptance.sh PAYLOAD UID USER MAIN_ROOT BROKER_ROOT SIGNER_ROOT
+EVIDENCE_DIR` is invoked by the single-login harness while the installed
+services are healthy. It verifies the active enrollment, byte-identical
+installed binaries, exact running service UIDs and executable paths, clean
+source revisions matching `SOURCE_REVISIONS`, and authenticated health. It
+then reruns the triad protocol, transport, activation, checkpoint, Machine
+client, policy-update, Broker, and Signer acceptance sources while the real
+installed services remain active. Fault injection stays confined to test
+executables. A final process/health recheck precedes digest-bound
+`installed_ac_01_35.pass` and `mui_12.pass` evidence.
+
 The manually dispatched `macOS Unix-principal W0` workflow is the repository's
 disposable-host provisioner. It runs only on a fresh GitHub-hosted macOS VM,
 first proves that the runner login has a GUI launchd domain, builds all three
 public repositories from the selected refs, creates a non-production W0
 bundle, installs an ephemeral root-owned release pin and host marker, runs this
-harness, and removes those markers in an unconditional cleanup step. The
-workflow does not produce or advertise a production platform claim.
+harness including the installed acceptance rerun, uploads only digest-bound
+criterion files after success, and removes those markers in an unconditional
+cleanup step. The workflow does not produce or advertise a production
+platform claim.
 
 The lane currently proves account/group shape, non-transitive membership,
 root/service filesystem ownership, explicit checkpoint/config/database

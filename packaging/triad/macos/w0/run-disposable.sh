@@ -923,6 +923,30 @@ if [[ -n "$failing_upgrade_payload" ]]; then
   assert_active_release "$baseline_digest"
 fi
 
+installed_acceptance_inputs=0
+for value in \
+  "${BLOOM_MACOS_INSTALLED_ACCEPTANCE_MAIN_ROOT:-}" \
+  "${BLOOM_MACOS_INSTALLED_ACCEPTANCE_BROKER_ROOT:-}" \
+  "${BLOOM_MACOS_INSTALLED_ACCEPTANCE_SIGNER_ROOT:-}" \
+  "${BLOOM_MACOS_W0_EVIDENCE_DIR:-}"
+do
+  [[ -z "$value" ]] || installed_acceptance_inputs=$((installed_acceptance_inputs + 1))
+done
+if [[ "$installed_acceptance_inputs" -ne 0 ]]; then
+  [[ "$installed_acceptance_inputs" -eq 4 ]] || {
+    echo "installed acceptance requires all three source roots and the evidence directory" >&2
+    exit 65
+  }
+  "$triad_source/macos/w0/run-installed-acceptance.sh" \
+    "$current_good_payload" \
+    "$login_uid" \
+    "$login_user" \
+    "$BLOOM_MACOS_INSTALLED_ACCEPTANCE_MAIN_ROOT" \
+    "$BLOOM_MACOS_INSTALLED_ACCEPTANCE_BROKER_ROOT" \
+    "$BLOOM_MACOS_INSTALLED_ACCEPTANCE_SIGNER_ROOT" \
+    "$BLOOM_MACOS_W0_EVIDENCE_DIR"
+fi
+
 "$installer" uninstall / "$login_uid" "retain-bloom-login-$login_uid"
 retained_record="/Library/Application Support/BloomTriad/retained/$login_uid.json"
 [[ ! -e "$enrollment" && -f "$retained_record" ]] || {
@@ -1010,5 +1034,25 @@ do
     exit 1
   fi
 done
+
+if [[ -n "${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" ]]; then
+  subject_digest="$(
+    "$triad_source/release/macos-conformance-subject.sh" "$current_good_payload"
+  )"
+  for criterion in \
+    mui_02 \
+    mui_03 \
+    mui_04 \
+    mui_07 \
+    mui_08 \
+    mui_10 \
+    negative_access
+  do
+    temporary="$BLOOM_MACOS_W0_EVIDENCE_DIR/.$criterion.$$.new"
+    printf '%s\n' "$subject_digest" > "$temporary"
+    chmod 0644 "$temporary"
+    mv -f "$temporary" "$BLOOM_MACOS_W0_EVIDENCE_DIR/$criterion.pass"
+  done
+fi
 
 echo "Bloom macOS Unix-principal disposable W0 isolation checks passed"
