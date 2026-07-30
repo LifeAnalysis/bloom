@@ -11,12 +11,18 @@ on:
         description: Public bloom-signer ref
         required: true
         default: master
+  pull_request:
+    types:
+      - labeled
 
 permissions:
   contents: read
 
 jobs:
   disposable-w0:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'run-macos-w0'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -28,13 +34,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref }}
+          ref: ${{ inputs.broker_ref || 'master' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@v4
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref }}
+          ref: ${{ inputs.signer_ref || 'master' }}
           path: bloom-signer
       - uses: dtolnay/rust-toolchain@stable
 
