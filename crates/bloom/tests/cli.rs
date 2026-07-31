@@ -825,20 +825,17 @@ fn wallet_stage_without_daemon_uses_in_process_parser() {
 }
 
 #[test]
-fn wallet_list_reads_a_pre_migration_public_projection_without_broker() {
+fn wallet_list_ignores_legacy_keystore_without_a_broker_projection() {
     let home = fresh_home();
-    let address = seed_legacy_wallet_fixture(home.path(), "alice");
-    let list = bloom_cmd(home.path())
+    seed_legacy_wallet_fixture(home.path(), "alice");
+    bloom_cmd(home.path())
         .args(["wallet", "list"])
         .assert()
-        .success();
-    let output = String::from_utf8(list.get_output().stdout.clone()).unwrap();
-    assert!(
-        output
-            .lines()
-            .any(|line| line == format!("alice\t{address}\tlocal")),
-        "wallet list missing fixture projection: {output}"
-    );
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "Broker is unavailable and no cached wallet projection exists",
+        ));
 }
 
 #[test]
@@ -926,61 +923,56 @@ fn request_cli_dry_run_uses_vfs_lifecycle_and_body_receipt_helpers() {
 }
 
 #[test]
-fn status_on_empty_keystore_points_to_wallet_creation() {
+fn status_without_broker_or_projection_reports_wallets_unavailable() {
     let home = fresh_home();
     let assert = bloom_cmd(home.path()).args(["status"]).assert().success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(
-        out.contains("no wallets yet"),
-        "empty status should say no wallet exists:\n{out}"
+        out.contains("wallets: unavailable"),
+        "status must not treat an unavailable projection as an empty wallet set:\n{out}"
     );
     assert!(
-        out.contains("bloom wallet new main"),
-        "status should point at the explicit wallet command:\n{out}"
+        !out.contains("no wallets yet"),
+        "status must not falsely claim that no wallets exist:\n{out}"
+    );
+    assert!(
+        !home.path().join("keystore").exists(),
+        "public status must not create the legacy keystore"
+    );
+    assert!(
+        !home.path().join("auth").exists(),
+        "public status must not create the legacy approval store"
+    );
+    assert!(
+        !home.path().join("outbox").exists(),
+        "public status must not construct the legacy daemon composition"
     );
 }
 
-/// `wallet address <name>` prints the bare checksummed address; adding `--qr`
-/// prepends a scannable QR block while keeping the address line.
 #[test]
-fn wallet_address_with_and_without_qr() {
+fn wallet_address_ignores_legacy_keystore_without_a_broker_projection() {
     let home = fresh_home();
     seed_legacy_wallet_fixture(home.path(), "alice");
 
-    let plain = bloom_cmd(home.path())
+    bloom_cmd(home.path())
         .args(["wallet", "address", "alice"])
         .assert()
-        .success();
-    let plain_out = String::from_utf8(plain.get_output().stdout.clone()).unwrap();
-    let addr = plain_out.trim();
-    assert!(
-        addr.starts_with("0x") && addr.len() == 42,
-        "plain output should be a bare address, got: {plain_out:?}"
-    );
+        .failure()
+        .stderr(predicate::str::contains("has no cached projection"));
 
-    let qr = bloom_cmd(home.path())
+    bloom_cmd(home.path())
         .args(["wallet", "address", "alice", "--qr"])
         .assert()
-        .success();
-    let qr_out = String::from_utf8(qr.get_output().stdout.clone()).unwrap();
-    assert!(
-        qr_out.contains(addr),
-        "--qr output must still include the address:\n{qr_out}"
-    );
-    assert!(
-        qr_out.lines().count() > plain_out.lines().count(),
-        "--qr should add a QR block above the address:\n{qr_out}"
-    );
+        .failure()
+        .stderr(predicate::str::contains("has no cached projection"));
 }
 
-/// `wallet address <name> --qr-out <path>` writes a scannable SVG QR file and
-/// still prints the address; the SVG is a real `<svg>` document.
 #[test]
-fn wallet_address_qr_out_writes_svg() {
+fn wallet_address_qr_out_does_not_use_legacy_keystore() {
     let home = fresh_home();
     seed_legacy_wallet_fixture(home.path(), "alice");
     let svg_path = home.path().join("deposit.svg");
-    let out = bloom_cmd(home.path())
+    bloom_cmd(home.path())
         .args([
             "wallet",
             "address",
@@ -989,17 +981,9 @@ fn wallet_address_qr_out_writes_svg() {
             svg_path.to_str().unwrap(),
         ])
         .assert()
-        .success();
-    // The bare address still goes to stdout (scriptable).
-    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
-    assert!(stdout.trim().starts_with("0x"), "stdout: {stdout:?}");
-    // The SVG file exists and is a real SVG document.
-    let svg = std::fs::read_to_string(&svg_path).expect("qr svg written");
-    assert!(
-        svg.contains("<svg") && svg.contains("</svg>"),
-        "expected an SVG document, got: {}",
-        &svg[..svg.len().min(80)]
-    );
+        .failure()
+        .stderr(predicate::str::contains("has no cached projection"));
+    assert!(!svg_path.exists());
 }
 
 /// Spin up an in-process `IpcServer` bound to the home's default socket

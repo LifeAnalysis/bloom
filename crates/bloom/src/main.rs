@@ -30,6 +30,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
 use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork, UsdSendRequest, pretty_json};
+use bloom_machine_client::WalletProjectionReader as _;
 use bloom_proto::{HomeDir, HomeWritePermit};
 use bloom_vfs::{
     VfsPath,
@@ -129,6 +130,25 @@ fn resolve_server_endpoint(home: &HomeDir, endpoint: Option<&str>) -> Result<Res
 
 fn configured_broker_client() -> Result<bloom_machine_client::MachineBrokerClient> {
     configured_broker_client_with_activation(false)
+}
+
+fn configured_wallet_projection_reader(
+    home: &HomeDir,
+) -> Result<bloom_machine_client::CachedWalletProjectionReader> {
+    let broker = match configured_broker_client() {
+        Ok(client) => Some(client),
+        Err(error) => {
+            debug!(error = %error, "wallet projection using stale cache until Broker is available");
+            None
+        }
+    };
+    bloom_machine_client::CachedWalletProjectionReader::new(
+        broker,
+        bloom_machine_client::FileProjectionStore::new(
+            home.cache_dir().join("wallet-projections.json"),
+        ),
+    )
+    .context("open Machine wallet projection cache")
 }
 
 fn configured_broker_client_with_activation(
@@ -1695,45 +1715,71 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Status => {
-            let d = Daemon::from_home(home).context("build daemon")?;
+            // Status is a public, projection-only surface. Do not construct a
+            // Daemon here: that composition still opens legacy authority
+            // stores while the extraction milestones are in progress.
+            let config = if home.config_path().is_file() {
+                bloom_proto::Config::load(&home.config_path()).context("load config")?
+            } else {
+                bloom_proto::Config::local_default()
+            };
+            let projected_wallets = match configured_wallet_projection_reader(&home)?
+                .list_wallets()
+                .await
+            {
+                Ok(wallets) => Some(wallets),
+                Err(error)
+                    if error.code
+                        == bloom_triad_protocol::ProtocolErrorCode::ServiceUnavailable =>
+                {
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            };
             println!("version: {}", env!("CARGO_PKG_VERSION"));
-            println!("home: {}", d.home.root().display());
-            println!("chains: {:?}", d.chains.list_names());
-            println!("default_chain: {}", d.config.default_chain);
+            println!("home: {}", home.root().display());
+            println!(
+                "chains: {:?}",
+                config.chains.keys().cloned().collect::<Vec<_>>()
+            );
+            println!("default_chain: {}", config.default_chain);
             println!(
                 "default_wallet: {}",
-                d.config.default_wallet.as_deref().unwrap_or("<none>")
+                config.default_wallet.as_deref().unwrap_or("<none>")
             );
-            if d.config.hyperliquid.is_some() {
+            if config.hyperliquid.is_some() {
                 println!("hyperliquid_vfs: enabled (/hyperliquid)");
-                // Which wallets have an actual trading boundary in force.
-                let policed: Vec<String> = d
-                    .keystore
-                    .list()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|w| w.policy.hyperliquid.is_configured())
-                    .map(|w| w.name)
-                    .collect();
-                if policed.is_empty() {
-                    println!(
-                        "hyperliquid_policy: none configured (any wallet can trade unconstrained \
-                         once unlocked — add [hyperliquid] to a wallet policy)"
-                    );
-                } else {
-                    println!("hyperliquid_policy: configured for {}", policed.join(", "));
+                match &projected_wallets {
+                    Some(wallets) => println!(
+                        "hyperliquid_policy: Broker/Signer enforced for {} projected wallet(s)",
+                        wallets.len()
+                    ),
+                    None => println!(
+                        "hyperliquid_policy: unavailable (Broker offline and no cached projection)"
+                    ),
                 }
             } else {
                 println!("hyperliquid_vfs: disabled (add [hyperliquid] to config.toml)");
             }
             println!("try: bloom vfs ls /");
-            if d.keystore.list()?.is_empty() {
-                println!("no wallets yet — create one with bloom wallet new main");
-            } else {
-                println!("deposit: bloom wallet address <wallet> --qr");
-                println!("agent workflow: browse the mounted VFS or use bloom vfs cat/ls/write");
+            match projected_wallets {
+                Some(wallets) if wallets.is_empty() => {
+                    println!("no wallets yet — create one with bloom wallet new main");
+                }
+                Some(_) => {
+                    println!("deposit: bloom wallet address <wallet> --qr");
+                    println!(
+                        "agent workflow: browse the mounted VFS or use bloom vfs cat/ls/write"
+                    );
+                }
+                None => println!(
+                    "wallets: unavailable (Broker offline and no cached public projection)"
+                ),
             }
-            if let Some(snap) = d.update_checker.quick_check_cached() {
+            let update_checker =
+                bloom_update::UpdateChecker::new(env!("CARGO_PKG_VERSION"), home.cache_dir())
+                    .context("build update checker")?;
+            if let Some(snap) = update_checker.quick_check_cached() {
                 let latest = snap.latest.as_deref().unwrap_or("?");
                 let latest_display = latest.strip_prefix('v').unwrap_or(latest);
                 let available = match snap.available() {
@@ -1982,38 +2028,43 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Cmd::Wallet(WalletCmd::List) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            for info in d.keystore.list()? {
-                let kind = match info.kind {
-                    bloom_keystore::WalletKind::Local => "local",
-                    bloom_keystore::WalletKind::Watch => "watch",
-                    bloom_keystore::WalletKind::PasskeyGated => "passkey",
-                };
-                println!("{}\t{}\t{}", info.name, info.address, kind);
+            let reader = configured_wallet_projection_reader(&home)?;
+            for projection in reader.list_wallets().await? {
+                println!(
+                    "{}\t{}\t{}",
+                    projection.wallet.wallet_id,
+                    projection.primary_address()?,
+                    projection.wallet.wallet_kind
+                );
             }
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Portfolio { network }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            let client = hl_client(&d.home, &network)?;
-            let wallets = d.keystore.list()?;
+            let client = hl_client(&home, &network)?;
+            let wallets = configured_wallet_projection_reader(&home)?
+                .list_wallets()
+                .await?;
             let mut set = tokio::task::JoinSet::new();
-            for (idx, info) in wallets.into_iter().enumerate() {
+            for (idx, projection) in wallets.into_iter().enumerate() {
                 let client = client.clone();
                 set.spawn(async move {
-                    let address = format!("{:?}", info.address).to_ascii_lowercase();
+                    let address = projection
+                        .primary_address()
+                        .map(str::to_owned)
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
                     let res = client
                         .info(serde_json::json!({
                             "type": "clearinghouseState",
                             "user": address,
                         }))
                         .await;
-                    (idx, info, address, res)
+                    (idx, projection, address, res)
                 });
             }
             let mut rows: Vec<(usize, WalletPortfolioRow)> = Vec::new();
             while let Some(joined) = set.join_next().await {
-                let (idx, info, address, ch_result) = joined?;
+                let (idx, projection, address, ch_result) = joined?;
                 let (account_value, withdrawable, positions) = match ch_result {
                     Ok(v) => {
                         let av = v
@@ -2048,7 +2099,7 @@ async fn run(cli: Cli) -> Result<()> {
                 rows.push((
                     idx,
                     WalletPortfolioRow {
-                        name: info.name,
+                        name: projection.wallet.wallet_id.as_str().to_owned(),
                         address,
                         account_value,
                         withdrawable,
@@ -2062,10 +2113,15 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Address { name, qr, qr_out }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            // Read-only: an unsigned/stale passkey policy must not block this.
-            let info = d.keystore.info_unverified(&name)?;
-            let address = bloom_proto::checksum_address(&info.address);
+            let reader = configured_wallet_projection_reader(&home)?;
+            let wallet_id = bloom_triad_protocol::Token::new(name)
+                .context("wallet ID must be a protocol token")?;
+            let projection = reader.get_wallet(&wallet_id).await?;
+            let address: alloy::primitives::Address = projection
+                .primary_address()?
+                .parse()
+                .context("Broker wallet projection contains an invalid address")?;
+            let address = bloom_proto::checksum_address(&address);
             if let Some(path) = qr_out {
                 match commands::qr::render_qr_svg(&address) {
                     Some(svg) => {

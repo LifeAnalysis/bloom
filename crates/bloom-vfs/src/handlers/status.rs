@@ -45,6 +45,7 @@ use tokio::time::timeout;
 
 use bloom_evm::ChainRegistry;
 use bloom_keystore::Keystore;
+use bloom_machine_client::WalletProjectionReader;
 use bloom_prices::PricesClient;
 use bloom_proto::{AuditLog, BackendsConfig};
 use bloom_rpc::EndpointHealthSnapshot;
@@ -102,6 +103,7 @@ pub use bloom_update::UpdateAvailable;
 pub struct StatusHandler {
     pub chains: ChainRegistry,
     pub keystore: Keystore,
+    pub wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     pub tx_engine: TxEngine,
     pub audit: Arc<AuditLog>,
     pub prices: Option<PricesClient>,
@@ -184,6 +186,7 @@ impl StatusHandler {
         Self {
             chains,
             keystore,
+            wallet_projections: None,
             tx_engine,
             audit,
             prices,
@@ -210,6 +213,14 @@ impl StatusHandler {
         f: Arc<dyn Fn() -> Option<UpdateSnapshot> + Send + Sync>,
     ) -> Self {
         self.update_snapshot_fn = Some(f);
+        self
+    }
+
+    pub fn with_wallet_projections(
+        mut self,
+        wallet_projections: Arc<dyn WalletProjectionReader>,
+    ) -> Self {
+        self.wallet_projections = Some(wallet_projections);
         self
     }
 
@@ -430,8 +441,22 @@ impl StatusHandler {
         0
     }
 
-    fn wallet_count(&self) -> u64 {
-        self.keystore.list().map(|v| v.len() as u64).unwrap_or(0)
+    async fn wallet_count(&self) -> Result<u64, HandlerError> {
+        if let Some(projections) = &self.wallet_projections {
+            return projections
+                .list_wallets()
+                .await
+                .map(|wallets| wallets.len() as u64)
+                .map_err(|error| HandlerError::backend(error.to_string()));
+        }
+        #[cfg(test)]
+        {
+            return Ok(self.keystore.list().map(|v| v.len() as u64).unwrap_or(0));
+        }
+        #[cfg(not(test))]
+        Err(HandlerError::backend(
+            "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
+        ))
     }
 
     fn outbox_pending_count(&self) -> u64 {
@@ -776,7 +801,7 @@ impl StatusHandler {
                 Ok(format!("{}\n", self.prices_entries()).into_bytes())
             }
             [a, leaf] if a == "wallets" && leaf == "count" => {
-                Ok(format!("{}\n", self.wallet_count()).into_bytes())
+                Ok(format!("{}\n", self.wallet_count().await?).into_bytes())
             }
             [a, leaf] if a == "outbox" && leaf == "pending_count" => {
                 Ok(format!("{}\n", self.outbox_pending_count()).into_bytes())

@@ -2547,9 +2547,11 @@ dependencies = [
 name = "bloom-machine-client"
 version = "0.1.3"
 dependencies = [
+ "async-trait",
  "bloom-triad-local-transport",
  "bloom-triad-protocol",
  "ed25519-dalek",
+ "fs2",
  "serde",
  "serde_jcs",
  "serde_json",

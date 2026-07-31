@@ -61,12 +61,19 @@ pub trait BasefeeProvider: Send + Sync {
     async fn basefee_wei(&self, chain: &str) -> Option<u128>;
 }
 
-/// Per-wallet policy lookup. Returns `(stuck_after, basefee_overrun_pct)`
-/// for a wallet — the two fields the scanner derives from
-/// `policy.bump` in a wallet's `policy.toml`. The `interval` from the
-/// global config is shared across wallets (the scanner is one task);
-/// only the trigger thresholds vary per wallet.
-pub type WalletPolicyLookup = Arc<dyn Fn(&str) -> (Duration, u32) + Send + Sync>;
+/// Explicit public-projection state used by the advisory scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletPolicyProjection {
+    Current(Duration, u32),
+    Stale(Duration, u32),
+    Unknown,
+    Unavailable,
+}
+
+/// Per-wallet public policy projection lookup. Unknown or unavailable
+/// projection state suppresses advisory output instead of silently applying
+/// defaults as though the wallet had been authenticated.
+pub type WalletPolicyLookup = Arc<dyn Fn(&str) -> WalletPolicyProjection + Send + Sync>;
 
 /// Background scanner that identifies stuck transactions and writes
 /// `bump.tx` / `cancel.tx` / `bump_advice.json` artefacts.
@@ -106,10 +113,29 @@ impl BumpScanner {
         self
     }
 
-    fn trigger_thresholds(&self, wallet: &str) -> (Duration, u32) {
+    fn trigger_thresholds(&self, wallet: &str) -> Option<(Duration, u32)> {
         match &self.wallet_policy {
-            Some(f) => f(wallet),
-            None => (self.cfg.stuck_after, self.cfg.basefee_overrun_pct),
+            Some(f) => match f(wallet) {
+                WalletPolicyProjection::Current(stuck_after, overrun) => {
+                    Some((stuck_after, overrun))
+                }
+                WalletPolicyProjection::Stale(stuck_after, overrun) => {
+                    tracing::warn!(wallet, "bump scanner using stale public wallet projection");
+                    Some((stuck_after, overrun))
+                }
+                WalletPolicyProjection::Unknown => {
+                    tracing::warn!(wallet, "bump scanner skipping unknown projected wallet");
+                    None
+                }
+                WalletPolicyProjection::Unavailable => {
+                    tracing::warn!(
+                        wallet,
+                        "bump scanner skipping unavailable wallet projections"
+                    );
+                    None
+                }
+            },
+            None => Some((self.cfg.stuck_after, self.cfg.basefee_overrun_pct)),
         }
     }
 
@@ -127,7 +153,10 @@ impl BumpScanner {
             return Ok(());
         }
 
-        let (stuck_after, basefee_overrun_pct) = self.trigger_thresholds(&entry.wallet);
+        let Some((stuck_after, basefee_overrun_pct)) = self.trigger_thresholds(&entry.wallet)
+        else {
+            return Ok(());
+        };
 
         let basefee = self.basefee_provider.basefee_wei(&entry.chain).await;
         let max_fee = entry.fees.max_fee_per_gas();
@@ -416,5 +445,27 @@ mod tests {
         let va: serde_json::Value =
             serde_json::from_slice(&fs::read(&advice_path).unwrap()).unwrap();
         assert_eq!(va["reason"], "basefee_overrun");
+    }
+
+    #[tokio::test]
+    async fn tick_suppresses_advice_when_wallet_projection_is_unavailable() {
+        let tmp = TempDir::new().unwrap();
+        let outbox = Outbox::new(tmp.path()).unwrap();
+        seed_sent_entry(&outbox, "alice", "ethereum", 100);
+        let scanner = BumpScanner::new(
+            outbox.clone(),
+            Arc::new(RwLock::new(BTreeMap::new())),
+            Arc::new(StaticBasefee(Some(150))),
+            BumpScannerConfig::default(),
+        )
+        .with_wallet_policy(Arc::new(|_| WalletPolicyProjection::Unavailable));
+
+        scanner.tick().await.unwrap();
+
+        let entry = outbox.walk_all_sent().unwrap().pop().unwrap();
+        let directory = outbox.sent_dir("alice", "ethereum", &entry.id).unwrap();
+        assert!(!directory.join("bump.tx").exists());
+        assert!(!directory.join("cancel.tx").exists());
+        assert!(!directory.join("bump_advice.json").exists());
     }
 }

@@ -44,7 +44,9 @@ use bloom_auth_api::{
 use bloom_auth_api::{SIGNING_ATTESTATION_SCHEMA_V1, SignHashRequest, SigningAttestation};
 use bloom_evm::ChainRegistry;
 use bloom_keystore::Keystore;
-use bloom_machine_client::MachineBrokerClient;
+#[cfg(not(test))]
+use bloom_machine_client::WalletProjection;
+use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
 use bloom_proto::{
     AddressBook, CapabilityStatus, CapabilityViewEntry, HomeWritePermit, Policy, RawIntent,
     SigningModel, Venue,
@@ -156,6 +158,9 @@ pub struct WalletsHandler {
     /// Authenticated production authority edge. When absent, custody and
     /// policy mutations fail closed outside tests.
     pub broker: Option<MachineBrokerClient>,
+    /// Key-free authenticated wallet view. Production public reads require it;
+    /// the legacy keystore is never a fallback projection source.
+    pub wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     /// Machine-owned workflow projections; never a Broker or Signer state root.
     policy_projection_root: std::path::PathBuf,
 }
@@ -178,6 +183,7 @@ impl WalletsHandler {
             hyperliquid_handler: None,
             auth_services: AuthServices::default(),
             broker: None,
+            wallet_projections: None,
             policy_projection_root,
         }
     }
@@ -189,6 +195,14 @@ impl WalletsHandler {
 
     pub fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
         self.broker = broker;
+        self
+    }
+
+    pub fn with_wallet_projections(
+        mut self,
+        wallet_projections: Arc<dyn WalletProjectionReader>,
+    ) -> Self {
+        self.wallet_projections = Some(wallet_projections);
         self
     }
 
@@ -226,6 +240,7 @@ impl WalletsHandler {
     /// Role-labeled address view for a wallet. The keystore `address` is both
     /// the `owner` and the `signer` (the owner key signs). Venue-specific
     /// role addresses are exposed by their installed Petals.
+    #[cfg(test)]
     fn addresses_json(
         &self,
         wallet: &str,
@@ -257,6 +272,58 @@ impl WalletsHandler {
             "policy_status": policy_status,
             "unlocked": unlocked,
             "roles": serde_json::Value::Object(roles),
+        });
+        let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
+        out.push(b'\n');
+        Ok(out)
+    }
+
+    #[cfg(not(test))]
+    async fn wallet_projection(&self, wallet: &str) -> Result<WalletProjection, HandlerError> {
+        let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        self.wallet_projections
+            .as_ref()
+            .ok_or_else(|| {
+                HandlerError::backend(
+                    "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
+                )
+            })?
+            .get_wallet(&wallet_id)
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))
+    }
+
+    #[cfg(not(test))]
+    async fn wallet_projection_list(&self) -> Result<Vec<WalletProjection>, HandlerError> {
+        self.wallet_projections
+            .as_ref()
+            .ok_or_else(|| {
+                HandlerError::backend(
+                    "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
+                )
+            })?
+            .list_wallets()
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))
+    }
+
+    #[cfg(not(test))]
+    fn projection_addresses_json(
+        &self,
+        projection: &WalletProjection,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let owner = projection.primary_address().map_err(err_be)?;
+        let body = serde_json::json!({
+            "wallet": projection.wallet.wallet_id,
+            "kind": projection.wallet.wallet_kind,
+            "owner": owner,
+            "signer": owner,
+            "policy_status": "broker_verified",
+            "unlocked": false,
+            "freshness": projection.freshness,
+            "observed_at_ms": projection.observed_at_ms,
+            "roles": serde_json::Map::<String, serde_json::Value>::new(),
         });
         let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
         out.push(b'\n');
@@ -730,17 +797,9 @@ impl WalletsHandler {
     async fn read_triad_wallet_policy(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
         use sha2::Digest as _;
 
-        let broker = self.broker.as_ref().ok_or_else(|| {
-            HandlerError::backend(
-                "SERVICE_UNAVAILABLE: canonical policy read requires the authenticated Broker edge",
-            )
-        })?;
         let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
-        let snapshot = broker
-            .policy(wallet_id.clone())
-            .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        let snapshot = self.wallet_projection(wallet).await?.policy;
         let canonical = snapshot.canonical_policy.decode();
         if snapshot.wallet_id != wallet_id
             || bloom_triad_protocol::Digest32::from_bytes(sha2::Sha256::digest(&canonical).into())
@@ -1674,7 +1733,7 @@ impl WalletsHandler {
             .map_err(|e| HandlerError::backend(format!("issue policy-session challenge: {e}")))
     }
 
-    fn wallet_dir_entries(_kind: bloom_keystore::WalletKind) -> Vec<Entry> {
+    fn wallet_dir_entries() -> Vec<Entry> {
         let entries = vec![
             Entry::file("address"),
             Entry::file("address.qr.png"),
@@ -2489,7 +2548,10 @@ impl WalletsHandler {
             return Err(HandlerError::not_found(path.to_string_path()));
         }
         let wallet = &segs[0];
+        #[cfg(test)]
         self.keystore.info_unverified(wallet).map_err(err_be)?;
+        #[cfg(not(test))]
+        let _projection = self.wallet_projection(wallet).await?;
         self.migrate_legacy_policy_updates(wallet);
         if segs.len() == 1 {
             return Ok(Entry::dir(wallet));
@@ -2620,22 +2682,64 @@ impl WalletsHandler {
             return Err(HandlerError::not_found(path.to_string_path()));
         }
         let wallet = &segs[0];
+        #[cfg(test)]
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
         self.migrate_legacy_policy_updates(wallet);
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
+            #[cfg(test)]
             "address" => {
                 Ok(format!("{}\n", bloom_proto::checksum_address(&info.address)).into_bytes())
             }
+            #[cfg(not(test))]
+            "address" => {
+                let projection = self.wallet_projection(wallet).await?;
+                Ok(format!("{}\n", projection.primary_address().map_err(err_be)?).into_bytes())
+            }
+            #[cfg(test)]
             "address.qr.svg" => {
                 let address = bloom_proto::checksum_address(&info.address);
                 render_address_qr_svg(&address)
             }
+            #[cfg(not(test))]
+            "address.qr.svg" => {
+                let projection = self.wallet_projection(wallet).await?;
+                render_address_qr_svg(projection.primary_address().map_err(err_be)?)
+            }
+            #[cfg(test)]
             "address.qr.png" => {
                 let address = bloom_proto::checksum_address(&info.address);
                 render_address_qr_png(&address)
             }
+            #[cfg(not(test))]
+            "address.qr.png" => {
+                let projection = self.wallet_projection(wallet).await?;
+                render_address_qr_png(projection.primary_address().map_err(err_be)?)
+            }
+            #[cfg(test)]
             "addresses.json" => self.addresses_json(wallet, &info),
+            #[cfg(not(test))]
+            "addresses.json" => {
+                let projection = self.wallet_projection(wallet).await?;
+                self.projection_addresses_json(&projection)
+            }
+            #[cfg(test)]
             "public_key" => Ok(format!("0x{}\n", info.pubkey_hex).into_bytes()),
+            #[cfg(not(test))]
+            "public_key" => {
+                let projection = self.wallet_projection(wallet).await?;
+                Ok(format!(
+                    "0x{}\n",
+                    hex::encode(
+                        projection
+                            .primary_key()
+                            .map_err(err_be)?
+                            .canonical_public_key
+                            .decode()
+                    )
+                )
+                .into_bytes())
+            }
+            #[cfg(test)]
             "kind" => {
                 let s = match info.kind {
                     bloom_keystore::WalletKind::Local => "local",
@@ -2644,8 +2748,23 @@ impl WalletsHandler {
                 };
                 Ok(format!("{}\n", s).into_bytes())
             }
+            #[cfg(not(test))]
+            "kind" => {
+                let projection = self.wallet_projection(wallet).await?;
+                Ok(format!("{}\n", projection.wallet.wallet_kind.as_str()).into_bytes())
+            }
+            #[cfg(test)]
             "policy.toml" => {
                 let body = toml::to_string_pretty(&info.policy).map_err(err_be)?;
+                Ok(body.into_bytes())
+            }
+            #[cfg(not(test))]
+            "policy.toml" => {
+                let projection = self.wallet_projection(wallet).await?;
+                let policy: bloom_triad_protocol::CanonicalWalletPolicy =
+                    serde_json::from_slice(&projection.policy.canonical_policy.decode())
+                        .map_err(err_be)?;
+                let body = toml::to_string_pretty(&policy).map_err(err_be)?;
                 Ok(body.into_bytes())
             }
             #[cfg(not(test))]
@@ -2821,8 +2940,17 @@ impl WalletsHandler {
     async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         let segs = path.segments();
         if segs.is_empty() {
+            #[cfg(test)]
             let infos = self.keystore.list().map_err(err_be)?;
+            #[cfg(test)]
             let mut out: Vec<Entry> = infos.into_iter().map(|i| Entry::dir(&i.name)).collect();
+            #[cfg(not(test))]
+            let mut out: Vec<Entry> = self
+                .wallet_projection_list()
+                .await?
+                .into_iter()
+                .map(|projection| Entry::dir(projection.wallet.wallet_id.as_str()))
+                .collect();
             out.push(Entry::writable_file("new"));
             return Ok(out);
         }
@@ -2830,10 +2958,13 @@ impl WalletsHandler {
             return Err(HandlerError::NotADir(path.to_string_path()));
         }
         let wallet = &segs[0];
-        let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
+        #[cfg(test)]
+        self.keystore.info_unverified(wallet).map_err(err_be)?;
+        #[cfg(not(test))]
+        let _projection = self.wallet_projection(wallet).await?;
         self.migrate_legacy_policy_updates(wallet);
         match segs.len() {
-            1 => Ok(Self::wallet_dir_entries(info.kind)),
+            1 => Ok(Self::wallet_dir_entries()),
             2 if segs[1] == "chains" => Ok(self
                 .chains
                 .list_names()
@@ -3020,14 +3151,27 @@ impl WalletsHandler {
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
         // Read-only chain leaves (balance/nonce): never gated on policy sig.
+        #[cfg(test)]
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
+        #[cfg(test)]
+        let address = info.address;
+        #[cfg(not(test))]
+        let address: alloy::primitives::Address = self
+            .wallet_projection(wallet)
+            .await?
+            .primary_address()
+            .map_err(err_be)?
+            .parse()
+            .map_err(|error| {
+                HandlerError::backend(format!("invalid projected address: {error}"))
+            })?;
         let client = self
             .chains
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", chain)))?;
         match rest {
             [s] if s == "balance" => {
-                let bal = client.balance(info.address).await.map_err(err_be)?;
+                let bal = client.balance(address).await.map_err(err_be)?;
                 let spec = client.spec();
                 Ok(super::balances::display_line(
                     bal,
@@ -3036,11 +3180,11 @@ impl WalletsHandler {
                 ))
             }
             [s] if s == "balance.raw" => {
-                let bal = client.balance(info.address).await.map_err(err_be)?;
+                let bal = client.balance(address).await.map_err(err_be)?;
                 Ok(super::balances::raw_line(bal))
             }
             [s] if s == "balance.json" => {
-                let bal = client.balance(info.address).await.map_err(err_be)?;
+                let bal = client.balance(address).await.map_err(err_be)?;
                 let spec = client.spec();
                 Ok(super::balances::balance_json(
                     chain,
@@ -3052,7 +3196,7 @@ impl WalletsHandler {
                 ))
             }
             [s] if s == "nonce" => {
-                let n = client.nonce(info.address).await.map_err(err_be)?;
+                let n = client.nonce(address).await.map_err(err_be)?;
                 Ok(format!("{}\n", n).into_bytes())
             }
             [s, state, id, fname] if s == "outbox" => {
@@ -3080,11 +3224,7 @@ impl WalletsHandler {
                 };
                 let own_hashes = self.bloom_staged_hashes(wallet, chain);
                 let mut out = Vec::new();
-                for tx in idx
-                    .snapshot()
-                    .into_iter()
-                    .filter(|t| t.from == info.address)
-                {
+                for tx in idx.snapshot().into_iter().filter(|t| t.from == address) {
                     let hex = format!("{:?}", tx.hash).to_lowercase();
                     if own_hashes.contains(&hex) {
                         continue;
@@ -3103,7 +3243,7 @@ impl WalletsHandler {
                 let (observed, mempool_by_nonce) = match self.mempool_indexes.get(chain) {
                     Some(i) => {
                         let snap = i.snapshot();
-                        let observed = i.observed_nonces(info.address);
+                        let observed = i.observed_nonces(address);
                         // (nonce -> hash) for this address in the mempool.
                         // Multiple entries at the same nonce are possible
                         // (replacements). We surface them all as candidate
@@ -3111,7 +3251,7 @@ impl WalletsHandler {
                         // hashes filter them out below.
                         let mut by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
                             std::collections::BTreeMap::new();
-                        for tx in snap.into_iter().filter(|t| t.from == info.address) {
+                        for tx in snap.into_iter().filter(|t| t.from == address) {
                             let hex = format!("{:?}", tx.hash).to_lowercase();
                             by_nonce.entry(tx.nonce).or_default().push(hex);
                         }
@@ -3157,7 +3297,7 @@ impl WalletsHandler {
                     }
                 }
                 let body = serde_json::json!({
-                    "address": bloom_proto::checksum_address(&info.address),
+                    "address": bloom_proto::checksum_address(&address),
                     "observed_nonces": observed,
                     "outbox_pending_nonces": pending_nonces,
                     "outbox_sent_nonces": sent_nonces,

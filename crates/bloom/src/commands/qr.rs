@@ -23,3 +23,24 @@ pub fn render_qr_svg(data: &str) -> Option<String> {
             .build(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ADDRESS: &str = "0x0000000000000000000000000000000000000001";
+
+    #[test]
+    fn terminal_qr_is_nonempty_and_preserves_scriptable_address_separately() {
+        let qr = render_qr(ADDRESS).unwrap();
+        assert!(qr.lines().count() > 1);
+        assert!(!qr.contains(ADDRESS));
+    }
+
+    #[test]
+    fn svg_qr_is_a_complete_document() {
+        let svg = render_qr_svg(ADDRESS).unwrap();
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("</svg>"));
+    }
+}

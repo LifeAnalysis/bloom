@@ -45,7 +45,10 @@ use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
 use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
-use bloom_machine_client::{MachineBrokerClient, TrustedPetalSignRequest};
+use bloom_machine_client::{
+    CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient,
+    TrustedPetalSignRequest, WalletProjectionReader,
+};
 use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::abi::{
     ApprovalRequired, ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome,
@@ -290,6 +293,7 @@ struct PetalTxOutbox {
     tx_engine: TxEngine,
     chains: ChainRegistry,
     keystore: Keystore,
+    wallet_projections: Arc<dyn WalletProjectionReader>,
     address_book: Arc<AddressBook>,
     write_permit: Option<Arc<HomeWritePermit>>,
 }
@@ -1347,10 +1351,23 @@ impl PetalHost for DaemonPetalHost {
                 "data-hex must be canonical 0x-prefixed hex".into(),
             ));
         }
-        let wallet = service
+        let wallet_id = bloom_triad_protocol::Token::new(req.wallet.clone())
+            .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?;
+        let wallet_projection = service
+            .wallet_projections
+            .get_wallet(&wallet_id)
+            .await
+            .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?;
+        let wallet_address = wallet_projection
+            .primary_address()
+            .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?
+            .parse::<Address>()
+            .map_err(|error| HostError::Invalid(format!("wallet address: {error}")))?;
+        let wallet_policy = service
             .keystore
             .info(&req.wallet)
-            .map_err(|e| HostError::Invalid(format!("wallet: {e}")))?;
+            .map_err(|e| HostError::Invalid(format!("legacy planning policy: {e}")))?
+            .policy;
         let chain = service
             .chains
             .get(&req.chain)
@@ -1404,7 +1421,7 @@ impl PetalHost for DaemonPetalHost {
             .stage_with_execution_origin_and_fee_overrides(
                 permit,
                 &req.wallet,
-                wallet.address,
+                wallet_address,
                 RawIntent {
                     body: RawIntentBody::Raw {
                         to: req.to,
@@ -1418,7 +1435,7 @@ impl PetalHost for DaemonPetalHost {
                     usd_value_hint: None,
                 },
                 &chain,
-                &wallet.policy,
+                &wallet_policy,
                 Some(service.address_book.as_ref()),
                 Some(origin),
                 fee_overrides,
@@ -1834,6 +1851,7 @@ pub struct Daemon {
     pub audit: Arc<AuditLog>,
     pub auth_services: AuthServices,
     pub signer_cache: Arc<bloom_keystore::petal_host::SignerCache>,
+    pub wallet_projections: Arc<dyn WalletProjectionReader>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
@@ -1920,6 +1938,23 @@ impl Daemon {
         }
         let paid_http_rpc_resolver: Arc<dyn PaidHttpChainRpcResolver> =
             Arc::new(ConfigPaidHttpRpcResolver::from_config(&config));
+        let wallet_projections: Arc<dyn WalletProjectionReader> = Arc::new(
+            CachedWalletProjectionReader::new(
+                broker.clone(),
+                FileProjectionStore::new(home.cache_dir().join("wallet-projections.json")),
+            )
+            .map_err(|error| {
+                DaemonError::Audit(format!("Machine wallet projection cache: {error}"))
+            })?,
+        );
+        if broker.is_some() && tokio::runtime::Handle::try_current().is_ok() {
+            let projection_refresh = wallet_projections.clone();
+            tokio::spawn(async move {
+                if let Err(error) = projection_refresh.list_wallets().await {
+                    warn!(%error, "Machine wallet projection refresh failed");
+                }
+            });
+        }
 
         // Build per-chain mempool indexes + handlers from [mempool.<chain>]
         // config. Each entry creates an LRU index, a VFS handler, and
@@ -2358,6 +2393,7 @@ impl Daemon {
                 env!("CARGO_PKG_VERSION"),
             )
             .with_mempool_statuses(initial_mempool_statuses)
+            .with_wallet_projections(wallet_projections.clone())
             .with_update_snapshot_fn(Arc::new(move || {
                 // Always produce a snapshot. The VFS renders the
                 // fields that depend on a successful refresh
@@ -2418,6 +2454,7 @@ impl Daemon {
             tx_engine: tx_engine.clone(),
             chains: chains.clone(),
             keystore: keystore.clone(),
+            wallet_projections: wallet_projections.clone(),
             address_book: address_book_arc.clone(),
             write_permit: home_write_permit.clone(),
         });
@@ -2504,6 +2541,7 @@ impl Daemon {
                     )
                     .with_auth_services(auth_services.clone())
                     .with_broker(broker.clone())
+                    .with_wallet_projections(wallet_projections.clone())
                     .with_policy_projection_root(home.root().join("machine-policy-projections"))
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_mempool_indexes(mempool_indexes.clone())
@@ -2562,7 +2600,7 @@ impl Daemon {
         // /next.md — brutally-scoped next-action aggregator for agents.
         // Answers: what wallets need attention, what confirms are pending,
         // what capabilities are active/expired/orphaned, what risk data is stale.
-        let next_keystore = keystore.clone();
+        let next_wallet_projections = wallet_projections.clone();
         let next_tx_engine = tx_engine.clone();
         let next_hl = hyperliquid_handler.clone();
         let next_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> = Arc::new(move || {
@@ -2572,47 +2610,53 @@ impl Daemon {
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
 
-            // 1. Unsigned-policy passkey wallets
-            let mut unsigned = Vec::new();
-            if let Ok(infos) = next_keystore.list() {
-                for info in &infos {
-                    let status = next_keystore
-                        .policy_status(&info.name)
-                        .unwrap_or(bloom_keystore::PolicyStatus::NotApplicable);
-                    if status == bloom_keystore::PolicyStatus::Unsigned
-                        || status == bloom_keystore::PolicyStatus::Stale
-                    {
-                        unsigned.push(format!(
-                            "- `{}`: policy is **{:?}** — run `bloom wallet sign-policy {}` to enable agent trading",
-                            info.name, status, info.name
-                        ));
-                    }
-                }
+            let (wallets, wallet_projection_unavailable) =
+                match next_wallet_projections.cached_wallets() {
+                    Ok(wallets) => (wallets, false),
+                    Err(_) => (Vec::new(), true),
+                };
+
+            if wallet_projection_unavailable {
+                md.push_str("## Wallet Projections Unavailable\n\n");
+                md.push_str(
+                    "Broker is offline and no cached public wallet projection is available. Authority operations remain fail-closed.\n\n",
+                );
             }
-            if !unsigned.is_empty() {
-                md.push_str("## Unsigned Policies\n\n");
-                for u in &unsigned {
-                    md.push_str(u);
-                    md.push('\n');
+
+            // 1. Stale public projections remain readable but never authorize.
+            let stale_wallets: Vec<String> = wallets
+                .iter()
+                .filter(|projection| {
+                    projection.freshness == bloom_machine_client::ProjectionFreshness::Stale
+                })
+                .map(|projection| projection.wallet.wallet_id.as_str().to_owned())
+                .collect();
+            if !stale_wallets.is_empty() {
+                md.push_str("## Stale Wallet Projections\n\n");
+                for wallet in &stale_wallets {
+                    md.push_str(&format!(
+                        "- `{wallet}`: cached public data is **stale**; signing and custody still require Broker\n"
+                    ));
                 }
                 md.push('\n');
             }
 
             // 2. Pending outbox confirms
             let mut pending_confirms = Vec::new();
-            if let Ok(infos) = next_keystore.list() {
-                for info in &infos {
+            {
+                for projection in &wallets {
+                    let wallet = projection.wallet.wallet_id.as_str();
                     let sessions = next_tx_engine.session_store().active(now_ms);
-                    let has_session = sessions.iter().any(|s| s.wallet == info.name);
+                    let has_session = sessions.iter().any(|s| s.wallet == wallet);
                     if has_session {
                         for s in &sessions {
-                            if s.wallet != info.name {
+                            if s.wallet != wallet {
                                 continue;
                             }
                             if s.expires_ms > now_ms {
                                 pending_confirms.push(format!(
                                     "- `{}`: {} pending tx ids, session `{}` active (expires in {}s)",
-                                    info.name,
+                                    wallet,
                                     s.allowed_pending_ids.len(),
                                     s.id,
                                     ((s.expires_ms - now_ms) / 1000)
@@ -2636,21 +2680,22 @@ impl Daemon {
                 let mut expired = Vec::new();
                 let mut orphaned = Vec::new();
                 let mut stale = Vec::new();
-                if let Ok(infos) = next_keystore.list() {
-                    for info in &infos {
-                        let views = hl.capability_views_for(&info.name);
+                {
+                    for projection in &wallets {
+                        let wallet = projection.wallet.wallet_id.as_str();
+                        let views = hl.capability_views_for(wallet);
                         for v in &views {
                             match v.status {
                                 bloom_proto::CapabilityStatus::Expired => {
                                     expired.push(format!(
                                         "- `{}` session `{}`: **expired** — no new orders accepted",
-                                        info.name, v.id
+                                        wallet, v.id
                                     ));
                                 }
                                 bloom_proto::CapabilityStatus::Orphaned => {
                                     orphaned.push(format!(
                                         "- `{}` session `{}`: **orphaned** — daemon lost the agent key after restart. Owner must recover via `orphan_cancel_all` or `orphan_close_all` at `{}`",
-                                        info.name, v.id, v.revoke_path
+                                        wallet, v.id, v.revoke_path
                                     ));
                                 }
                                 bloom_proto::CapabilityStatus::Active => {
@@ -2659,7 +2704,7 @@ impl Daemon {
                                     {
                                         stale.push(format!(
                                             "- `{}` session `{}`: expiring in {}s",
-                                            info.name, v.id, secs
+                                            wallet, v.id, secs
                                         ));
                                     }
                                 }
@@ -2694,7 +2739,11 @@ impl Daemon {
                 }
             }
 
-            if unsigned.is_empty() && pending_confirms.is_empty() && next_hl.is_none() {
+            if !wallet_projection_unavailable
+                && stale_wallets.is_empty()
+                && pending_confirms.is_empty()
+                && next_hl.is_none()
+            {
                 md.push_str("No wallets with pending actions.\n\n");
                 md.push_str("All policies are signed, no outbox confirms await review, and no Hyperliquid sessions are active.\n");
             }
@@ -2729,13 +2778,9 @@ impl Daemon {
         // scanner walks the outbox every 30s and emits `bump.tx` /
         // `cancel.tx` / `bump_advice.json` artefacts next to stuck txs.
         //
-        // Per-wallet `policy.bump.stuck_after_secs` and `basefee_overrun_pct`
-        // are honoured via a lookup closure that reads each tx entry's
-        // wallet's `policy.toml` at scan time. Unknown wallets fall back
-        // to the scanner's global defaults (the same values exposed by
-        // `BumpPolicy::default()` — they're kept in sync). Reading on
-        // each scan tick (rather than caching at startup) means policy
-        // edits take effect on the next pass without a daemon restart.
+        // The canonical Broker policy has no Machine-local bump tuning.
+        // Resolve wallet existence from the public projection and use the
+        // scanner's explicit defaults; never reopen legacy policy.toml.
         let mut bump_shutdown: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
         if !mempool_indexes.is_empty() && tokio::runtime::Handle::try_current().is_ok() {
             let shared_indexes: bloom_tx::bump_scanner::MempoolIndexes =
@@ -2747,19 +2792,37 @@ impl Daemon {
             let cfg = bloom_tx::bump_scanner::BumpScannerConfig::default();
             let default_stuck_after = cfg.stuck_after;
             let default_overrun = cfg.basefee_overrun_pct;
-            let ks_for_lookup = keystore.clone();
+            let projections_for_lookup = wallet_projections.clone();
             let wallet_policy: bloom_tx::bump_scanner::WalletPolicyLookup =
                 Arc::new(move |wallet: &str| {
-                    match ks_for_lookup.info(wallet) {
-                        Ok(info) => (
-                            Duration::from_secs(info.policy.bump.stuck_after_secs),
-                            info.policy.bump.basefee_overrun_pct,
-                        ),
-                        // Unknown wallet / missing policy.toml / parse error:
-                        // fall back to global defaults rather than skipping
-                        // the entry. A bad policy.toml shouldn't disable
-                        // bump detection for that wallet's stuck txs.
-                        Err(_) => (default_stuck_after, default_overrun),
+                    let projections = match projections_for_lookup.cached_wallets() {
+                        Ok(projections) => projections,
+                        Err(_) => {
+                            return bloom_tx::bump_scanner::WalletPolicyProjection::Unavailable;
+                        }
+                    };
+                    let Some(projection) = projections
+                        .iter()
+                        .find(|projection| projection.wallet.wallet_id.as_str() == wallet)
+                    else {
+                        return bloom_tx::bump_scanner::WalletPolicyProjection::Unknown;
+                    };
+                    // The canonical Broker policy intentionally has no
+                    // Machine-local bump tuning, so authenticated projections
+                    // use the scanner defaults while preserving freshness.
+                    match projection.freshness {
+                        bloom_machine_client::ProjectionFreshness::Fresh => {
+                            bloom_tx::bump_scanner::WalletPolicyProjection::Current(
+                                default_stuck_after,
+                                default_overrun,
+                            )
+                        }
+                        bloom_machine_client::ProjectionFreshness::Stale => {
+                            bloom_tx::bump_scanner::WalletPolicyProjection::Stale(
+                                default_stuck_after,
+                                default_overrun,
+                            )
+                        }
                     }
                 });
             let scanner = Arc::new(
@@ -2885,6 +2948,7 @@ impl Daemon {
             audit: audit_arc,
             auth_services,
             signer_cache,
+            wallet_projections,
             vfs,
             petals,
             watch_registry,
@@ -3576,6 +3640,7 @@ mod tests {
             tx_engine: daemon.tx_engine.clone(),
             chains: daemon.chains.clone(),
             keystore: daemon.keystore.clone(),
+            wallet_projections: daemon.wallet_projections.clone(),
             address_book: daemon.address_book.clone(),
             write_permit: daemon.home_write_permit.clone(),
         })

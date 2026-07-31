@@ -3,13 +3,17 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use bloom_machine_client::MachineBrokerClient;
+use bloom_keystore::Keystore;
+use bloom_machine_client::{
+    CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient,
+};
 use bloom_proto::{AddressBook, HomeDir, HomeWritePermit};
 use bloom_triad_protocol::{
     Base64UrlBytes, CanonicalWalletPolicy, CeremonyKind, CeremonyPublicStatus, CeremonyState,
-    CustodyResult, DecimalU64, Digest32, MachineBrokerRequest, MachineBrokerResponse,
-    MachineBrokerService, OperationId, PolicyCommitReceipt, PolicyUpdatePrepareResponse,
-    ServiceFuture, SignedPolicySnapshot, Token,
+    CredentialPublic, CryptoSuite, CustodyResult, DecimalU64, Digest32, KeyPublic, KeyRef, KeySpec,
+    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, OperationId,
+    PolicyCommitReceipt, PolicyUpdatePrepareResponse, ProtocolError, ProtocolErrorCode,
+    ServiceFuture, SignedPolicySnapshot, Token, WalletPublic, WalletRequest,
 };
 use bloom_tx::{outbox::Outbox, tx_engine::TxEngine};
 use bloom_vfs::{Handler, HandlerError, VfsPath, handlers::wallets::WalletsHandler};
@@ -23,6 +27,7 @@ struct FixtureState {
 }
 
 struct BrokerFixture {
+    available: AtomicBool,
     complete: AtomicBool,
     lose_prepare_response_once: AtomicBool,
     ceremony_state_override: parking_lot::Mutex<Option<CeremonyState>>,
@@ -44,6 +49,44 @@ impl BrokerFixture {
             signer_signature: Base64UrlBytes::from_bytes(&[5; 64]),
         }
     }
+
+    fn key_ref(&self) -> KeyRef {
+        KeyRef {
+            backend: Token::new("local").unwrap(),
+            backend_instance: Token::new("primary").unwrap(),
+            locator: "alice/root".into(),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: Digest32::from_bytes([12; 32]),
+            derivation: None,
+        }
+    }
+
+    fn wallet_public(&self) -> WalletPublic {
+        let policy = if self.complete.load(Ordering::SeqCst)
+            && self.state.lock().proposed_policy.is_some()
+        {
+            self.committed_snapshot()
+        } else {
+            self.baseline.clone()
+        };
+        WalletPublic {
+            wallet_id: Token::new("alice").unwrap(),
+            wallet_kind: Token::new("passkey").unwrap(),
+            key_refs: vec![self.key_ref()],
+            policy_version: policy.version,
+            policy_digest: policy.policy_digest,
+            wallet_revocation_epoch: DecimalU64::new(0),
+        }
+    }
+
+    fn key_public(&self) -> KeyPublic {
+        KeyPublic {
+            key_ref: self.key_ref(),
+            canonical_public_key: Base64UrlBytes::from_bytes(&[13; 33]),
+            addresses: vec!["0x0000000000000000000000000000000000000001".into()],
+            supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        }
+    }
 }
 
 impl MachineBrokerService for BrokerFixture {
@@ -52,8 +95,34 @@ impl MachineBrokerService for BrokerFixture {
         request: MachineBrokerRequest,
     ) -> ServiceFuture<'a, MachineBrokerResponse> {
         Box::pin(async move {
+            if !self.available.load(Ordering::SeqCst) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "projection test Broker unavailable",
+                ));
+            }
             self.requests.lock().push(request.clone());
             match request {
+                MachineBrokerRequest::WalletListPublic(_) => {
+                    Ok(MachineBrokerResponse::WalletListPublic(vec![
+                        self.wallet_public(),
+                    ]))
+                }
+                MachineBrokerRequest::KeyListPublic(WalletRequest { wallet_id })
+                    if wallet_id.as_str() == "alice" =>
+                {
+                    Ok(MachineBrokerResponse::KeyListPublic(vec![
+                        self.key_public(),
+                    ]))
+                }
+                MachineBrokerRequest::CredentialListPublic(WalletRequest { wallet_id })
+                    if wallet_id.as_str() == "alice" =>
+                {
+                    Ok(MachineBrokerResponse::CredentialListPublic(Vec::<
+                        CredentialPublic,
+                    >::new(
+                    )))
+                }
                 MachineBrokerRequest::PolicyRead(_) => {
                     let snapshot = if self.complete.load(Ordering::SeqCst)
                         && self.state.lock().proposed_policy.is_some()
@@ -160,6 +229,7 @@ fn policy(maximum_approval_lifetime_ms: u64) -> CanonicalWalletPolicy {
 fn broker_fixture(lose_prepare_response_once: bool) -> Arc<BrokerFixture> {
     let baseline_bytes = serde_jcs::to_vec(&policy(60_000)).unwrap();
     Arc::new(BrokerFixture {
+        available: AtomicBool::new(true),
         complete: AtomicBool::new(false),
         lose_prepare_response_once: AtomicBool::new(lose_prepare_response_once),
         ceremony_state_override: parking_lot::Mutex::new(None),
@@ -183,9 +253,85 @@ fn broker_fixture(lose_prepare_response_once: bool) -> Arc<BrokerFixture> {
 }
 
 #[tokio::test]
+async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let keystore = Keystore::new(temp.path().join("empty-keystore")).unwrap();
+    assert!(keystore.list().unwrap().is_empty());
+    let fixture = broker_fixture(false);
+    let expected_policy = fixture.baseline.canonical_policy.decode();
+    let cache = temp.path().join("cache/wallets.json");
+    let projections = Arc::new(
+        CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(fixture.clone())),
+            FileProjectionStore::new(&cache),
+        )
+        .unwrap(),
+    );
+    let handler = WalletsHandler::new(
+        keystore,
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+    )
+    .with_wallet_projections(projections);
+
+    let root = handler.list(&VfsPath::parse("/").unwrap()).await.unwrap();
+    assert!(root.iter().any(|entry| entry.name == "alice"));
+    assert_eq!(
+        handler
+            .read(&VfsPath::parse("/alice/address").unwrap())
+            .await
+            .unwrap(),
+        b"0x0000000000000000000000000000000000000001\n"
+    );
+    assert_eq!(
+        handler
+            .read(&VfsPath::parse("/alice/kind").unwrap())
+            .await
+            .unwrap(),
+        b"passkey\n"
+    );
+
+    fixture.available.store(false, Ordering::SeqCst);
+    let stale_projections = Arc::new(
+        CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(fixture)),
+            FileProjectionStore::new(cache),
+        )
+        .unwrap(),
+    );
+    let stale_handler = WalletsHandler::new(
+        Keystore::new(temp.path().join("another-empty-keystore")).unwrap(),
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(
+            Outbox::new(temp.path().join("stale-outbox")).unwrap(),
+            60_000,
+        ),
+        AddressBook::default(),
+    )
+    .with_wallet_projections(stale_projections);
+    let addresses: serde_json::Value = serde_json::from_slice(
+        &stale_handler
+            .read(&VfsPath::parse("/alice/addresses.json").unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(addresses["freshness"], "stale");
+    assert_eq!(
+        stale_handler
+            .read(&VfsPath::parse("/alice/policy.json").unwrap())
+            .await
+            .unwrap(),
+        expected_policy,
+        "canonical policy must remain readable from the authenticated stale projection"
+    );
+}
+
+#[tokio::test]
 async fn vfs_policy_write_without_broker_never_mutates_legacy_policy_bytes() {
     let temp = tempfile::tempdir().unwrap();
-    let keystore = bloom_keystore::Keystore::new(temp.path().join("keystore")).unwrap();
+    let keystore = Keystore::new(temp.path().join("keystore")).unwrap();
     keystore.create_local("alice", "test-passphrase").unwrap();
     let (before, _) = keystore.raw_policy("alice").unwrap();
     let proposed_legacy_toml = format!("{before}\n# direct-write probe\n");
@@ -216,7 +362,7 @@ async fn vfs_policy_write_without_broker_never_mutates_legacy_policy_bytes() {
 #[tokio::test]
 async fn vfs_policy_prepare_response_loss_reconciles_the_persisted_operation_id() {
     let temp = tempfile::tempdir().unwrap();
-    let keystore = bloom_keystore::Keystore::new(temp.path().join("keystore")).unwrap();
+    let keystore = Keystore::new(temp.path().join("keystore")).unwrap();
     keystore.create_local("alice", "test-passphrase").unwrap();
     let fixture = broker_fixture(true);
     let service: Arc<dyn MachineBrokerService> = fixture.clone();
@@ -271,7 +417,7 @@ async fn vfs_policy_prepare_response_loss_reconciles_the_persisted_operation_id(
 #[tokio::test]
 async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_receipt() {
     let temp = tempfile::tempdir().unwrap();
-    let keystore = bloom_keystore::Keystore::new(temp.path().join("keystore")).unwrap();
+    let keystore = Keystore::new(temp.path().join("keystore")).unwrap();
     keystore.create_local("alice", "test-passphrase").unwrap();
     let outbox = Outbox::new(temp.path().join("outbox")).unwrap();
     let fixture = broker_fixture(false);
@@ -334,7 +480,14 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
         TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
         AddressBook::default(),
     )
-    .with_broker(Some(broker))
+    .with_broker(Some(broker.clone()))
+    .with_wallet_projections(Arc::new(
+        CachedWalletProjectionReader::new(
+            Some(broker.clone()),
+            FileProjectionStore::new(temp.path().join("cache/restarted-wallets.json")),
+        )
+        .unwrap(),
+    ))
     .with_policy_projection_root(&projection_root)
     .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
     let ready_status = restarted
@@ -375,6 +528,9 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::CeremonyStatus(_),
             MachineBrokerRequest::CustodyResult(_),
             MachineBrokerRequest::PolicyCommitUpdate(_),
+            MachineBrokerRequest::WalletListPublic(_),
+            MachineBrokerRequest::KeyListPublic(_),
+            MachineBrokerRequest::CredentialListPublic(_),
             MachineBrokerRequest::PolicyRead(_)
         ]
     ));
@@ -388,7 +544,7 @@ async fn vfs_policy_terminal_ceremony_states_clear_urls_and_fail_the_projection(
         CeremonyState::Failed,
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let keystore = bloom_keystore::Keystore::new(temp.path().join("keystore")).unwrap();
+        let keystore = Keystore::new(temp.path().join("keystore")).unwrap();
         keystore.create_local("alice", "test-passphrase").unwrap();
         let fixture = broker_fixture(false);
         let service: Arc<dyn MachineBrokerService> = fixture.clone();

@@ -6,6 +6,13 @@
 
 #![forbid(unsafe_code)]
 
+mod projection;
+
+pub use projection::{
+    CachedWalletProjectionReader, FileProjectionStore, ProjectionFreshness, ProjectionVerification,
+    WalletProjection, WalletProjectionReader,
+};
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
