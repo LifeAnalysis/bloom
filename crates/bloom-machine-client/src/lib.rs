@@ -421,6 +421,121 @@ impl MachineBrokerClient {
         .map(ExactPayloadSignOutcome::ApprovalRequired)
     }
 
+    /// Prepare or execute one exact ordered payload batch using the existing
+    /// `sealed_approval.prepare` and `signing.sign_batch` wire methods.
+    ///
+    /// The ordered payload bytes, suite-derived hashes, approval identity, and
+    /// Broker operation identity are all frozen together. A caller may retry
+    /// the same durable request after ceremony completion; it cannot replace,
+    /// reorder, add, or remove a child without invalidating the selector and
+    /// operation digest.
+    pub async fn sign_exact_payload_batch(
+        &self,
+        request: ExactPayloadBatchSignRequest,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        request.validate()?;
+        let wallet = self.wallet(request.wallet_id.clone()).await?;
+        let key_ref = unique_key_for_suite(&wallet.key_refs, request.crypto_suite)?;
+        let activation_mode = request
+            .activation_mode
+            .clone()
+            .unwrap_or_else(|| default_activation_mode(&key_ref));
+        let ordered_payload_digests = request
+            .preimages
+            .iter()
+            .map(|payload| Digest32::from_bytes(Sha256::digest(payload).into()))
+            .collect::<Vec<_>>();
+        let ordered_hashes = request
+            .preimages
+            .iter()
+            .map(|payload| suite_hash(request.crypto_suite, payload))
+            .collect::<Vec<_>>();
+        if request.claimed_hashes != ordered_hashes {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::SelectorMismatch,
+                "exact batch payload hashes do not match the selected CryptoSuite",
+            ));
+        }
+
+        if let Some(approval_id) = request.approval_id {
+            let operation_digest = SignOperationIdentity {
+                operation_id: request.signing_operation_id.clone(),
+                approval_id: approval_id.clone(),
+                key_ref: key_ref.clone(),
+                crypto_suite: request.crypto_suite,
+                ordered_payload_digests: ordered_payload_digests.clone(),
+                ordered_hashes: ordered_hashes.clone(),
+                petal_use_claim_digest: None,
+                claim_assurance_digest: None,
+                policy_version: wallet.policy_version,
+                policy_digest: wallet.policy_digest,
+            }
+            .digest()?;
+            return self
+                .sign_batch(MachineSignRequest {
+                    operation_id: request.signing_operation_id,
+                    operation_digest,
+                    approval_id,
+                    key_ref,
+                    crypto_suite: request.crypto_suite,
+                    payloads: SigningPayloads::Batch {
+                        children: request
+                            .preimages
+                            .iter()
+                            .map(|payload| Base64UrlBytes::from_bytes(payload))
+                            .collect(),
+                    },
+                    petal_use_claim: None,
+                    claim_assurance_evidence: None,
+                    provenance: request.provenance,
+                })
+                .await
+                .map(ExactPayloadSignOutcome::Signed);
+        }
+
+        let signature_count = u64::try_from(request.preimages.len()).map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::LimitExceededSignatures,
+                "exact batch signature count exceeds protocol limits",
+            )
+        })?;
+        let terms = SealedApprovalTerms {
+            subject: approval_subject(&request.provenance),
+            wallet_id: request.wallet_id,
+            key_ref,
+            allowed_crypto_suites: vec![request.crypto_suite],
+            selector: ApprovalSelector::Exact {
+                ordered_payload_digests,
+                ordered_hashes,
+            },
+            limits: ApprovalLimits {
+                max_operations: DecimalU64::new(1),
+                max_signatures: DecimalU64::new(signature_count),
+                operation_rate_limits: Vec::new(),
+                signature_rate_limits: Vec::new(),
+                value_limits: Vec::new(),
+            },
+            activation_mode,
+            wallet_revocation_epoch: wallet.wallet_revocation_epoch,
+            policy_version: wallet.policy_version,
+            policy_digest: wallet.policy_digest,
+            provenance_digest: request.provenance_digest,
+            request_nonce: request.request_nonce,
+            issued_at_ms: request.issued_at_ms.clone(),
+            not_before_ms: request.issued_at_ms,
+            expires_at_ms: request.expires_at_ms,
+            renewal_of: None,
+        };
+        terms.validate()?;
+        self.prepare_approval(ApprovalPrepareRequest {
+            operation_id: request.approval_operation_id,
+            terms,
+            canonical_plan_facts_digest: request.canonical_plan_facts_digest,
+        })
+        .await
+        .map(ExactPayloadSignOutcome::ApprovalRequired)
+    }
+
     pub async fn prepare_approval(
         &self,
         request: ApprovalPrepareRequest,
@@ -834,6 +949,51 @@ pub struct ExactPayloadSignRequest {
     pub expires_at_ms: DecimalU64,
     pub canonical_plan_facts_digest: Digest32,
     pub approval_id: Option<Digest32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExactPayloadBatchSignRequest {
+    pub wallet_id: Token,
+    pub preimages: Vec<Vec<u8>>,
+    pub claimed_hashes: Vec<Digest32>,
+    pub crypto_suite: CryptoSuite,
+    pub provenance: ProvenanceSubject,
+    pub provenance_digest: Digest32,
+    /// `None` selects the fail-closed v1 default: boot-bound for local keys and
+    /// backend-managed for non-local enrolled backends.
+    pub activation_mode: Option<ActivationMode>,
+    pub approval_operation_id: OperationId,
+    pub signing_operation_id: OperationId,
+    pub request_nonce: RequestNonce,
+    pub issued_at_ms: DecimalU64,
+    pub expires_at_ms: DecimalU64,
+    pub canonical_plan_facts_digest: Digest32,
+    pub approval_id: Option<Digest32>,
+}
+
+impl ExactPayloadBatchSignRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.expires_at_ms.get() <= self.issued_at_ms.get() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "exact batch approval validity interval is invalid",
+            ));
+        }
+        if self.preimages.len() != self.claimed_hashes.len() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "exact batch payload and claimed-hash counts differ",
+            ));
+        }
+        SigningPayloads::Batch {
+            children: self
+                .preimages
+                .iter()
+                .map(|payload| Base64UrlBytes::from_bytes(payload))
+                .collect(),
+        }
+        .validate()
+    }
 }
 
 impl ExactPayloadSignRequest {
@@ -1516,6 +1676,28 @@ mod tests {
                             broker_receipt_digest: digest(91),
                         }))
                     }
+                    MachineBrokerRequest::SigningSignBatch(request) => {
+                        let signature_count = match &request.payloads {
+                            SigningPayloads::Batch { children } => children.len(),
+                            SigningPayloads::Single { .. } => 1,
+                        };
+                        Ok(MachineBrokerResponse::SigningSignBatch(SigningResult {
+                            operation_id: request.operation_id,
+                            operation_digest: if self.corrupt_response {
+                                digest(99)
+                            } else {
+                                request.operation_digest
+                            },
+                            signatures: (0..signature_count)
+                                .map(|index| NormalizedSignature {
+                                    crypto_suite: request.crypto_suite,
+                                    bytes: Base64UrlBytes::from_bytes(&[index as u8 + 7; 65]),
+                                })
+                                .collect(),
+                            signer_receipt_digest: digest(90),
+                            broker_receipt_digest: digest(91),
+                        }))
+                    }
                     MachineBrokerRequest::SealedApprovalPrepare(request) => {
                         Ok(MachineBrokerResponse::SealedApprovalPrepare(
                             SealedApprovalPrepareResponse {
@@ -1866,6 +2048,35 @@ mod tests {
         }
     }
 
+    fn exact_batch_request(
+        preimages: Vec<Vec<u8>>,
+        approval_id: Option<Digest32>,
+    ) -> ExactPayloadBatchSignRequest {
+        let claimed_hashes = preimages
+            .iter()
+            .map(|payload| Digest32::from_bytes(Keccak256::digest(payload).into()))
+            .collect();
+        ExactPayloadBatchSignRequest {
+            wallet_id: token("wallet"),
+            preimages,
+            claimed_hashes,
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            provenance: ProvenanceSubject::Cli {
+                client_id: token("bloom-cli"),
+                command_class: token("transaction.confirm_batch"),
+            },
+            provenance_digest: digest(60),
+            activation_mode: Some(ActivationMode::BootBound),
+            approval_operation_id: OperationId::from_bytes([65; 32]),
+            signing_operation_id: OperationId::from_bytes([66; 32]),
+            request_nonce: RequestNonce::from_bytes([67; 16]),
+            issued_at_ms: DecimalU64::new(1_000),
+            expires_at_ms: DecimalU64::new(601_000),
+            canonical_plan_facts_digest: digest(68),
+            approval_id,
+        }
+    }
+
     #[tokio::test]
     async fn exact_payload_prepares_then_signs_without_a_hash_only_path() {
         let broker = Arc::new(MockBroker {
@@ -1929,6 +2140,110 @@ mod tests {
         );
         assert!(request.petal_use_claim.is_none());
         assert!(request.claim_assurance_evidence.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_payload_batch_prepares_then_uses_sign_batch_with_receipts() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        let payloads = vec![
+            b"unsigned EVM child 1".to_vec(),
+            b"unsigned EVM child 2".to_vec(),
+        ];
+        let prepared = client
+            .sign_exact_payload_batch(exact_batch_request(payloads.clone(), None))
+            .await
+            .unwrap();
+        let ExactPayloadSignOutcome::ApprovalRequired(prepared) = prepared else {
+            panic!("first call must prepare one exact batch approval");
+        };
+
+        {
+            let requests = broker.requests.lock().unwrap();
+            let MachineBrokerRequest::SealedApprovalPrepare(request) = &requests[1] else {
+                panic!("second call must be sealed_approval.prepare");
+            };
+            assert_eq!(request.terms.limits.max_operations.get(), 1);
+            assert_eq!(request.terms.limits.max_signatures.get(), 2);
+            assert_eq!(
+                request.terms.selector,
+                ApprovalSelector::Exact {
+                    ordered_payload_digests: payloads
+                        .iter()
+                        .map(|payload| Digest32::from_bytes(Sha256::digest(payload).into()))
+                        .collect(),
+                    ordered_hashes: payloads
+                        .iter()
+                        .map(|payload| Digest32::from_bytes(Keccak256::digest(payload).into()))
+                        .collect(),
+                }
+            );
+        }
+
+        let signed = client
+            .sign_exact_payload_batch(exact_batch_request(
+                payloads.clone(),
+                Some(prepared.approval_id),
+            ))
+            .await
+            .unwrap();
+        let ExactPayloadSignOutcome::Signed(signed) = signed else {
+            panic!("approved retry must call signing.sign_batch");
+        };
+        assert_eq!(signed.signatures.len(), 2);
+        assert_eq!(signed.signer_receipt_digest, digest(90));
+        assert_eq!(signed.broker_receipt_digest, digest(91));
+
+        let requests = broker.requests.lock().unwrap();
+        let MachineBrokerRequest::SigningSignBatch(request) = &requests[3] else {
+            panic!("fourth call must be signing.sign_batch");
+        };
+        assert_eq!(
+            request.payloads,
+            SigningPayloads::Batch {
+                children: payloads
+                    .iter()
+                    .map(|payload| Base64UrlBytes::from_bytes(payload))
+                    .collect(),
+            }
+        );
+        assert!(request.petal_use_claim.is_none());
+        assert!(request.claim_assurance_evidence.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_payload_batch_rejects_reorder_before_prepare_or_sign() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(1),
+                policy_digest: digest(1),
+                wallet_revocation_epoch: DecimalU64::new(0),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let mut request = exact_batch_request(vec![b"one".to_vec(), b"two".to_vec()], None);
+        request.preimages.swap(0, 1);
+        let error = MachineBrokerClient::new(broker.clone())
+            .sign_exact_payload_batch(request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
+        assert_eq!(broker.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
