@@ -38,7 +38,7 @@ clean_home="$work/clean-home"
 broker_socket="$runtime/machine-broker/broker.sock"
 signer_socket="/private/var/run/bloom/$login_uid/broker-signer/signer.sock"
 signer_socket_dir="$(dirname "$signer_socket")"
-machine_socket="$runtime/machine.sock"
+machine_socket="$runtime/machine/machine.sock"
 broker_connected="$runtime/machine-broker/connected"
 signer_connected="$runtime/hostile-signer/connected"
 broker_user="bloom-broker-$login_uid"
@@ -91,11 +91,21 @@ trap cleanup EXIT INT TERM
   -o "$work/hostile-unix-listener"
 chmod 0755 "$work/hostile-unix-listener"
 
-mkdir -p "$runtime/machine-broker" "$runtime/hostile-signer" "$clean_home"
+mkdir -p \
+  "$runtime/machine" \
+  "$runtime/machine-broker" \
+  "$runtime/hostile-signer" \
+  "$clean_home"
+chown "$login_uid" "$runtime/machine"
 chown "$broker_uid" "$runtime/machine-broker"
 chown "$signer_uid" "$runtime/hostile-signer"
 chown -R "$login_uid" "$clean_home"
-chmod 0755 "$work" "$runtime" "$runtime/machine-broker" "$runtime/hostile-signer"
+chmod 0755 \
+  "$work" \
+  "$runtime" \
+  "$runtime/machine" \
+  "$runtime/machine-broker" \
+  "$runtime/hostile-signer"
 chmod 0700 "$clean_home"
 # Keep the clean test home intentionally small, but valid. Degraded authority
 # operation means Broker/Signer may be unavailable; it does not bypass normal
