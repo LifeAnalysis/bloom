@@ -32,6 +32,8 @@ for root in "$main_root" "$broker_root" "$signer_root"; do
   done < <(git -C "$root" ls-files --others --exclude-standard)
 done
 
+"$main_root/packaging/triad/release/check-machine-authority-boundary.sh" --require-clean
+
 for root in "$main_root" "$broker_root" "$signer_root"; do
   (
     cd "$root"

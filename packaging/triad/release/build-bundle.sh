@@ -29,6 +29,23 @@ for forbidden in \
   accepting_verifier \
   mint_approval \
   bloom.sign-hash \
+  bloom-keystore \
+  bloom-auth \
+  bloom-auth-api \
+  ApprovalVerifier \
+  AuthStoreWriter \
+  GrantStore \
+  InMemoryGrantStore \
+  KeystorePetalHost \
+  StoreApprovalVerifier \
+  KeystoreApprovalSignatureVerifier \
+  SignerCache \
+  EphemeralAgentKey \
+  PrivateKeySigner \
+  RegistrationCoordinator \
+  unsafe-debug-signer \
+  local-integration \
+  policy-session \
   test-only-release-key \
   test_credential
 do
