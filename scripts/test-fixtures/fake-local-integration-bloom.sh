@@ -127,6 +127,13 @@ hl_new_count = 0
 def handle_hl_new(payload):
     global hl_new_count
     request = json.loads(payload)
+    agent_name = request["agent_name"]
+    if not 1 <= len(agent_name) <= 16:
+        write_json(
+            f"hyperliquid/mainnet/agent_sessions/{wallet}/last_error.json",
+            {"error": "Extra agent name must be between 1 and 16 characters long."},
+        )
+        return
     sid = request["id"]
     root = f"hyperliquid/mainnet/agent_sessions/{wallet}/{sid}"
     if hl_new_count == 0:

@@ -167,6 +167,8 @@ server_log="${run_dir}/serve.log"
 server_pid=""
 session_active=0
 session_id="manual-mainnet-integration-$(date +%s)-$$"
+agent_name="$(printf 'bloom-i-%08d' "$(( $$ % 100000000 ))")"
+[ "${#agent_name}" -le 16 ] || die "internal Hyperliquid agent name exceeds 16 characters"
 mkdir "$mount_dir"
 
 mounted_path() {
@@ -196,6 +198,34 @@ vwrite_staging() {
 
 vls_names() {
   LC_ALL=C command ls -1 "$(mounted_path "$1")"
+}
+
+wait_for_hl_session() {
+  local session_file error_file error_before session_body current_error attempt
+  session_file="$(mounted_path "$1")"
+  error_file="$(mounted_path "$2")"
+  error_before="$3"
+  attempt=0
+  while [ "$attempt" -lt 150 ]; do
+    session_body="$(cat "$session_file" 2>/dev/null || true)"
+    if [ -n "$session_body" ]; then
+      printf '%s\n' "$session_body"
+      return 0
+    fi
+    current_error="$(cat "$error_file" 2>/dev/null || true)"
+    if [ -n "$current_error" ] && [ "$current_error" != "$error_before" ]; then
+      printf 'Hyperliquid session creation failed through the mounted filesystem:\n%s\n' \
+        "$current_error" >&2
+      return 1
+    fi
+    sleep 0.2
+    attempt=$((attempt + 1))
+  done
+  current_error="$(cat "$error_file" 2>/dev/null || true)"
+  if [ -n "$current_error" ]; then
+    printf 'Latest mounted Hyperliquid error:\n%s\n' "$current_error" >&2
+  fi
+  return 1
 }
 
 cleanup() {
@@ -360,7 +390,7 @@ if [ "$execute_hl" -eq 1 ]; then
       allow_vault_or_subaccount:false
     }')"
   session_request="$(jq -nc --arg id "$session_id" \
-    --arg name "bloom-manual-mainnet-integration" \
+    --arg name "$agent_name" \
     --argjson bounds "$session_policy" \
     '{id:$id,agent_name:$name,integration_bounds:$bounds}')"
   printf '\nPinned Hyperliquid request\n'
@@ -419,10 +449,16 @@ if [ "$execute_hl" -eq 1 ]; then
   printf '\nStaging Hyperliquid session approval...\n'
   vwrite_staging "/hyperliquid/mainnet/agent_sessions/${wallet}/new.json" "$session_request"
   open_approval "${session_path}/approval_challenge.json"
+  hl_error_path="/hyperliquid/mainnet/agent_sessions/${wallet}/last_error.json"
+  hl_error_before="$(cat "$(mounted_path "$hl_error_path")" 2>/dev/null || true)"
   vwrite "/hyperliquid/mainnet/agent_sessions/${wallet}/new.json" "$session_request"
+  if ! session_json="$(wait_for_hl_session \
+    "${session_path}/session.json" "$hl_error_path" "$hl_error_before")"; then
+    die "mounted Hyperliquid session creation did not complete"
+  fi
   session_active=1
   printf 'Hyperliquid bounded session:\n'
-  vcat "${session_path}/session.json" | jq .
+  printf '%s\n' "$session_json" | jq .
 
   hl_is_buy=false
   [ "$hl_side" = "buy" ] && hl_is_buy=true
