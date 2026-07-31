@@ -35,6 +35,18 @@ output="$(
 grep -q 'Preflight passed' <<<"$output"
 grep -q 'No passkey prompt was opened and no order was submitted' <<<"$output"
 
+# A first run may spend more than the former ten-second deadline provisioning
+# configured Petals before the server creates its IPC socket.
+delayed_output="$(
+  BLOOM_HOME="${test_root}/home" \
+  BLOOM_INTEGRATION_BIN="$fixture_bin" \
+  BLOOM_INTEGRATION_OPEN=true \
+  BLOOM_FAKE_STARTUP_DELAY_SECS=11 \
+    "$runner" --wallet test-passkey 2>"${test_root}/delayed.err"
+)"
+grep -q 'Preflight passed' <<<"$delayed_output"
+grep -q 'Still starting Bloom' "${test_root}/delayed.err"
+
 if BLOOM_HOME="${test_root}/home" \
   BLOOM_INTEGRATION_BIN="$fixture_bin" \
   BLOOM_INTEGRATION_OPEN=true \

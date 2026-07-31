@@ -21,6 +21,7 @@ import sys
 import time
 
 path = sys.argv[1]
+time.sleep(float(os.environ.get("BLOOM_FAKE_STARTUP_DELAY_SECS", "0")))
 try:
     os.unlink(path)
 except FileNotFoundError:

@@ -56,6 +56,8 @@ Environment:
   BLOOM_HOME              Wallet home (default: ~/.bloom)
   BLOOM_INTEGRATION_BIN   Use an already-built local-integration binary
   BLOOM_INTEGRATION_OPEN  Browser opener (default: open)
+  BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS
+                          Server/Petal startup deadline (default: 300)
 EOF
 }
 
@@ -98,6 +100,12 @@ esac
 command -v jq >/dev/null 2>&1 || die "jq is required (brew install jq)"
 command -v shasum >/dev/null 2>&1 || die "shasum is required"
 browser_open="${BLOOM_INTEGRATION_OPEN:-open}"
+startup_timeout_secs="${BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS:-300}"
+case "$startup_timeout_secs" in
+  *[!0-9]*|'') die "BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS must be an integer" ;;
+esac
+[ "$startup_timeout_secs" -ge 1 ] && [ "$startup_timeout_secs" -le 1800 ] ||
+  die "BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS must be between 1 and 1800"
 
 live=0
 preflight_blockers=0
@@ -233,22 +241,30 @@ fi
   --endpoint "unix:${socket}" --local-integration >"$server_log" 2>&1 &
 server_pid=$!
 
-ready=0
-for _ in $(seq 1 100); do
-  if [ -S "$socket" ]; then
-    ready=1
-    break
-  fi
+startup_started_at="$(date +%s)"
+startup_deadline=$((startup_started_at + startup_timeout_secs))
+startup_next_notice=$((startup_started_at + 10))
+while [ ! -S "$socket" ]; do
   if ! kill -0 "$server_pid" 2>/dev/null; then
     cat "$server_log" >&2
     die "local integration server exited during startup"
   fi
-  sleep 0.1
+  startup_now="$(date +%s)"
+  if [ "$startup_now" -ge "$startup_deadline" ]; then
+    cat "$server_log" >&2
+    die "local integration server did not become ready within ${startup_timeout_secs}s"
+  fi
+  if [ "$startup_now" -ge "$startup_next_notice" ]; then
+    startup_last_log="$(tail -n 1 "$server_log" 2>/dev/null || true)"
+    printf 'Still starting Bloom (%ss elapsed); configured Petals may be provisioning.\n' \
+      "$((startup_now - startup_started_at))" >&2
+    if [ -n "$startup_last_log" ]; then
+      printf '  last server log: %s\n' "$startup_last_log" >&2
+    fi
+    startup_next_notice=$((startup_now + 30))
+  fi
+  sleep 0.2
 done
-[ "$ready" -eq 1 ] || {
-  cat "$server_log" >&2
-  die "local integration server did not become ready"
-}
 
 bloom() {
   "$bloom_bin" --quiet --home "$home_dir" --connect "unix:${socket}" "$@"
