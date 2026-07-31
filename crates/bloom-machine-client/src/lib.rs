@@ -20,16 +20,18 @@ use std::{
 
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use bloom_triad_protocol::{
-    ActivationMode, ApprovalLifecycleState, ApprovalLimits, ApprovalPrepareRequest,
-    ApprovalPublicStatus, ApprovalSelector, ApprovalSubject, Base64UrlBytes, CeremonyPublicStatus,
-    CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse,
-    CustodyResult, DecimalU64, Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest,
-    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
-    OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
+    ActivationMode, ApprovalLifecycleState, ApprovalLimitState, ApprovalLimits,
+    ApprovalPrepareRequest, ApprovalPublicStatus, ApprovalRenewRequest, ApprovalSelector,
+    ApprovalSubject, Base64UrlBytes, CeremonyPublicStatus, CeremonyState, CredentialPublic,
+    CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse, CustodyResult, DecimalU64,
+    Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest, MachineBrokerRequest,
+    MachineBrokerResponse, MachineBrokerService, MachineSignRequest, OperationId,
+    OperationPublicStatus, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
     PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
-    ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce,
-    SealedApprovalPrepareResponse, SealedApprovalTerms, SignOperationIdentity,
-    SignedPolicySnapshot, SigningPayloads, SigningResult, Token, WalletPublic, WalletRequest,
+    ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, RevocationState,
+    RevokeRequest, SealedApprovalPrepareResponse, SealedApprovalTerms, SignOperationIdentity,
+    SignedPolicySnapshot, SigningPayloads, SigningResult, Token, WalletOperationRequest,
+    WalletPublic, WalletRequest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -419,6 +421,75 @@ impl MachineBrokerClient {
         {
             MachineBrokerResponse::SealedApprovalStatus(status) => Ok(status),
             _ => Err(response_mismatch("sealed_approval.status")),
+        }
+    }
+
+    pub async fn list_approvals(
+        &self,
+        wallet_id: Token,
+    ) -> Result<Vec<ApprovalPublicStatus>, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::SealedApprovalList(WalletRequest {
+                wallet_id,
+            }))
+            .await?
+        {
+            MachineBrokerResponse::SealedApprovalList(statuses) => Ok(statuses),
+            _ => Err(response_mismatch("sealed_approval.list")),
+        }
+    }
+
+    pub async fn approval_limit_state(
+        &self,
+        approval_id: Digest32,
+    ) -> Result<ApprovalLimitState, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::SealedApprovalLimitState(IdRequest {
+                id: approval_id,
+            }))
+            .await?
+        {
+            MachineBrokerResponse::SealedApprovalLimitState(state) => Ok(state),
+            _ => Err(response_mismatch("sealed_approval.limit_state")),
+        }
+    }
+
+    pub async fn renew_approval(
+        &self,
+        request: ApprovalRenewRequest,
+    ) -> Result<SealedApprovalPrepareResponse, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::SealedApprovalRenew(request))
+            .await?
+        {
+            MachineBrokerResponse::SealedApprovalRenew(response) => Ok(response),
+            _ => Err(response_mismatch("sealed_approval.renew")),
+        }
+    }
+
+    pub async fn revoke_approval(
+        &self,
+        request: RevokeRequest,
+    ) -> Result<ApprovalPublicStatus, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::SealedApprovalRevoke(request))
+            .await?
+        {
+            MachineBrokerResponse::SealedApprovalRevoke(status) => Ok(status),
+            _ => Err(response_mismatch("sealed_approval.revoke")),
+        }
+    }
+
+    pub async fn revoke_all_approvals(
+        &self,
+        request: WalletOperationRequest,
+    ) -> Result<RevocationState, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::SealedApprovalRevokeAll(request))
+            .await?
+        {
+            MachineBrokerResponse::SealedApprovalRevokeAll(state) => Ok(state),
+            _ => Err(response_mismatch("sealed_approval.revoke_all")),
         }
     }
 
@@ -1411,6 +1482,71 @@ mod tests {
                             },
                         ))
                     }
+                    MachineBrokerRequest::SealedApprovalStatus(request) => Ok(
+                        MachineBrokerResponse::SealedApprovalStatus(ApprovalPublicStatus {
+                            approval_id: request.id,
+                            wallet_id: token("wallet"),
+                            state: ApprovalLifecycleState::Active,
+                            effective_claim_assurance: None,
+                            ceremony_url: None,
+                            ceremony_expires_at_ms: None,
+                        }),
+                    ),
+                    MachineBrokerRequest::SealedApprovalList(request) => {
+                        Ok(MachineBrokerResponse::SealedApprovalList(vec![
+                            ApprovalPublicStatus {
+                                approval_id: digest(71),
+                                wallet_id: request.wallet_id,
+                                state: ApprovalLifecycleState::Active,
+                                effective_claim_assurance: None,
+                                ceremony_url: None,
+                                ceremony_expires_at_ms: None,
+                            },
+                        ]))
+                    }
+                    MachineBrokerRequest::SealedApprovalLimitState(request) => Ok(
+                        MachineBrokerResponse::SealedApprovalLimitState(ApprovalLimitState {
+                            approval_id: request.id,
+                            committed_operations: DecimalU64::new(1),
+                            reserved_operations: DecimalU64::new(2),
+                            quarantined_operations: DecimalU64::new(3),
+                            committed_signatures: DecimalU64::new(4),
+                            reserved_signatures: DecimalU64::new(5),
+                            quarantined_signatures: DecimalU64::new(6),
+                        }),
+                    ),
+                    MachineBrokerRequest::SealedApprovalRenew(request) => Ok(
+                        MachineBrokerResponse::SealedApprovalRenew(SealedApprovalPrepareResponse {
+                            approval_id: request.replacement_terms.approval_id()?,
+                            state: ApprovalPrepareState::AwaitingCeremony,
+                            ceremony_url: "http://localhost:18734/ceremony/renew".into(),
+                            ceremony_expires_at_ms: request.replacement_terms.expires_at_ms,
+                            review_manifest_digest: digest(72),
+                        }),
+                    ),
+                    MachineBrokerRequest::SealedApprovalRevoke(request) => Ok(
+                        MachineBrokerResponse::SealedApprovalRevoke(ApprovalPublicStatus {
+                            approval_id: request.approval_id,
+                            wallet_id: request.wallet_id,
+                            state: ApprovalLifecycleState::Revoked,
+                            effective_claim_assurance: None,
+                            ceremony_url: None,
+                            ceremony_expires_at_ms: None,
+                        }),
+                    ),
+                    MachineBrokerRequest::SealedApprovalRevokeAll(request) => Ok(
+                        MachineBrokerResponse::SealedApprovalRevokeAll(RevocationState {
+                            wallet_id: request.wallet_id,
+                            wallet_revocation_epoch: DecimalU64::new(9),
+                            wallet_tombstone: None,
+                            approval_tombstone_digest: digest(73),
+                            approval_tombstone_count: DecimalU64::new(2),
+                            observed_at_ms: DecimalU64::new(10),
+                            issuer_service_id: token("bloom-broker"),
+                            key_id: token("broker-key"),
+                            signature: Base64UrlBytes::from_bytes(&[1, 2, 3]),
+                        }),
+                    ),
                     MachineBrokerRequest::CeremonyStatus(request) => {
                         let operation_id =
                             OperationId::new(request.id.as_str().to_owned()).unwrap();
@@ -2014,6 +2150,187 @@ mod tests {
 
     fn token(value: &str) -> Token {
         Token::new(value).unwrap()
+    }
+
+    fn approval_terms(wallet: &str, renewal_of: Option<Digest32>) -> SealedApprovalTerms {
+        SealedApprovalTerms {
+            subject: ApprovalSubject::Cli {
+                client_id: token("bloom-cli"),
+                command_class: token("test.approval"),
+            },
+            wallet_id: token(wallet),
+            key_ref: key_ref(),
+            allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+            selector: ApprovalSelector::Exact {
+                ordered_payload_digests: vec![digest(80)],
+                ordered_hashes: vec![digest(81)],
+            },
+            limits: ApprovalLimits {
+                max_operations: DecimalU64::new(1),
+                max_signatures: DecimalU64::new(1),
+                operation_rate_limits: vec![],
+                signature_rate_limits: vec![],
+                value_limits: vec![],
+            },
+            activation_mode: ActivationMode::BootBound,
+            wallet_revocation_epoch: DecimalU64::new(1),
+            policy_version: DecimalU64::new(2),
+            policy_digest: digest(82),
+            provenance_digest: digest(83),
+            request_nonce: RequestNonce::from_bytes([84; 16]),
+            issued_at_ms: DecimalU64::new(1_000),
+            not_before_ms: DecimalU64::new(1_000),
+            expires_at_ms: DecimalU64::new(61_000),
+            renewal_of,
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_management_wrappers_dispatch_existing_protocol_methods() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(2),
+                policy_digest: digest(82),
+                wallet_revocation_epoch: DecimalU64::new(1),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        let old_id = digest(70);
+
+        assert_eq!(
+            client.list_approvals(token("wallet")).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            client
+                .approval_limit_state(old_id.clone())
+                .await
+                .unwrap()
+                .approval_id,
+            old_id
+        );
+        let renewal = ApprovalRenewRequest {
+            operation_id: OperationId::from_bytes([85; 32]),
+            old_approval_id: old_id.clone(),
+            replacement_terms: approval_terms("wallet", Some(old_id.clone())),
+        };
+        assert_eq!(
+            client
+                .renew_approval(renewal.clone())
+                .await
+                .unwrap()
+                .ceremony_url,
+            "http://localhost:18734/ceremony/renew"
+        );
+        let revoke = RevokeRequest {
+            operation_id: OperationId::from_bytes([86; 32]),
+            approval_id: old_id.clone(),
+            wallet_id: token("wallet"),
+            reason: "test".into(),
+        };
+        assert_eq!(
+            client.revoke_approval(revoke.clone()).await.unwrap().state,
+            ApprovalLifecycleState::Revoked
+        );
+        let revoke_all = WalletOperationRequest {
+            operation_id: OperationId::from_bytes([87; 32]),
+            wallet_id: token("wallet"),
+        };
+        assert_eq!(
+            client
+                .revoke_all_approvals(revoke_all.clone())
+                .await
+                .unwrap()
+                .approval_tombstone_count,
+            DecimalU64::new(2)
+        );
+
+        let requests = broker.requests.lock().unwrap();
+        assert!(matches!(
+            &requests[0],
+            MachineBrokerRequest::SealedApprovalList(_)
+        ));
+        assert!(matches!(
+            &requests[1],
+            MachineBrokerRequest::SealedApprovalLimitState(_)
+        ));
+        assert_eq!(
+            requests[2],
+            MachineBrokerRequest::SealedApprovalRenew(renewal)
+        );
+        assert_eq!(
+            requests[3],
+            MachineBrokerRequest::SealedApprovalRevoke(revoke)
+        );
+        assert_eq!(
+            requests[4],
+            MachineBrokerRequest::SealedApprovalRevokeAll(revoke_all)
+        );
+    }
+
+    struct MismatchedApprovalBroker;
+
+    impl MachineBrokerService for MismatchedApprovalBroker {
+        fn dispatch<'a>(
+            &'a self,
+            _request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async { Ok(MachineBrokerResponse::WalletListPublic(vec![])) })
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_management_wrappers_reject_mismatched_responses() {
+        let client = MachineBrokerClient::new(Arc::new(MismatchedApprovalBroker));
+        let old_id = digest(90);
+        let renewal = ApprovalRenewRequest {
+            operation_id: OperationId::from_bytes([91; 32]),
+            old_approval_id: old_id.clone(),
+            replacement_terms: approval_terms("wallet", Some(old_id.clone())),
+        };
+        let revoke = RevokeRequest {
+            operation_id: OperationId::from_bytes([92; 32]),
+            approval_id: old_id.clone(),
+            wallet_id: token("wallet"),
+            reason: "test".into(),
+        };
+        let revoke_all = WalletOperationRequest {
+            operation_id: OperationId::from_bytes([93; 32]),
+            wallet_id: token("wallet"),
+        };
+        assert_eq!(
+            client
+                .list_approvals(token("wallet"))
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::MalformedFrame
+        );
+        assert_eq!(
+            client.approval_limit_state(old_id).await.unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+        assert_eq!(
+            client.renew_approval(renewal).await.unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+        assert_eq!(
+            client.revoke_approval(revoke).await.unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+        assert_eq!(
+            client
+                .revoke_all_approvals(revoke_all)
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::MalformedFrame
+        );
     }
 
     #[tokio::test]

@@ -457,26 +457,10 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
             true
         }
         // Everything else reaches the VFS handler through the plain write lane.
-        // In particular these first-party Sealed Approval actions are NOT raw
-        // signer lanes and must forward through to `vfs.write` rather than be
-        // denied here:
-        //   * Wallet policy writes (`policy.toml`): passkey wallets stage a
-        //     challenge and install only under a grant-gated PetalHost signature;
-        //     local wallets write immediately (their policy is unsigned).
-        //   * Policy-session minting (`policy-session/new`): the wallets handler
-        //     stages an approval challenge and mints the bounded session only
-        //     under a grant-gated signature — exactly like `policy.toml`.
-        //   * Paid HTTP confirm (`/requests/<id>/confirm`): the requests handler
-        //     stages an approval challenge on the first write and signs the
-        //     x402/Tempo MPP credential only under a grant-gated PetalHost
-        //     signature.
-        //   * Hyperliquid owner approvals (`agent_sessions/<wallet>/new.json`
-        //     and `exchange/<wallet>/send_asset.json`): the Hyperliquid
-        //     handler stages approval and signs only under a grant-gated
-        //     PetalHost signature.
-        // None of these silently consumes a cached signer, and the old
-        // write_unlocked lane is disabled for passkey wallets — denying them here
-        // would leave mounted confirm/mint with no working path.
+        // In particular Broker-backed policy, Sealed Approval, transaction, and
+        // paid-request operations are not raw signer lanes. They must reach the
+        // owning VFS handler, which delegates authorization and signing to
+        // Broker rather than consuming Machine-held authority.
         _ => false,
     }
 }
@@ -721,18 +705,14 @@ summary = "Demo app used by IPC tests."
         }
 
         for path in [
-            // policy.toml now reaches the VFS handler, which stages a Sealed
-            // Approval for passkey wallets rather than being denied at the lane.
+            // Policy updates and Sealed Approval lifecycle operations reach the
+            // VFS handler and are delegated to Broker.
             "/wallets/minnow/policy.toml",
-            // policy-session/new likewise reaches the wallets handler, which
-            // stages a Sealed Approval challenge and mints the bounded session
-            // only under a grant-gated signature (handler-owned, not a raw lane).
-            "/wallets/minnow/policy-session/new",
+            "/wallets/minnow/sealed-approvals/new.json",
+            "/wallets/minnow/sealed-approvals/approval-1/revoke",
             "/wallets/minnow/chains/polygon/outbox/new.tx",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/confirm",
-            // Paid-request confirm likewise reaches the VFS handler: the first
-            // write stages a Sealed Approval challenge and signing only happens
-            // under a grant-gated PetalHost signature.
+            // Paid-request confirm reaches its Broker exact-signing handler.
             "/requests/latest/confirm",
             "/requests/req_123/confirm",
             "/requests/pending/req_123/confirm",

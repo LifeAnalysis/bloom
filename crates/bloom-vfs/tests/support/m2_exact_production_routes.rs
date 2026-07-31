@@ -7,6 +7,7 @@ use bloom_machine_client::{
     MachineBrokerClient, ProjectionFreshness, ProjectionVerification, WalletProjection,
     WalletProjectionReader,
 };
+use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_triad_protocol::{
     ApprovalPrepareState, ApprovalSubject, Base64UrlBytes, CanonicalWalletPolicy, CredentialPublic,
     CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef, KeySpec, MachineBrokerRequest,
@@ -17,6 +18,7 @@ use bloom_triad_protocol::{
 };
 use bloom_vfs::handlers::{HyperliquidHandler, RequestsHandler};
 use bloom_vfs::{BrokerExactPayloadSigner, Handler, HandlerError, VfsPath};
+use mpp::protocol::core::Base64UrlJson;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -35,6 +37,7 @@ fn digest(byte: u8) -> Digest32 {
 struct ExactBroker {
     wallet: WalletPublic,
     requests: Mutex<Vec<MachineBrokerRequest>>,
+    signing_results: Mutex<Vec<SigningResult>>,
 }
 
 impl MachineBrokerService for ExactBroker {
@@ -60,7 +63,7 @@ impl MachineBrokerService for ExactBroker {
                 MachineBrokerRequest::SigningSign(request) => {
                     let mut signature = [2_u8; 65];
                     signature[64] = 1;
-                    Ok(MachineBrokerResponse::SigningSign(SigningResult {
+                    let result = SigningResult {
                         operation_id: request.operation_id,
                         operation_digest: request.operation_digest,
                         signatures: vec![NormalizedSignature {
@@ -69,7 +72,9 @@ impl MachineBrokerService for ExactBroker {
                         }],
                         signer_receipt_digest: digest(90),
                         broker_receipt_digest: digest(91),
-                    }))
+                    };
+                    self.signing_results.lock().unwrap().push(result.clone());
+                    Ok(MachineBrokerResponse::SigningSign(result))
                 }
                 other => Err(ProtocolError::new(
                     ProtocolErrorCode::UnknownMethod,
@@ -162,9 +167,11 @@ fn exact_signer(wallet: WalletPublic) -> (BrokerExactPayloadSigner, Arc<ExactBro
     let broker = Arc::new(ExactBroker {
         wallet,
         requests: Mutex::new(Vec::new()),
+        signing_results: Mutex::new(Vec::new()),
     });
     let classes = [
         "paid-http.x402",
+        "paid-http.mpp",
         "hyperliquid.usd-send",
         "hyperliquid.approve-agent",
     ];
@@ -243,6 +250,35 @@ async fn spawn_http_fixture(kind: &'static str) -> Url {
                         "payment required",
                     )
                 }
+            } else if kind == "mpp" {
+                if request
+                    .to_ascii_lowercase()
+                    .contains("authorization: payment ")
+                {
+                    ("200 OK", String::new(), "paid")
+                } else {
+                    let challenge = mpp::PaymentChallenge::new(
+                        "m2-mpp-charge",
+                        "merchant.example",
+                        "tempo",
+                        "charge",
+                        Base64UrlJson::from_value(&serde_json::json!({
+                            "amount": "10000",
+                            "currency": "0x20c0000000000000000000000000000000000000",
+                            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                            "methodDetails": {
+                                "chainId": 42431,
+                                "feePayer": true
+                            }
+                        }))
+                        .unwrap(),
+                    );
+                    (
+                        "402 Payment Required",
+                        format!("WWW-Authenticate: {}\r\n", challenge.to_header().unwrap()),
+                        "payment required",
+                    )
+                }
             } else if request.starts_with("POST /info") {
                 (
                     "200 OK",
@@ -264,6 +300,17 @@ async fn spawn_http_fixture(kind: &'static str) -> Url {
         }
     });
     Url::parse(&format!("http://{address}/")).unwrap()
+}
+
+struct StaticTempoRpc;
+
+impl PaidHttpChainRpcResolver for StaticTempoRpc {
+    fn http_rpc_urls_for_chain_id(&self, chain_id: u64) -> Vec<String> {
+        assert_eq!(chain_id, 42431);
+        // Fee-payer MPP charges do not call the RPC, but the production backend
+        // still requires packaging to have selected a syntactically valid URL.
+        vec!["http://127.0.0.1:1".into()]
+    }
 }
 
 fn operation_classes(requests: &[MachineBrokerRequest]) -> Vec<String> {
@@ -335,6 +382,91 @@ async fn production_x402_route_prepares_then_signs_through_broker() {
             .join("requests/sent")
             .join(id)
             .join("private/exact-signing/credential.json")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn production_mpp_route_prepares_then_signs_through_broker() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (wallet, projections) = projection("0x1111111111111111111111111111111111111111".into());
+    let (signer, broker) = exact_signer(wallet);
+    let merchant = spawn_http_fixture("mpp").await;
+    let handler =
+        RequestsHandler::new_projected(temporary.path(), Some("alice".into()), projections)
+            .with_paid_http_rpc_resolver(Arc::new(StaticTempoRpc))
+            .with_exact_signer(Some(signer));
+    let request = format!(
+        "GET {} wallet=alice max_amount_usd=20000",
+        merchant.join("paid").unwrap()
+    );
+    handler
+        .write(&VfsPath::parse("/new").unwrap(), request.as_bytes())
+        .await
+        .unwrap();
+    let id = std::fs::read_dir(temporary.path().join("requests/pending"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .into_owned();
+    let confirm = VfsPath::parse(&format!("/pending/{id}/confirm")).unwrap();
+    let staged_checks = std::fs::read_to_string(
+        temporary
+            .path()
+            .join("requests/pending")
+            .join(&id)
+            .join("policy_check.json"),
+    )
+    .unwrap();
+
+    let first = handler.write(&confirm, b"confirm").await.unwrap_err();
+    assert!(
+        matches!(&first, HandlerError::Backend(message) if message == "paid-http Broker approval required"),
+        "expected Broker ceremony, got {first:?}; staged checks: {staged_checks}"
+    );
+    assert!(
+        temporary
+            .path()
+            .join("requests/pending")
+            .join(&id)
+            .join("approval_challenge.json")
+            .exists()
+    );
+
+    handler.write(&confirm, b"confirm").await.unwrap();
+    assert!(temporary.path().join("requests/sent").join(&id).exists());
+    let requests = broker.requests.lock().unwrap();
+    let prepare = requests.iter().find_map(|request| match request {
+        MachineBrokerRequest::SealedApprovalPrepare(request) => Some(request),
+        _ => None,
+    });
+    let prepare = prepare.expect("MPP must prepare an exact sealed approval");
+    assert!(matches!(
+        &prepare.terms.subject,
+        ApprovalSubject::System { operation_class, .. }
+            if operation_class.as_str() == "paid-http.mpp"
+    ));
+    let sign = requests.iter().find_map(|request| match request {
+        MachineBrokerRequest::SigningSign(request) => Some(request),
+        _ => None,
+    });
+    let sign = sign.expect("MPP retry must submit the exact payload for signing");
+    assert_eq!(sign.approval_id, prepare.terms.approval_id().unwrap());
+    let signing_results = broker.signing_results.lock().unwrap();
+    let result = signing_results
+        .first()
+        .expect("MPP signing must return a Signer receipt");
+    assert_eq!(result.operation_id, sign.operation_id);
+    assert_eq!(result.signer_receipt_digest, digest(90));
+    assert!(
+        temporary
+            .path()
+            .join("requests/sent")
+            .join(id)
+            .join("private/exact-signing/charge-transaction.json")
             .exists()
     );
 }

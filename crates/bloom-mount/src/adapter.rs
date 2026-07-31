@@ -182,12 +182,10 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // policy.toml and policy-session/new writes flow through to the VFS
-        // wallets handler, which stages a first-party Sealed Approval for passkey
-        // wallets (challenge + grant-gated install/mint) and writes local policy
-        // immediately. They no longer route through the disabled write_unlocked
-        // re-sign lane, so the mount must forward them to `vfs.write` rather than
-        // deny on flush.
+        // Policy updates and sealed-approval lifecycle writes flow through to
+        // the VFS wallets handler. It delegates authority to Broker and never
+        // routes them through the disabled raw wallet-signer lane, so the mount
+        // must forward them to `vfs.write` rather than deny on flush.
         _ => false,
     }
 }
@@ -1902,11 +1900,13 @@ mod tests {
     #[test]
     fn mount_classifier_forwards_handler_owned_sealed_approval_writes() {
         // Handler-owned Sealed Approval actions must reach the VFS handler, not
-        // be denied at the mount signer lane. policy-session/new now behaves
-        // like policy.toml: the wallets handler enforces Sealed Approval.
+        // be denied at the mount signer lane. Broker remains authoritative.
         for path in [
             "/wallets/minnow/policy.toml",
-            "/wallets/minnow/policy-session/new",
+            "/wallets/minnow/sealed-approvals/new.json",
+            "/wallets/minnow/sealed-approvals/approval-id/renew",
+            "/wallets/minnow/sealed-approvals/approval-id/revoke",
+            "/wallets/minnow/sealed-approvals/revoke_all",
             "/requests/pending/req_1/confirm",
             "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
         ] {

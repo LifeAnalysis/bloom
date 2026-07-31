@@ -197,6 +197,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mounted_help_uses_canonical_sealed_approval_vocabulary() {
+        let help = String::from_utf8(
+            DocsHandler::new()
+                .read(&VfsPath::parse("/README.md").unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!help.contains("policy-session"), "{help}");
+        assert!(help.contains("sealed-approvals"), "{help}");
+        assert!(help.contains("Broker enforces"), "{help}");
+    }
+
+    #[tokio::test]
     async fn petals_doc_is_rendered_at_read_time() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let renderer_calls = calls.clone();

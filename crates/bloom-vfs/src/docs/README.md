@@ -191,23 +191,34 @@ Read-only leaves (`address`, `addresses.json`, `public_key`, `kind`, balances)
 always work, even when a passkey wallet's `policy.toml` is unsigned or stale.
 The policy signature only gates staging/broadcast/signing.
 
-## Batch signing (policy sessions)
+## Reusable authority (sealed approvals)
 
-To avoid a passkey prompt per `$1` transaction, mint a **bounded session** with
-one ceremony. It authorizes only the listed transactions, on the listed chains,
-up to a total USD cap, until it expires:
+Reusable signing authority is owned durably by Broker and Signer. Machine does
+not mint grants or keep an in-memory authorization bypass. Prepare an approval
+by writing the canonical `ApprovalPrepareRequest` JSON produced by the client
+to the mounted wallet path:
 
 ```sh
-echo '{"chains":[42161,8453],"max_usd":10,"ttl_secs":600,"pending_ids":["0001-a","0001-b"]}' \
-  > /bloom/wallets/alice/policy-session/new          # passkey ceremony renders the envelope
-cat /bloom/wallets/alice/policy-session/active.json   # live sessions + remaining budget
-echo y > /bloom/wallets/alice/policy-session/<id>/revoke
+cp approval-prepare.json /bloom/wallets/alice/sealed-approvals/new.json
+cat /bloom/wallets/alice/sealed-approvals/new.json       # exact ceremony projection
+cat /bloom/wallets/alice/sealed-approvals/active.json    # Broker-backed active approvals
+cat /bloom/wallets/alice/sealed-approvals/<id>/status.json
+cat /bloom/wallets/alice/sealed-approvals/<id>/limits.json
 ```
 
-Confirms that fall inside the bounds (chain ∈ list, id ∈ list, not expired,
-cumulative USD ≤ cap) broadcast without another prompt; anything outside
-re-prompts. The session lives only in memory and expires independently of the
-unlocked key.
+Complete the returned browser ceremony before using the approval. Renewal and
+revocation also accept their canonical Broker request JSON; they never mutate
+authority locally in Machine:
+
+```sh
+cp approval-renew.json /bloom/wallets/alice/sealed-approvals/<id>/renew
+cp approval-revoke.json /bloom/wallets/alice/sealed-approvals/<id>/revoke
+cp approval-revoke-all.json /bloom/wallets/alice/sealed-approvals/revoke_all
+```
+
+Broker enforces the approval subject, operation classes, limits, expiry, and
+revocation on every signing request. An absent or unavailable Broker fails
+closed; mounted projections are display and orchestration state, not authority.
 
 ## Writing (stage-confirm)
 

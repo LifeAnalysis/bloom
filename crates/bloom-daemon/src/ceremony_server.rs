@@ -478,123 +478,46 @@ async fn complete(
     );
     daemon.signer_cache.prune_expired(now);
 
-    // Whether this sealed action broadcasts an EVM transaction. Only broadcast
-    // actions have a chain, a per-wallet outbox entry, and a tx to execute.
-    // Non-broadcast first-party actions (wallet-policy updates, policy-session
-    // mints) have none of these — the minted grant is their authorization, and
-    // they are installed by retrying their own mounted write. So we route the
-    // outbox-only tx-engine persistence/execution below only for broadcasts;
-    // calling into the tx engine for a non-tx action would be a layering error
-    // (and previously failed with "missing chain_name", revoking the grant).
+    // The embedded local-integration ceremony no longer owns any transaction
+    // execution path. Non-broadcast developer actions may still consume the
+    // freshly minted in-process grant until M5 replaces this harness. A
+    // broadcast request must use the out-of-process triad harness so exact
+    // payload signing remains Broker/Signer-owned even in development.
     let is_broadcast = action.chain_name().is_some();
-
-    // Persist approval.json into the outbox projection — broadcast actions only.
-    if is_broadcast
-        && let Err(e) = daemon
-            .tx_engine
-            .persist_outbox_ceremony_approval(&action, &signed)
-    {
+    if let Err(message) = embedded_execution_allowed(execute, is_broadcast) {
         revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now).await;
-        return err_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("persist approval artifact: {e}"),
-        );
+        return err_json(StatusCode::SERVICE_UNAVAILABLE, message.to_string());
     }
 
-    // grant + execute: broadcast immediately from sealed bytes.
-    let mut executed = false;
-    let mut tx_hash: Option<String> = None;
     // For a non-broadcast action, "approve + execute" is equivalent to "approve":
     // mint the grant and let the caller retry the write. Failing here would
     // revoke the valid grant.
-    let broadcastable = execute && is_broadcast;
-    if execute && !broadcastable {
+    if execute {
         tracing::info!(
             wallet = %wallet,
             action_id = %action.action_id(),
             "ceremony.execute.non_broadcast_action: grant minted, install happens on write retry"
         );
     }
-    if broadcastable {
-        // The chain registry is keyed by the human chain name ("base"), not the
-        // CAIP-2 `network` header ("eip155:8453"), so resolve it from the sealed
-        // policy snapshot rather than the header.
-        let chain_name = match action.chain_name() {
-            Some(name) => name.to_string(),
-            None => {
-                revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now)
-                    .await;
-                return err_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "grant minted but sealed action is missing chain_name for execute".to_string(),
-                );
-            }
-        };
-        let client = match daemon.chains.get(&chain_name) {
-            Some(c) => c,
-            None => {
-                let message =
-                    format!("grant minted but chain '{chain_name}' is not configured for execute");
-                revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now)
-                    .await;
-                if let Err(project_err) = daemon.tx_engine.project_sealed_action_execute_failure(
-                    &action,
-                    &chain_name,
-                    &message,
-                ) {
-                    tracing::warn!(err = %project_err, "ceremony.execute.failure_projection_failed");
-                }
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, message);
-            }
-        };
-        let policy = match daemon.keystore.info(&wallet) {
-            Ok(info) => info.policy,
-            Err(e) => {
-                let message = format!("grant minted but wallet policy unavailable: {e}");
-                revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now)
-                    .await;
-                if let Err(project_err) = daemon.tx_engine.project_sealed_action_execute_failure(
-                    &action,
-                    &chain_name,
-                    &message,
-                ) {
-                    tracing::warn!(err = %project_err, "ceremony.execute.failure_projection_failed");
-                }
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, message);
-            }
-        };
-        match daemon
-            .tx_engine
-            .execute_sealed_action(&action, &chain_name, &client, &policy)
-            .await
-        {
-            Ok(exec) => {
-                executed = true;
-                tx_hash = Some(format!("{:#x}", exec.tx_hash));
-            }
-            Err(e) => {
-                let message = format!("grant minted but execute failed: {e}");
-                revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now)
-                    .await;
-                if let Err(project_err) = daemon.tx_engine.project_sealed_action_execute_failure(
-                    &action,
-                    &chain_name,
-                    &message,
-                ) {
-                    tracing::warn!(err = %project_err, "ceremony.execute.failure_projection_failed");
-                }
-                return err_json(StatusCode::BAD_GATEWAY, message);
-            }
-        }
-    }
 
     Json(serde_json::json!({
         "ok": true,
         "grant_id": grant.grant_id,
-        "executed": executed,
-        "tx_hash": tx_hash,
+        "executed": false,
+        "tx_hash": null,
     }))
     .into_response()
+}
+
+const EMBEDDED_BROADCAST_DIAGNOSTIC: &str = "embedded local-integration cannot broadcast or sign transactions; use the out-of-process \
+     triad integration harness so Broker and Signer own exact payload signing";
+
+fn embedded_execution_allowed(_execute: bool, is_broadcast: bool) -> Result<(), &'static str> {
+    if is_broadcast {
+        Err(EMBEDDED_BROADCAST_DIAGNOSTIC)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -728,6 +651,21 @@ mod tests {
                 .unwrap_err(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[test]
+    fn embedded_broadcast_execution_is_explicitly_fail_closed() {
+        assert_eq!(
+            embedded_execution_allowed(false, true).unwrap_err(),
+            EMBEDDED_BROADCAST_DIAGNOSTIC
+        );
+        assert!(embedded_execution_allowed(true, false).is_ok());
+        assert_eq!(
+            embedded_execution_allowed(true, true).unwrap_err(),
+            EMBEDDED_BROADCAST_DIAGNOSTIC
+        );
+        assert!(EMBEDDED_BROADCAST_DIAGNOSTIC.contains("out-of-process triad"));
+        assert!(EMBEDDED_BROADCAST_DIAGNOSTIC.contains("Broker and Signer"));
     }
 
     #[test]

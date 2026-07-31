@@ -50,6 +50,7 @@ use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
 use bloom_keystore::Keystore;
 #[cfg(any(test, feature = "local-integration"))]
 use bloom_keystore::KeystoreApprovalSignatureVerifier;
+#[cfg(any(test, feature = "local-integration"))]
 use bloom_keystore::petal_host::SignerCache as LegacyCache;
 use bloom_machine_client::{
     CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient,
@@ -79,6 +80,8 @@ use bloom_revert::{
 use bloom_tx::DynPriceOracle;
 use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxState};
 use bloom_tx::tx_engine::{Eip1559FeeOverrides, TxEngine};
+#[cfg(any(test, feature = "local-integration"))]
+use bloom_vfs::AuthServices as LegacyAuthority;
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
@@ -87,8 +90,7 @@ use bloom_vfs::handlers::{
     StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::{
-    AuthServices as LegacyAuthority, BrokerExactPayloadSigner, FileOperationIndex, OperationIndex,
-    PathCache, Vfs, VfsPath,
+    BrokerExactPayloadSigner, FileOperationIndex, OperationIndex, PathCache, Vfs, VfsPath,
 };
 use bloom_watch::{WatchExecutor, WatchRegistry};
 use futures::StreamExt;
@@ -352,12 +354,38 @@ impl DaemonPetalHost {
                 "petal-key-requests is an owner-only ceremony projection".into(),
             ));
         }
+        let segments = parsed.segments();
+        let owner_wallet_ceremony_projection = segments.first().map(String::as_str)
+            == Some("wallets")
+            && ((segments.len() == 4
+                && segments[2] == "sealed-approvals"
+                && segments[3] == "new.json")
+                || (segments.len() == 5
+                    && segments[2] == "sealed-approvals"
+                    && segments[4] == "renew")
+                || (segments.len() == 5
+                    && segments[2] == "policy-updates"
+                    && segments[3] == "latest"
+                    && matches!(
+                        segments[4].as_str(),
+                        "approval_challenge.json" | "status.json"
+                    ))
+                || (segments.len() == 6
+                    && segments[2] == "policy-updates"
+                    && segments[3] == "pending"
+                    && matches!(
+                        segments[5].as_str(),
+                        "approval_challenge.json" | "status.json"
+                    )));
+        if owner_wallet_ceremony_projection {
+            return Err(HostError::Denied(
+                "wallet ceremony launch projections are owner-only".into(),
+            ));
+        }
         Ok(())
     }
 
-    fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>, auth_services: LegacyAuthority) -> Self {
-        #[cfg(not(any(test, feature = "local-integration")))]
-        let _ = &auth_services;
+    fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>) -> Self {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(20))
@@ -368,7 +396,7 @@ impl DaemonPetalHost {
             http,
             audit,
             #[cfg(any(test, feature = "local-integration"))]
-            auth_services,
+            auth_services: LegacyAuthority::default(),
             tx_outbox: None,
             tx_stage_lock: tokio::sync::Mutex::new(()),
             #[cfg(any(test, feature = "local-integration"))]
@@ -381,6 +409,12 @@ impl DaemonPetalHost {
             #[cfg(feature = "unsafe-debug-signer")]
             unsafe_debug_signer: None,
         }
+    }
+
+    #[cfg(any(test, feature = "local-integration"))]
+    fn with_legacy_authority(mut self, auth_services: LegacyAuthority) -> Self {
+        self.auth_services = auth_services;
+        self
     }
 
     fn with_tx_outbox(mut self, tx_outbox: PetalTxOutbox) -> Self {
@@ -2226,7 +2260,9 @@ pub struct Daemon {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
+    #[cfg(any(test, feature = "local-integration"))]
     pub auth_services: LegacyAuthority,
+    #[cfg(any(test, feature = "local-integration"))]
     pub signer_cache: Arc<LegacyCache>,
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
     pub vfs: Vfs,
@@ -2561,7 +2597,6 @@ impl Daemon {
                 auth_store,
                 KeystoreApprovalSignatureVerifier::new(keystore.clone()),
             ));
-            tx_engine = tx_engine.with_auth_services(auth_verifier.clone(), auth_verifier.clone());
             let grant_store: Arc<dyn bloom_auth_api::GrantStore> =
                 Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
             let attestation_registry: Arc<dyn bloom_auth_api::SigningAttestationSchemaRegistry> =
@@ -2576,8 +2611,6 @@ impl Daemon {
                 )
                 .with_signer_cache(signer_cache.clone()),
             );
-            tx_engine =
-                tx_engine.with_host_signing_services(grant_store.clone(), petal_host.clone());
             let registration_coordinator: Arc<dyn bloom_auth_api::WalletRegistrationCoordinator> =
                 Arc::new(registration::RegistrationCoordinator::new(
                     keystore.clone(),
@@ -2596,10 +2629,6 @@ impl Daemon {
             .with_registration_coordinator(registration_coordinator);
             (auth_services, signer_cache)
         };
-        #[cfg(not(any(test, feature = "local-integration")))]
-        let auth_services: LegacyAuthority = Default::default();
-        #[cfg(not(any(test, feature = "local-integration")))]
-        let signer_cache: Arc<LegacyCache> = Arc::new(Default::default());
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
@@ -2819,20 +2848,18 @@ impl Daemon {
         let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
         let petal_vfs_host = Arc::new(LateVfsHost::new());
-        let petal_app_host = DaemonPetalHost::new(
-            petal_vfs_host.clone(),
-            audit_arc.clone(),
-            auth_services.clone(),
-        )
-        .with_broker(broker.clone())
-        .with_petal_key_state_root(home.cache_dir().join("petal-key-requests"))
-        .with_tx_outbox(PetalTxOutbox {
-            tx_engine: tx_engine.clone(),
-            chains: chains.clone(),
-            wallet_projections: wallet_projections.clone(),
-            address_book: address_book_arc.clone(),
-            write_permit: home_write_permit.clone(),
-        });
+        let petal_app_host = DaemonPetalHost::new(petal_vfs_host.clone(), audit_arc.clone())
+            .with_broker(broker.clone())
+            .with_petal_key_state_root(home.cache_dir().join("petal-key-requests"))
+            .with_tx_outbox(PetalTxOutbox {
+                tx_engine: tx_engine.clone(),
+                chains: chains.clone(),
+                wallet_projections: wallet_projections.clone(),
+                address_book: address_book_arc.clone(),
+                write_permit: home_write_permit.clone(),
+            });
+        #[cfg(any(test, feature = "local-integration"))]
+        let petal_app_host = petal_app_host.with_legacy_authority(auth_services.clone());
         #[cfg(feature = "unsafe-debug-signer")]
         let petal_app_host = match &unsafe_debug_signer {
             Some((wallet, signer)) => {
@@ -2909,25 +2936,22 @@ impl Daemon {
             vfs_builder = vfs_builder.mount("hyperliquid", hl.clone() as _);
         }
 
+        let wallets_handler = WalletsHandler::new(
+            keystore.clone(),
+            chains.clone(),
+            tx_engine.clone(),
+            address_book.clone(),
+        );
+        let wallets_handler = wallets_handler
+            .with_broker(broker.clone())
+            .with_wallet_projections(wallet_projections.clone())
+            .with_policy_projection_root(home.root().join("machine-policy-projections"))
+            .with_home_write_permit_opt(home_write_permit.clone())
+            .with_mempool_indexes(mempool_indexes.clone())
+            .with_hyperliquid_handler(hyperliquid_handler.clone());
+
         vfs_builder = vfs_builder
-            .mount(
-                "wallets",
-                Arc::new(
-                    WalletsHandler::new(
-                        keystore.clone(),
-                        chains.clone(),
-                        tx_engine.clone(),
-                        address_book.clone(),
-                    )
-                    .with_auth_services(auth_services.clone())
-                    .with_broker(broker.clone())
-                    .with_wallet_projections(wallet_projections.clone())
-                    .with_policy_projection_root(home.root().join("machine-policy-projections"))
-                    .with_home_write_permit_opt(home_write_permit.clone())
-                    .with_mempool_indexes(mempool_indexes.clone())
-                    .with_hyperliquid_handler(hyperliquid_handler.clone()),
-                ) as _,
-            )
+            .mount("wallets", Arc::new(wallets_handler) as _)
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
             .mount(
                 "requests",
@@ -2982,15 +3006,9 @@ impl Daemon {
         // Answers: what wallets need attention, what confirms are pending,
         // what capabilities are active/expired/orphaned, what risk data is stale.
         let next_wallet_projections = wallet_projections.clone();
-        let next_tx_engine = tx_engine.clone();
         let next_hl = hyperliquid_handler.clone();
         let next_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> = Arc::new(move || {
             let mut md = String::from("# Next Actions\n\n");
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-
             let (wallets, wallet_projection_unavailable) =
                 match next_wallet_projections.cached_wallets() {
                     Ok(wallets) => (wallets, false),
@@ -3022,41 +3040,7 @@ impl Daemon {
                 md.push('\n');
             }
 
-            // 2. Pending outbox confirms
-            let mut pending_confirms = Vec::new();
-            {
-                for projection in &wallets {
-                    let wallet = projection.wallet.wallet_id.as_str();
-                    let sessions = next_tx_engine.session_store().active(now_ms);
-                    let has_session = sessions.iter().any(|s| s.wallet == wallet);
-                    if has_session {
-                        for s in &sessions {
-                            if s.wallet != wallet {
-                                continue;
-                            }
-                            if s.expires_ms > now_ms {
-                                pending_confirms.push(format!(
-                                    "- `{}`: {} pending tx ids, session `{}` active (expires in {}s)",
-                                    wallet,
-                                    s.allowed_pending_ids.len(),
-                                    s.id,
-                                    ((s.expires_ms - now_ms) / 1000)
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            if !pending_confirms.is_empty() {
-                md.push_str("## Pending Outbox Confirms\n\n");
-                for p in &pending_confirms {
-                    md.push_str(p);
-                    md.push('\n');
-                }
-                md.push('\n');
-            }
-
-            // 3. Capability status (HL sessions)
+            // 2. Capability status (HL sessions)
             if let Some(ref hl) = next_hl {
                 let mut expired = Vec::new();
                 let mut orphaned = Vec::new();
@@ -3120,11 +3104,7 @@ impl Daemon {
                 }
             }
 
-            if !wallet_projection_unavailable
-                && stale_wallets.is_empty()
-                && pending_confirms.is_empty()
-                && next_hl.is_none()
-            {
+            if !wallet_projection_unavailable && stale_wallets.is_empty() && next_hl.is_none() {
                 md.push_str("No wallets with pending actions.\n\n");
                 md.push_str("All policies are signed, no outbox confirms await review, and no Hyperliquid sessions are active.\n");
             }
@@ -3327,7 +3307,9 @@ impl Daemon {
             home_write_permit,
             address_book: address_book_arc,
             audit: audit_arc,
+            #[cfg(any(test, feature = "local-integration"))]
             auth_services,
+            #[cfg(any(test, feature = "local-integration"))]
             signer_cache,
             wallet_projections,
             vfs,
@@ -3406,6 +3388,7 @@ impl Daemon {
         drop(update_shutdown);
 
         let outbox = self.tx_engine.outbox.clone();
+        #[cfg(any(test, feature = "local-integration"))]
         let registration_coordinator = self.auth_services.registration_coordinator().cloned();
         let (tx, mut rx) = watch::channel(false);
         let interval = Duration::from_secs(60);
@@ -3427,6 +3410,7 @@ impl Daemon {
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
                             Err(e) => warn!(error = %e, "outbox.sweep_expired_failed"),
                         }
+                        #[cfg(any(test, feature = "local-integration"))]
                         if let Some(coordinator) = &registration_coordinator {
                             match coordinator.sweep_expired(now_ms as u64).await {
                                 Ok(0) => tracing::trace!("wallet_registration.sweep_expired.empty"),
@@ -3627,6 +3611,37 @@ mod tests {
     use bloom_triad_protocol::{MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService};
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Handler;
+    use bloom_vfs::handler::{Entry, HandlerError};
+
+    struct GuestWalletProjectionFixture {
+        wrote: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for GuestWalletProjectionFixture {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::file(
+                path.segments().last().map(String::as_str).unwrap_or(""),
+            ))
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if path.segments().last().map(String::as_str) == Some("address") {
+                Ok(b"0x0000000000000000000000000000000000000001\n".to_vec())
+            } else {
+                Ok(b"owner-only-launch-token".to_vec())
+            }
+        }
+
+        async fn list(&self, _path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            Ok(vec![Entry::file("address")])
+        }
+
+        async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            self.wrote.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     struct PetalKeyBrokerFixture {
         completed: std::sync::atomic::AtomicBool,
@@ -3816,11 +3831,7 @@ mod tests {
     async fn daemon_petal_host_sign_hash_rejects_calls_without_trusted_petal_context() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(
-            Arc::new(LateVfsHost::new()),
-            audit,
-            LegacyAuthority::default(),
-        );
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
         let err = host
             .sign_hash(SignRequest {
                 wallet: "alice".into(),
@@ -3841,13 +3852,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let fixture = Arc::new(PetalKeyBrokerFixture::new());
-        let host = DaemonPetalHost::new(
-            Arc::new(LateVfsHost::new()),
-            audit,
-            LegacyAuthority::default(),
-        )
-        .with_broker(Some(MachineBrokerClient::new(fixture.clone())))
-        .with_petal_key_state_root(dir.path().join("petal-key-requests"));
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit)
+            .with_broker(Some(MachineBrokerClient::new(fixture.clone())))
+            .with_petal_key_state_root(dir.path().join("petal-key-requests"));
         let context = PetalRouteContext {
             petal_root: "exchange".into(),
             package_hash: "aa".repeat(32),
@@ -3961,7 +3968,7 @@ mod tests {
         let late_vfs = Arc::new(LateVfsHost::new());
         late_vfs.set(owner_vfs);
         let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
-        let guest = DaemonPetalHost::new(late_vfs, audit, LegacyAuthority::default());
+        let guest = DaemonPetalHost::new(late_vfs, audit);
 
         let operations = [
             guest.vfs_lookup("petal-key-requests").await.map(|_| ()),
@@ -3990,15 +3997,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn petal_guest_vfs_denies_normalized_owner_wallet_ceremony_projections() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet_projection = Arc::new(GuestWalletProjectionFixture {
+            wrote: std::sync::atomic::AtomicBool::new(false),
+        });
+        let owner_vfs = Arc::new(
+            Vfs::builder()
+                .mount("wallets", wallet_projection.clone())
+                .build(),
+        );
+        let owner_secret = owner_vfs
+            .read(&VfsPath::parse("wallets/alice/sealed-approvals/new.json").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(owner_secret, b"owner-only-launch-token");
+
+        let late_vfs = Arc::new(LateVfsHost::new());
+        late_vfs.set(owner_vfs);
+        let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
+        let guest = DaemonPetalHost::new(late_vfs, audit);
+        let protected = vec![
+            "wallets/alice/sealed-approvals/new.json".to_string(),
+            format!("wallets/alice/sealed-approvals/{}/renew", "11".repeat(32)),
+            "wallets/alice/policy-updates/latest/approval_challenge.json".to_string(),
+            "wallets/alice/policy-updates/latest/status.json".to_string(),
+            "wallets/alice/policy-updates/pending/policy-update-abc/approval_challenge.json"
+                .to_string(),
+            "wallets/alice/policy-updates/pending/policy-update-abc/status.json".to_string(),
+            "public/../wallets/alice/sealed-approvals/new.json".to_string(),
+            "wallets/alice/adjacent/../policy-updates/latest/status.json".to_string(),
+        ];
+        for path in &protected {
+            let operations = [
+                guest.vfs_lookup(path).await.map(|_| ()),
+                guest.vfs_list(path).await.map(|_| ()),
+                guest.vfs_read(path).await.map(|_| ()),
+                guest.vfs_write(path, b"replace").await,
+            ];
+            for result in operations {
+                assert!(
+                    matches!(result, Err(HostError::Denied(ref message)) if message.contains("owner-only")),
+                    "guest operation unexpectedly reached owner projection {path}: {result:?}"
+                );
+            }
+        }
+        assert!(
+            !wallet_projection
+                .wrote
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "normalized denied writes must never reach WalletsHandler"
+        );
+
+        let adjacent = guest.vfs_read("wallets/alice/address").await.unwrap();
+        assert_eq!(adjacent, b"0x0000000000000000000000000000000000000001\n");
+        assert!(guest.vfs_lookup("wallets/alice/address").await.is_ok());
+        assert!(guest.vfs_list("wallets/alice").await.is_ok());
+    }
+
     #[test]
     fn daemon_petal_host_seals_petal_signing_action_from_trusted_route_context() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(
-            Arc::new(LateVfsHost::new()),
-            audit,
-            LegacyAuthority::default(),
-        );
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
         let req = SignRequest {
             wallet: "alice".into(),
             hash32: [7; 32],
@@ -4056,11 +4118,7 @@ mod tests {
     fn petal_signing_identity_is_stable_until_expiry() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(
-            Arc::new(LateVfsHost::new()),
-            audit,
-            LegacyAuthority::default(),
-        );
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
         let req = SignRequest {
             wallet: "alice".into(),
             hash32: [7; 32],
@@ -4107,11 +4165,7 @@ mod tests {
     fn petal_signing_identity_binds_the_complete_request_scope() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(
-            Arc::new(LateVfsHost::new()),
-            audit,
-            LegacyAuthority::default(),
-        );
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
         let req = SignRequest {
             wallet: "alice".into(),
             hash32: [7; 32],
@@ -4153,11 +4207,7 @@ mod tests {
     fn daemon_petal_host_seals_exact_ordered_hardened_signing_batch() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(
-            Arc::new(LateVfsHost::new()),
-            audit,
-            LegacyAuthority::default(),
-        );
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
         let context = PetalRouteContext {
             petal_root: "polymarket".into(),
             package_hash: "b".repeat(64),
@@ -4219,11 +4269,7 @@ mod tests {
     fn invalid_signing_batches_cannot_consume_identity_capacity() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(
-            Arc::new(LateVfsHost::new()),
-            audit,
-            LegacyAuthority::default(),
-        );
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
         let context = PetalRouteContext {
             petal_root: "example".into(),
             package_hash: "b".repeat(64),
@@ -4307,18 +4353,15 @@ mod tests {
     }
 
     fn test_petal_host(daemon: &Daemon) -> DaemonPetalHost {
-        DaemonPetalHost::new(
-            Arc::new(LateVfsHost::new()),
-            daemon.audit.clone(),
-            daemon.auth_services.clone(),
-        )
-        .with_tx_outbox(PetalTxOutbox {
-            tx_engine: daemon.tx_engine.clone(),
-            chains: daemon.chains.clone(),
-            wallet_projections: daemon.wallet_projections.clone(),
-            address_book: daemon.address_book.clone(),
-            write_permit: daemon.home_write_permit.clone(),
-        })
+        DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone())
+            .with_legacy_authority(daemon.auth_services.clone())
+            .with_tx_outbox(PetalTxOutbox {
+                tx_engine: daemon.tx_engine.clone(),
+                chains: daemon.chains.clone(),
+                wallet_projections: daemon.wallet_projections.clone(),
+                address_book: daemon.address_book.clone(),
+                write_permit: daemon.home_write_permit.clone(),
+            })
     }
 
     #[tokio::test]

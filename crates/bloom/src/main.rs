@@ -2316,8 +2316,8 @@ async fn run(cli: Cli) -> Result<()> {
             }
             bail!(
                 "atomic batch confirmation for wallet '{wallet}' is unavailable until the \
-                 Machine signing.sign_batch projection is connected to Broker; the legacy \
-                 in-process policy-session ceremony has been removed (confirmation text: \
+                 Machine signing.sign_batch projection is connected to Broker; no embedded \
+                 Machine approval or signing fallback is available (confirmation text: \
                  {text:?})"
             )
         }
