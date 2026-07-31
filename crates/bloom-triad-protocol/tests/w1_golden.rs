@@ -1,5 +1,5 @@
 use bloom_triad_protocol::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +48,21 @@ struct CeremonyVector {
     challenge_digest: Digest32,
     local_prf_aad: LocalPrfHpkeAad,
     local_prf_aad_canonical_jcs: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EnvelopeGoldenBody {
+    value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalHeadEnvelopeVector {
+    name: String,
+    unsigned_envelope: UnsignedEnvelope<EnvelopeGoldenBody>,
+    canonical_jcs: String,
+    head_signature_message_base64url: Base64UrlBytes,
 }
 
 #[test]
@@ -243,6 +258,24 @@ fn ceremony_challenge_and_hpke_aad_match_reviewed_artifact() {
     assert_eq!(
         String::from_utf8(vector.local_prf_aad.canonical_bytes().unwrap()).unwrap(),
         vector.local_prf_aad_canonical_jcs
+    );
+}
+
+#[test]
+fn broker_signer_journal_head_envelope_matches_reviewed_artifact() {
+    let vector: JournalHeadEnvelopeVector = serde_json::from_str(include_str!(
+        "../vectors/broker-signer-journal-head-v1.json"
+    ))
+    .unwrap();
+    assert_eq!(vector.name, "broker-signer-journal-head-minor-1");
+    assert_eq!(
+        String::from_utf8(vector.unsigned_envelope.canonical_bytes().unwrap()).unwrap(),
+        vector.canonical_jcs
+    );
+    let head = vector.unsigned_envelope.sender_journal_head.unwrap();
+    assert_eq!(
+        Base64UrlBytes::from_bytes(&head.signature_message()),
+        vector.head_signature_message_base64url
     );
 }
 

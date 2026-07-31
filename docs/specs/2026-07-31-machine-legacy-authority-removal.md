@@ -886,3 +886,22 @@ vectors, closed errors, fake-peer suites, and version negotiation. Publish and
 pin immutable releases rather than retaining sibling path dependencies. Amend
 the parent repository policy before treating this TODO as normative work; it is
 not part of M0--M6 unless separately ratified.
+
+## 21. Implementation decision log
+
+### 2026-07-31 — AC-18 authenticated journal-head transport
+
+The existing authenticated envelope carries an optional
+`sender_journal_head`, covered by the envelope application signature. Protocol
+minor 1 requires that field in both directions on the Broker-Signer edge and
+forbids it on Machine-Broker and every other edge. The head is separately
+signed by the sender application identity already pinned in the edge manifest;
+its `service_id` and `key_id` must equal the authenticated envelope sender and
+application key. Machine therefore cannot inject a peer checkpoint head.
+
+Minor 0 remains decodable only on edges whose contract does not require a
+journal head. Broker-Signer rejects minor 0 rather than negotiating away the
+checkpoint binding. No RPC method was added. Broker and Signer runtime work
+must use the minor-1 envelope helpers, checkpoint the authenticated peer head
+before dispatching or publishing security-mutation success, and degrade to
+read-only on checkpoint failure.

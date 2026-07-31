@@ -9,6 +9,19 @@ struct Body {
     value: String,
 }
 
+fn journal_head(signing_key: &SigningKey, service: &str, key_id: &str) -> SignedJournalHead {
+    let mut head = SignedJournalHead {
+        service_id: Token::new(service).unwrap(),
+        sequence: DecimalU64::new(7),
+        head_hash: Digest32::from_bytes([9; 32]),
+        key_id: Token::new(key_id).unwrap(),
+        signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    head.signature =
+        Base64UrlBytes::from_bytes(&signing_key.sign(&head.signature_message()).to_bytes());
+    head
+}
+
 fn signed() -> (SignedEnvelope<Body>, AuthenticatedPeer) {
     let signing_key = SigningKey::from_bytes(&[7; 32]);
     let body = Body {
@@ -30,6 +43,7 @@ fn signed() -> (SignedEnvelope<Body>, AuthenticatedPeer) {
         deadline_ms: DecimalU64::new(20),
         body,
         application_key_id: Token::new("broker-app-1").unwrap(),
+        sender_journal_head: Some(journal_head(&signing_key, "bloom-broker", "broker-app-1")),
     };
     let signature = signing_key.sign(&unsigned.canonical_bytes().unwrap());
     (
@@ -90,6 +104,101 @@ fn ac05_every_peer_and_envelope_binding_fails_closed() {
     );
 }
 
+fn resign(envelope: &mut SignedEnvelope<Body>, key: &SigningKey) {
+    envelope.signature = Base64UrlBytes::from_bytes(
+        &key.sign(&envelope.unsigned.canonical_bytes().unwrap())
+            .to_bytes(),
+    );
+}
+
+#[test]
+fn ac18_sender_journal_head_is_signed_required_and_edge_confined() {
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let (envelope, peer) = signed();
+    envelope.verify(501, &peer).unwrap();
+
+    let mut outer_tamper = envelope.clone();
+    outer_tamper
+        .unsigned
+        .sender_journal_head
+        .as_mut()
+        .unwrap()
+        .head_hash = Digest32::from_bytes([10; 32]);
+    assert_eq!(
+        outer_tamper.verify(501, &peer).unwrap_err().code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
+
+    let mut forged_head = outer_tamper;
+    resign(&mut forged_head, &signing_key);
+    assert_eq!(
+        forged_head.verify(501, &peer).unwrap_err().code,
+        ProtocolErrorCode::UnauthenticatedPeer
+    );
+
+    for mutate in ["missing", "service", "key"] {
+        let mut changed = envelope.clone();
+        match mutate {
+            "missing" => changed.unsigned.sender_journal_head = None,
+            "service" => {
+                changed
+                    .unsigned
+                    .sender_journal_head
+                    .as_mut()
+                    .unwrap()
+                    .service_id = Token::new("bloom-machine").unwrap();
+            }
+            "key" => {
+                changed
+                    .unsigned
+                    .sender_journal_head
+                    .as_mut()
+                    .unwrap()
+                    .key_id = Token::new("other-key").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        resign(&mut changed, &signing_key);
+        assert_eq!(
+            changed.verify(501, &peer).unwrap_err().code,
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "{mutate}"
+        );
+    }
+
+    let mut machine = envelope.clone();
+    machine.unsigned.caller_service_id = Token::new("bloom-machine").unwrap();
+    machine.unsigned.audience = Token::new("bloom-broker").unwrap();
+    machine.unsigned.application_key_id = Token::new("machine-app").unwrap();
+    let mut machine_peer = peer.clone();
+    machine_peer.service_id = machine.unsigned.caller_service_id.clone();
+    machine_peer.audience = machine.unsigned.audience.clone();
+    machine_peer.application_key_id = machine.unsigned.application_key_id.clone();
+    resign(&mut machine, &signing_key);
+    assert_eq!(
+        machine.verify(501, &machine_peer).unwrap_err().code,
+        ProtocolErrorCode::UnauthenticatedPeer,
+        "Machine must not inject a peer checkpoint head"
+    );
+
+    machine.unsigned.sender_journal_head = None;
+    resign(&mut machine, &signing_key);
+    machine.verify(501, &machine_peer).unwrap();
+
+    machine.unsigned.protocol.minor = 0;
+    resign(&mut machine, &signing_key);
+    machine.verify(501, &machine_peer).unwrap();
+
+    let mut downgraded_broker = envelope;
+    downgraded_broker.unsigned.protocol.minor = 0;
+    downgraded_broker.unsigned.sender_journal_head = None;
+    resign(&mut downgraded_broker, &signing_key);
+    assert_eq!(
+        downgraded_broker.verify(501, &peer).unwrap_err().code,
+        ProtocolErrorCode::UnsupportedVersion
+    );
+}
+
 fn enrolled() -> EnrolledKeyBinding {
     EnrolledKeyBinding {
         key_ref: KeyRef {
@@ -146,7 +255,7 @@ fn ac19_unsupported_versions_refuse_without_downgrade() {
     for version in [
         ProtocolVersion { major: 0, minor: 0 },
         ProtocolVersion { major: 2, minor: 0 },
-        ProtocolVersion { major: 1, minor: 1 },
+        ProtocolVersion { major: 1, minor: 2 },
     ] {
         assert_eq!(
             version.validate().unwrap_err().code,
@@ -284,6 +393,7 @@ fn authenticated_outer_method_must_match_typed_dispatch_method() {
         deadline_ms: DecimalU64::new(20),
         body,
         application_key_id: Token::new("broker-app-1").unwrap(),
+        sender_journal_head: Some(journal_head(&signing_key, "bloom-broker", "broker-app-1")),
     };
     let envelope = SignedEnvelope {
         signature: Base64UrlBytes::from_bytes(

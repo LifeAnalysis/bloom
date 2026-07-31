@@ -47,4 +47,4 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR_MIN: u16 = 0;
 
 /// Latest supported minor version.
-pub const PROTOCOL_MINOR_MAX: u16 = 0;
+pub const PROTOCOL_MINOR_MAX: u16 = 1;
