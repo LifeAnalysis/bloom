@@ -56,9 +56,17 @@ signer_socket_dir_owner=""
 signer_socket_dir_group=""
 signer_socket_dir_mode=""
 
+report_error() {
+  local status=$?
+  local line="$1"
+  echo "packaged Machine runtime negative failed at line $line (status $status)" >&2
+  return "$status"
+}
+trap 'report_error "$LINENO"' ERR
+
 cleanup() {
   status=$?
-  trap - EXIT INT TERM
+  trap - ERR EXIT INT TERM
   for pid in "$machine_service_pid" "$broker_listener_pid" "$signer_listener_pid"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
@@ -196,10 +204,11 @@ run_machine_with_deadline() {
     echo "packaged Machine hung with its authority service unavailable" >&2
     return 124
   fi
-  set +e
-  wait "$command_pid"
-  machine_status=$?
-  set -e
+  if wait "$command_pid"; then
+    machine_status=0
+  else
+    machine_status=$?
+  fi
   return "$machine_status"
 }
 
@@ -251,24 +260,28 @@ fi
 # Force the packaged Machine service itself across its configured Broker edge.
 # The hostile same-principal endpoint closes without an authenticated reply;
 # the VFS projection request must fail promptly rather than hang or fall back.
-set +e
-run_machine_with_deadline \
+if run_machine_with_deadline \
   "$work/projection.log" \
   --home "$clean_home" --connect "unix:$machine_socket" vfs ls /wallets
-projection_status=$?
-set -e
+then
+  projection_status=0
+else
+  projection_status=$?
+fi
 [[ "$projection_status" -ne 0 && "$projection_status" -ne 124 ]] || {
   cat "$work/projection.log" >&2
   echo "packaged Machine service did not fail the hostile Broker projection promptly" >&2
   exit 1
 }
 
-set +e
-run_machine_with_deadline \
+if run_machine_with_deadline \
   "$work/custody.log" \
   --home "$clean_home" wallet new ma13-runtime-negative
-custody_status=$?
-set -e
+then
+  custody_status=0
+else
+  custody_status=$?
+fi
 [[ "$custody_status" -ne 0 && "$custody_status" -ne 124 ]] || {
   cat "$work/custody.log" >&2
   echo "packaged Machine did not fail the Broker-hostile custody request promptly" >&2
