@@ -12,9 +12,7 @@ use alloy::eips::eip2930::AccessList;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, B256, Bytes, Signature, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
-#[cfg(all(test, feature = "unsafe-debug-signer"))]
-use alloy::signers::SignerSync;
-#[cfg(any(test, feature = "unsafe-debug-signer"))]
+#[cfg(test)]
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -447,8 +445,6 @@ pub struct TxEngine {
     /// `tokio::sync::Mutex` is the actual per-sender stage lock.
     nonce_locks: NonceLocks,
     triad_signing: Option<Arc<TriadSigningService>>,
-    #[cfg(feature = "unsafe-debug-signer")]
-    unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
 }
 
 impl TxEngine {
@@ -463,8 +459,6 @@ impl TxEngine {
             private_rpcs: Arc::new(RwLock::new(BTreeMap::new())),
             nonce_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             triad_signing: None,
-            #[cfg(feature = "unsafe-debug-signer")]
-            unsafe_debug_signer: None,
         }
     }
 
@@ -493,27 +487,6 @@ impl TxEngine {
             provenance_catalog,
         }));
         Ok(self)
-    }
-
-    /// Install an explicit local-only debug signer for one wallet. Policy
-    /// evaluation and transaction simulation still run; only the interactive
-    /// Sealed Approval ceremony is bypassed. Never enable this in production.
-    #[cfg(feature = "unsafe-debug-signer")]
-    pub fn with_unsafe_debug_signer(
-        mut self,
-        wallet: impl Into<String>,
-        signer: Arc<PrivateKeySigner>,
-    ) -> Self {
-        self.unsafe_debug_signer = Some((wallet.into(), signer));
-        self
-    }
-
-    #[cfg(feature = "unsafe-debug-signer")]
-    fn unsafe_debug_signer(&self, wallet: &str) -> Option<&Arc<PrivateKeySigner>> {
-        self.unsafe_debug_signer
-            .as_ref()
-            .filter(|(configured, _)| configured == wallet)
-            .map(|(_, signer)| signer)
     }
 
     /// Return (or create) the per-(wallet, chain, from) `tokio::sync::Mutex`
@@ -2955,16 +2928,6 @@ impl TxEngine {
             }
         }
 
-        #[cfg(feature = "unsafe-debug-signer")]
-        if self.unsafe_debug_signer(&staged.wallet).is_some() {
-            tracing::warn!(
-                wallet = %staged.wallet,
-                action = action_kind.action_kind(),
-                "tx.unsafe_debug_approval_bypass"
-            );
-            return Ok(());
-        }
-
         // In a triad Machine, authorization is durably reserved by Broker at
         // the payload-bearing signing call. Reaching this branch does not
         // authorize a signature; it only permits execution to advance to that
@@ -4880,7 +4843,6 @@ mod tests {
         (engine, dir)
     }
 
-    #[cfg(feature = "unsafe-debug-signer")]
     #[test]
     fn dependency_gate_blocks_until_predecessor_succeeds() {
         use crate::outbox::{MinedReceipt, OutboxState, RECEIPT_FILE};

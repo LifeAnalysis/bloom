@@ -53,7 +53,11 @@ if "$checker" --require-clean >"$work/strict.out" 2>&1; then
 fi
 grep -F 'forbidden production Machine dependency in bloom-default: bloom-keystore' \
   "$work/strict.out" >/dev/null
-grep -F 'forbidden authority-restoring production feature remains' \
+if grep -F 'forbidden authority-restoring production feature remains' \
   "$work/strict.out" >/dev/null
+then
+  echo "removed Machine authority feature is still present" >&2
+  exit 1
+fi
 
 echo "Machine authority boundary M0 tests passed"

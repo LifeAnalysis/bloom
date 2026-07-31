@@ -5,15 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "local-integration")]
-pub mod ceremony_server;
 pub mod ipc;
-#[cfg(any(test, feature = "local-integration"))]
-pub mod registration;
-#[cfg(any(test, feature = "local-integration"))]
-pub mod sealed_ceremony;
-#[cfg(any(test, feature = "local-integration"))]
-pub mod sign_hash;
 
 mod ens_resolver;
 mod price_oracle;
@@ -26,32 +18,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
-#[cfg(all(test, feature = "unsafe-debug-signer"))]
-use alloy::signers::SignerSync;
-#[cfg(feature = "unsafe-debug-signer")]
-use alloy::signers::local::PrivateKeySigner;
-#[cfg(any(test, feature = "local-integration"))]
-use base64::Engine as _;
-#[cfg(any(test, feature = "local-integration"))]
-use bloom_auth::{AuthStore, StoreApprovalVerifier};
 use bloom_auth_api::PETAL_PETAL_ID_PREFIX;
-#[cfg(any(test, feature = "local-integration"))]
-use bloom_auth_api::{
-    AssuranceLevel, CANONICAL_INTENT_HEADER_SCHEMA_V1, CanonicalEnvelope, CanonicalIntentHeader,
-    DaemonGrantTerms, ExecutorKind, PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1, PetalPolicySnapshot,
-    PetalSigningAttestationFacts, PolicyCheckClass, PolicyCheckResult, SealedAction,
-    SealedSignBatchEntry, SignHashRequest, signing_attestation_facts_digest,
-};
 use bloom_evm::{ChainClient, ChainRegistry};
 
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
-use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
-use bloom_keystore::Keystore;
-#[cfg(any(test, feature = "local-integration"))]
-use bloom_keystore::KeystoreApprovalSignatureVerifier;
-#[cfg(any(test, feature = "local-integration"))]
-use bloom_keystore::petal_host::SignerCache as LegacyCache;
 use bloom_machine_client::{
     CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient,
     TrustedPetalSignRequest, WalletProjectionReader,
@@ -65,8 +36,6 @@ use bloom_petals::{
     HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy,
     PayloadSignRequest, PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignOutcome,
 };
-#[cfg(any(test, feature = "local-integration"))]
-use bloom_petals::{SignBatchOutcome, SignBatchRequest, SignRequest};
 use bloom_prices::PricesClient;
 use bloom_proto::audit::AuditRecord;
 use bloom_proto::{
@@ -80,99 +49,24 @@ use bloom_revert::{
 use bloom_tx::DynPriceOracle;
 use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxState};
 use bloom_tx::tx_engine::{Eip1559FeeOverrides, TxEngine};
-#[cfg(any(test, feature = "local-integration"))]
-use bloom_vfs::AuthServices as LegacyAuthority;
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
-    AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, HyperliquidHandler,
-    OutboxHandler, PetalKeyRequestsHandler, PricesHandler, RequestsHandler, SimulateHandler,
-    StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
+    AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, OutboxHandler,
+    PetalKeyRequestsHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler,
+    ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::{
     BrokerExactPayloadSigner, FileOperationIndex, OperationIndex, PathCache, Vfs, VfsPath,
 };
 use bloom_watch::{WatchExecutor, WatchRegistry};
 use futures::StreamExt;
-#[cfg(any(test, feature = "local-integration"))]
-use rand::RngCore;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
-#[cfg(any(test, feature = "local-integration"))]
-mod embedded_authority_constants {
-    pub(super) const PETAL_ACTION_TTL_MS: u64 = 120_000;
-    pub(super) const MAX_ACTIVE_PETAL_ACTION_IDENTITIES: usize = 4_096;
-    pub(super) const PETAL_SIGNING_SUBJECT_KIND: &str = "petal_sign_hash";
-    pub(super) const PETAL_SIGNING_SUBJECT_SCHEMA_V1: &str = "bloom.petal.sign_hash_subject.v1";
-    pub(super) const PETAL_SIGNING_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash.action.v1";
-    pub(super) const PETAL_SIGNING_BATCH_ACTION_DOMAIN: &[u8] =
-        b"bloom.petal.sign_hash_batch.action.v1";
-    pub(super) const MAX_PETAL_SIGN_BATCH: usize = 16;
-}
-#[cfg(any(test, feature = "local-integration"))]
-use embedded_authority_constants::*;
-
-#[cfg(any(test, feature = "local-integration"))]
-#[derive(Clone)]
-struct PetalActionIdentity {
-    action_id: String,
-    expires_ms: u64,
-}
-
-#[cfg(any(test, feature = "local-integration"))]
-#[derive(Default)]
-struct PetalActionIdentityCache {
-    entries: std::collections::HashMap<[u8; 32], PetalActionIdentity>,
-}
-
-#[cfg(any(test, feature = "local-integration"))]
-impl PetalActionIdentityCache {
-    /// Keep one request identity for the challenge's complete live interval.
-    /// Expiry remains part of the action id, so the same scoped request gets a
-    /// fresh identity in its next lifecycle and cannot revive an old grant.
-    /// The fixed capacity fails closed rather than evicting a live approval.
-    fn resolve(
-        &mut self,
-        domain: &[u8],
-        action_id_prefix: &str,
-        fingerprint: &[u8],
-        now_ms: u64,
-    ) -> Result<PetalActionIdentity, HostError> {
-        self.entries
-            .retain(|_, identity| identity.expires_ms > now_ms);
-
-        let mut request_hasher = blake3::Hasher::new();
-        request_hasher.update(domain);
-        request_hasher.update(fingerprint);
-        let request_key = *request_hasher.finalize().as_bytes();
-        if let Some(identity) = self.entries.get(&request_key) {
-            return Ok(identity.clone());
-        }
-        if self.entries.len() >= MAX_ACTIVE_PETAL_ACTION_IDENTITIES {
-            return Err(HostError::Backend(
-                "too many active petal signing approval identities".into(),
-            ));
-        }
-
-        let expires_ms = now_ms
-            .checked_add(PETAL_ACTION_TTL_MS)
-            .ok_or_else(|| HostError::Backend("petal action expiry overflow".into()))?;
-        let mut action_hasher = blake3::Hasher::new();
-        action_hasher.update(domain);
-        action_hasher.update(fingerprint);
-        action_hasher.update(&expires_ms.to_be_bytes());
-        let identity = PetalActionIdentity {
-            action_id: format!("{action_id_prefix}{}", action_hasher.finalize().to_hex()),
-            expires_ms,
-        };
-        self.entries.insert(request_key, identity.clone());
-        Ok(identity)
-    }
-}
 
 /// Concrete adapter that bridges the Machine-owned central outbox and
 /// purpose-specific operation index for the EVM tx-engine outbox.
@@ -263,8 +157,6 @@ pub enum DaemonError {
     Home(#[from] bloom_proto::HomeError),
     #[error("config: {0}")]
     Config(#[from] bloom_proto::ConfigError),
-    #[error("keystore: {0}")]
-    Keystore(String),
     #[error("chain: {0}")]
     Chain(#[from] bloom_evm::ChainError),
     #[error("outbox: {0}")]
@@ -281,19 +173,12 @@ struct DaemonPetalHost {
     vfs: Arc<LateVfsHost>,
     http: reqwest::Client,
     audit: Arc<AuditLog>,
-    #[cfg(any(test, feature = "local-integration"))]
-    auth_services: LegacyAuthority,
     tx_outbox: Option<PetalTxOutbox>,
     tx_stage_lock: tokio::sync::Mutex<()>,
-    #[cfg(any(test, feature = "local-integration"))]
-    sign_batch_lock: tokio::sync::Mutex<()>,
-    #[cfg(any(test, feature = "local-integration"))]
-    petal_action_identities: std::sync::Mutex<PetalActionIdentityCache>,
     broker: Option<MachineBrokerClient>,
+    provenance_catalog: Option<bloom_triad_protocol::ProvenanceCatalog>,
     petal_key_state_root: Option<PathBuf>,
     petal_key_lock: tokio::sync::Mutex<()>,
-    #[cfg(feature = "unsafe-debug-signer")]
-    unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
 }
 
 const PETAL_KEY_STATE_SCHEMA: &str = "bloom.machine.petal-key-request.v1";
@@ -309,6 +194,10 @@ struct PetalKeyRequestState {
     request_id: String,
     scope: bloom_triad_protocol::PetalKeyScope,
     scope_digest: bloom_triad_protocol::Digest32,
+    /// Digest of the installer-signed provenance record that Broker will
+    /// independently require for a Petal-scoped Sealed Approval. This is
+    /// public authorization metadata, not a capability or secret.
+    provenance_digest: Option<bloom_triad_protocol::Digest32>,
     status: String,
     ceremony_url: Option<String>,
     ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64,
@@ -395,26 +284,13 @@ impl DaemonPetalHost {
             vfs,
             http,
             audit,
-            #[cfg(any(test, feature = "local-integration"))]
-            auth_services: LegacyAuthority::default(),
             tx_outbox: None,
             tx_stage_lock: tokio::sync::Mutex::new(()),
-            #[cfg(any(test, feature = "local-integration"))]
-            sign_batch_lock: tokio::sync::Mutex::new(()),
-            #[cfg(any(test, feature = "local-integration"))]
-            petal_action_identities: std::sync::Mutex::new(PetalActionIdentityCache::default()),
             broker: None,
+            provenance_catalog: None,
             petal_key_state_root: None,
             petal_key_lock: tokio::sync::Mutex::new(()),
-            #[cfg(feature = "unsafe-debug-signer")]
-            unsafe_debug_signer: None,
         }
-    }
-
-    #[cfg(any(test, feature = "local-integration"))]
-    fn with_legacy_authority(mut self, auth_services: LegacyAuthority) -> Self {
-        self.auth_services = auth_services;
-        self
     }
 
     fn with_tx_outbox(mut self, tx_outbox: PetalTxOutbox) -> Self {
@@ -424,6 +300,14 @@ impl DaemonPetalHost {
 
     fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
         self.broker = broker;
+        self
+    }
+
+    fn with_provenance_catalog(
+        mut self,
+        provenance_catalog: Option<bloom_triad_protocol::ProvenanceCatalog>,
+    ) -> Self {
+        self.provenance_catalog = provenance_catalog;
         self
     }
 
@@ -506,20 +390,6 @@ impl DaemonPetalHost {
         Ok(())
     }
 
-    #[cfg(feature = "unsafe-debug-signer")]
-    fn with_unsafe_debug_signer(mut self, wallet: String, signer: Arc<PrivateKeySigner>) -> Self {
-        self.unsafe_debug_signer = Some((wallet, signer));
-        self
-    }
-
-    #[cfg(all(test, feature = "unsafe-debug-signer"))]
-    fn unsafe_debug_signer(&self, wallet: &str) -> Option<&Arc<PrivateKeySigner>> {
-        self.unsafe_debug_signer
-            .as_ref()
-            .filter(|(configured, _)| configured == wallet)
-            .map(|(_, signer)| signer)
-    }
-
     fn petal_execution_origin(
         context: &PetalRouteContext,
     ) -> Result<bloom_proto::plan::ExecutionOrigin, HostError> {
@@ -537,398 +407,6 @@ impl DaemonPetalHost {
             petal_digest: context.package_hash.clone(),
             petal_version: "v1-package".into(),
         })
-    }
-
-    #[cfg(any(test, feature = "local-integration"))]
-    fn validate_petal_signing_scope(
-        req: &SignRequest,
-        context: &PetalRouteContext,
-    ) -> Result<std::collections::BTreeMap<String, String>, HostError> {
-        if req.wallet.trim().is_empty() || req.purpose.trim().is_empty() {
-            return Err(HostError::Invalid(
-                "sign-hash wallet and intent must be non-empty".into(),
-            ));
-        }
-        if context.petal_root.trim().is_empty()
-            || context.route_id.trim().is_empty()
-            || !bloom_petals::store::is_valid_hex_hash(&context.package_hash)
-        {
-            return Err(HostError::Invalid(
-                "trusted Petal route context is incomplete or has an invalid package hash".into(),
-            ));
-        }
-        if !matches!(context.op.as_str(), "lookup" | "list" | "read" | "write") {
-            return Err(HostError::Invalid(
-                "trusted Petal route context has an invalid operation".into(),
-            ));
-        }
-        let mut params = std::collections::BTreeMap::new();
-        for (key, value) in &context.params {
-            if params.insert(key.clone(), value.clone()).is_some() {
-                return Err(HostError::Invalid(
-                    "trusted Petal route context has duplicate parameter names".into(),
-                ));
-            }
-        }
-        Ok(params)
-    }
-
-    #[cfg(any(test, feature = "local-integration"))]
-    fn petal_action(
-        &self,
-        req: &SignRequest,
-        context: &PetalRouteContext,
-        now_ms: u64,
-    ) -> Result<(SealedAction, bloom_auth_api::SigningAttestation), HostError> {
-        self.petal_action_with_identity(req, context, now_ms, None)
-    }
-
-    #[cfg(any(test, feature = "local-integration"))]
-    fn petal_action_with_identity(
-        &self,
-        req: &SignRequest,
-        context: &PetalRouteContext,
-        now_ms: u64,
-        identity: Option<&PetalActionIdentity>,
-    ) -> Result<(SealedAction, bloom_auth_api::SigningAttestation), HostError> {
-        let params = Self::validate_petal_signing_scope(req, context)?;
-
-        let hash_hex = format!("0x{}", hex::encode(req.hash32));
-        let fingerprint = serde_json::to_vec(&serde_json::json!({
-            "wallet": req.wallet,
-            "hash_hex": hash_hex,
-            "intent": req.purpose,
-            "petal_root": context.petal_root,
-            "package_hash": context.package_hash,
-            "route_id": context.route_id,
-            "op": context.op,
-            "path": context.path,
-            "params": params,
-            "actor": context.actor,
-        }))
-        .map_err(|e| HostError::Backend(format!("encode petal action fingerprint: {e}")))?;
-        let identity = match identity {
-            Some(identity) => identity.clone(),
-            None => self
-                .petal_action_identities
-                .lock()
-                .map_err(|e| HostError::Backend(format!("lock petal action identities: {e}")))?
-                .resolve(
-                    PETAL_SIGNING_ACTION_DOMAIN,
-                    "appsign-",
-                    &fingerprint,
-                    now_ms,
-                )?,
-        };
-        let action_id = identity.action_id;
-        let expires_ms = identity.expires_ms;
-        let petal_id = format!("{PETAL_PETAL_ID_PREFIX}{}", context.petal_root);
-        let header = CanonicalIntentHeader {
-            schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
-            wallet: req.wallet.clone(),
-            surface: "petals".into(),
-            action_id: action_id.clone(),
-            petal_id: petal_id.clone(),
-            petal_digest: context.package_hash.clone(),
-            petal_version: "v1-package".into(),
-            executor_kind: ExecutorKind::Wasm,
-            network: "local".into(),
-            account: req.wallet.clone(),
-            action_kind: "petal.sign_hash".into(),
-            value_movement: true,
-            authority_change: true,
-            expires_ms,
-        };
-        let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Standard);
-        terms.max_ttl_secs = PETAL_ACTION_TTL_MS / 1_000;
-        terms.max_signatures = 1;
-        terms.allowed_sign_intents = vec![req.purpose.clone()];
-        terms.extra.insert(
-            "required.signing_hash".into(),
-            serde_json::Value::String(hash_hex.clone()),
-        );
-
-        let mut snapshot = PetalPolicySnapshot::minimal(&header);
-        snapshot.config.insert(
-            "petal_root".into(),
-            serde_json::Value::String(context.petal_root.clone()),
-        );
-        snapshot.config.insert(
-            "package_hash".into(),
-            serde_json::Value::String(context.package_hash.clone()),
-        );
-        snapshot.config.insert(
-            "route_id".into(),
-            serde_json::Value::String(context.route_id.clone()),
-        );
-        let policy_snapshot_digest = snapshot
-            .petal_policy_digest()
-            .map_err(|e| HostError::Backend(format!("digest petal policy snapshot: {e}")))?;
-        let facts = PetalSigningAttestationFacts {
-            facts_schema: PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
-            action_id,
-            wallet: req.wallet.clone(),
-            surface: "petals".into(),
-            petal_id,
-            petal_digest: context.package_hash.clone(),
-            petal_version: "v1-package".into(),
-            petal_root: context.petal_root.clone(),
-            package_hash: context.package_hash.clone(),
-            route_id: context.route_id.clone(),
-            op: context.op.clone(),
-            path: context.path.clone(),
-            params,
-            actor: context.actor.clone(),
-            intent: req.purpose.clone(),
-            signing_hash: hash_hex,
-            policy_snapshot_digest,
-        };
-        let facts_map = facts
-            .to_facts_map()
-            .map_err(|e| HostError::Backend(format!("encode petal signing facts: {e}")))?;
-        let facts_digest = signing_attestation_facts_digest(&facts_map)
-            .map_err(|e| HostError::Backend(format!("digest petal signing facts: {e}")))?;
-        terms.extra.insert(
-            "required.attestation_facts_digest".into(),
-            serde_json::Value::String(facts_digest),
-        );
-        let attestation = facts
-            .signing_attestation()
-            .map_err(|e| HostError::Backend(format!("build petal signing attestation: {e}")))?;
-        let subject = serde_json::to_vec(&facts)
-            .map_err(|e| HostError::Backend(format!("encode petal signing subject: {e}")))?;
-        let envelope = CanonicalEnvelope::new(
-            header,
-            PETAL_SIGNING_SUBJECT_KIND,
-            PETAL_SIGNING_SUBJECT_SCHEMA_V1,
-            subject,
-        );
-        let plan = format!(
-            "# Approve Petal signature\n\nPetal: `{}`\nPackage: `{}`\nRoute: `{}` {} `{}`\nWallet: `{}`\nIntent: `{}`\nHash: `{}`\n",
-            context.petal_root,
-            context.package_hash,
-            context.route_id,
-            context.op,
-            context.path,
-            req.wallet,
-            req.purpose,
-            attestation
-                .facts
-                .get("signing_hash")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default(),
-        );
-        let action = SealedAction::new(
-            envelope,
-            plan,
-            vec![PolicyCheckResult {
-                rule_id: "petal.route_provenance".into(),
-                rule_class: PolicyCheckClass::Informational,
-                outcome: "pass".into(),
-                message: "signature request is bound to the resolved Petal package and route"
-                    .into(),
-                step_up_ceiling: None,
-            }],
-            terms,
-            snapshot,
-            now_ms,
-        )
-        .map_err(|e| HostError::Backend(format!("seal petal signing action: {e}")))?;
-        Ok((action, attestation))
-    }
-
-    #[cfg(any(test, feature = "local-integration"))]
-    fn petal_batch_action(
-        &self,
-        requests: &[SignRequest],
-        now_ms: u64,
-    ) -> Result<(SealedAction, Vec<bloom_auth_api::SigningAttestation>), HostError> {
-        if requests.is_empty() || requests.len() > MAX_PETAL_SIGN_BATCH {
-            return Err(HostError::Invalid(format!(
-                "petal signing batch requires 1..={MAX_PETAL_SIGN_BATCH} requests"
-            )));
-        }
-        let first_context = requests[0].context.as_ref().ok_or_else(|| {
-            HostError::Denied("signing batch requires trusted Petal route context".into())
-        })?;
-        let first_wallet = requests[0].wallet.as_str();
-        let mut seen = std::collections::BTreeSet::new();
-        for request in requests {
-            if request.wallet != first_wallet || request.context.as_ref() != Some(first_context) {
-                return Err(HostError::Invalid(
-                    "signing batch entries must share one wallet and trusted route context".into(),
-                ));
-            }
-            let tuple = (
-                request.wallet.clone(),
-                request.hash32,
-                request.purpose.clone(),
-            );
-            if !seen.insert(tuple) {
-                return Err(HostError::Invalid(
-                    "signing batch contains a duplicate wallet/hash/intent entry".into(),
-                ));
-            }
-            Self::validate_petal_signing_scope(request, first_context)?;
-        }
-
-        let params = Self::validate_petal_signing_scope(&requests[0], first_context)?;
-        let request_fingerprint: Vec<_> = requests
-            .iter()
-            .map(|request| {
-                serde_json::json!({
-                    "wallet": request.wallet,
-                    "hash_hex": format!("0x{}", hex::encode(request.hash32)),
-                    "intent": request.purpose,
-                })
-            })
-            .collect();
-        let fingerprint = serde_json::to_vec(&serde_json::json!({
-            "requests": request_fingerprint,
-            "petal_root": first_context.petal_root,
-            "package_hash": first_context.package_hash,
-            "route_id": first_context.route_id,
-            "op": first_context.op,
-            "path": first_context.path,
-            "params": params,
-            "actor": first_context.actor,
-        }))
-        .map_err(|e| HostError::Backend(format!("encode petal batch fingerprint: {e}")))?;
-        let identity = self
-            .petal_action_identities
-            .lock()
-            .map_err(|e| HostError::Backend(format!("lock petal action identities: {e}")))?
-            .resolve(
-                PETAL_SIGNING_BATCH_ACTION_DOMAIN,
-                "appsign-batch-",
-                &fingerprint,
-                now_ms,
-            )?;
-        let action_id = identity.action_id.clone();
-        let expires_ms = identity.expires_ms;
-
-        let mut individual = Vec::with_capacity(requests.len());
-        for request in requests {
-            individual.push(self.petal_action_with_identity(
-                request,
-                first_context,
-                now_ms,
-                Some(&identity),
-            )?);
-        }
-
-        let mut attestations = Vec::with_capacity(individual.len());
-        let mut entries = Vec::with_capacity(individual.len());
-        for ((_, attestation), request) in individual.into_iter().zip(requests) {
-            let mut facts = PetalSigningAttestationFacts::from_attestation(&attestation)
-                .map_err(|e| HostError::Backend(format!("decode petal attestation: {e}")))?;
-            facts.action_id = action_id.clone();
-            let attestation = facts
-                .signing_attestation()
-                .map_err(|e| HostError::Backend(format!("build batch attestation: {e}")))?;
-            entries.push(SealedSignBatchEntry {
-                wallet: request.wallet.clone(),
-                intent: request.purpose.clone(),
-                hash_hex: format!("0x{}", hex::encode(request.hash32)),
-                attestation_facts_digest: signing_attestation_facts_digest(&attestation.facts)
-                    .map_err(|e| HostError::Backend(format!("digest batch attestation: {e}")))?,
-            });
-            attestations.push(attestation);
-        }
-
-        let petal_id = format!("{PETAL_PETAL_ID_PREFIX}{}", first_context.petal_root);
-        let header = CanonicalIntentHeader {
-            schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
-            wallet: first_wallet.into(),
-            surface: "petals".into(),
-            action_id: action_id.clone(),
-            petal_id,
-            petal_digest: first_context.package_hash.clone(),
-            petal_version: "v1-package".into(),
-            executor_kind: ExecutorKind::Wasm,
-            network: "local".into(),
-            account: first_wallet.into(),
-            action_kind: "petal.sign_hash_batch".into(),
-            value_movement: true,
-            authority_change: true,
-            expires_ms,
-        };
-        let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Hardened);
-        terms.max_ttl_secs = PETAL_ACTION_TTL_MS / 1_000;
-        terms.max_signatures = u32::try_from(entries.len())
-            .map_err(|_| HostError::Invalid("signing batch is too large".into()))?;
-        terms.allowed_sign_intents = requests
-            .iter()
-            .map(|request| request.purpose.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        terms.extra.insert(
-            "required.signing_requests".into(),
-            serde_json::to_value(&entries)
-                .map_err(|e| HostError::Backend(format!("encode sealed signing batch: {e}")))?,
-        );
-        let mut snapshot = PetalPolicySnapshot::minimal(&header);
-        snapshot.config.insert(
-            "petal_root".into(),
-            serde_json::Value::String(first_context.petal_root.clone()),
-        );
-        snapshot.config.insert(
-            "package_hash".into(),
-            serde_json::Value::String(first_context.package_hash.clone()),
-        );
-        snapshot.config.insert(
-            "route_id".into(),
-            serde_json::Value::String(first_context.route_id.clone()),
-        );
-        let subject = serde_json::to_vec(&serde_json::json!({
-            "action_id": action_id,
-            "requests": entries,
-        }))
-        .map_err(|e| HostError::Backend(format!("encode petal batch subject: {e}")))?;
-        let plan_entries = requests
-            .iter()
-            .enumerate()
-            .map(|(index, request)| {
-                format!(
-                    "{}. intent `{}`; hash `0x{}`",
-                    index + 1,
-                    request.purpose,
-                    hex::encode(request.hash32)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let action = SealedAction::new(
-            CanonicalEnvelope::new(
-                header,
-                "petal_sign_hash_batch",
-                "bloom.petal.sign_hash_batch_subject.v1",
-                subject,
-            ),
-            format!(
-                "# Approve Petal signature batch\n\nPetal: `{}`\nPackage: `{}`\nRoute: `{}` {} `{}`\nWallet: `{}`\n\n{}\n",
-                first_context.petal_root,
-                first_context.package_hash,
-                first_context.route_id,
-                first_context.op,
-                first_context.path,
-                first_wallet,
-                plan_entries,
-            ),
-            vec![PolicyCheckResult {
-                rule_id: "petal.route_provenance".into(),
-                rule_class: PolicyCheckClass::Informational,
-                outcome: "pass".into(),
-                message: "ordered signature batch is bound to the resolved Petal package and route".into(),
-                step_up_ceiling: None,
-            }],
-            terms,
-            snapshot,
-            now_ms,
-        )
-        .map_err(|e| HostError::Backend(format!("seal petal signing batch: {e}")))?;
-        Ok((action, attestations))
     }
 
     fn audit_http_fetch(
@@ -964,29 +442,6 @@ impl DaemonPetalHost {
             digest: String::new(),
         }) {
             warn!(error = %e, "petal.http_fetch.audit_append_failed");
-        }
-    }
-
-    #[cfg(any(test, feature = "local-integration"))]
-    fn audit_sign_hash(&self, req: &SignRequest, outcome: &str, error: Option<&str>) {
-        let mut data = serde_json::json!({
-            "purpose": req.purpose.as_str(),
-            "hash32": hex::encode(req.hash32),
-            "outcome": outcome,
-        });
-        if let Some(error) = error {
-            data["error"] = serde_json::json!(error);
-        }
-        if let Err(e) = self.audit.append(AuditRecord {
-            ts_ms: 0,
-            kind: "petal.sign_hash".into(),
-            wallet: Some(req.wallet.clone()),
-            chain: None,
-            data,
-            prev: String::new(),
-            digest: String::new(),
-        }) {
-            warn!(wallet = %req.wallet, error = %e, "petal.sign_hash.audit_append_failed");
         }
     }
 }
@@ -1099,6 +554,17 @@ impl PetalHost for DaemonPetalHost {
         let scope_digest = scope
             .digest()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let provenance_subject = bloom_triad_protocol::ProvenanceSubject::Petal {
+            package_hash: scope.package_hash.clone(),
+            route: scope.route.clone(),
+        };
+        let provenance_digest = self
+            .provenance_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.record(&provenance_subject))
+            .map(|record| record.digest())
+            .transpose()
+            .map_err(|error| HostError::Denied(error.to_string()))?;
         let path = self.petal_key_state_path(context, &req.request_id)?;
 
         if let Some(mut stored) = Self::read_petal_key_state(&path)? {
@@ -1106,6 +572,7 @@ impl PetalHost for DaemonPetalHost {
                 || stored.request_id != req.request_id
                 || stored.scope != scope
                 || stored.scope_digest != scope_digest
+                || stored.provenance_digest != provenance_digest
                 || !matches!(
                     (
                         stored.status.as_str(),
@@ -1230,6 +697,7 @@ impl PetalHost for DaemonPetalHost {
             request_id: req.request_id,
             scope,
             scope_digest,
+            provenance_digest,
             status: "awaiting_user".into(),
             ceremony_url: Some(prepared.ceremony_url),
             ceremony_expires_at_ms: prepared.ceremony_expires_at_ms,
@@ -1406,235 +874,6 @@ impl PetalHost for DaemonPetalHost {
             });
         }
         unreachable!("bounded redirect loop returns before exhausting iterator")
-    }
-
-    #[cfg(any(test, feature = "local-integration"))]
-    async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
-        match self.sign_hash_outcome(req).await? {
-            SignOutcome::Signature(signature) => Ok(signature),
-            SignOutcome::ApprovalRequired(approval) => Err(HostError::Denied(format!(
-                "Sealed Approval required for Petal sign_hash; action_id={}; ceremony_url={}",
-                approval.action_id, approval.ceremony_url
-            ))),
-        }
-    }
-
-    #[cfg(any(test, feature = "local-integration"))]
-    async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
-        let Some(context) = req.context.as_ref() else {
-            let err = HostError::Denied(
-                "Petal sign_hash requires trusted Petal route context and a Sealed Approval grant"
-                    .into(),
-            );
-            self.audit_sign_hash(&req, "denied", Some(&err.to_string()));
-            return Err(err);
-        };
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
-        let (action, attestation) = match self.petal_action(&req, context, now_ms) {
-            Ok(value) => value,
-            Err(err) => {
-                self.audit_sign_hash(&req, "denied", Some(&err.to_string()));
-                return Err(err);
-            }
-        };
-        #[cfg(feature = "unsafe-debug-signer")]
-        if let Some(signer) = self.unsafe_debug_signer(&req.wallet) {
-            tracing::warn!(
-                wallet = %req.wallet,
-                action_id = %action.action_id(),
-                "petal.unsafe_debug_signing_bypass"
-            );
-            let signature = signer
-                .sign_hash_sync(&alloy::primitives::B256::from(req.hash32))
-                .map_err(|e| HostError::Backend(format!("debug sign hash: {e}")))?
-                .as_bytes()
-                .to_vec();
-            self.audit_sign_hash(&req, "unsafe_debug_ok", None);
-            return Ok(SignOutcome::Signature(signature));
-        }
-        let active_grant = self
-            .auth_services
-            .require_grant_store()
-            .map_err(|e| HostError::Backend(e.to_string()))?
-            .get_active(
-                &req.wallet,
-                action.action_id(),
-                action.petal_id(),
-                action.petal_digest(),
-                now_ms,
-            )
-            .await
-            .map_err(|e| HostError::Backend(format!("lookup petal sealed grant: {e}")))?;
-        if active_grant.is_none() {
-            let writer = self
-                .auth_services
-                .require_writer()
-                .map_err(|e| HostError::Backend(e.to_string()))?;
-            writer
-                .stage_action(action.clone(), now_ms)
-                .await
-                .map_err(|e| HostError::Backend(format!("stage petal sealed action: {e}")))?;
-            let mut nonce = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut nonce);
-            let challenge = writer
-                .issue_challenge(
-                    action.surface(),
-                    action.action_id(),
-                    &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce),
-                    action.expires_ms,
-                    now_ms,
-                )
-                .await
-                .map_err(|e| HostError::Backend(format!("issue petal approval challenge: {e}")))?
-                .with_local_ceremony_url();
-            let ceremony_url = challenge
-                .ceremony_url
-                .unwrap_or_else(|| "unavailable".into());
-            let approval = SignOutcome::ApprovalRequired(ApprovalRequired {
-                action_id: action.action_id().to_string(),
-                ceremony_url,
-                expires_ms: action.expires_ms,
-            });
-            self.audit_sign_hash(&req, "approval_required", None);
-            return Ok(approval);
-        }
-
-        let signature = self
-            .auth_services
-            .require_petal_host()
-            .map_err(|e| HostError::Backend(e.to_string()))?
-            .sign_hash(
-                SignHashRequest {
-                    wallet: req.wallet.clone(),
-                    action_id: action.action_id().to_string(),
-                    intent: req.purpose.clone(),
-                    hash_hex: format!("0x{}", hex::encode(req.hash32)),
-                },
-                &attestation,
-                now_ms,
-            )
-            .await
-            .map_err(|e| HostError::Denied(format!("petal sealed signing denied: {e}")))?;
-        let signature = base64::engine::general_purpose::STANDARD
-            .decode(signature.signature_b64)
-            .map_err(|e| HostError::Backend(format!("decode petal signature: {e}")))?;
-        if signature.len() != 65 {
-            let err = HostError::Backend("petal signer returned a non-65-byte signature".into());
-            self.audit_sign_hash(&req, "error", Some(&err.to_string()));
-            return Err(err);
-        }
-        self.audit_sign_hash(&req, "ok", None);
-        Ok(SignOutcome::Signature(signature))
-    }
-
-    #[cfg(any(test, feature = "local-integration"))]
-    async fn sign_hashes_outcome(
-        &self,
-        req: SignBatchRequest,
-    ) -> Result<SignBatchOutcome, HostError> {
-        let _guard = self.sign_batch_lock.lock().await;
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
-        let (action, attestations) = self.petal_batch_action(&req.requests, now_ms)?;
-        #[cfg(feature = "unsafe-debug-signer")]
-        if let Some(signer) = self.unsafe_debug_signer(action.wallet()) {
-            tracing::warn!(
-                wallet = %action.wallet(),
-                action_id = %action.action_id(),
-                count = req.requests.len(),
-                "petal.unsafe_debug_batch_signing_bypass"
-            );
-            let mut signatures = Vec::with_capacity(req.requests.len());
-            for request in &req.requests {
-                signatures.push(
-                    signer
-                        .sign_hash_sync(&alloy::primitives::B256::from(request.hash32))
-                        .map_err(|e| HostError::Backend(format!("debug batch sign hash: {e}")))?
-                        .as_bytes()
-                        .to_vec(),
-                );
-            }
-            return Ok(SignBatchOutcome::Signatures(signatures));
-        }
-        let active_grant = self
-            .auth_services
-            .require_grant_store()
-            .map_err(|e| HostError::Backend(e.to_string()))?
-            .get_active(
-                action.wallet(),
-                action.action_id(),
-                action.petal_id(),
-                action.petal_digest(),
-                now_ms,
-            )
-            .await
-            .map_err(|e| HostError::Backend(format!("lookup petal batch grant: {e}")))?;
-        if active_grant.is_none() {
-            let writer = self
-                .auth_services
-                .require_writer()
-                .map_err(|e| HostError::Backend(e.to_string()))?;
-            writer
-                .stage_action(action.clone(), now_ms)
-                .await
-                .map_err(|e| HostError::Backend(format!("stage petal signing batch: {e}")))?;
-            let mut nonce = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut nonce);
-            let challenge = writer
-                .issue_challenge(
-                    action.surface(),
-                    action.action_id(),
-                    &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce),
-                    action.expires_ms,
-                    now_ms,
-                )
-                .await
-                .map_err(|e| HostError::Backend(format!("issue batch challenge: {e}")))?
-                .with_local_ceremony_url();
-            return Ok(SignBatchOutcome::ApprovalRequired(ApprovalRequired {
-                action_id: action.action_id().into(),
-                ceremony_url: challenge
-                    .ceremony_url
-                    .unwrap_or_else(|| "unavailable".into()),
-                expires_ms: action.expires_ms,
-            }));
-        }
-
-        let requests = req
-            .requests
-            .iter()
-            .map(|request| SignHashRequest {
-                wallet: request.wallet.clone(),
-                action_id: action.action_id().into(),
-                intent: request.purpose.clone(),
-                hash_hex: format!("0x{}", hex::encode(request.hash32)),
-            })
-            .collect();
-        let sealed = self
-            .auth_services
-            .require_petal_host()
-            .map_err(|e| HostError::Backend(e.to_string()))?
-            .sign_hash_batch(requests, &attestations, now_ms)
-            .await
-            .map_err(|e| HostError::Denied(format!("petal sealed batch signing denied: {e}")))?;
-        let mut signatures = Vec::with_capacity(sealed.len());
-        for signature in sealed {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(signature.signature_b64)
-                .map_err(|e| HostError::Backend(format!("decode batch signature: {e}")))?;
-            if bytes.len() != 65 {
-                return Err(HostError::Backend(
-                    "petal batch signer returned a non-65-byte signature".into(),
-                ));
-            }
-            signatures.push(bytes);
-        }
-        Ok(SignBatchOutcome::Signatures(signatures))
     }
 
     async fn sign_payload_outcome(
@@ -2255,15 +1494,10 @@ pub struct Daemon {
     pub home: HomeDir,
     pub config: Config,
     pub chains: ChainRegistry,
-    pub keystore: Keystore,
     pub tx_engine: TxEngine,
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
-    #[cfg(any(test, feature = "local-integration"))]
-    pub auth_services: LegacyAuthority,
-    #[cfg(any(test, feature = "local-integration"))]
-    pub signer_cache: Arc<LegacyCache>,
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
@@ -2468,64 +1702,9 @@ impl Daemon {
             }
         }
 
-        let keystore =
-            Keystore::new(home.keystore_dir()).map_err(|e| DaemonError::Keystore(e.to_string()))?;
-
-        #[cfg(feature = "unsafe-debug-signer")]
-        let unsafe_debug_signer = match (
-            std::env::var("BLOOM_UNSAFE_DEBUG_SIGNER_WALLET").ok(),
-            std::env::var("BLOOM_UNSAFE_DEBUG_PRIVATE_KEY_FILE").ok(),
-        ) {
-            (Some(wallet), Some(path)) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
-                    if mode != 0o600 {
-                        return Err(DaemonError::Keystore(format!(
-                            "unsafe debug private-key file must have mode 0600, got {mode:04o}"
-                        )));
-                    }
-                }
-                let key = std::fs::read_to_string(&path)?;
-                let signer: PrivateKeySigner = key.trim().parse().map_err(|e| {
-                    DaemonError::Keystore(format!("parse unsafe debug private key: {e}"))
-                })?;
-                let expected = keystore
-                    .info(&wallet)
-                    .map_err(|e| DaemonError::Keystore(e.to_string()))?
-                    .address;
-                if signer.address() != expected {
-                    return Err(DaemonError::Keystore(format!(
-                        "unsafe debug signer address {} does not match wallet {wallet} ({expected})",
-                        signer.address()
-                    )));
-                }
-                let signer = Arc::new(signer);
-                keystore
-                    .install_unsafe_debug_signer(&wallet, signer.clone())
-                    .map_err(|e| DaemonError::Keystore(e.to_string()))?;
-                warn!(
-                    wallet = %wallet,
-                    address = %expected,
-                    "UNSAFE DEBUG SIGNER ENABLED: interactive approval ceremonies are bypassed"
-                );
-                Some((wallet, signer))
-            }
-            (None, None) => None,
-            _ => {
-                return Err(DaemonError::Keystore(
-                    "BLOOM_UNSAFE_DEBUG_SIGNER_WALLET and BLOOM_UNSAFE_DEBUG_PRIVATE_KEY_FILE must be set together"
-                        .into(),
-                ));
-            }
-        };
-
         // The central outbox's idempotent identity map is Machine state, not
         // approval state. Keep it in a schema that cannot carry grants,
         // challenges, credentials, or signing secrets.
-        #[cfg(any(test, feature = "local-integration"))]
-        let auth_db_path = home.root().join("auth").join("auth.sqlite");
         let operation_index: Arc<dyn OperationIndex> = Arc::new(FileOperationIndex::new(
             home.root().join("operations/index.json"),
         ));
@@ -2557,11 +1736,6 @@ impl Daemon {
             (None, None) => None,
             _ => unreachable!("Broker/catalog pairing validated above"),
         };
-        #[cfg(feature = "unsafe-debug-signer")]
-        if let Some((wallet, signer)) = &unsafe_debug_signer {
-            tx_engine = tx_engine.with_unsafe_debug_signer(wallet.clone(), signer.clone());
-        }
-
         // Wire ENS resolver into TxEngine when a mainnet-style chain is
         // configured. We pick the first chain with id 1 / 11155111 / 5 /
         // 17000 (the ENS canonical-registry chains) for resolution.
@@ -2589,46 +1763,6 @@ impl Daemon {
         let audit =
             AuditLog::open(home.audit_path()).map_err(|e| DaemonError::Audit(e.to_string()))?;
         let audit_arc = Arc::new(audit.clone());
-        #[cfg(any(test, feature = "local-integration"))]
-        let (auth_services, signer_cache) = {
-            let auth_store = AuthStore::open(&auth_db_path)
-                .map_err(|e| DaemonError::Audit(format!("auth store: {e}")))?;
-            let auth_verifier = Arc::new(StoreApprovalVerifier::new(
-                auth_store,
-                KeystoreApprovalSignatureVerifier::new(keystore.clone()),
-            ));
-            let grant_store: Arc<dyn bloom_auth_api::GrantStore> =
-                Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
-            let attestation_registry: Arc<dyn bloom_auth_api::SigningAttestationSchemaRegistry> =
-                Arc::new(bloom_auth_api::DefaultAttestationRegistry::new());
-            let signer_cache = Arc::new(LegacyCache::new());
-            let petal_host: Arc<dyn bloom_auth_api::PetalHost> = Arc::new(
-                bloom_keystore::petal_host::KeystorePetalHost::new(
-                    Arc::new(keystore.clone()),
-                    grant_store.clone(),
-                    attestation_registry.clone(),
-                    audit_arc.clone(),
-                )
-                .with_signer_cache(signer_cache.clone()),
-            );
-            let registration_coordinator: Arc<dyn bloom_auth_api::WalletRegistrationCoordinator> =
-                Arc::new(registration::RegistrationCoordinator::new(
-                    keystore.clone(),
-                    auth_verifier.clone(),
-                    audit_arc.clone(),
-                    home.keystore_dir(),
-                ));
-            let auth_services = LegacyAuthority::new(
-                Some(auth_verifier.clone()),
-                Some(auth_verifier.clone()),
-                Some(auth_verifier),
-            )
-            .with_grant_store(grant_store)
-            .with_attestation_registry(attestation_registry)
-            .with_petal_host(petal_host)
-            .with_registration_coordinator(registration_coordinator);
-            (auth_services, signer_cache)
-        };
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
@@ -2781,7 +1915,6 @@ impl Daemon {
         let status_handler = Arc::new(
             StatusHandler::with_backends(
                 chains.clone(),
-                keystore.clone(),
                 tx_engine.clone(),
                 audit_arc.clone(),
                 Some(prices.clone()),
@@ -2795,9 +1928,9 @@ impl Daemon {
                 home.root().to_path_buf(),
                 SystemTime::now(),
                 env!("CARGO_PKG_VERSION"),
+                wallet_projections.clone(),
             )
             .with_mempool_statuses(initial_mempool_statuses)
-            .with_wallet_projections(wallet_projections.clone())
             .with_update_snapshot_fn(Arc::new(move || {
                 // Always produce a snapshot. The VFS renders the
                 // fields that depend on a successful refresh
@@ -2850,6 +1983,7 @@ impl Daemon {
         let petal_vfs_host = Arc::new(LateVfsHost::new());
         let petal_app_host = DaemonPetalHost::new(petal_vfs_host.clone(), audit_arc.clone())
             .with_broker(broker.clone())
+            .with_provenance_catalog(provenance_catalog.clone())
             .with_petal_key_state_root(home.cache_dir().join("petal-key-requests"))
             .with_tx_outbox(PetalTxOutbox {
                 tx_engine: tx_engine.clone(),
@@ -2858,15 +1992,6 @@ impl Daemon {
                 address_book: address_book_arc.clone(),
                 write_permit: home_write_permit.clone(),
             });
-        #[cfg(any(test, feature = "local-integration"))]
-        let petal_app_host = petal_app_host.with_legacy_authority(auth_services.clone());
-        #[cfg(feature = "unsafe-debug-signer")]
-        let petal_app_host = match &unsafe_debug_signer {
-            Some((wallet, signer)) => {
-                petal_app_host.with_unsafe_debug_signer(wallet.clone(), signer.clone())
-            }
-            None => petal_app_host,
-        };
         let petal_app_host = Arc::new(petal_app_host);
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
         let petals_for_docs = petals.clone();
@@ -2902,53 +2027,17 @@ impl Daemon {
                 ) as _,
             );
 
-        let hyperliquid_handler: Option<Arc<HyperliquidHandler>> = if let Some(hl_cfg) =
-            &config.hyperliquid
-        {
-            let hl_url = |raw: &str| match url::Url::parse(raw) {
-                Ok(u) => Some(u),
-                Err(e) => {
-                    warn!(url = %raw, error = %e, "daemon.hyperliquid_url_invalid_using_default");
-                    None
-                }
-            };
-            let mut mainnet = HyperliquidClient::new(HyperliquidNetwork::Mainnet);
-            if let Some(u) = hl_url(&hl_cfg.mainnet_url) {
-                mainnet = mainnet.with_base_url(u);
-            }
-            let mut testnet = HyperliquidClient::new(HyperliquidNetwork::Testnet);
-            if let Some(u) = hl_url(&hl_cfg.testnet_url) {
-                testnet = testnet.with_base_url(u);
-            }
-            debug!("daemon.hyperliquid_mounted");
-            let handler = Arc::new(
-                HyperliquidHandler::new(mainnet, testnet)
-                    .with_store_root(home.root().join("hyperliquid")),
-            );
-            handler.clone().start_monitoring();
-            Some(handler)
-        } else {
-            debug!("daemon.hyperliquid_skipped: no [hyperliquid] config");
-            None
-        };
-
-        if let Some(ref hl) = hyperliquid_handler {
-            vfs_builder = vfs_builder.mount("hyperliquid", hl.clone() as _);
-        }
-
         let wallets_handler = WalletsHandler::new(
-            keystore.clone(),
             chains.clone(),
             tx_engine.clone(),
             address_book.clone(),
+            wallet_projections.clone(),
+            home.root().join("machine-policy-projections"),
         );
         let wallets_handler = wallets_handler
             .with_broker(broker.clone())
-            .with_wallet_projections(wallet_projections.clone())
-            .with_policy_projection_root(home.root().join("machine-policy-projections"))
             .with_home_write_permit_opt(home_write_permit.clone())
-            .with_mempool_indexes(mempool_indexes.clone())
-            .with_hyperliquid_handler(hyperliquid_handler.clone());
+            .with_mempool_indexes(mempool_indexes.clone());
 
         vfs_builder = vfs_builder
             .mount("wallets", Arc::new(wallets_handler) as _)
@@ -3006,7 +2095,6 @@ impl Daemon {
         // Answers: what wallets need attention, what confirms are pending,
         // what capabilities are active/expired/orphaned, what risk data is stale.
         let next_wallet_projections = wallet_projections.clone();
-        let next_hl = hyperliquid_handler.clone();
         let next_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> = Arc::new(move || {
             let mut md = String::from("# Next Actions\n\n");
             let (wallets, wallet_projection_unavailable) =
@@ -3040,73 +2128,9 @@ impl Daemon {
                 md.push('\n');
             }
 
-            // 2. Capability status (HL sessions)
-            if let Some(ref hl) = next_hl {
-                let mut expired = Vec::new();
-                let mut orphaned = Vec::new();
-                let mut stale = Vec::new();
-                {
-                    for projection in &wallets {
-                        let wallet = projection.wallet.wallet_id.as_str();
-                        let views = hl.capability_views_for(wallet);
-                        for v in &views {
-                            match v.status {
-                                bloom_proto::CapabilityStatus::Expired => {
-                                    expired.push(format!(
-                                        "- `{}` session `{}`: **expired** — no new orders accepted",
-                                        wallet, v.id
-                                    ));
-                                }
-                                bloom_proto::CapabilityStatus::Orphaned => {
-                                    orphaned.push(format!(
-                                        "- `{}` session `{}`: **orphaned** — daemon lost the agent key after restart. Owner must recover via `orphan_cancel_all` or `orphan_close_all` at `{}`",
-                                        wallet, v.id, v.revoke_path
-                                    ));
-                                }
-                                bloom_proto::CapabilityStatus::Active => {
-                                    if let Some(secs) = v.expires_in_secs
-                                        && secs < 300
-                                    {
-                                        stale.push(format!(
-                                            "- `{}` session `{}`: expiring in {}s",
-                                            wallet, v.id, secs
-                                        ));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                if !expired.is_empty() {
-                    md.push_str("## Expired Sessions\n\n");
-                    for e in &expired {
-                        md.push_str(e);
-                        md.push('\n');
-                    }
-                    md.push('\n');
-                }
-                if !orphaned.is_empty() {
-                    md.push_str("## Orphaned Sessions (Needs Owner)\n\n");
-                    for o in &orphaned {
-                        md.push_str(o);
-                        md.push('\n');
-                    }
-                    md.push('\n');
-                }
-                if !stale.is_empty() {
-                    md.push_str("## Expiring Soon\n\n");
-                    for s in &stale {
-                        md.push_str(s);
-                        md.push('\n');
-                    }
-                    md.push('\n');
-                }
-            }
-
-            if !wallet_projection_unavailable && stale_wallets.is_empty() && next_hl.is_none() {
+            if !wallet_projection_unavailable && stale_wallets.is_empty() {
                 md.push_str("No wallets with pending actions.\n\n");
-                md.push_str("All policies are signed, no outbox confirms await review, and no Hyperliquid sessions are active.\n");
+                md.push_str("All policies are signed and no outbox confirms await review.\n");
             }
             md.into_bytes()
         });
@@ -3302,15 +2326,10 @@ impl Daemon {
             home,
             config,
             chains,
-            keystore,
             tx_engine,
             home_write_permit,
             address_book: address_book_arc,
             audit: audit_arc,
-            #[cfg(any(test, feature = "local-integration"))]
-            auth_services,
-            #[cfg(any(test, feature = "local-integration"))]
-            signer_cache,
             wallet_projections,
             vfs,
             petals,
@@ -3388,8 +2407,6 @@ impl Daemon {
         drop(update_shutdown);
 
         let outbox = self.tx_engine.outbox.clone();
-        #[cfg(any(test, feature = "local-integration"))]
-        let registration_coordinator = self.auth_services.registration_coordinator().cloned();
         let (tx, mut rx) = watch::channel(false);
         let interval = Duration::from_secs(60);
         let handle = tokio::spawn(async move {
@@ -3409,14 +2426,6 @@ impl Daemon {
                             Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
                             Err(e) => warn!(error = %e, "outbox.sweep_expired_failed"),
-                        }
-                        #[cfg(any(test, feature = "local-integration"))]
-                        if let Some(coordinator) = &registration_coordinator {
-                            match coordinator.sweep_expired(now_ms as u64).await {
-                                Ok(0) => tracing::trace!("wallet_registration.sweep_expired.empty"),
-                                Ok(n) => info!(swept = n, "wallet_registration.sweep_expired"),
-                                Err(e) => warn!(error = %e, "wallet_registration.sweep_expired_failed"),
-                            }
                         }
                     }
                     _ = rx.changed() => {
@@ -3818,8 +2827,8 @@ mod tests {
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("petals").is_some());
         assert!(
-            d.vfs.handler("hyperliquid").is_some(),
-            "fresh homes should mount Hyperliquid with public defaults"
+            d.vfs.handler("hyperliquid").is_none(),
+            "native Hyperliquid must not be mounted; use petals/hyperliquid"
         );
         assert!(
             d.vfs.handler("polymarket").is_none(),
@@ -3828,32 +2837,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_petal_host_sign_hash_rejects_calls_without_trusted_petal_context() {
-        let dir = tempfile::tempdir().unwrap();
-        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
-        let err = host
-            .sign_hash(SignRequest {
-                wallet: "alice".into(),
-                hash32: [7; 32],
-                purpose: "test.intent".into(),
-                context: None,
-            })
-            .await
-            .unwrap_err();
-        let HostError::Denied(msg) = err else {
-            panic!("expected denied error");
-        };
-        assert!(msg.contains("trusted Petal route context"), "{msg}");
-    }
-
-    #[tokio::test]
     async fn petal_key_host_reconciles_retry_and_fails_closed_on_changed_or_tampered_state() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let fixture = Arc::new(PetalKeyBrokerFixture::new());
+        let provenance_record = bloom_triad_protocol::ProvenanceRecord {
+            subject: bloom_triad_protocol::ProvenanceSubject::Petal {
+                package_hash: bloom_triad_protocol::Digest32::from_bytes([0xaa; 32]),
+                route: "r000007".into(),
+            },
+            publisher: bloom_triad_protocol::Token::new("fixture-publisher").unwrap(),
+            operation_classes: vec![bloom_triad_protocol::ProvenanceOperationClass {
+                operation_class: bloom_triad_protocol::Token::new("exchange-agent").unwrap(),
+                fee_asset: None,
+            }],
+            installer_key_id: bloom_triad_protocol::Token::new("fixture-installer").unwrap(),
+            installer_signature: bloom_triad_protocol::Base64UrlBytes::from_bytes(&[0x55; 64]),
+        };
+        let expected_provenance_digest = provenance_record.digest().unwrap();
         let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit)
             .with_broker(Some(MachineBrokerClient::new(fixture.clone())))
+            .with_provenance_catalog(Some(bloom_triad_protocol::ProvenanceCatalog {
+                schema: bloom_triad_protocol::PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![provenance_record],
+            }))
             .with_petal_key_state_root(dir.path().join("petal-key-requests"));
         let context = PetalRouteContext {
             petal_root: "exchange".into(),
@@ -3907,6 +2914,10 @@ mod tests {
             "http://127.0.0.1:18734/ceremony/owner-only"
         );
         assert_eq!(owner_status["status"], "awaiting_user");
+        assert_eq!(
+            owner_status["provenance_digest"],
+            expected_provenance_digest.as_str()
+        );
         let owner_vfs = Vfs::builder()
             .mount(
                 "petal-key-requests",
@@ -4057,259 +3068,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_petal_host_seals_petal_signing_action_from_trusted_route_context() {
-        let dir = tempfile::tempdir().unwrap();
-        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
-        let req = SignRequest {
-            wallet: "alice".into(),
-            hash32: [7; 32],
-            purpose: "portfolio.position.sign".into(),
-            context: Some(PetalRouteContext {
-                petal_root: "portfolio".into(),
-                package_hash: "a".repeat(64),
-                route_id: "r000001".into(),
-                op: "read".into(),
-                path: "/positions".into(),
-                params: vec![("account".into(), "main".into())],
-                actor: Some("agent-1".into()),
-            }),
-        };
-        let (action, attestation) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 1)
-            .unwrap();
-
-        assert_eq!(action.surface(), "petals");
-        assert_eq!(action.petal_id(), "petal:portfolio");
-        assert_eq!(action.petal_digest(), "a".repeat(64));
-        assert_eq!(action.daemon_terms.max_signatures, 1);
-        assert_eq!(
-            action.daemon_terms.allowed_sign_intents,
-            vec![req.purpose.clone()]
-        );
-        assert!(
-            action
-                .daemon_terms
-                .extra
-                .contains_key("required.attestation_facts_digest")
-        );
-        assert_eq!(
-            attestation
-                .facts
-                .get("route_id")
-                .and_then(|value| value.as_str()),
-            Some("r000001")
-        );
-        let expected_hash = format!("0x{}", hex::encode([7; 32]));
-        assert_eq!(
-            attestation
-                .facts
-                .get("signing_hash")
-                .and_then(|value| value.as_str()),
-            Some(expected_hash.as_str())
-        );
-
-        let mut root_context = req.context.clone().unwrap();
-        root_context.path.clear();
-        host.petal_action(&req, &root_context, 1).unwrap();
-    }
-
-    #[test]
-    fn petal_signing_identity_is_stable_until_expiry() {
-        let dir = tempfile::tempdir().unwrap();
-        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
-        let req = SignRequest {
-            wallet: "alice".into(),
-            hash32: [7; 32],
-            purpose: "example.batch_sign".into(),
-            context: Some(PetalRouteContext {
-                petal_root: "example".into(),
-                package_hash: "a".repeat(64),
-                route_id: "r-sign".into(),
-                op: "write".into(),
-                path: "/sign/alice/begin".into(),
-                params: vec![("wallet".into(), "alice".into())],
-                actor: None,
-            }),
-        };
-
-        let (start, _) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 1)
-            .unwrap();
-        let (end_of_bucket, _) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 59_999)
-            .unwrap();
-        assert_eq!(start.action_id(), end_of_bucket.action_id());
-        assert_eq!(end_of_bucket.expires_ms, 120_001);
-
-        let (next_bucket, _) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 60_000)
-            .unwrap();
-        assert_eq!(start.action_id(), next_bucket.action_id());
-        assert_eq!(next_bucket.expires_ms, start.expires_ms);
-
-        let (last_live_retry, _) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 120_000)
-            .unwrap();
-        assert_eq!(start.action_id(), last_live_retry.action_id());
-
-        let (after_expiry, _) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 120_001)
-            .unwrap();
-        assert_ne!(start.action_id(), after_expiry.action_id());
-        assert_eq!(after_expiry.expires_ms, 240_001);
-    }
-
-    #[test]
-    fn petal_signing_identity_binds_the_complete_request_scope() {
-        let dir = tempfile::tempdir().unwrap();
-        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
-        let req = SignRequest {
-            wallet: "alice".into(),
-            hash32: [7; 32],
-            purpose: "example.sign".into(),
-            context: Some(PetalRouteContext {
-                petal_root: "example".into(),
-                package_hash: "a".repeat(64),
-                route_id: "r-sign".into(),
-                op: "write".into(),
-                path: "/sign/alice".into(),
-                params: vec![("wallet".into(), "alice".into())],
-                actor: Some("agent-1".into()),
-            }),
-        };
-        let (original, _) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 1)
-            .unwrap();
-
-        let mut changed_hash = req.clone();
-        changed_hash.hash32 = [8; 32];
-        let (changed_hash, _) = host
-            .petal_action(&changed_hash, changed_hash.context.as_ref().unwrap(), 1)
-            .unwrap();
-        assert_ne!(original.action_id(), changed_hash.action_id());
-
-        let mut changed_context = req.clone();
-        changed_context.context.as_mut().unwrap().actor = Some("agent-2".into());
-        let (changed_context, _) = host
-            .petal_action(
-                &changed_context,
-                changed_context.context.as_ref().unwrap(),
-                1,
-            )
-            .unwrap();
-        assert_ne!(original.action_id(), changed_context.action_id());
-    }
-
-    #[test]
-    fn daemon_petal_host_seals_exact_ordered_hardened_signing_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
-        let context = PetalRouteContext {
-            petal_root: "polymarket".into(),
-            package_hash: "b".repeat(64),
-            route_id: "r-onboard".into(),
-            op: "write".into(),
-            path: "/onboard/alice/begin".into(),
-            params: vec![("wallet".into(), "alice".into())],
-            actor: None,
-        };
-        let requests = vec![
-            SignRequest {
-                wallet: "alice".into(),
-                hash32: [1; 32],
-                purpose: "polymarket.onboard".into(),
-                context: Some(context.clone()),
-            },
-            SignRequest {
-                wallet: "alice".into(),
-                hash32: [2; 32],
-                purpose: "polymarket.relayer_batch".into(),
-                context: Some(context),
-            },
-        ];
-        let (action, attestations) = host.petal_batch_action(&requests, 1).unwrap();
-        assert_eq!(action.daemon_terms.assurance, AssuranceLevel::Hardened);
-        assert_eq!(action.daemon_terms.max_signatures, 2);
-        assert_eq!(attestations.len(), 2);
-        let entries: Vec<SealedSignBatchEntry> =
-            serde_json::from_value(action.daemon_terms.extra["required.signing_requests"].clone())
-                .unwrap();
-        assert_eq!(entries[0].hash_hex, format!("0x{}", hex::encode([1; 32])));
-        assert_eq!(entries[1].hash_hex, format!("0x{}", hex::encode([2; 32])));
-        assert!(
-            entries
-                .iter()
-                .all(|entry| !entry.attestation_facts_digest.is_empty())
-        );
-
-        let (across_retry_boundary, _) = host.petal_batch_action(&requests, 60_000).unwrap();
-        assert_eq!(action.action_id(), across_retry_boundary.action_id());
-        assert_eq!(action.expires_ms, across_retry_boundary.expires_ms);
-
-        let (after_expiry, _) = host
-            .petal_batch_action(&requests, action.expires_ms)
-            .unwrap();
-        assert_ne!(action.action_id(), after_expiry.action_id());
-
-        let mut reversed = requests.clone();
-        reversed.reverse();
-        let (reversed_action, _) = host.petal_batch_action(&reversed, 1).unwrap();
-        assert_ne!(action.action_id(), reversed_action.action_id());
-        assert!(
-            host.petal_batch_action(&[requests[0].clone(), requests[0].clone()], 1)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn invalid_signing_batches_cannot_consume_identity_capacity() {
-        let dir = tempfile::tempdir().unwrap();
-        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit);
-        let context = PetalRouteContext {
-            petal_root: "example".into(),
-            package_hash: "b".repeat(64),
-            route_id: "r-sign".into(),
-            op: "write".into(),
-            path: "/sign/alice".into(),
-            params: vec![("wallet".into(), "alice".into())],
-            actor: None,
-        };
-
-        for index in 0..MAX_ACTIVE_PETAL_ACTION_IDENTITIES {
-            let mut hash32 = [0; 32];
-            hash32[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            let invalid = SignRequest {
-                wallet: "alice".into(),
-                hash32,
-                purpose: String::new(),
-                context: Some(context.clone()),
-            };
-            assert!(host.petal_batch_action(&[invalid], 1).is_err());
-        }
-        assert_eq!(
-            host.petal_action_identities.lock().unwrap().entries.len(),
-            0
-        );
-
-        let valid = SignRequest {
-            wallet: "alice".into(),
-            hash32: [7; 32],
-            purpose: "example.sign".into(),
-            context: Some(context),
-        };
-        host.petal_batch_action(&[valid], 1).unwrap();
-        assert_eq!(
-            host.petal_action_identities.lock().unwrap().entries.len(),
-            1
-        );
-    }
-
-    #[test]
     fn daemon_petal_host_derives_evm_origin_only_from_trusted_route_context() {
         let context = PetalRouteContext {
             petal_root: "polymarket".into(),
@@ -4353,15 +3111,15 @@ mod tests {
     }
 
     fn test_petal_host(daemon: &Daemon) -> DaemonPetalHost {
-        DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone())
-            .with_legacy_authority(daemon.auth_services.clone())
-            .with_tx_outbox(PetalTxOutbox {
+        DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone()).with_tx_outbox(
+            PetalTxOutbox {
                 tx_engine: daemon.tx_engine.clone(),
                 chains: daemon.chains.clone(),
                 wallet_projections: daemon.wallet_projections.clone(),
                 address_book: daemon.address_book.clone(),
                 write_permit: daemon.home_write_permit.clone(),
-            })
+            },
+        )
     }
 
     #[tokio::test]
@@ -4584,19 +3342,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(denied, HostError::Denied(_)));
-    }
-
-    #[test]
-    fn config_without_hyperliquid_keeps_surface_disabled() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = HomeDir::at(dir.path());
-        home.ensure().unwrap();
-        let mut config = Config::local_default();
-        config.hyperliquid = None;
-        config.save(&home.config_path()).unwrap();
-
-        let daemon = Daemon::from_home(home).unwrap();
-        assert!(daemon.vfs.handler("hyperliquid").is_none());
     }
 
     /// A pre-existing watch spec on disk should be loaded into the

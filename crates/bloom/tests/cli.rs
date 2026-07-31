@@ -19,8 +19,15 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use async_trait::async_trait;
+use bloom_machine_client::{ProjectionFreshness, ProjectionVerification, WalletProjection};
+use bloom_triad_protocol::{
+    Base64UrlBytes, CanonicalWalletPolicy, CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef,
+    KeySpec, SignedPolicySnapshot, Token, WalletPublic,
+};
 use bloom_vfs::{Entry, Handler, HandlerError, VfsPath};
 use predicates::prelude::*;
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 /// Build a Command for the `bloom` binary that always runs against a
@@ -84,6 +91,101 @@ fn seed_legacy_wallet_fixture(home: &Path, name: &str) -> String {
     let keystore = bloom_keystore::Keystore::new(home.join("keystore")).unwrap();
     let info = keystore.create_local(name, "test-only-passphrase").unwrap();
     bloom_proto::checksum_address(&info.address)
+}
+
+/// Seed the authenticated, key-free public projection cache that production
+/// Machine uses while Broker is unavailable. This deliberately contains only
+/// public key metadata and a Broker-authenticated policy snapshot.
+fn seed_wallet_projection_fixture(home: &Path, name: &str) {
+    #[derive(Serialize)]
+    struct ProjectionDigestInput<'a> {
+        schema: &'static str,
+        wallet: &'a WalletPublic,
+        keys: &'a [KeyPublic],
+        credentials: &'a [bloom_triad_protocol::CredentialPublic],
+        policy: &'a SignedPolicySnapshot,
+    }
+
+    let wallet_id = Token::new(name.to_owned()).expect("valid fixture wallet ID");
+    let key_ref = KeyRef {
+        backend: Token::new("local").unwrap(),
+        backend_instance: Token::new("primary").unwrap(),
+        locator: format!("{name}/root"),
+        key_spec: KeySpec::Secp256k1,
+        public_key_fingerprint: Digest32::from_bytes([3; 32]),
+        derivation: None,
+    };
+    let canonical_policy = serde_jcs::to_vec(&CanonicalWalletPolicy {
+        wallet_id: wallet_id.clone(),
+        maximum_approval_lifetime_ms: 300_000,
+        allowed_petal_packages: Vec::new(),
+        allowed_destinations: Vec::new(),
+        required_verifiers: Vec::new(),
+    })
+    .expect("canonicalize fixture policy");
+    let policy_digest = Digest32::from_bytes(Sha256::digest(&canonical_policy).into());
+    let wallet = WalletPublic {
+        wallet_id: wallet_id.clone(),
+        wallet_kind: Token::new("passkey").unwrap(),
+        key_refs: vec![key_ref.clone()],
+        policy_version: DecimalU64::new(1),
+        policy_digest: policy_digest.clone(),
+        wallet_revocation_epoch: DecimalU64::new(0),
+    };
+    let keys = vec![KeyPublic {
+        key_ref,
+        canonical_public_key: Base64UrlBytes::from_bytes(&[4; 33]),
+        addresses: vec!["0x0000000000000000000000000000000000000001".into()],
+        supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+    }];
+    let credentials = Vec::new();
+    let policy = SignedPolicySnapshot {
+        wallet_id,
+        version: DecimalU64::new(1),
+        canonical_policy: Base64UrlBytes::from_bytes(&canonical_policy),
+        policy_digest,
+        policy_signing_key_id: Token::new("policy-key").unwrap(),
+        policy_verifying_key: Base64UrlBytes::from_bytes(&[5; 32]),
+        signer_signature: Base64UrlBytes::from_bytes(&[6; 64]),
+    };
+    let response_digest = Digest32::from_bytes(
+        Sha256::digest(
+            serde_jcs::to_vec(&ProjectionDigestInput {
+                schema: "bloom.machine-wallet-projections.v1",
+                wallet: &wallet,
+                keys: &keys,
+                credentials: &credentials,
+                policy: &policy,
+            })
+            .expect("canonicalize fixture projection"),
+        )
+        .into(),
+    );
+    let projection = WalletProjection {
+        wallet,
+        keys,
+        credentials,
+        policy,
+        source_protocol: "bloom.machine-broker.v1".into(),
+        response_digest,
+        observed_at_ms: 1,
+        freshness: ProjectionFreshness::Fresh,
+        verification: ProjectionVerification::AuthenticatedBroker,
+    };
+    write_file(
+        home,
+        "cache/wallet-projections.json",
+        &serde_json::to_vec(&serde_json::json!({
+            "schema": "bloom.machine-wallet-projections.v1",
+            "wallets": {
+                name: {
+                    "state": "live",
+                    "projection": projection,
+                }
+            }
+        }))
+        .expect("encode fixture projection cache"),
+    );
 }
 
 #[derive(Default)]
@@ -681,26 +783,10 @@ fn serve_refuses_when_home_write_lock_is_live() {
 
     let mut command = bloom_cmd(home.path());
     command.arg("serve");
-    if cfg!(feature = "local-integration") {
-        command.arg("--local-integration");
-    }
     command.assert().failure().stderr(
         predicate::str::contains("already open for writing")
             .and(predicate::str::contains(lock.display().to_string())),
     );
-}
-
-#[cfg(feature = "local-integration")]
-#[test]
-fn local_integration_build_requires_explicit_serve_flag() {
-    let home = fresh_home();
-    bloom_cmd(home.path())
-        .arg("serve")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "pass --local-integration explicitly",
-        ));
 }
 
 #[test]
@@ -880,7 +966,7 @@ fn wallet_import_rejects_path_names_before_broker_contact() {
 #[test]
 fn request_cli_dry_run_uses_vfs_lifecycle_and_body_receipt_helpers() {
     let home = fresh_home();
-    seed_legacy_wallet_fixture(home.path(), "alice");
+    seed_wallet_projection_fixture(home.path(), "alice");
 
     let (url, hits) = http_fixture(200, &[("content-type", "text/plain")], b"cli-body\n");
     let new = bloom_cmd(home.path())

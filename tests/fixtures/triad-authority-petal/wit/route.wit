@@ -1,0 +1,15 @@
+package bloom:fixture@0.1.0;
+
+world route-file {
+  use bloom:route/types@0.1.0.{ctx, entry, route-error, route-meta};
+
+  import bloom:store/kv@0.1.0;
+  import bloom:key/derive@0.1.0;
+  import bloom:sign/signing@0.3.0;
+
+  export metadata: func(ctx: ctx) -> result<route-meta, route-error>;
+  export lookup: func(ctx: ctx) -> result<entry, route-error>;
+  export %list: func(ctx: ctx) -> result<list<entry>, route-error>;
+  export read: func(ctx: ctx) -> result<list<u8>, route-error>;
+  export write: func(ctx: ctx, body: list<u8>) -> result<_, route-error>;
+}

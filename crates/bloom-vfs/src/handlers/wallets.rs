@@ -30,10 +30,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bloom_auth_api::AssuranceLevel;
 use bloom_evm::ChainRegistry;
+#[cfg(test)]
 use bloom_keystore::Keystore;
 use bloom_machine_client::WalletProjection;
 use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
-use bloom_proto::{AddressBook, CapabilityViewEntry, HomeWritePermit, Policy, RawIntent, Venue};
+use bloom_proto::{AddressBook, CapabilityViewEntry, HomeWritePermit, Policy, RawIntent};
 use bloom_tx::{
     intent_parser,
     outbox::OutboxState,
@@ -124,6 +125,7 @@ impl TriadPolicyUpdateProjection {
 
 #[derive(Clone)]
 pub struct WalletsHandler {
+    #[cfg(test)]
     pub keystore: Keystore,
     pub chains: ChainRegistry,
     pub tx_engine: TxEngine,
@@ -131,8 +133,6 @@ pub struct WalletsHandler {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub mempool_indexes:
         Arc<std::collections::BTreeMap<String, Arc<bloom_mempool::PendingTxIndex>>>,
-    /// Optional Hyperliquid handler for capability roll-up aggregation.
-    pub hyperliquid_handler: Option<Arc<crate::handlers::hyperliquid::HyperliquidHandler>>,
     /// Authenticated production authority edge. When absent, custody and
     /// policy mutations fail closed outside tests.
     pub broker: Option<MachineBrokerClient>,
@@ -144,6 +144,9 @@ pub struct WalletsHandler {
 }
 
 impl WalletsHandler {
+    /// Unit-test-only constructor for legacy fixtures. Production callers
+    /// must provide the authenticated, key-free projection reader instead.
+    #[cfg(test)]
     pub fn new(
         keystore: Keystore,
         chains: ChainRegistry,
@@ -158,28 +161,34 @@ impl WalletsHandler {
             address_book: Arc::new(address_book),
             home_write_permit: None,
             mempool_indexes: Arc::new(std::collections::BTreeMap::new()),
-            hyperliquid_handler: None,
             broker: None,
             wallet_projections: None,
             policy_projection_root,
         }
     }
 
+    #[cfg(not(test))]
+    pub fn new(
+        chains: ChainRegistry,
+        tx_engine: TxEngine,
+        address_book: AddressBook,
+        wallet_projections: Arc<dyn WalletProjectionReader>,
+        policy_projection_root: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            chains,
+            tx_engine,
+            address_book: Arc::new(address_book),
+            home_write_permit: None,
+            mempool_indexes: Arc::new(std::collections::BTreeMap::new()),
+            broker: None,
+            wallet_projections: Some(wallet_projections),
+            policy_projection_root: policy_projection_root.into(),
+        }
+    }
+
     pub fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
         self.broker = broker;
-        self
-    }
-
-    pub fn with_wallet_projections(
-        mut self,
-        wallet_projections: Arc<dyn WalletProjectionReader>,
-    ) -> Self {
-        self.wallet_projections = Some(wallet_projections);
-        self
-    }
-
-    pub fn with_policy_projection_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
-        self.policy_projection_root = root.into();
         self
     }
 
@@ -190,14 +199,6 @@ impl WalletsHandler {
 
     pub fn with_home_write_permit_opt(mut self, permit: Option<Arc<HomeWritePermit>>) -> Self {
         self.home_write_permit = permit;
-        self
-    }
-
-    pub fn with_hyperliquid_handler(
-        mut self,
-        hl: Option<Arc<crate::handlers::hyperliquid::HyperliquidHandler>>,
-    ) -> Self {
-        self.hyperliquid_handler = hl;
         self
     }
 
@@ -265,6 +266,7 @@ impl WalletsHandler {
             .map_err(|error| HandlerError::backend(error.to_string()))
     }
 
+    #[cfg(not(test))]
     async fn wallet_projection_list(&self) -> Result<Vec<WalletProjection>, HandlerError> {
         self.wallet_projections
             .as_ref()
@@ -316,6 +318,9 @@ impl WalletsHandler {
             "owner": owner,
             "signer": owner,
             "policy_status": "broker_verified",
+            "policy_version": projection.wallet.policy_version,
+            "policy_digest": projection.wallet.policy_digest,
+            "wallet_revocation_epoch": projection.wallet.wallet_revocation_epoch,
             "unlocked": false,
             "freshness": projection.freshness,
             "observed_at_ms": projection.observed_at_ms,
@@ -332,10 +337,6 @@ impl WalletsHandler {
 
     fn all_capability_views_for(&self, wallet: &str) -> Vec<CapabilityViewEntry> {
         let mut all = self.evm_capability_views_for(wallet);
-        if let Some(ref hl) = self.hyperliquid_handler {
-            let hl_views = hl.capability_views_for(wallet);
-            all.extend(hl_views);
-        }
         all.sort_by(|a, b| {
             a.created_ms
                 .cmp(&b.created_ms)
@@ -365,11 +366,10 @@ impl WalletsHandler {
                 md.push_str(&format!(
                     "## {} ({})\n\n",
                     c.id,
-                    match c.venue {
-                        Venue::Hyperliquid => "Hyperliquid",
-                        Venue::EvmOutbox => "EVM outbox",
-                        Venue::Defi => "DeFi",
-                    }
+                    serde_json::to_value(&c.venue)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unknown".to_owned()),
                 ));
                 md.push_str(&format!("- **Signing model:** {:?}\n", c.signing_model));
                 md.push_str(&format!("- **Status:** {:?}\n", c.status));

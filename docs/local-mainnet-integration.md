@@ -1,45 +1,48 @@
 # Manual local mainnet integration
 
 This is the developer path for exercising the real Bloom binary, installed
-Petals, an existing passkey wallet, both venue APIs, policy evaluation,
-the kernel-mounted NFS VFS, interactive browser ceremonies, signing,
-submission, and receipts without
-running Machine, Broker, and Signer as separate services.
+Petals, an existing passkey wallet, the Polymarket API, policy evaluation,
+the kernel-mounted NFS VFS and interactive browser ceremonies with Machine,
+Broker, and Signer running as separate processes.
 
-It is deliberately not a deployment mode. The `local-integration` Cargo
-feature compiles the custody adapters into the Machine process, and
-`serve --local-integration` must also be supplied at runtime. A normal build
-does not contain those adapters. A special build refuses to serve without the
-runtime flag.
+It is deliberately not a deployment mode and makes no UID-isolation claim.
+The `triad-dev-harness` feature adds only same-UID developer enrollment and
+transport bootstrap; it adds no custody, passkey verification, or signing code
+to Machine. Signer keeps custody, Broker owns the ceremony origin, and normal
+release bundles reject this feature.
+
+The developer enrollment and Broker/Signer databases persist at
+`$BLOOM_TRIAD_DEV_ROOT` (default `~/.bloom-triad-dev`). Machine state defaults
+to `$BLOOM_TRIAD_DEV_ROOT/machine-home`. Process sockets,
+the kernel mount, and logs are new for every run. This is intentional: Signer
+must retain the passkey credential, encrypted root, and backend state across
+runs. A fresh Signer database cannot use a legacy wallet merely because an
+encrypted record exists under `~/.bloom/keystore`; neither Machine nor these
+scripts read or copy that legacy private material.
 
 ## What the runner protects
 
 `scripts/local-mainnet-integration.sh` defaults to non-spending preflight. Live
 mode:
 
-- requires an explicit opt-in for each selected venue; either venue can be run
-  separately so retrying one failure never repeats a successful order;
+- requires an explicit Polymarket opt-in;
 - requires exact venue, market, side, size, price/slippage bound, and order
   type;
-- accepts only Hyperliquid perp limit orders with a $10–$25 notional;
-- creates a developer-only Hyperliquid policy envelope for exactly one asset,
-  at most $25 notional/position/loss, and at most five minutes;
 - accepts only Polymarket `FAK` or `FOK` orders with at most $25 maximum
   consideration;
 - displays the Polymarket plan, policy result, revalidated quote, and final
-  review intent before either order is submitted;
-- requires an exact terminal acknowledgement, then a Hyperliquid passkey
-  approval and a separate Polymarket passkey approval;
-- cancels a resting Hyperliquid `Alo` order, and also attempts cancellation
-  and session stop if the runner exits abnormally;
+  review intent before the order is submitted;
+- requires an exact terminal acknowledgement and a draft-specific Polymarket
+  passkey approval;
+- authorizes only the fixture package in a fresh wallet policy through the
+  mounted `policy.validate_update` ceremony and exact mounted commit retry;
+- derives a fresh Signer-owned, Petal-scoped fixture sub-key, then prepares its
+  Petal-scoped Sealed Approval through the mounted approval adapter and signs a
+  fixture payload through real passkey ceremonies before the venue
+  compatibility gate;
 - accesses wallet identity, venue state, Petal routes, plans, ceremonies, and
   receipts exclusively through ordinary reads and writes beneath the temporary
   kernel mount; it never uses the `bloom vfs` fallback or IPC operations.
-
-The local Hyperliquid policy is in memory and is accepted only if the stored
-wallet has no configured Hyperliquid policy. It never edits `policy.toml`.
-If a wallet already has a policy, that policy remains authoritative and the
-developer overlay is refused.
 
 Venue acceptance is not proof of a fill. `Ioc`/`FAK` with a marketable bound
 normally fills immediately up to that bound and cancels the remainder;
@@ -50,10 +53,10 @@ to trade at.
 
 - macOS with the passkey available to the current login's browser/keychain;
 - Rust/Cargo and `jq` (`brew install jq`);
-- an existing Bloom passkey wallet under `~/.bloom/keystore`;
+- a wallet enrolled through a real Broker registration or import ceremony in
+  the persistent developer triad root;
 - the pinned Polymarket Petal enabled in Bloom's preinstalled Petal config;
-- Hyperliquid mainnet collateral and Polymarket onboarding/funding sufficient
-  for the chosen orders;
+- Polymarket onboarding/funding sufficient for the chosen order;
 - no other local process listening on `127.0.0.1:18734`.
 
 The last rule is fail-closed. If the root-installed Broker is active, unload
@@ -76,6 +79,32 @@ The runner does not perform either root action. If the port is owned, startup
 fails before any order is staged. An installed enrollment may remain on disk;
 the local process does not connect to it.
 
+On first use, start the launcher in one terminal (replace the paths if needed):
+
+```bash
+mkdir -p ~/.bloom-triad-dev/machine-home /tmp/bloom-triad-mount /tmp/bloom-triad-logs
+scripts/triad-dev-launch.sh \
+  --developer-root ~/.bloom-triad-dev \
+  --machine-home ~/.bloom-triad-dev/machine-home \
+  --mount /tmp/bloom-triad-mount \
+  --machine-socket /tmp/bloom-triad-machine.sock \
+  --log-dir /tmp/bloom-triad-logs \
+  --ready-file /tmp/bloom-triad-ready
+```
+
+The launcher writes the exact authenticated connection environment to
+`/tmp/bloom-triad-logs/triad.env`. In a second terminal:
+
+```bash
+source /tmp/bloom-triad-logs/triad.env
+target/debug/bloom wallet import WALLET_NAME   # or: wallet new WALLET_NAME
+```
+
+Open the printed Broker ceremony URL. Registration creates a fresh address;
+import requires entering the key only in the Broker-hosted browser ceremony.
+Stop the launcher after the wallet appears under the mount. Subsequent runner
+invocations reuse that Signer state and select it with `--wallet WALLET_NAME`.
+
 ## 1. Run preflight
 
 The smallest invocation is:
@@ -85,13 +114,25 @@ scripts/local-mainnet-integration.sh \
   --wallet hl-mainnet-validation
 ```
 
-No ceremony opens and no order is created. Serving may install/update the
-pinned Petal, but custody material and venue positions are not changed.
+No venue order is created. A fresh wallet first receives a narrowly scoped
+policy-update ceremony adding only the deterministic fixture package. The next
+ceremony derives a short-lived Signer-owned key scoped to that installed Petal,
+and the final ceremony activates a canonical Petal-scoped Sealed Approval
+prepared through `/wallets/<wallet>/sealed-approvals/new.json`. A wallet whose
+policy already allows the fixture skips only the policy-update ceremony. The
+Petal receives only its public `KeyRef`, approval ID, and signature; it never
+receives private key material. Serving may
+install/update the pinned Polymarket Petal, but venue positions are not changed.
 Preflight verifies:
 
 - the mounted wallet exists, reports passkey kind, and exposes its address;
+- a normal empty package allowlist is extended through the Broker-originated
+  `policy_update` custody ceremony and installed only by the exact mounted
+  retry that supplies the completed receipt to `policy.commit_update`;
+- the mounted fixture can derive and use a generic Petal sub-key through Broker
+  and Signer using exact mounted retries, with missing approval failing closed
+  before the runner prepares the canonical mounted Sealed Approval;
 - the pinned Polymarket Petal loads;
-- Hyperliquid mainnet metadata and the wallet account snapshot are readable;
 - the Polymarket route contract and onboarding, account, and trade directories
   are reachable through the kernel-mounted filesystem.
 
@@ -100,19 +141,23 @@ when the mounted `trade/<wallet>/new` file is written in live mode. Preflight
 does not invoke its refresh-on-read status leaves through a non-filesystem
 fallback.
 
-Supply candidate markets to get their current metadata during preflight:
+Supply a candidate market during preflight:
 
 ```bash
 scripts/local-mainnet-integration.sh \
   --wallet hl-mainnet-validation \
-  --hl-coin BTC \
   --pm-slug YOUR-POLYMARKET-SLUG
 ```
 
-This prints the Hyperliquid asset ID that must be pinned in the live command
-and echoes the explicitly selected Polymarket slug. Live mounted draft creation
+This echoes the explicitly selected Polymarket slug. Live mounted draft creation
 refuses unavailable markets, incomplete onboarding, insufficient funding, or
-policy failures before any passkey ceremony or order submission.
+policy failures before its order-specific passkey ceremony or submission.
+
+The currently pinned Polymarket v0.1.3 Petal imports the retired
+`bloom:sign/signing@0.1.0` hash-signing interface. Read-only preflight still
+works, but live mode fails before creating a draft unless the pinned Petal has
+upgraded to production payload signing `bloom:sign/signing@0.3.0`. The harness
+does not patch or special-case the Petal.
 
 ## 2. Run bounded mainnet submissions
 
@@ -122,13 +167,6 @@ recommendation:
 ```bash
 scripts/local-mainnet-integration.sh \
   --wallet hl-mainnet-validation \
-  --execute-hyperliquid \
-  --hl-coin BTC \
-  --hl-asset-id 0 \
-  --hl-side buy \
-  --hl-price YOUR_MAXIMUM_PRICE \
-  --hl-size YOUR_SIZE \
-  --hl-tif Ioc \
   --execute-polymarket \
   --pm-slug YOUR-POLYMARKET-SLUG \
   --pm-outcome Yes \
@@ -140,26 +178,33 @@ scripts/local-mainnet-integration.sh \
 
 The command validates all numeric bounds before touching venue state. It then:
 
-1. starts the special Bloom process on a private Unix socket;
-2. mounts its VFS over NFS at a private temporary directory;
-3. rechecks the wallet, Hyperliquid state, and Polymarket Petal surface
+1. starts the production session sentinel, Signer, Broker, and Machine protocol
+   implementations under the developer profile;
+2. mounts Machine's VFS over NFS at a private temporary directory and waits for
+   both the mount table entry and a readable mounted root;
+3. if required, writes the complete canonical policy to the mounted
+   `wallets/<wallet>/policy.json`, completes the Broker-originated
+   `policy_update` custody ceremony, and retries the exact policy bytes to
+   commit through Signer compare-and-swap;
+4. derives a fixture Petal sub-key, completes its owner-only custody ceremony,
+   observes that signing without an approval hint fails closed, prepares a
+   canonical Petal-scoped approval through the mounted
+   `sealed-approvals/new.json`, completes that ceremony, and verifies the
+   exact mounted retry's signature result;
+5. rechecks the wallet and Polymarket Petal surface
    exclusively with ordinary filesystem reads through that mount;
-4. creates and revalidates an unsigned Polymarket draft through filesystem
+6. creates and revalidates an unsigned Polymarket draft through filesystem
    writes;
-5. prints both pinned requests and all available review artifacts;
-6. asks for an exact acknowledgement naming the selected venue or venues;
-7. opens the real passkey ceremony for the exact Hyperliquid five-minute
-   session, retries session creation, and submits the exact order;
-8. asks for a draft-specific Polymarket acknowledgement;
-9. opens the real passkey ceremony for the exact Polymarket order, retries the
+7. prints all available review artifacts;
+8. asks for an exact Polymarket mainnet acknowledgement;
+9. asks for a draft-specific Polymarket acknowledgement;
+10. opens the real passkey ceremony for the exact Polymarket order, retries the
    exact post, and reads the receipt;
-10. cancels applicable resting orders, stops the session, unmounts, and exits.
+11. unmounts and exits.
 
 The runner retains its temporary log directory on any failure and prints its
 path. Do not retry blindly after an ambiguous network failure: inspect the
-persisted Hyperliquid response/session audit and Polymarket receipt first.
-If one venue succeeds and the other fails, retry only the failed venue by
-omitting the successful venue's `--execute-*` flag and arguments.
+persisted Polymarket receipt first.
 
 ## Local deterministic verification
 
@@ -167,9 +212,8 @@ These do not contact mainnet or open a passkey prompt:
 
 ```bash
 scripts/test-local-mainnet-integration.sh
-cargo test -p bloom-vfs --features local-integration local_integration_bounds
 cargo check -p bloom --no-default-features
-cargo check -p bloom --no-default-features --features local-integration
+cargo check -p bloom --no-default-features --features mount,triad-dev-harness
 ```
 
 The actual passkey and live venue submissions are intentionally manual because

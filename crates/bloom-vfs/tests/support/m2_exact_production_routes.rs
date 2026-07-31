@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use super::Keystore;
 use async_trait::async_trait;
-use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
 use bloom_machine_client::{
     MachineBrokerClient, ProjectionFreshness, ProjectionVerification, WalletProjection,
     WalletProjectionReader,
@@ -16,7 +15,7 @@ use bloom_triad_protocol::{
     ProvenanceRecord, ProvenanceSubject, SealedApprovalPrepareResponse, ServiceFuture,
     SignedPolicySnapshot, SigningResult, Token, WalletPublic,
 };
-use bloom_vfs::handlers::{HyperliquidHandler, RequestsHandler};
+use bloom_vfs::handlers::RequestsHandler;
 use bloom_vfs::{BrokerExactPayloadSigner, Handler, HandlerError, VfsPath};
 use mpp::protocol::core::Base64UrlJson;
 use sha2::{Digest as _, Sha256};
@@ -169,12 +168,7 @@ fn exact_signer(wallet: WalletPublic) -> (BrokerExactPayloadSigner, Arc<ExactBro
         requests: Mutex::new(Vec::new()),
         signing_results: Mutex::new(Vec::new()),
     });
-    let classes = [
-        "paid-http.x402",
-        "paid-http.mpp",
-        "hyperliquid.usd-send",
-        "hyperliquid.approve-agent",
-    ];
+    let classes = ["paid-http.x402", "paid-http.mpp"];
     let records = classes
         .into_iter()
         .map(|class| ProvenanceRecord {
@@ -469,35 +463,4 @@ async fn production_mpp_route_prepares_then_signs_through_broker() {
             .join("private/exact-signing/charge-transaction.json")
             .exists()
     );
-}
-
-#[tokio::test]
-async fn production_native_hyperliquid_writes_fail_closed_without_broker_calls() {
-    let temporary = tempfile::tempdir().unwrap();
-    let keystore = Keystore::new(temporary.path().join("keystore")).unwrap();
-    keystore.create_local("alice", "pw").unwrap();
-    let address = format!("{:#x}", keystore.info_unverified("alice").unwrap().address);
-    let (wallet, _projections) = projection(address);
-    let (_signer, broker) = exact_signer(wallet);
-    let endpoint = spawn_http_fixture("hyperliquid").await;
-    let mainnet =
-        HyperliquidClient::new(HyperliquidNetwork::Mainnet).with_base_url(endpoint.clone());
-    let testnet = HyperliquidClient::new(HyperliquidNetwork::Testnet).with_base_url(endpoint);
-    let _ = keystore;
-    let handler = HyperliquidHandler::new(mainnet, testnet)
-        .with_store_root(temporary.path().join("hyperliquid"));
-
-    let send_path = VfsPath::parse("/testnet/exchange/alice/send_asset.json").unwrap();
-    let send_error = handler.write(&send_path, b"{}").await.unwrap_err();
-    assert!(
-        matches!(send_error, HandlerError::Unsupported(message) if message.contains("Hyperliquid Petal"))
-    );
-
-    let session_path = VfsPath::parse("/testnet/agent_sessions/alice/new.json").unwrap();
-    let session_error = handler.write(&session_path, b"{}").await.unwrap_err();
-    assert!(
-        matches!(session_error, HandlerError::Unsupported(message) if message.contains("Hyperliquid Petal"))
-    );
-
-    assert!(broker.requests.lock().unwrap().is_empty());
 }

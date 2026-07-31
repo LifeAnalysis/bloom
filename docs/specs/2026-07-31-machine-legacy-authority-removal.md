@@ -610,15 +610,24 @@ Machine restart loses no authority state because Machine owns none.
 ### M5 — developer harness migration
 
 - Make deterministic Broker debug-driver coverage replace daemon signer tests.
-- Make the out-of-process real-passkey mounted integration pass for Petals and
-  Polymarket, including generic Petal sub-key derivation and use. Exercise
+- Make the out-of-process real-passkey mounted integration pass for the generic
+  Petal sub-key derivation and payload-signing fixture, and exercise the pinned
+  Polymarket Petal through its mounted production interface. The currently
+  pinned Polymarket release imports retired hash-only signing; until a separately
+  owned upstream release adopts the existing payload-bearing ABI, the harness
+  must prove mounted read compatibility and fail before draft creation. A live
+  Polymarket submission becomes a release acceptance test when that immutable
+  upstream pin is updated; M5 must not add a shim or modify the Petal. Exercise
   Hyperliquid through its replacement Petal when that Petal is available; do
   not preserve the native agent-session path as a harness dependency.
 - Delete Machine embedded ceremony, registration, signer-cache, local PRF, and
   unsafe debug signer code and features.
 
 Completion: both developer workflows pass without a Machine key-bearing
-dependency.
+dependency. The manual workflow completes genuine passkey custody and signing
+for the generic fixture; the pinned legacy Polymarket route is mounted and its
+live incompatibility is proven fail-closed before draft creation as specified
+above.
 
 ### M6 — dependency and artifact purge
 

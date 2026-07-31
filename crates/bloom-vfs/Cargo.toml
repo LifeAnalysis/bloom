@@ -7,10 +7,6 @@ description = "Path router and handlers for bloom virtual filesystem"
 
 [features]
 default = []
-unsafe-debug-signer = ["bloom-keystore/unsafe-debug-signer"]
-# Permit the dedicated local integration binary to wire the legacy
-# passkey-backed hash-signing adapter. Normal builds keep it unreachable.
-local-integration = []
 
 [dependencies]
 bloom-auth-api.workspace = true
@@ -18,7 +14,6 @@ bloom-mempool.workspace = true
 bloom-machine-client.workspace = true
 bloom-proto.workspace = true
 bloom-triad-protocol.workspace = true
-bloom-keystore.workspace = true
 bloom-paid-http.workspace = true
 bloom-paid-mpp.workspace = true
 bloom-paid-x402.workspace = true
@@ -26,7 +21,6 @@ bloom-evm.workspace = true
 bloom-rpc.workspace = true
 bloom-tx.workspace = true
 bloom-tools.workspace = true
-bloom-hyperliquid.workspace = true
 bloom-watch.workspace = true
 bloom-prices.workspace = true
 bloom-etherscan.workspace = true
@@ -57,5 +51,6 @@ qrcode.workspace = true
 
 [dev-dependencies]
 bloom-auth.workspace = true
+bloom-keystore.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["process", "rt-multi-thread", "macros", "time", "io-util"] }

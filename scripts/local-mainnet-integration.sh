@@ -2,25 +2,19 @@
 #
 # Manual, passkey-backed mainnet integration for Bloom's local developer
 # profile. The default is non-spending preflight. No order is sent unless its
-# venue-specific --execute-* flag is present and the operator types the final
+# --execute-polymarket flag is present and the operator types the final
 # acknowledgement at the terminal.
 
 set -euo pipefail
 
 readonly MAX_USD="25"
-readonly HL_SESSION_SECS="300"
+readonly FIXTURE_PACKAGE_HASH="2e2344e74b7ed11d4bb4c939671be9da72e13147dd16c3f6b6c347ae2c84d1ad"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-home_dir="${BLOOM_HOME:-${HOME}/.bloom}"
+developer_root="${BLOOM_TRIAD_DEV_ROOT:-${HOME}/.bloom-triad-dev}"
+home_dir="${BLOOM_HOME:-${developer_root}/machine-home}"
 wallet=""
-execute_hl=0
 execute_pm=0
-hl_coin=""
-hl_asset_id=""
-hl_side=""
-hl_price=""
-hl_size=""
-hl_tif="Ioc"
 pm_slug=""
 pm_outcome=""
 pm_side=""
@@ -33,28 +27,27 @@ usage() {
 Usage:
   scripts/local-mainnet-integration.sh --wallet WALLET
 
-Non-spending preflight is the default. To submit tightly bounded mainnet orders,
-add either or both venue blocks:
-
-  --execute-hyperliquid
-  --hl-coin COIN --hl-asset-id ID --hl-side buy|sell
-  --hl-price PRICE --hl-size SIZE [--hl-tif Ioc|Alo]
+Non-spending preflight is the default. It still performs the real passkey
+ceremonies needed to derive a fixture Petal sub-key and sign a fixture payload;
+it never submits a venue order. To submit a tightly bounded mainnet order, add:
 
   --execute-polymarket
   --pm-slug SLUG --pm-outcome OUTCOME --pm-side buy|sell
   --pm-amount AMOUNT --pm-price-bound PRICE [--pm-order-type FAK|FOK]
 
 Safety properties:
-  * Each live venue requires its own flag, exact arguments, and acknowledgement.
-  * Hyperliquid is one perp asset, limit only, <= $25 notional, <= 5 minutes.
+  * Live submission requires its explicit flag, exact arguments, and acknowledgement.
   * Polymarket is FAK/FOK only and <= $25 maximum consideration.
   * Exact plans and policy checks print before any passkey prompt.
   * The runner never directly reads or edits wallet keys or policy files.
-  * The special binary refuses to serve unless --local-integration is explicit.
+  * Machine is built without embedded custody or signing features.
 
 Environment:
-  BLOOM_HOME              Wallet home (default: ~/.bloom)
-  BLOOM_INTEGRATION_BIN   Use an already-built local-integration binary
+  BLOOM_HOME              Isolated Machine home (default: $BLOOM_TRIAD_DEV_ROOT/machine-home)
+  BLOOM_TRIAD_DEV_ROOT    Persistent Broker/Signer developer state and enrollment
+                          (default: ~/.bloom-triad-dev)
+  BLOOM_TRIAD_DEV_LAUNCHER
+                          Deterministic shell-test launcher override
   BLOOM_INTEGRATION_OPEN  Browser opener (default: open)
   BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS
                           Server/Petal startup deadline (default: 300)
@@ -73,13 +66,6 @@ need_value() {
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --wallet) need_value "$@"; wallet="$2"; shift 2 ;;
-    --execute-hyperliquid) execute_hl=1; shift ;;
-    --hl-coin) need_value "$@"; hl_coin="$2"; shift 2 ;;
-    --hl-asset-id) need_value "$@"; hl_asset_id="$2"; shift 2 ;;
-    --hl-side) need_value "$@"; hl_side="$2"; shift 2 ;;
-    --hl-price) need_value "$@"; hl_price="$2"; shift 2 ;;
-    --hl-size) need_value "$@"; hl_size="$2"; shift 2 ;;
-    --hl-tif) need_value "$@"; hl_tif="$2"; shift 2 ;;
     --execute-polymarket) execute_pm=1; shift ;;
     --pm-slug) need_value "$@"; pm_slug="$2"; shift 2 ;;
     --pm-outcome) need_value "$@"; pm_outcome="$2"; shift 2 ;;
@@ -108,7 +94,7 @@ esac
 
 live=0
 preflight_blockers=0
-if [ "$execute_hl" -eq 1 ] || [ "$execute_pm" -eq 1 ]; then
+if [ "$execute_pm" -eq 1 ]; then
   live=1
 fi
 
@@ -121,21 +107,6 @@ is_positive_decimal() {
 if [ "$live" -eq 1 ]; then
   command -v "$browser_open" >/dev/null 2>&1 ||
     die "browser opener '$browser_open' was not found"
-  if [ "$execute_hl" -eq 1 ]; then
-    for value in "$hl_coin" "$hl_asset_id" "$hl_side" "$hl_price" "$hl_size"; do
-      [ -n "$value" ] || die "all live Hyperliquid arguments shown in --help are required"
-    done
-    case "$hl_asset_id" in *[!0-9]*|'') die "--hl-asset-id must be an unsigned integer" ;; esac
-    case "$hl_side" in buy|sell) ;; *) die "--hl-side must be buy or sell" ;; esac
-    case "$hl_tif" in Ioc|Alo) ;; *) die "--hl-tif must be Ioc or Alo" ;; esac
-    is_positive_decimal "$hl_price" || die "--hl-price must be a positive decimal"
-    is_positive_decimal "$hl_size" || die "--hl-size must be a positive decimal"
-    hl_notional="$(jq -nr --arg p "$hl_price" --arg s "$hl_size" \
-      '($p|tonumber) * ($s|tonumber)')"
-    jq -en --arg n "$hl_notional" --arg cap "$MAX_USD" \
-      '($n|tonumber) >= 10 and ($n|tonumber) <= ($cap|tonumber)' >/dev/null ||
-      die "Hyperliquid order notional must be between \$10 and \$${MAX_USD}"
-  fi
   if [ "$execute_pm" -eq 1 ]; then
     for value in "$pm_slug" "$pm_outcome" "$pm_side" "$pm_amount" "$pm_bound"; do
       [ -n "$value" ] || die "all live Polymarket arguments shown in --help are required"
@@ -164,11 +135,8 @@ run_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-mainnet-integration.XXXXXX")"
 socket="${run_dir}/bloom.sock"
 mount_dir="${run_dir}/mount"
 server_log="${run_dir}/serve.log"
+ready_file="${run_dir}/triad.ready"
 server_pid=""
-session_active=0
-session_id="manual-mainnet-integration-$(date +%s)-$$"
-agent_name="$(printf 'bloom-i-%08d' "$(( $$ % 100000000 ))")"
-[ "${#agent_name}" -le 16 ] || die "internal Hyperliquid agent name exceeds 16 characters"
 mkdir "$mount_dir"
 
 mounted_path() {
@@ -200,45 +168,82 @@ vls_names() {
   LC_ALL=C command ls -1 "$(mounted_path "$1")"
 }
 
-wait_for_hl_result() {
-  local result_file error_file error_before description result_body current_error attempt
-  result_file="$(mounted_path "$1")"
-  error_file="$(mounted_path "$2")"
-  error_before="$3"
-  description="$4"
-  attempt=0
-  while [ "$attempt" -lt 150 ]; do
-    result_body="$(cat "$result_file" 2>/dev/null || true)"
-    if [ -n "$result_body" ]; then
-      printf '%s\n' "$result_body"
+wait_for_fixture_stage() {
+  expected="$1"
+  attempts=0
+  while [ "$attempts" -lt 100 ]; do
+    fixture_body="$(cat "$(mounted_path "/petals/triad-authority-fixture/session.json")" 2>/dev/null || true)"
+    fixture_stage="$(printf '%s' "$fixture_body" | jq -r '
+      if .stage == "key" then "key:" + (.outcome.state // "")
+      else .stage // ""
+      end
+    ' 2>/dev/null || true)"
+    if [ "$fixture_stage" = "$expected" ]; then
+      printf '%s\n' "$fixture_body"
       return 0
     fi
-    current_error="$(cat "$error_file" 2>/dev/null || true)"
-    if [ -n "$current_error" ] && [ "$current_error" != "$error_before" ]; then
-      printf 'Hyperliquid %s failed through the mounted filesystem:\n%s\n' \
-        "$description" "$current_error" >&2
-      return 1
-    fi
-    sleep 0.2
-    attempt=$((attempt + 1))
+    attempts=$((attempts + 1))
+    sleep 0.05
   done
-  current_error="$(cat "$error_file" 2>/dev/null || true)"
-  if [ -n "$current_error" ]; then
-    printf 'Latest mounted Hyperliquid %s error:\n%s\n' \
-      "$description" "$current_error" >&2
-  fi
-  return 1
+  die "fixture Petal did not reach mounted stage ${expected}"
+}
+
+wait_for_policy_status() {
+  expected="$1"
+  attempts=0
+  while [ "$attempts" -lt 200 ]; do
+    policy_status_path="/wallets/${wallet}/policy-updates/latest/status.json"
+    if [ "$expected" = "confirmed" ] && [ -n "${policy_update_action_id:-}" ]; then
+      policy_status_path="/wallets/${wallet}/policy-updates/confirmed/${policy_update_action_id}/status.json"
+    fi
+    policy_status_body="$(cat "$(mounted_path "$policy_status_path")" 2>/dev/null || true)"
+    policy_status="$(printf '%s' "$policy_status_body" | jq -r '.status // ""' 2>/dev/null || true)"
+    if [ "$policy_status" = "$expected" ]; then
+      printf '%s\n' "$policy_status_body"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.05
+  done
+  die "wallet policy update did not reach mounted status ${expected}"
+}
+
+wait_for_approval_prepare() {
+  attempts=0
+  while [ "$attempts" -lt 200 ]; do
+    approval_body="$(cat "$(mounted_path "/wallets/${wallet}/sealed-approvals/new.json")" 2>/dev/null || true)"
+    if printf '%s' "$approval_body" | jq -e '
+      (.approval_id | test("^[0-9a-f]{64}$")) and
+      (.ceremony_url | type == "string")
+    ' >/dev/null 2>&1; then
+      printf '%s\n' "$approval_body"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.05
+  done
+  die "fixture Sealed Approval prepare did not appear through the mount"
+}
+
+wait_for_approval_active() {
+  expected_approval_id="$1"
+  attempts=0
+  while [ "$attempts" -lt 200 ]; do
+    approvals_body="$(cat "$(mounted_path "/wallets/${wallet}/sealed-approvals/active.json")" 2>/dev/null || true)"
+    if printf '%s' "$approvals_body" | jq -e --arg approval_id "$expected_approval_id" '
+      any(.approvals[]?; .approval_id == $approval_id and .state == "active")
+    ' >/dev/null 2>&1; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.05
+  done
+  die "fixture Sealed Approval did not become active through the mount"
 }
 
 cleanup() {
   status=$?
   trap - EXIT INT TERM
-  if [ "$session_active" -eq 1 ] && [ -S "$socket" ]; then
-    vwrite "/hyperliquid/mainnet/agent_sessions/${wallet}/${session_id}/cancel_all" \
-      '{}' >/dev/null 2>&1 || true
-    vwrite "/hyperliquid/mainnet/agent_sessions/${wallet}/${session_id}/stop" \
-      '{}' >/dev/null 2>&1 || true
-  fi
   if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
@@ -252,34 +257,29 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [ -n "${BLOOM_INTEGRATION_BIN:-}" ]; then
-  bloom_bin="$BLOOM_INTEGRATION_BIN"
-  [ -x "$bloom_bin" ] || die "BLOOM_INTEGRATION_BIN is not executable"
-else
-  (
-    cd "$repo_root"
-    cargo build -p bloom --no-default-features --features local-integration,mount
-  )
-  bloom_bin="${repo_root}/target/debug/bloom"
-fi
-
-"$bloom_bin" --home "$home_dir" serve \
-  --endpoint "unix:${socket}" --mount "$mount_dir" \
-  --local-integration >"$server_log" 2>&1 &
+triad_launcher="${BLOOM_TRIAD_DEV_LAUNCHER:-${repo_root}/scripts/triad-dev-launch.sh}"
+[ -x "$triad_launcher" ] || die "triad developer launcher is not executable: $triad_launcher"
+"$triad_launcher" \
+  --developer-root "$developer_root" \
+  --machine-home "$home_dir" \
+  --mount "$mount_dir" \
+  --machine-socket "$socket" \
+  --log-dir "$run_dir" \
+  --ready-file "$ready_file" >"$server_log" 2>&1 &
 server_pid=$!
 
 startup_started_at="$(date +%s)"
 startup_deadline=$((startup_started_at + startup_timeout_secs))
 startup_next_notice=$((startup_started_at + 10))
-while [ ! -S "$socket" ]; do
+while [ ! -f "$ready_file" ]; do
   if ! kill -0 "$server_pid" 2>/dev/null; then
     cat "$server_log" >&2
-    die "local integration server exited during startup"
+    die "triad developer harness exited during startup"
   fi
   startup_now="$(date +%s)"
   if [ "$startup_now" -ge "$startup_deadline" ]; then
     cat "$server_log" >&2
-    die "local integration server did not become ready within ${startup_timeout_secs}s"
+    die "triad developer harness did not become ready within ${startup_timeout_secs}s"
   fi
   if [ "$startup_now" -ge "$startup_next_notice" ]; then
     startup_last_log="$(tail -n 1 "$server_log" 2>/dev/null || true)"
@@ -295,9 +295,11 @@ done
 
 open_approval() {
   artifact_path="$1"
+  approval_selector="${2:-.}"
   artifact="$(vcat "$artifact_path")"
-  ceremony_url="$(printf '%s' "$artifact" | jq -er '.ceremony_url')"
-  expires_ms="$(printf '%s' "$artifact" | jq -r '.expires_ms // .expires_at_ms // "unknown"')"
+  approval="$(printf '%s' "$artifact" | jq -ec "$approval_selector")"
+  ceremony_url="$(printf '%s' "$approval" | jq -er '.ceremony_url')"
+  expires_ms="$(printf '%s' "$approval" | jq -r '.expires_ms // .expires_at_ms // .ceremony_expires_at_ms // "unknown"')"
   printf '\nPasskey approval required:\n'
   printf '%s\n' "$artifact" | jq .
   "$browser_open" "$ceremony_url"
@@ -315,56 +317,153 @@ wallet_kind="$(vcat "/wallets/${wallet}/kind" | tr -d '[:space:]')"
 wallet_address="$(vcat "/wallets/${wallet}/address" | tr -d '[:space:]')"
 printf 'Passkey wallet: %s (%s)\n' "$wallet" "$wallet_address"
 
-if [ "$live" -eq 0 ] || [ "$execute_hl" -eq 1 ]; then
-  hl_meta="$(vcat "/hyperliquid/mainnet/perp_meta.json")"
-  hl_resolved_coin="$(printf '%s' "$hl_meta" |
-    jq -er --argjson id "${hl_asset_id:-0}" '.universe[$id].name')"
-  printf 'Hyperliquid mainnet: reachable (asset 0 is %s)\n' \
-    "$(printf '%s' "$hl_meta" | jq -er '.universe[0].name')"
-  if [ -n "$hl_coin" ]; then
-    hl_discovered_id="$(printf '%s' "$hl_meta" | jq -er --arg coin "$hl_coin" '
-      .universe | to_entries[] | select(.value.name == $coin) | .key
-    ')"
-    printf 'Requested Hyperliquid coin: %s has asset id %s\n' "$hl_coin" "$hl_discovered_id"
-  fi
-  hl_account="$(vcat "/hyperliquid/mainnet/users/${wallet_address}/clearinghouse.json")"
-  printf 'Hyperliquid account snapshot:\n'
-  printf '%s\n' "$hl_account" | jq '{
-    account_value: .marginSummary.accountValue,
-    withdrawable: .withdrawable,
-    positions: [.assetPositions[]? | {
-      coin: .position.coin,
-      size: .position.szi,
-      entry_price: .position.entryPx,
-      unrealized_pnl: .position.unrealizedPnl
-    }]
-  }'
-  if ! printf '%s' "$hl_account" |
-    jq -e '(.marginSummary.accountValue | tonumber) > 0' >/dev/null
-  then
-    printf 'BLOCKER: Hyperliquid account value is zero or unreadable.\n' >&2
-    preflight_blockers=1
-  fi
-  if [ "$execute_hl" -eq 1 ]; then
-    hl_extra_agents="$(vcat "/hyperliquid/mainnet/users/${wallet_address}/extra_agents.json")"
-    reusable_agent_name="$(printf '%s' "$hl_extra_agents" | jq -er '
-      [.[] | (.name // "") | select(test("^bloom-i-[A-Za-z0-9._-]+$"))][0] // ""
-    ')"
-    if [ -n "$reusable_agent_name" ]; then
-      agent_name="$reusable_agent_name"
-      [ "${#agent_name}" -le 16 ] ||
-        die "existing Hyperliquid integration agent name exceeds 16 characters"
-      printf 'Hyperliquid integration agent: reusing named slot %s\n' "$agent_name"
-    else
-      named_agent_count="$(printf '%s' "$hl_extra_agents" | jq '
-        [.[] | select((.name // "") != "")] | length
-      ')"
-      [ "$named_agent_count" -lt 3 ] ||
-        die "all three named Hyperliquid API-wallet slots are occupied and none belongs to this integration runner"
-      printf 'Hyperliquid integration agent: allocating named slot %s\n' "$agent_name"
-    fi
-  fi
+# A freshly registered wallet has no allowed Petal packages. Add only the
+# deterministic fixture package through the canonical mounted policy custody
+# lifecycle: policy.validate_update preparation, Broker-owned policy_update
+# ceremony, completed custody receipt, and policy.commit_update on the exact
+# write retry. This never edits policy state directly and does not make the
+# production default permissive.
+current_policy="$(vcat "/wallets/${wallet}/policy.json")"
+printf '%s' "$current_policy" | jq -e \
+  --arg wallet "$wallet" \
+  '.wallet_id == $wallet and (.allowed_petal_packages | type == "array")' \
+  >/dev/null || die "mounted wallet policy is malformed or names another wallet"
+fixture_policy_allowed="$(printf '%s' "$current_policy" | jq -r \
+  --arg package_hash "$FIXTURE_PACKAGE_HASH" \
+  '.allowed_petal_packages | index($package_hash) != null')"
+if [ "$fixture_policy_allowed" != "true" ]; then
+  proposed_policy="$(printf '%s' "$current_policy" | jq -cS \
+    --arg package_hash "$FIXTURE_PACKAGE_HASH" \
+    '.allowed_petal_packages = ((.allowed_petal_packages + [$package_hash]) | unique | sort)')"
+  printf '\nAuthorizing the fixture Petal package through the mounted wallet policy...\n'
+  vwrite_staging "/wallets/${wallet}/policy.json" "$proposed_policy"
+  policy_update_status="$(wait_for_policy_status "awaiting_custody")"
+  policy_update_action_id="$(printf '%s' "$policy_update_status" | jq -er '.action_id')"
+  open_approval "/wallets/${wallet}/policy-updates/latest/approval_challenge.json"
+  wait_for_policy_status "ready_to_commit" >/dev/null
+  vwrite "/wallets/${wallet}/policy.json" "$proposed_policy"
+  wait_for_policy_status "confirmed" >/dev/null
+  installed_policy="$(vcat "/wallets/${wallet}/policy.json")"
+  printf '%s' "$installed_policy" | jq -e \
+    --arg package_hash "$FIXTURE_PACKAGE_HASH" \
+    '.allowed_petal_packages | index($package_hash) != null' \
+    >/dev/null || die "committed mounted wallet policy omitted the fixture package"
+  printf 'Wallet policy: fixture package committed through policy_update custody\n'
+else
+  printf 'Wallet policy: fixture package already allowed\n'
 fi
+
+# Prove the generic Petal authority path before checking venue compatibility:
+# ordinary mounted write -> owner-mounted key ceremony -> exact retry ->
+# payload-signing ceremony -> exact retry. No CLI or RPC shortcut is used.
+fixture_path="/petals/triad-authority-fixture/session.json"
+fixture_request_id="manual-fixture-$(date +%s)-$$"
+fixture_nonce="$(printf '%s' "$fixture_request_id" | shasum -a 256 | awk '{print substr($1, 1, 32)}')"
+fixture_request="$(jq -nc \
+  --arg request_id "$fixture_request_id" --arg wallet_id "$wallet" \
+  --arg nonce_hex "$fixture_nonce" \
+  '{request_id:$request_id,wallet_id:$wallet_id,purpose:"fixture.payload",
+    maximum_lifetime_ms:900000,
+    preimage_hex:"66697874757265207061796c6f6164",
+    nonce_hex:$nonce_hex,approval_hint:null}')"
+printf '\nRequesting a Signer-owned fixture Petal sub-key through the mount...\n'
+vwrite_staging "$fixture_path" "$fixture_request"
+fixture_result="$(wait_for_fixture_stage "key:pending")"
+printf '%s' "$fixture_result" | jq -e '
+  .stage == "key" and .outcome.state == "pending" and
+  (.outcome.operation_id | type == "string") and
+  (.outcome.scope_digest | type == "string")
+' >/dev/null || die "fixture Petal did not return a pending scoped-key operation"
+
+fixture_key_record=""
+while IFS= read -r record_name; do
+  [ -n "$record_name" ] || continue
+  candidate="/petal-key-requests/${record_name}"
+  candidate_body="$(vcat "$candidate")"
+  if printf '%s' "$candidate_body" | jq -e --arg request_id "$fixture_request_id" \
+    '.request_id == $request_id and .status == "awaiting_user"' >/dev/null
+  then
+    fixture_key_record="$candidate"
+    break
+  fi
+done < <(vls_names "/petal-key-requests")
+[ -n "$fixture_key_record" ] || die "owner-mounted fixture key ceremony record was not found"
+open_approval "$fixture_key_record"
+
+vwrite_staging "$fixture_path" "$fixture_request"
+fixture_result="$(wait_for_fixture_stage "signing_failed")"
+printf '%s' "$fixture_result" | jq -e '
+  .stage == "signing_failed" and
+  (.error | contains("APPROVAL_NOT_FOUND"))
+' >/dev/null || die "fixture Petal did not fail closed before Sealed Approval preparation"
+
+# The Petal cannot mint its own reusable authority and the host does not
+# fabricate an approval from a missing hint. Read only public authority inputs
+# through owner-mounted projections, prepare the canonical Petal-scoped Sealed
+# Approval through its existing mounted adapter, complete the Broker ceremony,
+# then pass the returned approval ID on the exact fixture retry.
+fixture_key_record_body="$(vcat "$fixture_key_record")"
+fixture_key_ref="$(printf '%s' "$fixture_key_record_body" | jq -ec '.public_key.key_ref')"
+fixture_provenance_digest="$(printf '%s' "$fixture_key_record_body" | jq -er '.provenance_digest')"
+fixture_agent_id="$(printf '%s' "$fixture_key_record_body" | jq -c '.scope.agent_id')"
+wallet_authority="$(vcat "/wallets/${wallet}/addresses.json")"
+policy_version="$(printf '%s' "$wallet_authority" | jq -er '.policy_version')"
+policy_digest="$(printf '%s' "$wallet_authority" | jq -er '.policy_digest')"
+wallet_revocation_epoch="$(printf '%s' "$wallet_authority" | jq -er '.wallet_revocation_epoch')"
+for digest_value in "$fixture_provenance_digest" "$policy_digest"; do
+  printf '%s' "$digest_value" | jq -R -e 'test("^[0-9a-f]{64}$")' >/dev/null ||
+    die "mounted approval authority metadata contains a malformed digest"
+done
+approval_now_ms="$(( $(date +%s) * 1000 ))"
+approval_expires_ms="$((approval_now_ms + 240000))"
+approval_operation_id="$(printf '%s' "${fixture_request_id}:approval" | shasum -a 256 | awk '{print $1}')"
+approval_nonce="$(printf '%s' "${fixture_request_id}:nonce" | shasum -a 256 | awk '{print substr($1, 1, 32)}')"
+approval_plan="$(jq -ncS \
+  --arg wallet_id "$wallet" --arg package_hash "$FIXTURE_PACKAGE_HASH" \
+  --arg route "r000001" --arg operation_class "fixture.payload" \
+  --arg payload_sha256 "$(printf 'fixture payload' | shasum -a 256 | awk '{print $1}')" \
+  '{wallet_id:$wallet_id,package_hash:$package_hash,route:$route,
+    operation_class:$operation_class,payload_sha256:$payload_sha256}')"
+approval_plan_digest="$(printf '%s' "$approval_plan" | shasum -a 256 | awk '{print $1}')"
+approval_request="$(jq -ncS \
+  --arg operation_id "$approval_operation_id" --arg wallet_id "$wallet" \
+  --arg package_hash "$FIXTURE_PACKAGE_HASH" --arg route "r000001" \
+  --argjson agent_id "$fixture_agent_id" --argjson key_ref "$fixture_key_ref" \
+  --arg policy_version "$policy_version" --arg policy_digest "$policy_digest" \
+  --arg revocation_epoch "$wallet_revocation_epoch" \
+  --arg provenance_digest "$fixture_provenance_digest" --arg nonce "$approval_nonce" \
+  --arg issued_at_ms "$approval_now_ms" --arg expires_at_ms "$approval_expires_ms" \
+  --arg plan_digest "$approval_plan_digest" \
+  '{operation_id:$operation_id,canonical_plan_facts_digest:$plan_digest,terms:{
+    subject:{kind:"petal",package_hash:$package_hash,route:$route,agent_id:$agent_id},
+    wallet_id:$wallet_id,key_ref:$key_ref,
+    allowed_crypto_suites:["secp256k1-sha256-recoverable"],
+    selector:{kind:"petal",package_hash:$package_hash,route:$route,
+      allowed_operation_classes:["fixture.payload"],required_claim_assurance:"machine_asserted"},
+    limits:{max_operations:"1",max_signatures:"1",operation_rate_limits:[],
+      signature_rate_limits:[],value_limits:[]},
+    activation_mode:{kind:"boot_bound"},wallet_revocation_epoch:$revocation_epoch,
+    policy_version:$policy_version,policy_digest:$policy_digest,
+    provenance_digest:$provenance_digest,request_nonce:$nonce,
+    issued_at_ms:$issued_at_ms,not_before_ms:$issued_at_ms,
+    expires_at_ms:$expires_at_ms,renewal_of:null}}')"
+printf '\nPreparing the fixture Petal Sealed Approval through the mount...\n'
+vwrite "/wallets/${wallet}/sealed-approvals/new.json" "$approval_request"
+approval_projection="$(wait_for_approval_prepare)"
+fixture_approval_id="$(printf '%s' "$approval_projection" | jq -er '.approval_id')"
+open_approval "/wallets/${wallet}/sealed-approvals/new.json"
+wait_for_approval_active "$fixture_approval_id"
+fixture_request="$(printf '%s' "$fixture_request" | jq -cS --arg approval_id "$fixture_approval_id" \
+  '.approval_hint = $approval_id')"
+
+vwrite "$fixture_path" "$fixture_request"
+fixture_result="$(wait_for_fixture_stage "complete")"
+printf '%s' "$fixture_result" | jq -e '
+  .stage == "complete" and
+  (.public_key.key_ref_jcs | type == "array") and
+  (.signature_hex | test("^[0-9a-f]+$"))
+' >/dev/null || die "fixture Petal did not complete scoped payload signing"
+printf 'Fixture Petal: Signer-owned sub-key derived and payload signed through mounted files\n'
 
 if [ "$live" -eq 0 ] || [ "$execute_pm" -eq 1 ]; then
   route_contract="$(vcat "/petals/polymarket/meta/route-contract.json")"
@@ -374,6 +473,12 @@ if [ "$live" -eq 0 ] || [ "$execute_pm" -eq 1 ]; then
   vls_names "/petals/polymarket/account" >/dev/null
   vls_names "/petals/polymarket/trade" >/dev/null
   printf 'Polymarket Petal: mounted and route contract loaded\n'
+  pm_triad_compatible="$(printf '%s' "$route_contract" | jq -r '
+    [.. | strings] | any(contains("bloom:sign/signing@0.3.0"))
+  ')"
+  if [ "$pm_triad_compatible" != "true" ]; then
+    printf 'Polymarket Petal: read-only preflight only; pinned release lacks production triad payload signing\n'
+  fi
   if [ -n "$pm_slug" ]; then
     case "$pm_slug" in *[!A-Za-z0-9._-]*|'') die "Polymarket slug contains unsafe characters" ;; esac
     printf 'Requested Polymarket slug: %s\n' "$pm_slug"
@@ -383,43 +488,15 @@ fi
 if [ "$live" -eq 0 ]; then
   [ "$preflight_blockers" -eq 0 ] ||
     die "preflight found an external prerequisite blocker; no order was submitted"
-  printf '\nPreflight passed. No passkey prompt was opened and no order was submitted.\n'
+  printf '\nPreflight passed. Fixture passkey ceremonies completed; no venue order was submitted.\n'
   printf 'Re-run with the exact live arguments shown by --help when ready.\n'
   exit 0
 fi
 
 [ "$preflight_blockers" -eq 0 ] ||
   die "live preflight found an external prerequisite blocker; no order was staged"
-
-if [ "$execute_hl" -eq 1 ]; then
-  [ "$hl_resolved_coin" = "$hl_coin" ] ||
-    die "Hyperliquid asset id ${hl_asset_id} resolves to '${hl_resolved_coin}', not '${hl_coin}'"
-  session_path="/hyperliquid/mainnet/agent_sessions/${wallet}/${session_id}"
-  session_policy="$(jq -nc \
-    --arg coin "$hl_coin" --argjson cap 25 --argjson secs "$HL_SESSION_SECS" \
-    '{
-      allowed_assets:[$coin],
-      allowed_order_types:["limit"],
-      max_notional_usd:($cap|tostring),
-      max_position_usd:($cap|tostring),
-      max_loss_usd:($cap|tostring),
-      max_session_secs:$secs,
-      allow_reduce_only:true,
-      allow_trigger_orders:false,
-      allow_twap:false,
-      allow_builder_fees:false,
-      allow_vault_or_subaccount:false
-    }')"
-  session_request="$(jq -nc --arg id "$session_id" \
-    --arg name "$agent_name" \
-    --argjson bounds "$session_policy" \
-    '{id:$id,agent_name:$name,integration_bounds:$bounds}')"
-  printf '\nPinned Hyperliquid request\n'
-  printf '  %s %s %s @ %s, tif=%s, max notional=$%s\n' \
-    "$hl_side" "$hl_size" "$hl_coin" "$hl_price" "$hl_tif" "$hl_notional"
-  printf '  ephemeral policy:\n'
-  printf '%s\n' "$session_policy" | jq .
-fi
+[ "$pm_triad_compatible" = "true" ] ||
+  die "pinned Polymarket Petal is not production-triad signing compatible; no draft was staged"
 
 if [ "$execute_pm" -eq 1 ]; then
   if [ "$pm_side" = "buy" ]; then
@@ -455,60 +532,10 @@ if [ "$execute_pm" -eq 1 ]; then
   vcat "${draft_path}/review_intent.json" | jq .
 fi
 
-if [ "$execute_hl" -eq 1 ] && [ "$execute_pm" -eq 1 ]; then
-  mainnet_ack="EXECUTE BOTH MAINNET ORDERS"
-elif [ "$execute_hl" -eq 1 ]; then
-  mainnet_ack="EXECUTE HYPERLIQUID MAINNET ORDER"
-else
-  mainnet_ack="EXECUTE POLYMARKET MAINNET ORDER"
-fi
+mainnet_ack="EXECUTE POLYMARKET MAINNET ORDER"
 printf '\nType exactly “%s” to authorize the selected submission(s): ' "$mainnet_ack"
 IFS= read -r acknowledgement
 [ "$acknowledgement" = "$mainnet_ack" ] || die "mainnet acknowledgement did not match"
-
-if [ "$execute_hl" -eq 1 ]; then
-  printf '\nStaging Hyperliquid session approval...\n'
-  vwrite_staging "/hyperliquid/mainnet/agent_sessions/${wallet}/new.json" "$session_request"
-  open_approval "${session_path}/approval_challenge.json"
-  hl_error_path="/hyperliquid/mainnet/agent_sessions/${wallet}/last_error.json"
-  hl_error_before="$(cat "$(mounted_path "$hl_error_path")" 2>/dev/null || true)"
-  vwrite "/hyperliquid/mainnet/agent_sessions/${wallet}/new.json" "$session_request"
-  if ! session_json="$(wait_for_hl_result \
-    "${session_path}/session.json" "$hl_error_path" "$hl_error_before" \
-    "session creation")"; then
-    die "mounted Hyperliquid session creation did not complete"
-  fi
-  session_active=1
-  printf 'Hyperliquid bounded session:\n'
-  printf '%s\n' "$session_json" | jq .
-
-  hl_is_buy=false
-  [ "$hl_side" = "buy" ] && hl_is_buy=true
-  hl_order="$(jq -nc \
-    --argjson asset "$hl_asset_id" --argjson buy "$hl_is_buy" \
-    --arg price "$hl_price" --arg size "$hl_size" --arg tif "$hl_tif" \
-    '{
-      action:{
-        type:"order",
-        orders:[{a:$asset,b:$buy,p:$price,s:$size,r:false,t:{limit:{tif:$tif}}}],
-        grouping:"na"
-      }
-  }')"
-  printf '\nSubmitting Hyperliquid order...\n'
-  hl_order_error_path="${session_path}/last_error.json"
-  hl_order_error_before="$(cat "$(mounted_path "$hl_order_error_path")" 2>/dev/null || true)"
-  vwrite "${session_path}/order.json" "$hl_order"
-  if ! hl_response="$(wait_for_hl_result \
-    "${session_path}/last_response.json" "$hl_order_error_path" \
-    "$hl_order_error_before" "order submission")"; then
-    die "mounted Hyperliquid order submission did not complete successfully"
-  fi
-  printf '%s\n' "$hl_response" | jq .
-  printf '%s' "$hl_response" | jq -e '
-    (.response.status == "ok") and
-    ([.. | objects | .error? // empty] | length == 0)
-  ' >/dev/null || die "Hyperliquid did not return a clean successful response"
-fi
 
 if [ "$execute_pm" -eq 1 ]; then
   printf '\nType exactly “POST POLYMARKET DRAFT %s” to request its passkey approval: ' "$draft_id"
@@ -528,16 +555,5 @@ if [ "$execute_pm" -eq 1 ]; then
   ' >/dev/null || die "Polymarket receipt reports rejection/failure"
 fi
 
-if [ "$execute_hl" -eq 1 ]; then
-  # Alo is post-only and may rest. Cancel all session orders before stopping so
-  # the manual test cannot accidentally leave an order behind.
-  if [ "$hl_tif" = "Alo" ]; then
-    printf '\nCancelling any resting Hyperliquid order from the ALO test...\n'
-    vwrite "${session_path}/cancel_all" '{}'
-  fi
-  vwrite "${session_path}/stop" '{}'
-  session_active=0
-fi
-
-printf '\nPASS: selected mainnet venue submission(s) returned non-error receipts.\n'
+printf '\nPASS: the selected Polymarket mainnet submission returned a non-error receipt.\n'
 printf 'Inspect fills/positions separately; venue acceptance does not guarantee a fill.\n'

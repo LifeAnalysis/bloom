@@ -5,7 +5,7 @@ use std::sync::{
 
 use bloom_keystore::Keystore;
 use bloom_machine_client::{
-    CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient,
+    CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient, WalletProjectionReader,
 };
 use bloom_proto::{AddressBook, HomeDir, HomeWritePermit};
 use bloom_triad_protocol::{
@@ -21,6 +21,13 @@ use sha2::{Digest as _, Sha256};
 
 #[path = "support/m2_exact_production_routes.rs"]
 mod m2_exact_production_routes;
+
+fn projection_reader(
+    path: impl Into<std::path::PathBuf>,
+    broker: Option<MachineBrokerClient>,
+) -> Arc<dyn WalletProjectionReader> {
+    Arc::new(CachedWalletProjectionReader::new(broker, FileProjectionStore::new(path)).unwrap())
+}
 
 struct FixtureState {
     operation_id: Option<OperationId>,
@@ -262,6 +269,7 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
     assert!(keystore.list().unwrap().is_empty());
     let fixture = broker_fixture(false);
     let expected_policy = fixture.baseline.canonical_policy.decode();
+    let expected_policy_digest = fixture.baseline.policy_digest.clone();
     let cache = temp.path().join("cache/wallets.json");
     let projections = Arc::new(
         CachedWalletProjectionReader::new(
@@ -271,12 +279,12 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
         .unwrap(),
     );
     let handler = WalletsHandler::new(
-        keystore,
         bloom_evm::ChainRegistry::default(),
         TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
         AddressBook::default(),
-    )
-    .with_wallet_projections(projections);
+        projections,
+        temp.path().join("machine-policy-projections"),
+    );
 
     let root = handler.list(&VfsPath::parse("/").unwrap()).await.unwrap();
     assert!(root.iter().any(|entry| entry.name == "alice"));
@@ -304,15 +312,15 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
         .unwrap(),
     );
     let stale_handler = WalletsHandler::new(
-        Keystore::new(temp.path().join("another-empty-keystore")).unwrap(),
         bloom_evm::ChainRegistry::default(),
         TxEngine::new(
             Outbox::new(temp.path().join("stale-outbox")).unwrap(),
             60_000,
         ),
         AddressBook::default(),
-    )
-    .with_wallet_projections(stale_projections);
+        stale_projections,
+        temp.path().join("stale-machine-policy-projections"),
+    );
     let addresses: serde_json::Value = serde_json::from_slice(
         &stale_handler
             .read(&VfsPath::parse("/alice/addresses.json").unwrap())
@@ -321,6 +329,9 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
     )
     .unwrap();
     assert_eq!(addresses["freshness"], "stale");
+    assert_eq!(addresses["policy_version"], "1");
+    assert_eq!(addresses["policy_digest"], expected_policy_digest.as_str());
+    assert_eq!(addresses["wallet_revocation_epoch"], "0");
     assert_eq!(
         stale_handler
             .read(&VfsPath::parse("/alice/policy.json").unwrap())
@@ -341,12 +352,12 @@ async fn vfs_policy_write_without_broker_never_mutates_legacy_policy_bytes() {
     let home = HomeDir::at(temp.path().join("home"));
     let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
     let handler = WalletsHandler::new(
-        keystore.clone(),
         bloom_evm::ChainRegistry::default(),
         TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
         AddressBook::default(),
+        projection_reader(temp.path().join("cache/no-broker-wallets.json"), None),
+        temp.path().join("machine-policy-projections"),
     )
-    .with_policy_projection_root(temp.path().join("machine-policy-projections"))
     .with_home_write_permit(permit);
 
     let error = handler
@@ -371,13 +382,16 @@ async fn vfs_policy_prepare_response_loss_reconciles_the_persisted_operation_id(
     let service: Arc<dyn MachineBrokerService> = fixture.clone();
     let home = HomeDir::at(temp.path().join("home"));
     let handler = WalletsHandler::new(
-        keystore,
         bloom_evm::ChainRegistry::default(),
         TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
         AddressBook::default(),
+        projection_reader(
+            temp.path().join("cache/prepare-loss-wallets.json"),
+            Some(MachineBrokerClient::new(service.clone())),
+        ),
+        temp.path().join("machine-policy-projections"),
     )
     .with_broker(Some(MachineBrokerClient::new(service)))
-    .with_policy_projection_root(temp.path().join("machine-policy-projections"))
     .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
     let write_path = VfsPath::parse("alice/policy.json").unwrap();
     let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
@@ -430,13 +444,16 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
     let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
     let projection_root = temp.path().join("machine-policy-projections");
     let handler = WalletsHandler::new(
-        keystore.clone(),
         bloom_evm::ChainRegistry::default(),
         TxEngine::new(outbox, 60_000),
         AddressBook::default(),
+        projection_reader(
+            temp.path().join("cache/policy-wallets.json"),
+            Some(broker.clone()),
+        ),
+        &projection_root,
     )
     .with_broker(Some(broker.clone()))
-    .with_policy_projection_root(&projection_root)
     .with_home_write_permit(permit);
     let write_path = VfsPath::parse("alice/policy.json").unwrap();
     let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
@@ -478,20 +495,16 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
     fixture.complete.store(true, Ordering::SeqCst);
     drop(handler);
     let restarted = WalletsHandler::new(
-        keystore,
         bloom_evm::ChainRegistry::default(),
         TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
         AddressBook::default(),
+        projection_reader(
+            temp.path().join("cache/restarted-wallets.json"),
+            Some(broker.clone()),
+        ),
+        &projection_root,
     )
     .with_broker(Some(broker.clone()))
-    .with_wallet_projections(Arc::new(
-        CachedWalletProjectionReader::new(
-            Some(broker.clone()),
-            FileProjectionStore::new(temp.path().join("cache/restarted-wallets.json")),
-        )
-        .unwrap(),
-    ))
-    .with_policy_projection_root(&projection_root)
     .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
     let ready_status = restarted
         .read(&VfsPath::parse("alice/policy-updates/latest/status.json").unwrap())
@@ -554,13 +567,16 @@ async fn vfs_policy_terminal_ceremony_states_clear_urls_and_fail_the_projection(
         let home = HomeDir::at(temp.path().join("home"));
         let projection_root = temp.path().join("machine-policy-projections");
         let handler = WalletsHandler::new(
-            keystore,
             bloom_evm::ChainRegistry::default(),
             TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
             AddressBook::default(),
+            projection_reader(
+                temp.path().join("cache/terminal-wallets.json"),
+                Some(MachineBrokerClient::new(service.clone())),
+            ),
+            &projection_root,
         )
         .with_broker(Some(MachineBrokerClient::new(service)))
-        .with_policy_projection_root(&projection_root)
         .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
         let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
 

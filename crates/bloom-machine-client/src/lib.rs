@@ -113,6 +113,31 @@ impl MachineBrokerClient {
             manifest_path,
             "bloom-machine",
         )?;
+        Self::connect_unix_from_loaded(socket_path, identity, manifest)
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    pub fn connect_unix_from_developer_files(
+        developer_root: impl AsRef<Path>,
+        socket_path: impl Into<PathBuf>,
+        identity_path: impl AsRef<Path>,
+        edge_manifest_path: impl AsRef<Path>,
+    ) -> Result<Self, ProtocolError> {
+        let (identity, manifest) =
+            bloom_triad_local_transport::load_developer_identity_and_manifest(
+                developer_root.as_ref(),
+                identity_path.as_ref(),
+                edge_manifest_path.as_ref(),
+                "bloom-machine",
+            )?;
+        Self::connect_unix_from_loaded(socket_path, identity, manifest)
+    }
+
+    fn connect_unix_from_loaded(
+        socket_path: impl Into<PathBuf>,
+        identity: LocalIdentity,
+        manifest: bloom_triad_local_transport::EdgeManifest,
+    ) -> Result<Self, ProtocolError> {
         let machine = manifest.machine.into_acl()?;
         let broker = manifest.broker.into_acl()?;
         if machine.service_id != identity.service_id
@@ -1230,6 +1255,27 @@ pub fn load_provenance_catalog(path: impl AsRef<Path>) -> Result<ProvenanceCatal
         )
     })?;
     decode_provenance_catalog(&bytes)
+}
+
+#[cfg(feature = "triad-dev-harness")]
+pub fn load_developer_provenance_catalog(
+    developer_root: impl AsRef<Path>,
+    path: impl AsRef<Path>,
+) -> Result<ProvenanceCatalog, ProtocolError> {
+    bloom_triad_local_transport::validate_developer_security_file(
+        developer_root.as_ref(),
+        path.as_ref(),
+        "provenance catalog",
+    )?;
+    let catalog: ProvenanceCatalog =
+        serde_json::from_slice(&std::fs::read(path.as_ref()).map_err(|error| {
+            ProtocolError::new(ProtocolErrorCode::UnauthenticatedPeer, error.to_string())
+        })?)
+        .map_err(|error| {
+            ProtocolError::new(ProtocolErrorCode::UnauthenticatedPeer, error.to_string())
+        })?;
+    catalog.validate_shape()?;
+    Ok(catalog)
 }
 
 fn decode_provenance_catalog(bytes: &[u8]) -> Result<ProvenanceCatalog, ProtocolError> {

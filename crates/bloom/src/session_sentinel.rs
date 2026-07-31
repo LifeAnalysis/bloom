@@ -14,7 +14,11 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use bloom_triad_local_transport::{PeerAcl, authenticate_server, load_identity_and_manifest};
+#[cfg(feature = "triad-dev-harness")]
+use bloom_triad_local_transport::load_developer_identity_and_manifest;
+use bloom_triad_local_transport::{
+    PeerAcl, authenticate_server_one_of, load_identity_and_manifest,
+};
 use rustix::process::geteuid;
 use tokio::{io::AsyncReadExt as _, net::UnixListener, sync::Semaphore};
 
@@ -27,26 +31,59 @@ pub async fn run() -> Result<()> {
         bail!("the login-session sentinel must not run as root");
     }
 
-    let enrollment_root = env_path(
-        "BLOOM_ENROLLMENT_ROOT",
-        "/Library/Application Support/BloomTriad/enrollments",
-    );
-    let Some(_) = load_enrollment(&enrollment_root, effective_uid)? else {
-        // The global LaunchAgent is offered to every GUI login. An
-        // unenrolled login is the normal successful no-op case.
-        return Ok(());
+    #[cfg(feature = "triad-dev-harness")]
+    let developer_root = std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").map(PathBuf::from);
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let developer_root: Option<PathBuf> = None;
+    let config_root = if let Some(root) = developer_root.as_ref() {
+        root.join("config")
+    } else {
+        let enrollment_root = env_path(
+            "BLOOM_ENROLLMENT_ROOT",
+            "/Library/Application Support/BloomTriad/enrollments",
+        );
+        let Some(_) = load_enrollment(&enrollment_root, effective_uid)? else {
+            // The global LaunchAgent is offered to every GUI login. An
+            // unenrolled login is the normal successful no-op case.
+            return Ok(());
+        };
+        env_path(
+            "BLOOM_CONFIG_ROOT",
+            "/Library/Application Support/BloomTriad/config",
+        )
+        .join(effective_uid.to_string())
     };
-    let config_root = env_path(
-        "BLOOM_CONFIG_ROOT",
-        "/Library/Application Support/BloomTriad/config",
-    )
-    .join(effective_uid.to_string());
-    let identity_path = config_root.join("session/identity.json");
+    let identity_path = if developer_root.is_some() {
+        config_root.join("session-identity.json")
+    } else {
+        config_root.join("session/identity.json")
+    };
     let manifest_path = config_root.join("edge-manifest.json");
     require_login_owned_private_file(&identity_path, effective_uid)?;
-    let (identity, manifest) =
-        load_identity_and_manifest(&identity_path, &manifest_path, SESSION_SERVICE_ID)
-            .context("load authenticated session identity")?;
+    #[cfg(feature = "triad-dev-harness")]
+    let loaded_developer = developer_root.as_ref().map(|root| {
+        load_developer_identity_and_manifest(
+            root,
+            &identity_path,
+            &manifest_path,
+            SESSION_SERVICE_ID,
+        )
+    });
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let loaded_developer: Option<
+        Result<
+            (
+                bloom_triad_local_transport::LocalIdentity,
+                bloom_triad_local_transport::EdgeManifest,
+            ),
+            bloom_triad_protocol::ProtocolError,
+        >,
+    > = None;
+    let (identity, manifest) = loaded_developer
+        .unwrap_or_else(|| {
+            load_identity_and_manifest(&identity_path, &manifest_path, SESSION_SERVICE_ID)
+        })
+        .context("load authenticated session identity")?;
     let broker_acl = manifest
         .broker
         .into_acl()
@@ -64,8 +101,22 @@ pub async fn run() -> Result<()> {
         .session_socket_gid
         .ok_or_else(|| anyhow::anyhow!("edge manifest has no session socket group"))?;
 
-    let runtime_root = env_path("BLOOM_RUNTIME_ROOT", "/private/var/run/bloom");
-    let session_dir = runtime_root.join(effective_uid.to_string()).join("session");
+    let session_dir = if let Some(root) = developer_root.as_ref() {
+        let runtime = std::env::var_os("BLOOM_TRIAD_DEVELOPER_RUNTIME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("runtime"));
+        let canonical_root = fs::canonicalize(root).context("canonicalize developer root")?;
+        let canonical_runtime =
+            fs::canonicalize(&runtime).context("canonicalize developer runtime directory")?;
+        if !canonical_runtime.starts_with(&canonical_root) {
+            bail!("developer runtime directory escapes the declared developer root");
+        }
+        canonical_runtime.join("session")
+    } else {
+        env_path("BLOOM_RUNTIME_ROOT", "/private/var/run/bloom")
+            .join(effective_uid.to_string())
+            .join("session")
+    };
     require_session_directory(&session_dir, effective_uid, socket_gid)?;
     let socket_path = session_dir.join("session.sock");
     remove_owned_stale_socket(&socket_path, effective_uid, socket_gid)?;
@@ -105,33 +156,26 @@ async fn serve_authenticated_services(
             .peer_cred()
             .context("inspect session peer credentials")?
             .uid();
-        let Some(peer) = peers
-            .iter()
-            .find(|candidate| candidate.effective_uid == observed_uid)
-            .cloned()
-        else {
-            tracing::warn!(observed_uid, "session_sentinel.rejected_uid");
-            continue;
-        };
         let Ok(permit) = connections.clone().try_acquire_owned() else {
             tracing::warn!("session_sentinel.connection_quota_exhausted");
             continue;
         };
         let identity = identity.clone();
+        let peers = peers.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let authenticated = tokio::time::timeout(
                 Duration::from_secs(2),
-                authenticate_server(&mut stream, &identity, &peer),
+                authenticate_server_one_of(&mut stream, &identity, &peers),
             )
             .await;
-            if !matches!(authenticated, Ok(Ok(()))) {
-                tracing::warn!(
-                    service_id = peer.service_id.as_str(),
-                    "session_sentinel.rejected_peer"
-                );
-                return;
-            }
+            let peer = match authenticated {
+                Ok(Ok(peer)) => peer,
+                _ => {
+                    tracing::warn!(observed_uid, "session_sentinel.rejected_peer");
+                    return;
+                }
+            };
             tracing::info!(
                 service_id = peer.service_id.as_str(),
                 "session_sentinel.service_authenticated"

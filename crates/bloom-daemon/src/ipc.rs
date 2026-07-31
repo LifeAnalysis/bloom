@@ -718,18 +718,6 @@ summary = "Demo app used by IPC tests."
             "/requests/pending/req_123/confirm",
             "/requests/new",
             "/requests/pending/req_123/cancel",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
-            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_cancel_all",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_close_all",
-            "/hyperliquid/mainnet/exchange/minnow/order.json",
-            "/hyperliquid/mainnet/exchange/minnow/cancel.json",
-            "/hyperliquid/mainnet/exchange/minnow/schedule_cancel.json",
-            "/hyperliquid/mainnet/exchange/minnow/update_leverage.json",
-            "/hyperliquid/mainnet/exchange/minnow/send_asset.json",
-            "/hyperliquid/mainnet/exchange/minnow/raw_signed.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!write_path_uses_wallet_signer(&p), "{path}");

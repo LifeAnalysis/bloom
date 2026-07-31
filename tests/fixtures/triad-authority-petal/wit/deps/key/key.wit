@@ -1,0 +1,5 @@
+package bloom:key@0.1.0;
+
+interface derive {
+  request: func(request: list<u8>) -> result<list<u8>, string>;
+}

@@ -22,24 +22,20 @@ bloom gatekeeps every value-moving action through capabilities:
 - **Reads are always safe.** No signing, no ceremony, no wallet needed for chain
   state, balances, prices, books, candles, account state.
 - **Direct writes require owner approval.** The outbox stage-confirm flow,
-  one-off Hyperliquid exchange orders, and Polymarket trades each cross an
+  one-off Petal operations and Polymarket trades each cross an
   owner gate (passkey ceremony or local passphrase unlock).
 - **Automated action uses a capability.** Create a bounded session/capability
   first — the human approves the bounds once, then the agent operates inside
   them without re-prompting until expiry, breach, or revocation.
-- **The owner key is never handed off.** For capabilities that depend on owner
-  signing (EVM and installed Petals), the key will
-  reside in daemon RAM for a bounded window and auto-lock on expiry.
-  Hyperliquid already uses an ephemeral agent key that does not need the
-  owner key after session creation.
+- **The owner key is never handed off.** EVM and installed-Petal authority is
+  prepared by Broker and signed only by Signer; Machine never receives the
+  private key.
 
-To see what a wallet can do without a human, check its per-chain state and
-outbox, or its Hyperliquid sessions under `hyperliquid/<net>/agent_sessions/`.
+To see what a wallet can do without a human, check its per-chain state, outbox,
+and the mounted capability views of installed Petals.
 A read-only `wallets/<wallet>/capabilities/` roll-up and a VFS-root `next.md`
 aggregator expose the current capability and next-action view when the daemon
 has the relevant handlers mounted.
-
-Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
 
 ## Wallets
 
@@ -263,22 +259,12 @@ REQUEST
 Prefer request-local USD caps. If `plan.md` says policy is denied, do not retry
 blindly; inspect the wallet policy or ask the human to change it.
 
-## Hyperliquid (session-first)
+## Hyperliquid
 
-Hyperliquid trading uses Sealed Approval for owner authority:
-
-- **Agent sessions (RECOMMENDED):** write an explicit session id to
-  `hyperliquid/mainnet/agent_sessions/<wallet>/new.json`. If the write returns
-  permission denied, read that session directory's `approval_challenge.json`,
-  open or forward its `ceremony_url`, complete the grant ceremony, then retry
-  the same write. The resulting ephemeral API wallet trades inside policy
-  bounds at `hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json`
-  without additional owner prompts until the session expires or is stopped.
-
-- **Owner actions:** `hyperliquid/<network>/exchange/<wallet>/send_asset.json`
-  follows the same challenge/grant/retry flow and requires `transfer_cap_usd`.
-  Generic owner-signed order/cancel/update-leverage writes are disabled; use
-  agent sessions.
+The native Hyperliquid handler and agent-session authority are retired. Use an
+installed Hyperliquid Petal under `petals/<name>/` when one is present; discover
+its exact mounted routes and declared capabilities through `docs/petals.md`.
+Do not assume a Hyperliquid Petal is installed or fall back to native paths.
 
 ## Petals
 

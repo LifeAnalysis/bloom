@@ -7,8 +7,6 @@ pub mod chains_mempool;
 mod chains_nfts;
 pub mod docs;
 pub mod ens;
-#[path = "hyperliquid_retired.rs"]
-pub mod hyperliquid;
 pub mod outbox;
 pub mod petal_key_requests;
 pub mod prices;
@@ -25,7 +23,6 @@ pub use chains::ChainsHandler;
 pub use chains_mempool::MempoolHandler;
 pub use docs::DocsHandler;
 pub use ens::EnsHandler;
-pub use hyperliquid::HyperliquidHandler;
 pub use outbox::{CentralOutbox, OutboxHandler};
 pub use petal_key_requests::PetalKeyRequestsHandler;
 pub use prices::PricesHandler;

@@ -47,6 +47,115 @@ pub fn run_from_process_args() -> Result<()> {
     })
 }
 
+#[cfg(feature = "triad-dev-harness")]
+pub fn run_developer_from_process_args() -> Result<()> {
+    let uid = rustix::process::geteuid().as_raw();
+    let gid = rustix::process::getegid().as_raw();
+    if uid == 0 {
+        bail!("developer enrollment material generation refuses root");
+    }
+    if std::env::consts::OS != "macos" {
+        bail!("developer enrollment material generation requires Darwin");
+    }
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if args.len() != 5 {
+        bail!("invalid developer enrollment material invocation");
+    }
+    let template_dir = fs::canonicalize(Path::new(&args[2]))
+        .context("canonicalize developer enrollment template directory")?;
+    let output_dir = fs::canonicalize(Path::new(&args[3]))
+        .context("canonicalize developer enrollment output directory")?;
+    let release_digest = args[4]
+        .to_str()
+        .context("developer release digest is not UTF-8")?
+        .to_owned();
+    let plan = EnrollmentPlan {
+        template_dir,
+        output_dir,
+        login_uid: uid,
+        broker_uid: uid,
+        signer_uid: uid,
+        session_socket_gid: gid,
+        release_digest,
+    };
+    generate_for_owner(&plan, uid)?;
+    let developer_root = plan
+        .output_dir
+        .parent()
+        .context("developer config output has no parent root")?;
+    render_developer_runtime_paths(&plan.output_dir, developer_root)
+}
+
+#[cfg(any(test, feature = "triad-dev-harness"))]
+fn render_developer_runtime_paths(config_dir: &Path, developer_root: &Path) -> Result<()> {
+    let developer_root =
+        fs::canonicalize(developer_root).context("canonicalize generated developer triad root")?;
+    let state = developer_root.join("state");
+    let runtime = developer_root.join("runtime");
+    let mut broker: serde_json::Value =
+        serde_json::from_slice(&fs::read(config_dir.join("broker.json"))?)?;
+    broker["journal_path"] = state.join("broker/journal.db").display().to_string().into();
+    broker["authority_path"] = state
+        .join("broker/authority.db")
+        .display()
+        .to_string()
+        .into();
+    broker["ceremony_path"] = state
+        .join("broker/ceremonies.db")
+        .display()
+        .to_string()
+        .into();
+    broker["signer_socket_path"] = runtime
+        .join("signer/signer.sock")
+        .display()
+        .to_string()
+        .into();
+    broker["provenance_catalog_path"] = config_dir
+        .join("provenance-catalog.json")
+        .display()
+        .to_string()
+        .into();
+    broker["network_containment"] = serde_json::Value::Null;
+
+    let mut signer: serde_json::Value =
+        serde_json::from_slice(&fs::read(config_dir.join("signer.json"))?)?;
+    signer["database_path"] = state.join("signer/signer.db").display().to_string().into();
+    signer["network_containment"] = serde_json::Value::Null;
+    rewrite_private_json(&config_dir.join("broker.json"), &broker)?;
+    rewrite_private_json(&config_dir.join("signer.json"), &signer)?;
+
+    for name in ["broker.json", "signer.json"] {
+        let bytes = fs::read(config_dir.join(name))?;
+        if bytes.windows(2).any(|window| window == b"@B") {
+            bail!("developer {name} retains an unresolved packaging placeholder");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "triad-dev-harness"))]
+fn rewrite_private_json(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let temporary = path.with_extension("json.new");
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    bytes.zeroize();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
 pub fn run_identity_rotation_from_process_args() -> Result<()> {
     if rustix::process::geteuid().as_raw() != 0 {
         bail!("macOS identity rotation generation requires root");
@@ -660,6 +769,54 @@ mod tests {
                     & 0o777,
                 0o600
             );
+        }
+    }
+
+    #[test]
+    fn developer_configs_resolve_every_path_beneath_one_root_without_containment() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let output = root.join("config");
+        fs::create_dir(&output).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let plan = EnrollmentPlan {
+            template_dir: template_dir(),
+            output_dir: output.clone(),
+            login_uid: uid,
+            broker_uid: uid,
+            signer_uid: uid,
+            session_socket_gid: rustix::process::getegid().as_raw(),
+            release_digest: "33".repeat(32),
+        };
+        generate_for_owner(&plan, uid).unwrap();
+        render_developer_runtime_paths(&output, &root).unwrap();
+
+        let broker: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("broker.json")).unwrap()).unwrap();
+        let signer: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("signer.json")).unwrap()).unwrap();
+        assert!(broker["network_containment"].is_null());
+        assert!(signer["network_containment"].is_null());
+        for path in [
+            &broker["journal_path"],
+            &broker["authority_path"],
+            &broker["ceremony_path"],
+            &broker["signer_socket_path"],
+            &broker["provenance_catalog_path"],
+            &signer["database_path"],
+        ] {
+            let path = Path::new(path.as_str().unwrap());
+            assert!(path.is_absolute());
+            assert!(
+                path.starts_with(&root),
+                "{} escaped developer root",
+                path.display()
+            );
+        }
+        for name in ["broker.json", "signer.json"] {
+            assert!(!fs::read_to_string(output.join(name)).unwrap().contains('@'));
         }
     }
 

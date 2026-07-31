@@ -1,0 +1,33 @@
+package bloom:sign@0.3.0;
+
+interface signing {
+  record approval-required {
+    action-id: string,
+    ceremony-url: string,
+    expires-ms: u64,
+  }
+
+  variant sign-result {
+    signature(list<u8>),
+    approval-required(approval-required),
+  }
+
+  enum selector { exact, reusable }
+
+  record payload-sign-request {
+    wallet: string,
+    preimage: list<u8>,
+    claimed-hash: list<u8>,
+    signature-algorithm: string,
+    operation-class: string,
+    petal-use-claim-jcs: list<u8>,
+    claim-assurance-evidence: option<list<u8>>,
+    approval-hint: option<string>,
+    action: option<list<u8>>,
+    advisory: option<list<u8>>,
+    selector: selector,
+    key-ref-jcs: option<list<u8>>,
+  }
+
+  sign-payload: func(request: payload-sign-request) -> result<sign-result, string>;
+}

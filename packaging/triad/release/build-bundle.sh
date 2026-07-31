@@ -43,8 +43,11 @@ for forbidden in \
   EphemeralAgentKey \
   PrivateKeySigner \
   RegistrationCoordinator \
+  BLOOM_TRIAD_DEVELOPER_ROOT \
   unsafe-debug-signer \
   local-integration \
+  triad-dev-harness \
+  triad-authority-fixture \
   policy-session \
   test-only-release-key \
   test_credential
@@ -193,6 +196,8 @@ for forbidden in \
   accepting_verifier \
   mint_approval \
   bloom.sign-hash \
+  BLOOM_TRIAD_DEVELOPER_ROOT \
+  triad-authority-fixture \
   test-only-release-key \
   test_credential
 do

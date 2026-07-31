@@ -29,7 +29,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
-use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork, UsdSendRequest, pretty_json};
 use bloom_machine_client::WalletProjectionReader as _;
 use bloom_proto::{HomeDir, HomeWritePermit};
 use bloom_vfs::{
@@ -151,6 +150,18 @@ fn configured_wallet_projection_reader(
     .context("open Machine wallet projection cache")
 }
 
+fn validate_wallet_name(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            ),
+        "wallet name must be 1-64 ASCII alphanumeric, '-' or '_' characters"
+    );
+    Ok(())
+}
+
 fn configured_broker_client_with_activation(
     allow_activating: bool,
 ) -> Result<bloom_machine_client::MachineBrokerClient> {
@@ -171,12 +182,27 @@ fn configured_broker_client_with_activation(
         .map(std::path::PathBuf::from)
         .or_else(|| installed.as_ref().map(|paths| paths.edge_manifest.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from("/etc/bloom/edge-manifest.json"));
-    bloom_machine_client::MachineBrokerClient::connect_unix_from_files(
+    #[cfg(feature = "triad-dev-harness")]
+    let client = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
+        Some(root) => bloom_machine_client::MachineBrokerClient::connect_unix_from_developer_files(
+            root,
+            broker_socket.clone(),
+            machine_identity.clone(),
+            edge_manifest.clone(),
+        ),
+        None => bloom_machine_client::MachineBrokerClient::connect_unix_from_files(
+            broker_socket.clone(),
+            machine_identity.clone(),
+            edge_manifest.clone(),
+        ),
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let client = bloom_machine_client::MachineBrokerClient::connect_unix_from_files(
         broker_socket,
         machine_identity,
         edge_manifest,
-    )
-    .context("load authenticated Machine-to-Broker edge")
+    );
+    client.context("load authenticated Machine-to-Broker edge")
 }
 
 async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
@@ -235,6 +261,15 @@ fn configured_broker_connection() -> Result<(
                 .map(|paths| paths.provenance_catalog.clone())
         })
         .unwrap_or_else(|| std::path::PathBuf::from("/etc/bloom/provenance-catalog.json"));
+    #[cfg(feature = "triad-dev-harness")]
+    let catalog = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
+        Some(root) => {
+            bloom_machine_client::load_developer_provenance_catalog(root, &provenance_catalog)
+        }
+        None => bloom_machine_client::load_provenance_catalog(&provenance_catalog),
+    }
+    .context("load installer-owned provenance catalog")?;
+    #[cfg(not(feature = "triad-dev-harness"))]
     let catalog = bloom_machine_client::load_provenance_catalog(provenance_catalog)
         .context("load installer-owned provenance catalog")?;
     Ok((broker, catalog))
@@ -467,7 +502,7 @@ async fn launch_custody_ceremony(
     use rand::RngCore as _;
     use sha2::Digest as _;
 
-    bloom_keystore::Keystore::validate_name(requested_name)
+    validate_wallet_name(requested_name)
         .context("requested wallet name must be a safe single path segment")?;
     bloom_triad_protocol::Token::new(requested_name.to_owned())
         .context("requested wallet name must be a protocol token")?;
@@ -531,7 +566,7 @@ async fn prepare_policy_update(
     use rand::RngCore as _;
     use sha2::Digest as _;
 
-    bloom_keystore::Keystore::validate_name(requested_name)
+    validate_wallet_name(requested_name)
         .context("wallet name must be a safe single path segment")?;
     let wallet_id = bloom_triad_protocol::Token::new(requested_name.to_owned())
         .context("wallet name must be a protocol token")?;
@@ -918,14 +953,6 @@ enum Cmd {
             default_missing_value = DEFAULT_MOUNT_PATH
         )]
         mount: Option<PathBuf>,
-
-        /// Run the real passkey ceremony and custody adapters in this process.
-        ///
-        /// This is available only in a binary built with `local-integration`.
-        /// It deliberately collapses the production service boundary and must
-        /// never be used as a deployed profile.
-        #[arg(long)]
-        local_integration: bool,
     },
     /// Talk to a running `bloom serve` over its UDS JSON-RPC socket.
     #[command(subcommand)]
@@ -933,9 +960,6 @@ enum Cmd {
     /// Manage wasm petals: install, app, list, uninstall.
     #[command(subcommand, visible_alias = "petal")]
     Petals(PetalsCmd),
-    /// Hyperliquid HyperCore reads and tightly scoped test actions.
-    #[command(subcommand)]
-    Hyperliquid(HyperliquidCmd),
     /// Check for newer bloom releases on GitHub and inspect the
     /// current update-checker state.
     #[command(subcommand)]
@@ -1068,166 +1092,6 @@ enum UpdateCmd {
 }
 
 #[derive(Subcommand, Debug)]
-enum HyperliquidCmd {
-    /// Print account clearinghouse state.
-    Account {
-        user: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print spot/unified clearinghouse state.
-    SpotState {
-        user: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print open orders.
-    OpenOrders {
-        user: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print user fills.
-    Fills {
-        user: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print user funding history for a coin.
-    Funding {
-        user: String,
-        coin: String,
-        #[arg(long)]
-        start_time: Option<u64>,
-        #[arg(long)]
-        end_time: Option<u64>,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print an L2 order book snapshot.
-    Book {
-        coin: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print candle snapshots for a time range.
-    Candles {
-        coin: String,
-        interval: String,
-        start_time: u64,
-        end_time: u64,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print market metadata.
-    Metadata {
-        #[arg(long, default_value = "perp")]
-        kind: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Manage daemon-held ephemeral API-wallet sessions.
-    Session {
-        #[command(subcommand)]
-        command: HyperliquidSessionCmd,
-    },
-    /// Run the read-only smoke suite for an account.
-    TestReads {
-        user: String,
-        #[arg(long, default_value = "BTC")]
-        coin: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Transfer USDC internally between Hyperliquid accounts (usdSend, Sealed Approval).
-    /// Requires transfer_cap_usd in the wallet [hyperliquid] policy.
-    SendAsset {
-        wallet: String,
-        destination: String,
-        amount: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Place a far-away post-only perp order, then cancel it if it rests.
-    TestPostOnlyCancel {
-        wallet: String,
-        #[arg(long, default_value = "BTC")]
-        coin: String,
-        /// Perp asset id. BTC is normally 0 on mainnet.
-        #[arg(long, default_value_t = 0)]
-        asset: u32,
-        /// Explicit limit price. Defaults to roughly 50% of current mid.
-        #[arg(long)]
-        price: Option<String>,
-        /// Explicit size. Defaults to a size whose limit notional is just above $10.
-        #[arg(long)]
-        size: Option<String>,
-        /// Refuse if price * size is above this USD cap.
-        #[arg(long, default_value_t = 15.0)]
-        max_notional_usd: f64,
-        /// Required acknowledgement for a live-order test command.
-        #[arg(long)]
-        danger_accept_live_orders: bool,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum HyperliquidSessionCmd {
-    /// Create an approved ephemeral API-wallet session in the running daemon.
-    Create {
-        wallet: String,
-        #[arg(long)]
-        id: Option<String>,
-        #[arg(long)]
-        agent_name: Option<String>,
-        /// Vault/subaccount address this session trades on. When set, risk
-        /// monitoring and cleanup target this account and every submit must
-        /// carry a matching vaultAddress.
-        #[arg(long)]
-        vault_address: Option<String>,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print session status.
-    Status {
-        wallet: String,
-        id: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print session audit records.
-    Audit {
-        wallet: String,
-        id: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Stop a session without submitting cleanup orders.
-    Stop {
-        wallet: String,
-        id: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Cancel all open orders for the session account.
-    CancelAll {
-        wallet: String,
-        id: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Cancel orders and submit reduce-only IOC closes for open positions.
-    CloseAll {
-        wallet: String,
-        id: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum WalletCmd {
     /// Start a Broker-hosted wallet registration ceremony.
     New { name: String },
@@ -1236,14 +1100,6 @@ enum WalletCmd {
     Import { name: String },
     /// List configured wallets.
     List,
-    /// Print a table of all wallets with their total portfolio value across
-    /// all connected chains. Queries Hyperliquid clearinghouse state for each
-    /// wallet. Use `--network` to select mainnet (default) or testnet.
-    Portfolio {
-        /// Hyperliquid network to query. Defaults to mainnet.
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
     /// Print a wallet's deposit address. Default output is the bare checksummed
     /// address (one line, scriptable); `--qr` adds a scannable QR block above it,
     /// and `--qr-out <path>` writes a scannable SVG of the address to a file.
@@ -1334,56 +1190,21 @@ enum WalletCmd {
     Delete { name: String },
 }
 
-struct WalletPortfolioRow {
-    name: String,
-    address: String,
-    account_value: f64,
-    withdrawable: f64,
-    positions: Vec<String>,
-}
-
-fn print_portfolio_table(rows: &[WalletPortfolioRow], network: &str) {
-    if rows.is_empty() {
-        println!("no wallets found");
-        return;
-    }
-    println!("\n  Bloom Wallet Portfolio — Hyperliquid {network}\n");
-    println!(
-        "  {:<18} {:<44} {:>12} {:>12} POSITIONS",
-        "WALLET", "ADDRESS", "ACCT VALUE", "WITHDRAWABLE"
-    );
-    println!("  {}", "-".repeat(120));
-    for row in rows {
-        let pos_str = if row.positions.is_empty() {
-            "—".to_string()
-        } else {
-            row.positions.join(", ")
-        };
-        println!(
-            "  {:<18} {:<44} ${:>11} ${:>11} {}",
-            row.name.chars().take(18).collect::<String>(),
-            &row.address[..row.address.len().min(44)],
-            format!("{:.4}", row.account_value),
-            format!("{:.4}", row.withdrawable),
-            pos_str
-        );
-    }
-    println!("  {}", "-".repeat(120));
-    let total_value: f64 = rows.iter().map(|r| r.account_value).sum();
-    let total_wd: f64 = rows.iter().map(|r| r.withdrawable).sum();
-    let total_pos: usize = rows.iter().map(|r| r.positions.len()).sum();
-    println!(
-        "  {:<18} {:<44} ${:>11} ${:>11} {} position(s)\n",
-        "TOTAL",
-        "",
-        format!("{:.4}", total_value),
-        format!("{:.4}", total_wd),
-        total_pos
-    );
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
+    #[cfg(feature = "triad-dev-harness")]
+    if std::env::args_os().len() == 5
+        && std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new("--triad-render-developer-enrollment"))
+    {
+        return match triad_enrollment::run_developer_from_process_args() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Bloom developer triad enrollment generation failed: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if std::env::args_os().len() == 4
         && std::env::args_os().nth(1).as_deref()
             == Some(std::ffi::OsStr::new(
@@ -1748,20 +1569,6 @@ async fn run(cli: Cli) -> Result<()> {
                 "default_wallet: {}",
                 config.default_wallet.as_deref().unwrap_or("<none>")
             );
-            if config.hyperliquid.is_some() {
-                println!("hyperliquid_vfs: enabled (/hyperliquid)");
-                match &projected_wallets {
-                    Some(wallets) => println!(
-                        "hyperliquid_policy: Broker/Signer enforced for {} projected wallet(s)",
-                        wallets.len()
-                    ),
-                    None => println!(
-                        "hyperliquid_policy: unavailable (Broker offline and no cached projection)"
-                    ),
-                }
-            } else {
-                println!("hyperliquid_vfs: disabled (add [hyperliquid] to config.toml)");
-            }
             println!("try: bloom vfs ls /");
             match projected_wallets {
                 Some(wallets) if wallets.is_empty() => {
@@ -2040,79 +1847,6 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Wallet(WalletCmd::Portfolio { network }) => {
-            let client = hl_client(&home, &network)?;
-            let wallets = configured_wallet_projection_reader(&home)?
-                .list_wallets()
-                .await?;
-            let mut set = tokio::task::JoinSet::new();
-            for (idx, projection) in wallets.into_iter().enumerate() {
-                let client = client.clone();
-                set.spawn(async move {
-                    let address = projection
-                        .primary_address()
-                        .map(str::to_owned)
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    let res = client
-                        .info(serde_json::json!({
-                            "type": "clearinghouseState",
-                            "user": address,
-                        }))
-                        .await;
-                    (idx, projection, address, res)
-                });
-            }
-            let mut rows: Vec<(usize, WalletPortfolioRow)> = Vec::new();
-            while let Some(joined) = set.join_next().await {
-                let (idx, projection, address, ch_result) = joined?;
-                let (account_value, withdrawable, positions) = match ch_result {
-                    Ok(v) => {
-                        let av = v
-                            .get("marginSummary")
-                            .and_then(|m| m.get("accountValue"))
-                            .and_then(|a| a.as_str())
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        let wd = v
-                            .get("withdrawable")
-                            .and_then(|w| w.as_str())
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        let positions: Vec<String> = v
-                            .get("assetPositions")
-                            .and_then(|a| a.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|ap| {
-                                        ap.get("position")
-                                            .and_then(|p| p.get("coin"))
-                                            .and_then(|c| c.as_str())
-                                            .map(|s| s.to_string())
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        (av, wd, positions)
-                    }
-                    Err(_) => (0.0, 0.0, Vec::new()),
-                };
-                rows.push((
-                    idx,
-                    WalletPortfolioRow {
-                        name: projection.wallet.wallet_id.as_str().to_owned(),
-                        address,
-                        account_value,
-                        withdrawable,
-                        positions,
-                    },
-                ));
-            }
-            rows.sort_by_key(|(i, _)| *i);
-            let table: Vec<WalletPortfolioRow> = rows.into_iter().map(|(_, r)| r).collect();
-            print_portfolio_table(&table, &network);
-            Ok(())
-        }
         Cmd::Wallet(WalletCmd::Address { name, qr, qr_out }) => {
             let reader = configured_wallet_projection_reader(&home)?;
             let wallet_id = bloom_triad_protocol::Token::new(name)
@@ -2209,7 +1943,21 @@ async fn run(cli: Cli) -> Result<()> {
             debug!("cli.wallet.stage.via_inproc: no daemon socket present");
             let (home_permit, d) = build_write_daemon(home)?;
             let parsed = bloom_tx::intent_parser::parse(&body).context("parse intent")?;
-            let info = d.keystore.info(&wallet)?;
+            let wallet_id = bloom_triad_protocol::Token::new(wallet.clone())
+                .context("wallet ID must be a protocol token")?;
+            let projection = d
+                .wallet_projections
+                .get_wallet(&wallet_id)
+                .await
+                .context("load authenticated or cached public wallet projection")?;
+            let address = projection
+                .primary_address()
+                .context("projected wallet has no primary address")?
+                .parse()
+                .context("parse projected wallet address")?;
+            let policy = bloom_vfs::advisory_evm_policy(&projection, &chain)
+                .map_err(anyhow::Error::msg)
+                .context("derive key-free advisory staging policy")?;
             let client = d
                 .chains
                 .get(&chain)
@@ -2219,10 +1967,10 @@ async fn run(cli: Cli) -> Result<()> {
                 .stage(
                     &home_permit,
                     &wallet,
-                    info.address,
+                    address,
                     parsed,
                     &client,
-                    &info.policy,
+                    &policy,
                     Some(&d.address_book),
                 )
                 .await?;
@@ -2322,57 +2070,11 @@ async fn run(cli: Cli) -> Result<()> {
             )
         }
         Cmd::Ceremony(command) => handle_ceremony(&home, command).await,
-        Cmd::Serve {
-            endpoint,
-            mount,
-            local_integration,
-        } => {
-            if local_integration && !cfg!(feature = "local-integration") {
-                bail!(
-                    "--local-integration requires a binary built with \
-                     --features local-integration"
-                );
-            }
-            if local_integration && cfg!(feature = "unsafe-debug-signer") {
-                bail!(
-                    "--local-integration refuses a binary that also contains \
-                     unsafe-debug-signer; rebuild with exactly \
-                     --no-default-features --features local-integration"
-                );
-            }
-            if cfg!(feature = "local-integration") && !local_integration {
-                bail!(
-                    "this binary contains the local-integration custody profile; \
-                     pass --local-integration explicitly or rebuild without that feature"
-                );
-            }
-            if local_integration {
-                if rustix::process::geteuid().is_root() {
-                    bail!("local integration mode refuses to run as root");
-                }
-                if installed_macos_triad_paths()?.is_some() {
-                    eprintln!(
-                        "WARNING: an installed macOS triad enrollment exists; this local \
-                         process will not use it. The ceremony bind still fails closed if \
-                         the installed Broker owns 127.0.0.1:18734"
-                    );
-                }
-                eprintln!(
-                    "WARNING: LOCAL INTEGRATION MODE — Machine, custody, passkey ceremony, \
-                     and signing share one developer process; this is not a production \
-                     security profile"
-                );
-            }
+        Cmd::Serve { endpoint, mount } => {
             eprintln!("{ALPHA_DISCLOSURE}");
             let (_home_permit, d) = build_write_daemon(home.clone())?;
             github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision configured pre-installed Petals before serving")?;
-            #[cfg(feature = "local-integration")]
-            let ceremony_server = Some(
-                bloom_daemon::ceremony_server::spawn(&d)
-                    .await
-                    .context("bind local integration passkey ceremony listener")?,
-            );
             // Spawn the outbox expiry sweeper for the lifetime of the
             // serve command (fix #3). The handle is dropped (and the task
             // signalled to stop) right before the function returns.
@@ -2421,10 +2123,6 @@ async fn run(cli: Cli) -> Result<()> {
             // daemon-owned workers (watch executor, etc., fix #6).
             let unmount_result = unmount_bloom(mount_handle).await;
             sweeper.shutdown().await;
-            #[cfg(feature = "local-integration")]
-            if let Some(ceremony_server) = ceremony_server {
-                ceremony_server.shutdown().await;
-            }
             d.shutdown().await;
             serve_result?;
             unmount_result?;
@@ -2432,7 +2130,6 @@ async fn run(cli: Cli) -> Result<()> {
             println!("shutting down");
             Ok(())
         }
-        Cmd::Hyperliquid(cmd) => handle_hyperliquid(home, &client_endpoint, cmd).await,
         Cmd::Update(cmd) => handle_update(&home, cmd).await,
         Cmd::Petals(cmd) => {
             let _home_permit = HomeWritePermit::acquire(&home)?;
@@ -2830,148 +2527,6 @@ fn parse_batch_tx_ref(s: &str) -> Result<(String, String)> {
     Ok((chain.to_string(), id.to_string()))
 }
 
-async fn handle_hyperliquid(
-    home: HomeDir,
-    endpoint: &ResolvedEndpoint,
-    cmd: HyperliquidCmd,
-) -> Result<()> {
-    match cmd {
-        HyperliquidCmd::Account { user, network } => {
-            print_hl_info(&home, &network, hl_user_req("clearinghouseState", &user)).await
-        }
-        HyperliquidCmd::SpotState { user, network } => {
-            print_hl_info(
-                &home,
-                &network,
-                hl_user_req("spotClearinghouseState", &user),
-            )
-            .await
-        }
-        HyperliquidCmd::OpenOrders { user, network } => {
-            print_hl_info(&home, &network, hl_user_req("openOrders", &user)).await
-        }
-        HyperliquidCmd::Fills { user, network } => {
-            print_hl_info(&home, &network, hl_user_req("userFills", &user)).await
-        }
-        HyperliquidCmd::Funding {
-            user,
-            coin,
-            start_time,
-            end_time,
-            network,
-        } => {
-            let mut req = serde_json::json!({
-                "type": "userFunding",
-                "user": user.to_ascii_lowercase(),
-                "coin": coin,
-            });
-            let obj = req.as_object_mut().expect("json object");
-            if let Some(start) = start_time {
-                obj.insert("startTime".into(), serde_json::json!(start));
-            }
-            if let Some(end) = end_time {
-                obj.insert("endTime".into(), serde_json::json!(end));
-            }
-            print_hl_info(&home, &network, req).await
-        }
-        HyperliquidCmd::Book { coin, network } => {
-            print_hl_info(
-                &home,
-                &network,
-                serde_json::json!({"type": "l2Book", "coin": coin}),
-            )
-            .await
-        }
-        HyperliquidCmd::Candles {
-            coin,
-            interval,
-            start_time,
-            end_time,
-            network,
-        } => {
-            print_hl_info(
-                &home,
-                &network,
-                serde_json::json!({
-                    "type": "candleSnapshot",
-                    "req": {
-                        "coin": coin,
-                        "interval": interval,
-                        "startTime": start_time,
-                        "endTime": end_time,
-                    }
-                }),
-            )
-            .await
-        }
-        HyperliquidCmd::Metadata { kind, network } => {
-            let body = match kind.as_str() {
-                "perp" => serde_json::json!({"type": "meta"}),
-                "perp-contexts" => serde_json::json!({"type": "metaAndAssetCtxs"}),
-                "spot" => serde_json::json!({"type": "spotMeta"}),
-                "spot-contexts" => serde_json::json!({"type": "spotMetaAndAssetCtxs"}),
-                "mids" => serde_json::json!({"type": "allMids"}),
-                other => bail!(
-                    "unknown metadata kind '{other}' (use perp, perp-contexts, spot, spot-contexts, mids)"
-                ),
-            };
-            print_hl_info(&home, &network, body).await
-        }
-        HyperliquidCmd::Session { command } => handle_hl_session(endpoint, command).await,
-        HyperliquidCmd::SendAsset {
-            wallet,
-            destination,
-            amount,
-            network,
-        } => {
-            let path = format!("/hyperliquid/{network}/exchange/{wallet}/send_asset.json");
-            let body = serde_json::to_vec(&UsdSendRequest {
-                destination,
-                amount,
-                nonce: None,
-            })?;
-            hl_session_ipc_write_with_sealed_approval(endpoint, &path, body, &wallet).await?;
-            let last_response =
-                format!("/hyperliquid/{network}/exchange/{wallet}/last_response.json");
-            match hl_session_ipc_read(endpoint, &last_response).await {
-                Ok(bytes) => std::io::Write::write_all(&mut std::io::stdout(), &bytes)?,
-                Err(_) => println!("usdSend submitted"),
-            }
-            Ok(())
-        }
-        HyperliquidCmd::TestReads {
-            user,
-            coin,
-            network,
-        } => test_hl_reads(&home, &network, &user, &coin).await,
-        HyperliquidCmd::TestPostOnlyCancel {
-            wallet,
-            coin,
-            asset,
-            price,
-            size,
-            max_notional_usd,
-            danger_accept_live_orders,
-            network,
-        } => {
-            test_hl_post_only_cancel(
-                home,
-                TestPostOnlyCancelArgs {
-                    wallet,
-                    coin,
-                    asset,
-                    price,
-                    size,
-                    max_notional_usd,
-                    danger_accept_live_orders,
-                    network,
-                },
-            )
-            .await
-        }
-    }
-}
-
 async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
     match cmd {
         UpdateCmd::Status => {
@@ -3001,340 +2556,6 @@ async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
             Ok(())
         }
     }
-}
-
-async fn handle_hl_session(endpoint: &ResolvedEndpoint, cmd: HyperliquidSessionCmd) -> Result<()> {
-    match cmd {
-        HyperliquidSessionCmd::Create {
-            wallet,
-            id,
-            agent_name,
-            vault_address,
-            network,
-        } => {
-            let path = hl_session_wallet_path(&network, &wallet, "new.json");
-            let body = serde_json::json!({
-                "id": id,
-                "agent_name": agent_name,
-                "vault_address": vault_address,
-            });
-            hl_session_ipc_write_with_sealed_approval(
-                endpoint,
-                &path,
-                serde_json::to_vec(&body)?,
-                &wallet,
-            )
-            .await?;
-            let last_response =
-                format!("/hyperliquid/{network}/exchange/{wallet}/last_response.json");
-            match hl_session_ipc_read(endpoint, &last_response).await {
-                Ok(bytes) => std::io::Write::write_all(&mut std::io::stdout(), &bytes)?,
-                Err(_) => println!("created Hyperliquid agent session"),
-            }
-            Ok(())
-        }
-        HyperliquidSessionCmd::Status {
-            wallet,
-            id,
-            network,
-        } => {
-            let path = hl_session_path(&network, &wallet, &id, "status.json");
-            let bytes = hl_session_ipc_read(endpoint, &path).await?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
-            Ok(())
-        }
-        HyperliquidSessionCmd::Audit {
-            wallet,
-            id,
-            network,
-        } => {
-            let path = hl_session_path(&network, &wallet, &id, "audit.jsonl");
-            let bytes = hl_session_ipc_read(endpoint, &path).await?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
-            Ok(())
-        }
-        HyperliquidSessionCmd::Stop {
-            wallet,
-            id,
-            network,
-        } => {
-            hl_session_ipc_write(
-                endpoint,
-                &hl_session_path(&network, &wallet, &id, "stop"),
-                Vec::new(),
-            )
-            .await
-        }
-        HyperliquidSessionCmd::CancelAll {
-            wallet,
-            id,
-            network,
-        } => {
-            hl_session_ipc_write(
-                endpoint,
-                &hl_session_path(&network, &wallet, &id, "cancel_all"),
-                Vec::new(),
-            )
-            .await
-        }
-        HyperliquidSessionCmd::CloseAll {
-            wallet,
-            id,
-            network,
-        } => {
-            hl_session_ipc_write(
-                endpoint,
-                &hl_session_path(&network, &wallet, &id, "close_all"),
-                Vec::new(),
-            )
-            .await
-        }
-    }
-}
-
-fn hl_session_wallet_path(network: &str, wallet: &str, file: &str) -> String {
-    format!("/hyperliquid/{network}/agent_sessions/{wallet}/{file}")
-}
-
-fn hl_session_path(network: &str, wallet: &str, id: &str, file: &str) -> String {
-    format!("/hyperliquid/{network}/agent_sessions/{wallet}/{id}/{file}")
-}
-
-async fn hl_session_ipc_read(endpoint: &ResolvedEndpoint, path: &str) -> Result<Vec<u8>> {
-    let client = IpcClient::new(&endpoint.socket);
-    let Some(res) = try_ipc(
-        &client,
-        endpoint,
-        "read",
-        serde_json::json!({ "path": path }),
-    )
-    .await
-    .with_context(|| format!("ipc read via {}", endpoint.display))?
-    else {
-        bail!("Hyperliquid agent sessions require a running bloom serve daemon");
-    };
-    let b64 = res
-        .get("bytes_b64")
-        .and_then(|v| v.as_str())
-        .context("ipc read: missing bytes_b64")?;
-    B64.decode(b64).context("ipc read: bad base64")
-}
-
-async fn hl_session_ipc_write(
-    endpoint: &ResolvedEndpoint,
-    path: &str,
-    body: Vec<u8>,
-) -> Result<()> {
-    let client = IpcClient::new(&endpoint.socket);
-    let res = try_ipc(
-        &client,
-        endpoint,
-        "write",
-        serde_json::json!({
-            "path": path,
-            "bytes_b64": B64.encode(&body),
-        }),
-    )
-    .await
-    .with_context(|| format!("ipc write via {}", endpoint.display))?;
-    if res.is_none() {
-        bail!("Hyperliquid agent sessions require a running bloom serve daemon");
-    }
-    Ok(())
-}
-
-async fn hl_session_ipc_write_with_sealed_approval(
-    endpoint: &ResolvedEndpoint,
-    path: &str,
-    body: Vec<u8>,
-    wallet: &str,
-) -> Result<()> {
-    match hl_session_ipc_write_once(endpoint, path, &body).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("Hyperliquid Sealed Approval requires a running bloom serve daemon");
-        }
-        Err(e) if is_ipc_permission_denied(&e) => {
-            bail!(
-                "Hyperliquid signing for wallet '{wallet}' requires the Broker-backed \
-                 payload-bearing Sealed Approval flow; the legacy Machine-hosted ceremony \
-                 has been removed"
-            )
-        }
-        Err(e) => Err(e).with_context(|| format!("ipc write via {}", endpoint.display)),
-    }
-}
-
-async fn hl_session_ipc_write_once(
-    endpoint: &ResolvedEndpoint,
-    path: &str,
-    body: &[u8],
-) -> std::io::Result<()> {
-    let client = IpcClient::new(&endpoint.socket);
-    client
-        .call(
-            "write",
-            serde_json::json!({
-                "path": path,
-                "bytes_b64": B64.encode(body),
-            }),
-        )
-        .await
-        .map(|_| ())
-}
-
-fn is_ipc_permission_denied(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::PermissionDenied
-        || e.to_string().contains("\"code\":-32007")
-        || e.to_string()
-            .to_ascii_lowercase()
-            .contains("permission denied")
-}
-
-fn hl_network(raw: &str) -> Result<HyperliquidNetwork> {
-    match raw {
-        "mainnet" => Ok(HyperliquidNetwork::Mainnet),
-        "testnet" => Ok(HyperliquidNetwork::Testnet),
-        other => bail!("unknown Hyperliquid network '{other}' (use mainnet or testnet)"),
-    }
-}
-
-fn hl_client(home: &HomeDir, raw: &str) -> Result<HyperliquidClient> {
-    let network = hl_network(raw)?;
-    let mut client = HyperliquidClient::new(network);
-    // Honor [hyperliquid] mainnet_url/testnet_url overrides, same as the daemon
-    // (so local/staging/proxy deployments work from the CLI too).
-    if let Ok(config) = bloom_proto::Config::load_or_init(&home.config_path())
-        && let Some(hl) = config.hyperliquid
-    {
-        let raw_url = match network {
-            HyperliquidNetwork::Mainnet => hl.mainnet_url,
-            HyperliquidNetwork::Testnet => hl.testnet_url,
-        };
-        if let Ok(url) = raw_url.parse::<url::Url>() {
-            client = client.with_base_url(url);
-        }
-    }
-    Ok(client)
-}
-
-fn hl_user_req(kind: &str, user: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": kind,
-        "user": user.to_ascii_lowercase(),
-    })
-}
-
-async fn print_hl_info(home: &HomeDir, network: &str, body: serde_json::Value) -> Result<()> {
-    let client = hl_client(home, network)?;
-    let value = client.info(body).await?;
-    std::io::Write::write_all(&mut std::io::stdout(), &pretty_json(&value))?;
-    Ok(())
-}
-
-async fn test_hl_reads(home: &HomeDir, network: &str, user: &str, coin: &str) -> Result<()> {
-    let client = hl_client(home, network)?;
-    let now = bloom_hyperliquid::now_ms();
-    let start = now.saturating_sub(60 * 60 * 1000);
-    let calls = [
-        ("account", hl_user_req("clearinghouseState", user)),
-        ("spot_state", hl_user_req("spotClearinghouseState", user)),
-        ("open_orders", hl_user_req("openOrders", user)),
-        (
-            "frontend_open_orders",
-            hl_user_req("frontendOpenOrders", user),
-        ),
-        ("fills", hl_user_req("userFills", user)),
-        (
-            "funding",
-            serde_json::json!({
-                "type": "userFunding",
-                "user": user.to_ascii_lowercase(),
-                "coin": coin,
-                "startTime": start,
-                "endTime": now,
-            }),
-        ),
-        ("portfolio", hl_user_req("portfolio", user)),
-        ("rate_limit", hl_user_req("userRateLimit", user)),
-        ("mids", serde_json::json!({"type": "allMids"})),
-        ("perp_meta", serde_json::json!({"type": "meta"})),
-        (
-            "perp_contexts",
-            serde_json::json!({"type": "metaAndAssetCtxs"}),
-        ),
-        ("spot_meta", serde_json::json!({"type": "spotMeta"})),
-        (
-            "spot_contexts",
-            serde_json::json!({"type": "spotMetaAndAssetCtxs"}),
-        ),
-        ("book", serde_json::json!({"type": "l2Book", "coin": coin})),
-        (
-            "candles",
-            serde_json::json!({
-                "type": "candleSnapshot",
-                "req": {
-                    "coin": coin,
-                    "interval": "1m",
-                    "startTime": start,
-                    "endTime": now,
-                }
-            }),
-        ),
-    ];
-
-    let mut out = serde_json::Map::new();
-    for (name, body) in calls {
-        match client.info(body).await {
-            Ok(value) => {
-                out.insert(name.to_string(), value);
-            }
-            Err(e) => {
-                out.insert(
-                    name.to_string(),
-                    serde_json::json!({"error": e.to_string()}),
-                );
-            }
-        }
-    }
-    std::io::Write::write_all(
-        &mut std::io::stdout(),
-        &pretty_json(&serde_json::Value::Object(out)),
-    )?;
-    Ok(())
-}
-
-struct TestPostOnlyCancelArgs {
-    wallet: String,
-    coin: String,
-    asset: u32,
-    price: Option<String>,
-    size: Option<String>,
-    max_notional_usd: f64,
-    danger_accept_live_orders: bool,
-    network: String,
-}
-
-async fn test_hl_post_only_cancel(_home: HomeDir, args: TestPostOnlyCancelArgs) -> Result<()> {
-    let TestPostOnlyCancelArgs {
-        wallet: _wallet,
-        coin: _coin,
-        asset: _asset,
-        price: _price,
-        size: _size,
-        max_notional_usd,
-        danger_accept_live_orders,
-        network: _network,
-    } = args;
-    if !danger_accept_live_orders {
-        bail!("refusing live Hyperliquid test order without --danger-accept-live-orders");
-    }
-    if max_notional_usd <= 0.0 {
-        bail!("--max-notional-usd must be positive");
-    }
-    bail!(
-        "direct owner-key Hyperliquid test orders are disabled; create a Sealed Approval agent session and submit through /hyperliquid/<network>/agent_sessions/<wallet>/<session>/order.json"
-    )
 }
 
 #[cfg(not(feature = "mount"))]
@@ -3508,50 +2729,5 @@ mod tests {
         receipt.public_status = bloom_triad_protocol::CeremonyState::Succeeded;
         receipt.ceremony_kind = bloom_triad_protocol::CeremonyKind::WalletDelete;
         assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
-    }
-}
-
-#[cfg(test)]
-mod hl_cli_tests {
-    use super::*;
-
-    #[test]
-    fn post_only_cancel_test_requires_danger_flag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = rt
-            .block_on(test_hl_post_only_cancel(
-                HomeDir::at(tmp.path()),
-                TestPostOnlyCancelArgs {
-                    wallet: "minnow".into(),
-                    coin: "BTC".into(),
-                    asset: 0,
-                    price: None,
-                    size: None,
-                    max_notional_usd: 15.0,
-                    danger_accept_live_orders: false,
-                    network: "mainnet".into(),
-                },
-            ))
-            .unwrap_err();
-        assert!(err.to_string().contains("--danger-accept-live-orders"));
-    }
-
-    #[test]
-    fn hl_client_honors_config_endpoint_override() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = HomeDir::at(tmp.path());
-        let mut cfg = bloom_proto::Config::local_default();
-        cfg.hyperliquid = Some(bloom_proto::config::HyperliquidConfig {
-            mainnet_url: "http://localhost:9999/".into(),
-            ..Default::default()
-        });
-        std::fs::write(home.config_path(), toml::to_string(&cfg).unwrap()).unwrap();
-        // Mainnet uses the configured override.
-        let client = hl_client(&home, "mainnet").unwrap();
-        assert_eq!(client.base_url().as_str(), "http://localhost:9999/");
-        // Testnet wasn't overridden → default public endpoint.
-        let tclient = hl_client(&home, "testnet").unwrap();
-        assert!(tclient.base_url().as_str().contains("hyperliquid-testnet"));
     }
 }

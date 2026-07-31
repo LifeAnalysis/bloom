@@ -44,6 +44,7 @@ use serde::Serialize;
 use tokio::time::timeout;
 
 use bloom_evm::ChainRegistry;
+#[cfg(test)]
 use bloom_keystore::Keystore;
 use bloom_machine_client::WalletProjectionReader;
 use bloom_prices::PricesClient;
@@ -102,6 +103,7 @@ pub use bloom_update::UpdateAvailable;
 #[derive(Clone)]
 pub struct StatusHandler {
     pub chains: ChainRegistry,
+    #[cfg(test)]
     pub keystore: Keystore,
     pub wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     pub tx_engine: TxEngine,
@@ -138,6 +140,7 @@ impl StatusHandler {
     /// `cache/etherscan_entries` field; pass `None` if no etherscan cache
     /// has ever been wired. `etherscan_configured` reports whether the
     /// daemon's config provides etherscan credentials.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         chains: ChainRegistry,
@@ -169,6 +172,7 @@ impl StatusHandler {
     /// Variant of [`Self::new`] that takes the per-feature backend
     /// declaration. Used by the daemon so `status/backends/...` reflects
     /// the live config; tests can call [`Self::new`] for the default.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn with_backends(
         chains: ChainRegistry,
@@ -203,6 +207,42 @@ impl StatusHandler {
         }
     }
 
+    /// Production constructor: wallet status is derived exclusively from the
+    /// authenticated public projection. No key-bearing store is accepted.
+    #[cfg(not(test))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_backends(
+        chains: ChainRegistry,
+        tx_engine: TxEngine,
+        audit: Arc<AuditLog>,
+        prices: Option<PricesClient>,
+        etherscan_cache_dir: Option<PathBuf>,
+        etherscan_configured: bool,
+        backends: BackendsConfig,
+        home: PathBuf,
+        started_at: SystemTime,
+        version: impl Into<String>,
+        wallet_projections: Arc<dyn WalletProjectionReader>,
+    ) -> Self {
+        Self {
+            chains,
+            wallet_projections: Some(wallet_projections),
+            tx_engine,
+            audit,
+            prices,
+            etherscan_cache_dir,
+            etherscan_configured,
+            backends,
+            home,
+            started_at,
+            version: version.into(),
+            update_snapshot_fn: None,
+            chain_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            mempool_statuses: Arc::new(RwLock::new(BTreeMap::new())),
+            private_rpc_healths: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
     /// Wire the closure that produces the `update/*` subtree's
     /// snapshot. The daemon passes a closure that calls
     /// `bloom_update::UpdateChecker::snapshot` and converts to the
@@ -213,14 +253,6 @@ impl StatusHandler {
         f: Arc<dyn Fn() -> Option<UpdateSnapshot> + Send + Sync>,
     ) -> Self {
         self.update_snapshot_fn = Some(f);
-        self
-    }
-
-    pub fn with_wallet_projections(
-        mut self,
-        wallet_projections: Arc<dyn WalletProjectionReader>,
-    ) -> Self {
-        self.wallet_projections = Some(wallet_projections);
         self
     }
 
