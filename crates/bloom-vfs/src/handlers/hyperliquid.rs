@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 use base64::engine::general_purpose::STANDARD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bloom_auth_api::{
@@ -17,9 +17,9 @@ use bloom_auth_api::{
     HYPERLIQUID_USD_SEND_SIGN_INTENT, PetalPolicySnapshot, SealedAction, petal_identity,
     signing_attestation_facts_digest,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 use bloom_auth_api::{SIGNING_ATTESTATION_SCHEMA_V1, SignHashRequest, SigningAttestation};
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 use bloom_hyperliquid::signature_json_from_raw;
 use bloom_hyperliquid::{
     CancelWire, ExchangeAction, Grouping, HyperliquidClient, HyperliquidNetwork, HyperliquidSigner,
@@ -93,6 +93,10 @@ const AGENT_KEY_KEK_FILE: &str = ".agent_key_kek";
 const APPROVE_AGENT_PENDING_FILE: &str = "approve_agent_pending.json";
 const APPROVAL_FILE: &str = "approval.json";
 const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
+#[cfg(feature = "local-integration")]
+const LOCAL_INTEGRATION_MAX_NOTIONAL_MICRO: u64 = 25_000_000;
+#[cfg(feature = "local-integration")]
+const LOCAL_INTEGRATION_MAX_SESSION_SECS: u64 = 300;
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 const USD_SEND_PENDING_FILE: &str = "usd_send_pending.json";
 const APPROVE_AGENT_PENDING_SCHEMA: &str = "bloom.hyperliquid_approve_agent_pending.v1";
@@ -660,7 +664,11 @@ impl HyperliquidHandler {
             .keystore
             .info(wallet)
             .map_err(|e| HandlerError::backend(e.to_string()))?;
-        let policy = info.policy.hyperliquid.clone();
+        let stored_policy = info.policy.hyperliquid.clone();
+        #[cfg(feature = "local-integration")]
+        let policy = select_local_integration_policy(stored_policy, req.integration_bounds)?;
+        #[cfg(not(feature = "local-integration"))]
+        let policy = stored_policy;
         if !policy.is_session_capable() {
             return Err(HandlerError::invalid(
                 "refusing to create Hyperliquid agent session: wallet [hyperliquid] policy must set allowed_assets, max_notional_usd, max_position_usd, and max_loss_usd",
@@ -2055,7 +2063,7 @@ impl HyperliquidHandler {
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "local-integration")))]
     async fn host_sign_hyperliquid_hash(
         &self,
         wallet: &str,
@@ -2072,7 +2080,7 @@ impl HyperliquidHandler {
         ))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     async fn host_sign_hyperliquid_hash(
         &self,
         wallet: &str,
@@ -3851,6 +3859,65 @@ struct AgentSessionCreate {
     /// every submit must carry a matching `vaultAddress`.
     #[serde(default)]
     vault_address: Option<String>,
+    /// Ephemeral, in-memory bounds for the manual local integration harness.
+    /// This field does not exist in production builds and is accepted only
+    /// when the wallet has no configured Hyperliquid policy to override.
+    #[cfg(feature = "local-integration")]
+    #[serde(default)]
+    integration_bounds: Option<HyperliquidPolicy>,
+}
+
+#[cfg(feature = "local-integration")]
+fn select_local_integration_policy(
+    stored_policy: HyperliquidPolicy,
+    integration_bounds: Option<HyperliquidPolicy>,
+) -> Result<HyperliquidPolicy, HandlerError> {
+    let Some(bounds) = integration_bounds else {
+        return Ok(stored_policy);
+    };
+    if stored_policy.is_configured() {
+        return Err(HandlerError::invalid(
+            "local integration bounds cannot replace a configured wallet [hyperliquid] policy",
+        ));
+    }
+    validate_local_integration_bounds(&bounds)?;
+    Ok(bounds)
+}
+
+#[cfg(feature = "local-integration")]
+fn validate_local_integration_bounds(policy: &HyperliquidPolicy) -> Result<(), HandlerError> {
+    if !policy.is_session_capable() {
+        return Err(HandlerError::invalid(
+            "local integration bounds require allowed_assets, max_notional_usd, \
+             max_position_usd, and max_loss_usd",
+        ));
+    }
+    if policy.allowed_assets.len() != 1
+        || policy.allowed_order_types != BTreeSet::from(["limit".to_string()])
+        || policy
+            .max_notional_usd
+            .is_none_or(|value| value == 0 || value > LOCAL_INTEGRATION_MAX_NOTIONAL_MICRO)
+        || policy
+            .max_position_usd
+            .is_none_or(|value| value == 0 || value > LOCAL_INTEGRATION_MAX_NOTIONAL_MICRO)
+        || policy
+            .max_loss_usd
+            .is_none_or(|value| value == 0 || value > LOCAL_INTEGRATION_MAX_NOTIONAL_MICRO)
+        || policy
+            .max_session_secs
+            .is_none_or(|value| value == 0 || value > LOCAL_INTEGRATION_MAX_SESSION_SECS)
+        || policy.allow_trigger_orders
+        || policy.allow_twap
+        || policy.allow_builder_fees
+        || policy.allow_vault_or_subaccount
+    {
+        return Err(HandlerError::invalid(
+            "local integration bounds must allow exactly one asset and limit orders, \
+             cap notional/position/loss at $25, cap duration at 300 seconds, and \
+             disable trigger, TWAP, builder-fee, and vault/subaccount actions",
+        ));
+    }
+    Ok(())
 }
 
 struct ActiveHlSession {
@@ -5255,6 +5322,94 @@ fn err_invalid(e: bloom_hyperliquid::HyperliquidError) -> HandlerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "local-integration")]
+    fn valid_local_integration_bounds() -> HyperliquidPolicy {
+        HyperliquidPolicy {
+            allowed_assets: BTreeSet::from(["BTC".to_string()]),
+            allowed_order_types: BTreeSet::from(["limit".to_string()]),
+            max_notional_usd: Some(20_000_000),
+            max_position_usd: Some(20_000_000),
+            max_loss_usd: Some(20_000_000),
+            max_session_secs: Some(300),
+            allow_trigger_orders: false,
+            allow_twap: false,
+            allow_builder_fees: false,
+            allow_vault_or_subaccount: false,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "local-integration")]
+    #[test]
+    fn local_integration_bounds_accept_only_the_narrow_profile() {
+        validate_local_integration_bounds(&valid_local_integration_bounds()).unwrap();
+
+        let mut cases = Vec::new();
+
+        let mut two_assets = valid_local_integration_bounds();
+        two_assets.allowed_assets.insert("ETH".to_string());
+        cases.push(two_assets);
+
+        let mut trigger = valid_local_integration_bounds();
+        trigger.allowed_order_types.insert("trigger".to_string());
+        cases.push(trigger);
+
+        let mut oversized = valid_local_integration_bounds();
+        oversized.max_notional_usd = Some(LOCAL_INTEGRATION_MAX_NOTIONAL_MICRO + 1);
+        cases.push(oversized);
+
+        let mut long_lived = valid_local_integration_bounds();
+        long_lived.max_session_secs = Some(LOCAL_INTEGRATION_MAX_SESSION_SECS + 1);
+        cases.push(long_lived);
+
+        let mut builder = valid_local_integration_bounds();
+        builder.allow_builder_fees = true;
+        cases.push(builder);
+
+        let mut vault = valid_local_integration_bounds();
+        vault.allow_vault_or_subaccount = true;
+        cases.push(vault);
+
+        for unsafe_policy in cases {
+            let error = validate_local_integration_bounds(&unsafe_policy).unwrap_err();
+            assert!(matches!(error, HandlerError::Invalid(_)), "{error}");
+        }
+    }
+
+    #[cfg(feature = "local-integration")]
+    #[test]
+    fn local_integration_bounds_reject_zero_or_missing_caps() {
+        for clear_cap in 0..4 {
+            let mut policy = valid_local_integration_bounds();
+            match clear_cap {
+                0 => policy.max_notional_usd = None,
+                1 => policy.max_position_usd = Some(0),
+                2 => policy.max_loss_usd = None,
+                3 => policy.max_session_secs = Some(0),
+                _ => unreachable!(),
+            }
+            assert!(validate_local_integration_bounds(&policy).is_err());
+        }
+    }
+
+    #[cfg(feature = "local-integration")]
+    #[test]
+    fn local_integration_bounds_never_replace_a_configured_wallet_policy() {
+        let stored = HyperliquidPolicy {
+            allowed_assets: BTreeSet::from(["ETH".to_string()]),
+            max_notional_usd: Some(5_000_000),
+            ..Default::default()
+        };
+        let error =
+            select_local_integration_policy(stored.clone(), Some(valid_local_integration_bounds()))
+                .unwrap_err();
+        assert!(error.to_string().contains("cannot replace"), "{error}");
+
+        let selected = select_local_integration_policy(stored.clone(), None).unwrap();
+        assert_eq!(selected.allowed_assets, stored.allowed_assets);
+        assert_eq!(selected.max_notional_usd, stored.max_notional_usd);
+    }
     use bloom_auth::{AuthStore, RejectingApprovalSignatureVerifier, StoreApprovalVerifier};
     use bloom_auth_api::{ApprovalVerifier, AuthStoreView, AuthStoreWriter};
     use bloom_hyperliquid::{MAINNET_API_URL, TESTNET_API_URL};
@@ -5642,6 +5797,8 @@ mod tests {
                     id: Some("session-1".into()),
                     agent_name: Some("bloom-session".into()),
                     vault_address: None,
+                    #[cfg(feature = "local-integration")]
+                    integration_bounds: None,
                 },
             )
             .await
@@ -5969,6 +6126,8 @@ mod tests {
             id: Some("session-1".into()),
             agent_name: Some("desk-bot".into()),
             vault_address: Some("0x0000000000000000000000000000000000000002".into()),
+            #[cfg(feature = "local-integration")]
+            integration_bounds: None,
         };
 
         let err = h
@@ -6051,6 +6210,8 @@ mod tests {
             id: Some("session-1".into()),
             agent_name: Some("desk-bot".into()),
             vault_address: None,
+            #[cfg(feature = "local-integration")]
+            integration_bounds: None,
         };
 
         let err = h
@@ -6095,6 +6256,8 @@ mod tests {
             id: Some("session-1".into()),
             agent_name: Some("desk-bot".into()),
             vault_address: None,
+            #[cfg(feature = "local-integration")]
+            integration_bounds: None,
         };
 
         let err = h

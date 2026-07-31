@@ -8,6 +8,9 @@ description = "Path router and handlers for bloom virtual filesystem"
 [features]
 default = []
 unsafe-debug-signer = ["bloom-keystore/unsafe-debug-signer"]
+# Permit the dedicated local integration binary to wire the legacy
+# passkey-backed hash-signing adapter. Normal builds keep it unreachable.
+local-integration = []
 
 [dependencies]
 bloom-auth-api.workspace = true

@@ -897,6 +897,14 @@ enum Cmd {
             default_missing_value = DEFAULT_MOUNT_PATH
         )]
         mount: Option<PathBuf>,
+
+        /// Run the real passkey ceremony and custody adapters in this process.
+        ///
+        /// This is available only in a binary built with `local-integration`.
+        /// It deliberately collapses the production service boundary and must
+        /// never be used as a deployed profile.
+        #[arg(long)]
+        local_integration: bool,
     },
     /// Talk to a running `bloom serve` over its UDS JSON-RPC socket.
     #[command(subcommand)]
@@ -2257,11 +2265,57 @@ async fn run(cli: Cli) -> Result<()> {
             )
         }
         Cmd::Ceremony(command) => handle_ceremony(&home, command).await,
-        Cmd::Serve { endpoint, mount } => {
+        Cmd::Serve {
+            endpoint,
+            mount,
+            local_integration,
+        } => {
+            if local_integration && !cfg!(feature = "local-integration") {
+                bail!(
+                    "--local-integration requires a binary built with \
+                     --features local-integration"
+                );
+            }
+            if local_integration && cfg!(feature = "unsafe-debug-signer") {
+                bail!(
+                    "--local-integration refuses a binary that also contains \
+                     unsafe-debug-signer; rebuild with exactly \
+                     --no-default-features --features local-integration"
+                );
+            }
+            if cfg!(feature = "local-integration") && !local_integration {
+                bail!(
+                    "this binary contains the local-integration custody profile; \
+                     pass --local-integration explicitly or rebuild without that feature"
+                );
+            }
+            if local_integration {
+                if rustix::process::geteuid().is_root() {
+                    bail!("local integration mode refuses to run as root");
+                }
+                if installed_macos_triad_paths()?.is_some() {
+                    eprintln!(
+                        "WARNING: an installed macOS triad enrollment exists; this local \
+                         process will not use it. The ceremony bind still fails closed if \
+                         the installed Broker owns 127.0.0.1:18734"
+                    );
+                }
+                eprintln!(
+                    "WARNING: LOCAL INTEGRATION MODE — Machine, custody, passkey ceremony, \
+                     and signing share one developer process; this is not a production \
+                     security profile"
+                );
+            }
             eprintln!("{ALPHA_DISCLOSURE}");
             let (_home_permit, d) = build_write_daemon(home.clone())?;
             github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision configured pre-installed Petals before serving")?;
+            #[cfg(feature = "local-integration")]
+            let ceremony_server = Some(
+                bloom_daemon::ceremony_server::spawn(&d)
+                    .await
+                    .context("bind local integration passkey ceremony listener")?,
+            );
             // Spawn the outbox expiry sweeper for the lifetime of the
             // serve command (fix #3). The handle is dropped (and the task
             // signalled to stop) right before the function returns.
@@ -2310,6 +2364,10 @@ async fn run(cli: Cli) -> Result<()> {
             // daemon-owned workers (watch executor, etc., fix #6).
             let unmount_result = unmount_bloom(mount_handle).await;
             sweeper.shutdown().await;
+            #[cfg(feature = "local-integration")]
+            if let Some(ceremony_server) = ceremony_server {
+                ceremony_server.shutdown().await;
+            }
             d.shutdown().await;
             serve_result?;
             unmount_result?;

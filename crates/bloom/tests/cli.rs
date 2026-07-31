@@ -679,14 +679,28 @@ fn serve_refuses_when_home_write_lock_is_live() {
         .expect("hold home write permit");
     let lock = home.path().join("run").join(".daemon.lock");
 
+    let mut command = bloom_cmd(home.path());
+    command.arg("serve");
+    if cfg!(feature = "local-integration") {
+        command.arg("--local-integration");
+    }
+    command.assert().failure().stderr(
+        predicate::str::contains("already open for writing")
+            .and(predicate::str::contains(lock.display().to_string())),
+    );
+}
+
+#[cfg(feature = "local-integration")]
+#[test]
+fn local_integration_build_requires_explicit_serve_flag() {
+    let home = fresh_home();
     bloom_cmd(home.path())
         .arg("serve")
         .assert()
         .failure()
-        .stderr(
-            predicate::str::contains("already open for writing")
-                .and(predicate::str::contains(lock.display().to_string())),
-        );
+        .stderr(predicate::str::contains(
+            "pass --local-integration explicitly",
+        ));
 }
 
 #[test]

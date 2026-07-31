@@ -20,6 +20,10 @@ bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
 # Development-only private-key loader and approval bypass. Never enable for a
 # production build.
 unsafe-debug-signer = ["bloom-daemon/unsafe-debug-signer"]
+# Manual end-to-end harness: collapse the custody boundary into this process
+# while retaining real WebAuthn/passkey review and approval. Production
+# artifacts must never enable this feature.
+local-integration = ["bloom-daemon/local-integration"]
 
 [dependencies]
 bloom-proto.workspace = true

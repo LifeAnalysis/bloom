@@ -5,12 +5,14 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "local-integration")]
+pub mod ceremony_server;
 pub mod ipc;
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 pub mod registration;
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 pub mod sealed_ceremony;
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 pub mod sign_hash;
 
 mod ens_resolver;
@@ -26,11 +28,11 @@ use alloy::rpc::types::eth::TransactionRequest;
 use alloy::signers::SignerSync;
 #[cfg(feature = "unsafe-debug-signer")]
 use alloy::signers::local::PrivateKeySigner;
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 use base64::Engine as _;
 use bloom_auth::{AuthStore, StoreApprovalVerifier};
 use bloom_auth_api::PETAL_PETAL_ID_PREFIX;
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 use bloom_auth_api::{
     AssuranceLevel, CANONICAL_INTENT_HEADER_SCHEMA_V1, CanonicalEnvelope, CanonicalIntentHeader,
     DaemonGrantTerms, ExecutorKind, PETAL_SIGNING_ATTESTATION_FACTS_SCHEMA_V1, PetalPolicySnapshot,
@@ -53,7 +55,7 @@ use bloom_petals::{
     HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy,
     PayloadSignRequest, PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignOutcome,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 use bloom_petals::{SignBatchOutcome, SignBatchRequest, SignRequest};
 use bloom_prices::PricesClient;
 use bloom_proto::audit::AuditRecord;
@@ -78,7 +80,7 @@ use bloom_vfs::handlers::{
 use bloom_vfs::{AuthServices, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
 use futures::StreamExt;
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 use rand::RngCore;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -88,35 +90,35 @@ use tracing::{debug, info, warn};
 use std::sync::Mutex;
 
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 const PETAL_ACTION_TTL_MS: u64 = 120_000;
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 const MAX_ACTIVE_PETAL_ACTION_IDENTITIES: usize = 4_096;
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 const PETAL_SIGNING_SUBJECT_KIND: &str = "petal_sign_hash";
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 const PETAL_SIGNING_SUBJECT_SCHEMA_V1: &str = "bloom.petal.sign_hash_subject.v1";
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 const PETAL_SIGNING_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash.action.v1";
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 const PETAL_SIGNING_BATCH_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash_batch.action.v1";
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 const MAX_PETAL_SIGN_BATCH: usize = 16;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 #[derive(Clone)]
 struct PetalActionIdentity {
     action_id: String,
     expires_ms: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 #[derive(Default)]
 struct PetalActionIdentityCache {
     entries: std::collections::HashMap<[u8; 32], PetalActionIdentity>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "local-integration"))]
 impl PetalActionIdentityCache {
     /// Keep one request identity for the challenge's complete live interval.
     /// Expiry remains part of the action id, so the same scoped request gets a
@@ -270,13 +272,13 @@ struct DaemonPetalHost {
     vfs: Arc<LateVfsHost>,
     http: reqwest::Client,
     audit: Arc<AuditLog>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     auth_services: AuthServices,
     tx_outbox: Option<PetalTxOutbox>,
     tx_stage_lock: tokio::sync::Mutex<()>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     sign_batch_lock: tokio::sync::Mutex<()>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     petal_action_identities: Mutex<PetalActionIdentityCache>,
     broker: Option<MachineBrokerClient>,
     #[cfg(feature = "unsafe-debug-signer")]
@@ -294,7 +296,7 @@ struct PetalTxOutbox {
 
 impl DaemonPetalHost {
     fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>, auth_services: AuthServices) -> Self {
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "local-integration")))]
         let _ = &auth_services;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -305,13 +307,13 @@ impl DaemonPetalHost {
             vfs,
             http,
             audit,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "local-integration"))]
             auth_services,
             tx_outbox: None,
             tx_stage_lock: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "local-integration"))]
             sign_batch_lock: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "local-integration"))]
             petal_action_identities: Mutex::new(PetalActionIdentityCache::default()),
             broker: None,
             #[cfg(feature = "unsafe-debug-signer")]
@@ -362,7 +364,7 @@ impl DaemonPetalHost {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     fn validate_petal_signing_scope(
         req: &SignRequest,
         context: &PetalRouteContext,
@@ -396,7 +398,7 @@ impl DaemonPetalHost {
         Ok(params)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     fn petal_action(
         &self,
         req: &SignRequest,
@@ -406,7 +408,7 @@ impl DaemonPetalHost {
         self.petal_action_with_identity(req, context, now_ms, None)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     fn petal_action_with_identity(
         &self,
         req: &SignRequest,
@@ -560,7 +562,7 @@ impl DaemonPetalHost {
         Ok((action, attestation))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     fn petal_batch_action(
         &self,
         requests: &[SignRequest],
@@ -790,7 +792,7 @@ impl DaemonPetalHost {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     fn audit_sign_hash(&self, req: &SignRequest, outcome: &str, error: Option<&str>) {
         let mut data = serde_json::json!({
             "purpose": req.purpose.as_str(),
@@ -1001,7 +1003,7 @@ impl PetalHost for DaemonPetalHost {
         unreachable!("bounded redirect loop returns before exhausting iterator")
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
         match self.sign_hash_outcome(req).await? {
             SignOutcome::Signature(signature) => Ok(signature),
@@ -1012,7 +1014,7 @@ impl PetalHost for DaemonPetalHost {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     async fn sign_hash_outcome(&self, req: SignRequest) -> Result<SignOutcome, HostError> {
         let Some(context) = req.context.as_ref() else {
             let err = HostError::Denied(
@@ -1123,7 +1125,7 @@ impl PetalHost for DaemonPetalHost {
         Ok(SignOutcome::Signature(signature))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "local-integration"))]
     async fn sign_hashes_outcome(
         &self,
         req: SignBatchRequest,
@@ -2151,7 +2153,7 @@ impl Daemon {
         let attestation_registry: Arc<dyn bloom_auth_api::SigningAttestationSchemaRegistry> =
             Arc::new(bloom_auth_api::DefaultAttestationRegistry::new());
         let signer_cache = Arc::new(bloom_keystore::petal_host::SignerCache::new());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "local-integration"))]
         let petal_host: Arc<dyn bloom_auth_api::PetalHost> = Arc::new(
             bloom_keystore::petal_host::KeystorePetalHost::new(
                 Arc::new(keystore.clone()),
@@ -2161,7 +2163,7 @@ impl Daemon {
             )
             .with_signer_cache(signer_cache.clone()),
         );
-        #[cfg(test)]
+        #[cfg(any(test, feature = "local-integration"))]
         {
             tx_engine =
                 tx_engine.with_host_signing_services(grant_store.clone(), petal_host.clone());
@@ -2171,7 +2173,7 @@ impl Daemon {
         // only to unit tests while its fixtures are migrated. Production
         // registration is prepared through Broker and the Machine never owns
         // the ceremony listener.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "local-integration"))]
         let registration_coordinator: Arc<
             dyn bloom_auth_api::WalletRegistrationCoordinator,
         > = Arc::new(registration::RegistrationCoordinator::new(
@@ -2184,7 +2186,7 @@ impl Daemon {
         let auth_services = auth_services
             .with_grant_store(grant_store)
             .with_attestation_registry(attestation_registry);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "local-integration"))]
         let auth_services = auth_services
             .with_petal_host(petal_host)
             .with_registration_coordinator(registration_coordinator);

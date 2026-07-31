@@ -4,6 +4,11 @@ Operator's manual for working on `bloom`: building, running, testing, and
 debugging the daemon. The user-facing tour lives in [README.md](./README.md)
 and [QUICKSTART.md](./QUICKSTART.md); this file covers the dev loop.
 
+For a service-free developer process that still exercises an existing passkey
+wallet, installed Petals, and tightly bounded manual Hyperliquid + Polymarket
+mainnet submissions, see
+[`docs/local-mainnet-integration.md`](docs/local-mainnet-integration.md).
+
 ## Contents
 
 1. [Toolchain and prerequisites](#toolchain-and-prerequisites)

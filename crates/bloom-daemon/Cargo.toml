@@ -25,6 +25,10 @@ unsafe-debug-signer = [
     "bloom-tx/unsafe-debug-signer",
     "bloom-vfs/unsafe-debug-signer",
 ]
+# Manual local integration only. This restores the pre-triad, Machine-owned
+# ceremony and hash-signing adapters behind a compile-time boundary so a
+# developer can exercise a real passkey without installing service principals.
+local-integration = ["bloom-vfs/local-integration"]
 
 [dependencies]
 bloom-auth-api.workspace = true
