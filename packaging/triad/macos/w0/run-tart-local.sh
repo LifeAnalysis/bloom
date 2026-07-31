@@ -31,29 +31,50 @@ for repository_root in "$main_root" "$broker_root" "$signer_root"; do
   }
 done
 
-vm_exists() {
+vm_status() {
   local vm_name="$1"
-  tart list --format json |
-    jq -e --arg name "$vm_name" \
-      'any(.[]; .Source == "local" and .Name == $name)' >/dev/null
+  local listing status
+  if ! listing="$(tart list --format json)"; then
+    echo "failed to list local Tart VMs" >&2
+    return 70
+  fi
+  if ! status="$(
+    jq -er --arg name "$vm_name" '
+      if type != "array" then error("Tart VM list is not an array") else . end
+      | [ .[] | select(.Source == "local" and .Name == $name) ]
+      | if length == 0 then "missing"
+        elif length != 1 then error("duplicate local Tart VM")
+        elif .[0].Running then "running"
+        else "stopped"
+        end
+    ' <<<"$listing"
+  )"
+  then
+    echo "failed to query local Tart VM state: $vm_name" >&2
+    return 70
+  fi
+  printf '%s\n' "$status"
 }
 
-vm_running() {
-  local vm_name="$1"
-  tart list --format json |
-    jq -e --arg name "$vm_name" \
-      'any(.[]; .Source == "local" and .Name == $name and .Running)' >/dev/null
-}
-
-if ! vm_exists "$development_base"; then
-  echo "missing local Tart W0 development base: $development_base" >&2
-  echo "run $script_dir/provision-tart-local.sh first" >&2
-  exit 69
+if ! development_base_status="$(vm_status "$development_base")"; then
+  exit 70
 fi
-if vm_running "$development_base"; then
-  echo "local Tart W0 development base is already running: $development_base" >&2
-  exit 69
-fi
+case "$development_base_status" in
+  missing)
+    echo "missing local Tart W0 development base: $development_base" >&2
+    echo "run $script_dir/provision-tart-local.sh first" >&2
+    exit 69
+    ;;
+  running)
+    echo "local Tart W0 development base is already running: $development_base" >&2
+    exit 69
+    ;;
+  stopped) ;;
+  *)
+    echo "invalid local Tart VM state: $development_base_status" >&2
+    exit 70
+    ;;
+esac
 
 mkdir -p "$local_output_root"
 
@@ -74,10 +95,26 @@ run_pid=""
 completed=false
 
 stop_active_vm() {
-  if [[ -n "$active_vm" ]] && vm_running "$active_vm"; then
-    tart stop "$active_vm" >/dev/null 2>&1 || true
+  local attempt
+  if [[ -n "$active_vm" ]]; then
+    if ! tart stop "$active_vm" >/dev/null 2>&1; then
+      echo "failed to stop active Tart VM cleanly: $active_vm" >&2
+      [[ -z "$run_pid" ]] || kill "$run_pid" >/dev/null 2>&1 || true
+    fi
   fi
   if [[ -n "$run_pid" ]]; then
+    for attempt in {1..15}; do
+      kill -0 "$run_pid" >/dev/null 2>&1 || break
+      sleep 1
+    done
+    if kill -0 "$run_pid" >/dev/null 2>&1; then
+      echo "Tart run process did not exit after stop; terminating pid $run_pid" >&2
+      kill "$run_pid" >/dev/null 2>&1 || true
+      sleep 1
+    fi
+    if kill -0 "$run_pid" >/dev/null 2>&1; then
+      kill -KILL "$run_pid" >/dev/null 2>&1 || true
+    fi
     wait "$run_pid" >/dev/null 2>&1 || true
   fi
   run_pid=""
@@ -88,12 +125,10 @@ cleanup() {
   local status=$?
   trap - EXIT
   stop_active_vm
-  if vm_exists "$run_name"; then
-    if [[ "$status" -eq 0 || "$keep_failed" != true ]]; then
-      tart delete "$run_name" >/dev/null 2>&1 || true
-    else
-      echo "preserved failed disposable VM: $run_name" >&2
-    fi
+  if [[ "$status" -eq 0 || "$keep_failed" != true ]]; then
+    tart delete "$run_name" >/dev/null 2>&1 || true
+  else
+    echo "preserved failed disposable VM if it was created: $run_name" >&2
   fi
   if [[ "$completed" == true ]]; then
     echo "local macOS W0 passed; evidence: $local_output_root"
@@ -121,6 +156,14 @@ start_vm() {
 
   guest_ip=""
   for _ in {1..90}; do
+    if ! kill -0 "$run_pid" >/dev/null 2>&1; then
+      local run_status=0
+      wait "$run_pid" || run_status=$?
+      run_pid=""
+      active_vm=""
+      echo "Tart VM process exited before SSH was ready: $vm_name (status $run_status)" >&2
+      return 1
+    fi
     guest_ip="$(tart ip "$vm_name" 2>/dev/null || true)"
     if [[ -n "$guest_ip" ]] &&
       nc -z -w 1 "$guest_ip" 22 >/dev/null 2>&1 &&
@@ -131,7 +174,7 @@ start_vm() {
       # SSH can become reachable before macOS has fully settled the VirtioFS
       # directory shares. Give the guest a short stabilization window; the
       # release gate still retries and fails closed on abnormal reader exits.
-      sleep 5
+      sleep 30
       if sshpass -p "$guest_password" \
         ssh "${ssh_options[@]}" "admin@$guest_ip" /usr/bin/true \
         >/dev/null 2>&1

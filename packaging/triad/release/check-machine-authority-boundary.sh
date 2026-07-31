@@ -67,6 +67,27 @@ count_occurrences() {
   run_scanner count --marker "$marker" "$path"
 }
 
+rustc_host_triple() {
+  local attempt status=1 verbose line
+  for attempt in 1 2 3; do
+    if verbose="$(rustc -vV)"; then
+      while IFS= read -r line; do
+        if [[ "$line" == host:\ * ]]; then
+          printf '%s\n' "${line#host: }"
+          return 0
+        fi
+      done <<<"$verbose"
+      status=65
+      echo "rustc host discovery attempt $attempt returned no host triple" >&2
+    else
+      status=$?
+      echo "rustc host discovery attempt $attempt failed with status $status" >&2
+    fi
+    (( attempt == 3 )) || sleep 2
+  done
+  return "$status"
+}
+
 baseline_has_file() {
   local marker="$1"
   local relative="$2"
@@ -78,16 +99,27 @@ baseline_has_file() {
 
 check_source_ratchet() {
   local failed=0
-  local marker relative maximum actual absolute matches
+  local marker relative maximum actual absolute matches baseline_markers
   while IFS=$'\t' read -r marker relative maximum; do
     [[ -z "$marker" || "$marker" == \#* ]] && continue
-    actual="$(count_occurrences "$marker" "$relative")"
+    if ! actual="$(count_occurrences "$marker" "$relative")"; then
+      echo "failed to count Machine authority marker: $marker in $relative" >&2
+      failed=1
+      continue
+    fi
     if (( actual > maximum )); then
       echo "Machine authority marker expanded: $marker in $relative ($actual > $maximum)" >&2
       failed=1
     fi
   done < "$baseline"
 
+  if ! baseline_markers="$(
+    awk -F '\t' '$0 !~ /^#/ && NF >= 3 { print $1 }' "$baseline" | sort -u
+  )"
+  then
+    echo "failed to enumerate Machine authority baseline markers" >&2
+    return 1
+  fi
   while IFS= read -r marker; do
     [[ -z "$marker" ]] && continue
     if ! matches="$(
@@ -110,7 +142,7 @@ check_source_ratchet() {
         failed=1
       fi
     done <<<"$matches"
-  done < <(awk -F '\t' '$0 !~ /^#/ && NF >= 3 { print $1 }' "$baseline" | sort -u)
+  done <<<"$baseline_markers"
 
   (( failed == 0 ))
 }
@@ -128,19 +160,34 @@ cargo_tree_for_set() {
   )
   [[ "$defaults" == "no" ]] && args+=(--no-default-features)
   [[ "$features" != "-" ]] && args+=(--features "$features")
-  cargo "${args[@]}"
+  local attempt status=1
+  for attempt in 1 2 3; do
+    if cargo "${args[@]}"; then
+      return 0
+    else
+      status=$?
+    fi
+    echo "Cargo tree attempt $attempt failed with status $status" >&2
+    (( attempt == 3 )) || sleep 2
+  done
+  return "$status"
 }
 
 cargo_metadata_for_set() {
   local package="$1"
   local defaults="$2"
   local features="$3"
+  local host_triple
+  if ! host_triple="$(rustc_host_triple)"; then
+    echo "failed to resolve rustc host triple" >&2
+    return 1
+  fi
   local args=(
     metadata
     --format-version 1
     --locked
     --manifest-path "$workspace/Cargo.toml"
-    --filter-platform "$(rustc -vV | sed -n 's/^host: //p')"
+    --filter-platform "$host_triple"
   )
   [[ "$defaults" == "no" ]] && args+=(--no-default-features)
   [[ "$features" != "-" ]] && args+=(--features "$package/$features")
@@ -167,7 +214,10 @@ metadata_reachable_packages() {
     . as $metadata
     | ($metadata.packages | map({ key: .id, value: . }) | from_entries) as $packages
     | ($metadata.resolve.nodes | map({ key: .id, value: . }) | from_entries) as $nodes
-    | ($metadata.packages[] | select(.name == $root_name) | .id) as $root
+    | ([ $metadata.packages[] | select(.name == $root_name) | .id ]) as $roots
+    | (if ($roots | length) != 1 then
+        error("expected exactly one Machine root package named \($root_name)")
+      else $roots[0] end) as $root
     | def children($id):
         $nodes[$id].deps[]
         | select(any(.dep_kinds[]; .kind == null or .kind == "build"))
@@ -190,7 +240,10 @@ metadata_reachable_features() {
     . as $metadata
     | ($metadata.packages | map({ key: .id, value: . }) | from_entries) as $packages
     | ($metadata.resolve.nodes | map({ key: .id, value: . }) | from_entries) as $nodes
-    | ($metadata.packages[] | select(.name == $root_name) | .id) as $root
+    | ([ $metadata.packages[] | select(.name == $root_name) | .id ]) as $roots
+    | (if ($roots | length) != 1 then
+        error("expected exactly one Machine root package named \($root_name)")
+      else $roots[0] end) as $root
     | def children($id):
         $nodes[$id].deps[]
         | select(any(.dep_kinds[]; .kind == null or .kind == "build"))
@@ -209,38 +262,24 @@ metadata_reachable_features() {
 
 forbidden_dependencies() {
   if [[ -n "${BLOOM_MACHINE_FORBIDDEN_DEPENDENCIES:-}" ]]; then
-    tr ',' '\n' <<<"$BLOOM_MACHINE_FORBIDDEN_DEPENDENCIES"
+    printf '%s\n' "${BLOOM_MACHINE_FORBIDDEN_DEPENDENCIES//,/$'\n'}"
     return
   fi
-  cat <<'EOF'
-bloom-keystore
-bloom-auth
-bloom-auth-api
-bloom-hyperliquid
-alloy-signer-local
-alloy-signer-aws
-alloy-signer-gcp
-alloy-signer-ledger
-alloy-signer-trezor
-alloy-signer-turnkey
-alloy-signer-yubihsm
-coins-bip32
-coins-bip39
-eth-keystore
-webauthn-rs
-webauthn-rs-core
-aws-sdk-kms
-EOF
+  printf '%s\n' \
+    bloom-keystore bloom-auth bloom-auth-api bloom-hyperliquid \
+    alloy-signer-local alloy-signer-aws alloy-signer-gcp \
+    alloy-signer-ledger alloy-signer-trezor alloy-signer-turnkey \
+    alloy-signer-yubihsm coins-bip32 coins-bip39 eth-keystore \
+    webauthn-rs webauthn-rs-core aws-sdk-kms
 }
 
 forbidden_resolved_features() {
-  cat <<'EOF'
-*:local-integration
-*:unsafe-debug-signer
-*:triad-dev-harness
-alloy:signer-local
-webauthn-rs:danger-allow-state-serialisation
-EOF
+  printf '%s\n' \
+    '*:local-integration' \
+    '*:unsafe-debug-signer' \
+    '*:triad-dev-harness' \
+    'alloy:signer-local' \
+    'webauthn-rs:danger-allow-state-serialisation'
 }
 
 feature_is_forbidden() {
@@ -257,11 +296,16 @@ feature_is_forbidden() {
 }
 
 production_source_roots() {
-  local label package defaults features
+  local label package defaults features tree_output all_tree_output=""
   while IFS=$'\t' read -r label package defaults features; do
     [[ -z "$label" || "$label" == \#* ]] && continue
-    cargo_tree_for_set "$package" "$defaults" "$features"
-  done < "$feature_sets" |
+    if ! tree_output="$(cargo_tree_for_set "$package" "$defaults" "$features")"; then
+      echo "failed to enumerate production Machine source roots for $label" >&2
+      return 1
+    fi
+    all_tree_output+="$tree_output"$'\n'
+  done < "$feature_sets"
+  printf '%s' "$all_tree_output" |
     sed -n -E 's#^.* \((/[^)]*)\)( \(\*\))?$#\1#p' |
     sort -u |
     awk -v workspace="$workspace" '
@@ -273,9 +317,13 @@ production_source_roots() {
 }
 
 source_roots=()
+if ! source_roots_output="$(production_source_roots)"; then
+  echo "failed to resolve production Machine source roots" >&2
+  exit 1
+fi
 while IFS= read -r source_root; do
   [[ -n "$source_root" ]] && source_roots+=("$source_root")
-done < <(production_source_roots)
+done <<<"$source_roots_output"
 if [[ -n "${BLOOM_MACHINE_AUTHORITY_EXTRA_SOURCE_ROOTS:-}" ]]; then
   IFS=':' read -r -a extra_source_roots <<<"$BLOOM_MACHINE_AUTHORITY_EXTRA_SOURCE_ROOTS"
   source_roots+=("${extra_source_roots[@]}")
@@ -287,7 +335,13 @@ inventory_dependencies() {
     [[ -z "$label" || "$label" == \#* ]] && continue
     echo "feature-set: $label package=$package default-features=$defaults features=$features"
     metadata="$(cargo_metadata_for_set "$package" "$defaults" "$features")"
-    reachable="$(printf '%s\n' "$metadata" | metadata_reachable_packages "$package" | cut -f1)"
+    if ! reachable="$(
+      printf '%s\n' "$metadata" | metadata_reachable_packages "$package" | cut -f1
+    )"
+    then
+      echo "failed to resolve production Machine dependency closure in $label" >&2
+      return 1
+    fi
     while IFS= read -r dependency; do
       if printf '%s\n' "$reachable" | grep -Fx "$dependency" >/dev/null; then
         echo "  reachable-forbidden-dependency: $dependency"
@@ -299,6 +353,7 @@ inventory_dependencies() {
 require_clean_dependencies() {
   local failed=0
   local label package defaults features dependency metadata reachable observed_feature scan_status
+  local observed_features observed_dependency dependency_reachable
   while IFS=$'\t' read -r label package defaults features; do
     [[ -z "$label" || "$label" == \#* ]] && continue
     case ",${features}," in
@@ -312,19 +367,41 @@ require_clean_dependencies() {
       failed=1
       continue
     fi
-    reachable="$(printf '%s\n' "$metadata" | metadata_reachable_packages "$package" | cut -f1)"
+    if ! reachable="$(
+      printf '%s\n' "$metadata" | metadata_reachable_packages "$package" | cut -f1
+    )"
+    then
+      echo "failed to resolve production Machine dependency closure in $label" >&2
+      failed=1
+      continue
+    fi
     while IFS= read -r dependency; do
-      if printf '%s\n' "$reachable" | grep -Fx "$dependency" >/dev/null; then
+      dependency_reachable=false
+      while IFS= read -r observed_dependency; do
+        if [[ "$observed_dependency" == "$dependency" ]]; then
+          dependency_reachable=true
+          break
+        fi
+      done <<<"$reachable"
+      if [[ "$dependency_reachable" == true ]]; then
         echo "forbidden production Machine dependency in $label: $dependency" >&2
         failed=1
       fi
     done < <(forbidden_dependencies)
+    if ! observed_features="$(
+      printf '%s\n' "$metadata" | metadata_reachable_features "$package"
+    )"
+    then
+      echo "failed to resolve production Machine features in $label" >&2
+      failed=1
+      continue
+    fi
     while IFS= read -r observed_feature; do
       if feature_is_forbidden "$observed_feature"; then
         echo "forbidden resolved Machine feature in $label: $observed_feature" >&2
         failed=1
       fi
-    done < <(printf '%s\n' "$metadata" | metadata_reachable_features "$package" | sort -u)
+    done <<<"$observed_features"
   done < "$feature_sets"
 
   for manifest in \
@@ -363,40 +440,20 @@ source_marker_allowlisted() {
 }
 
 forbidden_source_markers() {
-  cat <<'EOF'
-bloom-keystore
-bloom-auth
-bloom-auth-api
-bloom_hyperliquid
-bloom_keystore
-bloom_auth
-KeystorePetalHost
-StoreApprovalVerifier
-KeystoreApprovalSignatureVerifier
-SignerCache
-EphemeralAgentKey
-PrivateKeySigner
-RegistrationCoordinator
-AuthServices
-InMemoryGrantStore
-SessionStore
-ActiveSession
-SessionActionFacts
-authorize_and_debit
-PetalHost::sign_hash
-sign_hash_sync
-backend_policy_for_wallet
-policy_override
-unsafe-debug-signer
-local-integration
-policy-session
-bloom.sign-hash
-EOF
+  printf '%s\n' \
+    bloom-keystore bloom-auth bloom-auth-api bloom_hyperliquid \
+    bloom_keystore bloom_auth KeystorePetalHost StoreApprovalVerifier \
+    KeystoreApprovalSignatureVerifier SignerCache EphemeralAgentKey \
+    PrivateKeySigner RegistrationCoordinator AuthServices InMemoryGrantStore \
+    SessionStore ActiveSession SessionActionFacts authorize_and_debit \
+    PetalHost::sign_hash sign_hash_sync backend_policy_for_wallet \
+    policy_override unsafe-debug-signer local-integration policy-session \
+    bloom.sign-hash
 }
 
 require_clean_sources() {
   local failed=0
-  local marker absolute relative source_root matches
+  local marker absolute relative source_root matches legacy_files
   while IFS= read -r marker; do
     [[ -z "$marker" ]] && continue
     for source_root in "${source_roots[@]}"; do
@@ -426,13 +483,22 @@ require_clean_sources() {
 
   for source_root in "${source_roots[@]}"; do
     [[ -d "$source_root/src" ]] || continue
+    if ! legacy_files="$(
+      find "$source_root/src" -type f \
+        \( -name 'registration.rs' -o -name 'sealed_ceremony.rs' -o \
+           -name 'sign_hash.rs' -o -name 'auth.sqlite' \) -print
+    )"
+    then
+      echo "failed to enumerate legacy authority source files in $source_root" >&2
+      failed=1
+      continue
+    fi
     while IFS= read -r absolute; do
+      [[ -z "$absolute" ]] && continue
       relative="${absolute#"$workspace/"}"
       echo "forbidden legacy authority source file: $relative" >&2
       failed=1
-    done < <(find "$source_root/src" -type f \
-      \( -name 'registration.rs' -o -name 'sealed_ceremony.rs' -o \
-         -name 'sign_hash.rs' -o -name 'auth.sqlite' \) -print)
+    done <<<"$legacy_files"
     if [[ -d "$source_root/src/ceremony_server" ]]; then
       relative="${source_root#"$workspace/"}/src/ceremony_server"
       echo "forbidden legacy authority source directory: $relative" >&2

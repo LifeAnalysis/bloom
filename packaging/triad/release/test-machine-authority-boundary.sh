@@ -97,6 +97,33 @@ fi
 grep -F 'failed to scan current Machine entry documentation:' \
   "$work/undecodable-entry-doc.out" >/dev/null
 
+real_cargo="$(command -v cargo)"
+mkdir "$work/failing-cargo-bin"
+printf '0\n' >"$work/cargo-tree-count"
+cat >"$work/failing-cargo-bin/cargo" <<EOF
+#!/bin/bash
+if [[ "\${1:-}" == tree ]]; then
+  count="\$(<"$work/cargo-tree-count")"
+  count="\$((count + 1))"
+  printf '%s\\n' "\$count" >"$work/cargo-tree-count"
+  if (( count <= 3 )); then
+    exit 42
+  fi
+fi
+exec "$real_cargo" "\$@"
+EOF
+chmod +x "$work/failing-cargo-bin/cargo"
+if PATH="$work/failing-cargo-bin:$PATH" \
+  "$checker" --require-clean >"$work/failed-tree.out" 2>&1
+then
+  echo "failed non-final Cargo tree feature set unexpectedly passed" >&2
+  exit 1
+fi
+grep -F 'failed to enumerate production Machine source roots for bloom-default' \
+  "$work/failed-tree.out" >/dev/null
+grep -F 'failed to resolve production Machine source roots' \
+  "$work/failed-tree.out" >/dev/null
+
 "$checker" --require-clean >"$work/strict.out"
 grep -Fx 'Machine production authority boundary is clean' "$work/strict.out" >/dev/null
 
