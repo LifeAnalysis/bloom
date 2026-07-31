@@ -24,7 +24,7 @@ for path in "$main_root" "$broker_root" "$signer_root" "$output_root"; do
     exit 69
   }
 done
-for command_name in cargo git jq rg ssh-keygen tar; do
+for command_name in cargo git jq python3 ssh-keygen tar; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "missing Tart W0 guest build dependency: $command_name" >&2
     exit 69

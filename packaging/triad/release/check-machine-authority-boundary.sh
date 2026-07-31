@@ -6,6 +6,7 @@ workspace="$(cd "$script_dir/../../.." && pwd -P)"
 baseline="${BLOOM_MACHINE_AUTHORITY_BASELINE:-$script_dir/machine-authority-baseline.tsv}"
 feature_sets="${BLOOM_MACHINE_PRODUCTION_FEATURE_SETS:-$script_dir/machine-production-feature-sets.tsv}"
 mode="${1:-}"
+scanner="$script_dir/machine-authority-scan.py"
 
 usage() {
   echo "usage: $0 --check-baseline|--inventory|--require-clean" >&2
@@ -17,12 +18,16 @@ case "$mode" in
   *) usage ;;
 esac
 
-for command_name in cargo jq rg awk sed sort uniq; do
+for command_name in cargo jq python3 awk sed sort uniq; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "machine authority boundary check requires $command_name" >&2
     exit 69
   }
 done
+test -f "$scanner" || {
+  echo "missing Machine authority scanner: $scanner" >&2
+  exit 66
+}
 test -f "$baseline" || {
   echo "missing Machine authority baseline: $baseline" >&2
   exit 66
@@ -30,6 +35,25 @@ test -f "$baseline" || {
 test -f "$feature_sets" || {
   echo "missing Machine production feature sets: $feature_sets" >&2
   exit 66
+}
+
+# VirtioFS-backed macOS guests can transiently terminate a reader while a new
+# directory share is settling immediately after boot. Retry only scanner
+# failures (exit >= 2 or signal); exit 1 remains the scanner's valid no-match
+# result. Exhausted retries are returned to the caller and always fail closed.
+run_scanner() {
+  local attempt status=2
+  for attempt in 1 2 3; do
+    if python3 "$scanner" "$@"; then
+      return 0
+    else
+      status=$?
+    fi
+    (( status == 1 )) && return 1
+    echo "Machine authority scanner attempt $attempt failed with status $status" >&2
+    (( attempt == 3 )) || sleep 2
+  done
+  return "$status"
 }
 
 count_occurrences() {
@@ -40,7 +64,7 @@ count_occurrences() {
     echo 0
     return
   fi
-  { rg -F -o -- "$marker" "$path" || true; } | wc -l | tr -d ' '
+  run_scanner count --marker "$marker" "$path"
 }
 
 baseline_has_file() {
@@ -54,7 +78,7 @@ baseline_has_file() {
 
 check_source_ratchet() {
   local failed=0
-  local marker relative maximum actual absolute
+  local marker relative maximum actual absolute matches
   while IFS=$'\t' read -r marker relative maximum; do
     [[ -z "$marker" || "$marker" == \#* ]] && continue
     actual="$(count_occurrences "$marker" "$relative")"
@@ -66,6 +90,18 @@ check_source_ratchet() {
 
   while IFS= read -r marker; do
     [[ -z "$marker" ]] && continue
+    if ! matches="$(
+      run_scanner files \
+        --marker "$marker" \
+        --suffix .rs \
+        --name Cargo.toml \
+        "${source_roots[@]}"
+    )"
+    then
+      echo "Machine authority source scan failed for marker: $marker" >&2
+      failed=1
+      continue
+    fi
     while IFS= read -r absolute; do
       [[ -z "$absolute" ]] && continue
       relative="${absolute#"$workspace/"}"
@@ -73,7 +109,7 @@ check_source_ratchet() {
         echo "Machine authority marker appeared in a new file: $marker in $relative" >&2
         failed=1
       fi
-    done < <(rg -l -F -g '*.rs' -g 'Cargo.toml' -- "$marker" "${source_roots[@]}" || true)
+    done <<<"$matches"
   done < <(awk -F '\t' '$0 !~ /^#/ && NF >= 3 { print $1 }' "$baseline" | sort -u)
 
   (( failed == 0 ))
@@ -108,7 +144,17 @@ cargo_metadata_for_set() {
   )
   [[ "$defaults" == "no" ]] && args+=(--no-default-features)
   [[ "$features" != "-" ]] && args+=(--features "$package/$features")
-  cargo "${args[@]}"
+  local attempt status=1
+  for attempt in 1 2 3; do
+    if cargo "${args[@]}"; then
+      return 0
+    else
+      status=$?
+    fi
+    echo "Cargo metadata attempt $attempt failed with status $status" >&2
+    (( attempt == 3 )) || sleep 2
+  done
+  return "$status"
 }
 
 # Print the exact normal/build closure selected for one Machine root. Cargo
@@ -252,7 +298,7 @@ inventory_dependencies() {
 
 require_clean_dependencies() {
   local failed=0
-  local label package defaults features dependency metadata reachable observed_feature
+  local label package defaults features dependency metadata reachable observed_feature scan_status
   while IFS=$'\t' read -r label package defaults features; do
     [[ -z "$label" || "$label" == \#* ]] && continue
     case ",${features}," in
@@ -288,11 +334,18 @@ require_clean_dependencies() {
     crates/bloom-tx/Cargo.toml
   do
     [[ -f "$workspace/$manifest" ]] || continue
-    if rg -n '^(unsafe-debug-signer|local-integration)[[:space:]]*=' \
+    if run_scanner regex \
+      --pattern '^(unsafe-debug-signer|local-integration)\s*=' \
       "$workspace/$manifest" >&2
     then
       echo "forbidden authority-restoring production feature remains in $manifest" >&2
       failed=1
+    else
+      scan_status=$?
+      if (( scan_status != 1 )); then
+        echo "failed to scan production Machine manifest: $manifest" >&2
+        failed=1
+      fi
     fi
   done
   (( failed == 0 ))
@@ -343,11 +396,23 @@ EOF
 
 require_clean_sources() {
   local failed=0
-  local marker absolute relative source_root
+  local marker absolute relative source_root matches
   while IFS= read -r marker; do
     [[ -z "$marker" ]] && continue
     for source_root in "${source_roots[@]}"; do
       [[ -d "$source_root/src" ]] || continue
+      if ! matches="$(
+        run_scanner files \
+          --marker "$marker" \
+          --suffix .rs \
+          --suffix .html \
+          "$source_root/src"
+      )"
+      then
+        echo "Machine authority source scan failed for marker: $marker" >&2
+        failed=1
+        continue
+      fi
       while IFS= read -r absolute; do
         [[ -z "$absolute" ]] && continue
         relative="${absolute#"$workspace/"}"
@@ -355,7 +420,7 @@ require_clean_sources() {
           echo "forbidden production Machine source marker: $marker in $relative" >&2
           failed=1
         fi
-      done < <(rg -l -F --glob '*.rs' --glob '*.html' -- "$marker" "$source_root/src" || true)
+      done <<<"$matches"
     done
   done < <(forbidden_source_markers)
 
@@ -385,7 +450,7 @@ require_clean_sources() {
 
 require_clean_current_entry_docs() {
   local failed=0
-  local configured relative path
+  local configured relative path scan_status
   local -a entry_docs
   if [[ -n "${BLOOM_MACHINE_CURRENT_ENTRY_DOCS:-}" ]]; then
     IFS=':' read -r -a entry_docs <<<"$BLOOM_MACHINE_CURRENT_ENTRY_DOCS"
@@ -401,18 +466,24 @@ require_clean_current_entry_docs() {
       failed=1
       continue
     fi
-    if rg -n -i \
-      -e '\bgrant(s|ed|ing)?\b' \
-      -e 'policy\.toml(\.sig)?' \
-      -e 'keystore' \
-      -e 'passphrase' \
-      -e 'wallet[[:space:]]+unlock' \
-      -e 'in-process' \
-      -e '/sign/(message|hash|typed_data)' \
-      -- "$path" >&2
+    if run_scanner regex --ignore-case \
+      --pattern '\bgrant(s|ed|ing)?\b' \
+      --pattern 'policy\.toml(\.sig)?' \
+      --pattern 'keystore' \
+      --pattern 'passphrase' \
+      --pattern 'wallet\s+unlock' \
+      --pattern 'in-process' \
+      --pattern '/sign/(message|hash|typed_data)' \
+      "$path" >&2
     then
       echo "forbidden legacy authority instruction in current entry documentation: $relative" >&2
       failed=1
+    else
+      scan_status=$?
+      if (( scan_status != 1 )); then
+        echo "failed to scan current Machine entry documentation: $relative" >&2
+        failed=1
+      fi
     fi
   done
   (( failed == 0 ))

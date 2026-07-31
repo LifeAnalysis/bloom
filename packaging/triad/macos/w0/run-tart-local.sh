@@ -128,7 +128,16 @@ start_vm() {
         ssh "${ssh_options[@]}" "admin@$guest_ip" /usr/bin/true \
         >/dev/null 2>&1
     then
-      return 0
+      # SSH can become reachable before macOS has fully settled the VirtioFS
+      # directory shares. Give the guest a short stabilization window; the
+      # release gate still retries and fails closed on abnormal reader exits.
+      sleep 5
+      if sshpass -p "$guest_password" \
+        ssh "${ssh_options[@]}" "admin@$guest_ip" /usr/bin/true \
+        >/dev/null 2>&1
+      then
+        return 0
+      fi
     fi
     sleep 2
   done

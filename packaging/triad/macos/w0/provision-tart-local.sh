@@ -132,13 +132,9 @@ if ! command -v cargo >/dev/null 2>&1; then
     https://sh.rustup.rs |
     /bin/sh -s -- -y --profile minimal --default-toolchain stable
 fi
-if ! command -v rg >/dev/null 2>&1; then
-  cargo install ripgrep --version 15.2.0 --locked
-fi
 cargo --version
 rustc --version
 jq --version
-rg --version | /usr/bin/head -1
 GUEST
 
 # A graceful guest shutdown is required for macOS to flush newly installed

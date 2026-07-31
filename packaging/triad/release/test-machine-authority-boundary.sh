@@ -87,6 +87,16 @@ fi
 grep -F 'forbidden legacy authority instruction in current entry documentation:' \
   "$work/stale-entry-doc.out" >/dev/null
 
+printf '\377\n' >"$work/undecodable-entry-doc.md"
+if BLOOM_MACHINE_CURRENT_ENTRY_DOCS="$work/undecodable-entry-doc.md" \
+  "$checker" --require-clean >"$work/undecodable-entry-doc.out" 2>&1
+then
+  echo "failed current-entry documentation scan unexpectedly passed" >&2
+  exit 1
+fi
+grep -F 'failed to scan current Machine entry documentation:' \
+  "$work/undecodable-entry-doc.out" >/dev/null
+
 "$checker" --require-clean >"$work/strict.out"
 grep -Fx 'Machine production authority boundary is clean' "$work/strict.out" >/dev/null
 
