@@ -200,22 +200,23 @@ vls_names() {
   LC_ALL=C command ls -1 "$(mounted_path "$1")"
 }
 
-wait_for_hl_session() {
-  local session_file error_file error_before session_body current_error attempt
-  session_file="$(mounted_path "$1")"
+wait_for_hl_result() {
+  local result_file error_file error_before description result_body current_error attempt
+  result_file="$(mounted_path "$1")"
   error_file="$(mounted_path "$2")"
   error_before="$3"
+  description="$4"
   attempt=0
   while [ "$attempt" -lt 150 ]; do
-    session_body="$(cat "$session_file" 2>/dev/null || true)"
-    if [ -n "$session_body" ]; then
-      printf '%s\n' "$session_body"
+    result_body="$(cat "$result_file" 2>/dev/null || true)"
+    if [ -n "$result_body" ]; then
+      printf '%s\n' "$result_body"
       return 0
     fi
     current_error="$(cat "$error_file" 2>/dev/null || true)"
     if [ -n "$current_error" ] && [ "$current_error" != "$error_before" ]; then
-      printf 'Hyperliquid session creation failed through the mounted filesystem:\n%s\n' \
-        "$current_error" >&2
+      printf 'Hyperliquid %s failed through the mounted filesystem:\n%s\n' \
+        "$description" "$current_error" >&2
       return 1
     fi
     sleep 0.2
@@ -223,7 +224,8 @@ wait_for_hl_session() {
   done
   current_error="$(cat "$error_file" 2>/dev/null || true)"
   if [ -n "$current_error" ]; then
-    printf 'Latest mounted Hyperliquid error:\n%s\n' "$current_error" >&2
+    printf 'Latest mounted Hyperliquid %s error:\n%s\n' \
+      "$description" "$current_error" >&2
   fi
   return 1
 }
@@ -343,6 +345,25 @@ if [ "$live" -eq 0 ] || [ "$execute_hl" -eq 1 ]; then
     printf 'BLOCKER: Hyperliquid account value is zero or unreadable.\n' >&2
     preflight_blockers=1
   fi
+  if [ "$execute_hl" -eq 1 ]; then
+    hl_extra_agents="$(vcat "/hyperliquid/mainnet/users/${wallet_address}/extra_agents.json")"
+    reusable_agent_name="$(printf '%s' "$hl_extra_agents" | jq -er '
+      [.[] | (.name // "") | select(test("^bloom-i-[A-Za-z0-9._-]+$"))][0] // ""
+    ')"
+    if [ -n "$reusable_agent_name" ]; then
+      agent_name="$reusable_agent_name"
+      [ "${#agent_name}" -le 16 ] ||
+        die "existing Hyperliquid integration agent name exceeds 16 characters"
+      printf 'Hyperliquid integration agent: reusing named slot %s\n' "$agent_name"
+    else
+      named_agent_count="$(printf '%s' "$hl_extra_agents" | jq '
+        [.[] | select((.name // "") != "")] | length
+      ')"
+      [ "$named_agent_count" -lt 3 ] ||
+        die "all three named Hyperliquid API-wallet slots are occupied and none belongs to this integration runner"
+      printf 'Hyperliquid integration agent: allocating named slot %s\n' "$agent_name"
+    fi
+  fi
 fi
 
 if [ "$live" -eq 0 ] || [ "$execute_pm" -eq 1 ]; then
@@ -452,8 +473,9 @@ if [ "$execute_hl" -eq 1 ]; then
   hl_error_path="/hyperliquid/mainnet/agent_sessions/${wallet}/last_error.json"
   hl_error_before="$(cat "$(mounted_path "$hl_error_path")" 2>/dev/null || true)"
   vwrite "/hyperliquid/mainnet/agent_sessions/${wallet}/new.json" "$session_request"
-  if ! session_json="$(wait_for_hl_session \
-    "${session_path}/session.json" "$hl_error_path" "$hl_error_before")"; then
+  if ! session_json="$(wait_for_hl_result \
+    "${session_path}/session.json" "$hl_error_path" "$hl_error_before" \
+    "session creation")"; then
     die "mounted Hyperliquid session creation did not complete"
   fi
   session_active=1
@@ -471,10 +493,16 @@ if [ "$execute_hl" -eq 1 ]; then
         orders:[{a:$asset,b:$buy,p:$price,s:$size,r:false,t:{limit:{tif:$tif}}}],
         grouping:"na"
       }
-    }')"
+  }')"
   printf '\nSubmitting Hyperliquid order...\n'
+  hl_order_error_path="${session_path}/last_error.json"
+  hl_order_error_before="$(cat "$(mounted_path "$hl_order_error_path")" 2>/dev/null || true)"
   vwrite "${session_path}/order.json" "$hl_order"
-  hl_response="$(vcat "${session_path}/last_response.json")"
+  if ! hl_response="$(wait_for_hl_result \
+    "${session_path}/last_response.json" "$hl_order_error_path" \
+    "$hl_order_error_before" "order submission")"; then
+    die "mounted Hyperliquid order submission did not complete successfully"
+  fi
   printf '%s\n' "$hl_response" | jq .
   printf '%s' "$hl_response" | jq -e '
     (.response.status == "ok") and

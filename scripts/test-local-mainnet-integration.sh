@@ -98,6 +98,38 @@ if command -v expect >/dev/null 2>&1; then
   grep -q 'PASS: selected mainnet venue submission(s)' "$live_output"
   test -f "${test_root}/fake-state/hl-order"
   test -f "${test_root}/fake-state/pm-posted"
+
+  hl_rejection_output="${test_root}/hl-rejection.out"
+  # Expect expands its own $env(RUNNER).
+  # shellcheck disable=SC2016
+  if RUNNER="$runner" \
+    BLOOM_HOME="${test_root}/home" \
+    BLOOM_FAKE_STATE="${test_root}/fake-rejection-state" \
+    BLOOM_FAKE_HL_ORDER_ERROR=1 \
+    BLOOM_INTEGRATION_BIN="$fixture_bin" \
+    BLOOM_INTEGRATION_OPEN=true \
+    expect -c '
+      set timeout 20
+      log_user 1
+      spawn $env(RUNNER) \
+        --wallet test-passkey \
+        --execute-hyperliquid \
+        --hl-coin BTC --hl-asset-id 0 --hl-side buy \
+        --hl-price 100000 --hl-size 0.0001 --hl-tif Ioc
+      expect "to authorize the selected submission(s):"
+      send "EXECUTE HYPERLIQUID MAINNET ORDER\r"
+      expect "Complete the passkey ceremony in the browser, then press Return"
+      send "\r"
+      expect eof
+      set result [wait]
+      exit [lindex $result 3]
+    ' >"$hl_rejection_output" 2>&1
+  then
+    printf 'mounted Hyperliquid rejection unexpectedly succeeded\n' >&2
+    exit 1
+  fi
+  grep -q 'Order could not immediately match against any resting orders' \
+    "$hl_rejection_output"
 fi
 
 test_ok=1

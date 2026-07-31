@@ -90,6 +90,16 @@ write_json(
     },
 )
 write_json(
+    f"hyperliquid/mainnet/users/{address}/extra_agents.json",
+    [
+        {
+            "name": "bloom-i-fixture",
+            "address": "0x0000000000000000000000000000000000000002",
+            "validUntil": 9999999999999,
+        }
+    ],
+)
+write_json(
     "petals/polymarket/meta/route-contract.json",
     {"schema": "fake.route-contract.v1", "abi": "0.1"},
 )
@@ -134,6 +144,12 @@ def handle_hl_new(payload):
             {"error": "Extra agent name must be between 1 and 16 characters long."},
         )
         return
+    if agent_name != "bloom-i-fixture":
+        write_json(
+            f"hyperliquid/mainnet/agent_sessions/{wallet}/last_error.json",
+            {"error": "runner did not reuse the existing integration agent name"},
+        )
+        return
     sid = request["id"]
     root = f"hyperliquid/mainnet/agent_sessions/{wallet}/{sid}"
     if hl_new_count == 0:
@@ -147,6 +163,17 @@ def handle_hl_new(payload):
         )
 
         def handle_order(_payload):
+            if os.environ.get("BLOOM_FAKE_HL_ORDER_ERROR"):
+                write_json(
+                    f"{root}/last_error.json",
+                    {
+                        "error": (
+                            "exchange action error: Order could not immediately "
+                            "match against any resting orders. asset=0"
+                        )
+                    },
+                )
+                return
             state.joinpath("hl-order").touch()
             write_json(
                 f"{root}/last_response.json",
