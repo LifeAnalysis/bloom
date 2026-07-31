@@ -128,6 +128,21 @@ field() {
     "/Library/Application Support/BloomTriad/enrollments/$login_uid.json"
 }
 
+payload_release_digest() {
+  selected_payload="$1"
+  manifest="$selected_payload/SHA256SUMS"
+  [[ -f "$manifest" && ! -L "$manifest" ]] || {
+    echo "two-login W0 payload has no regular signed manifest" >&2
+    exit 65
+  }
+  digest="$(shasum -a 256 "$manifest" | awk '{print $1}')"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "two-login W0 payload release digest is invalid" >&2
+    exit 65
+  }
+  printf '%s\n' "$digest"
+}
+
 wait_for_services_to_stop() {
   login_uid="$1"
   broker_uid="$(field "$login_uid" broker_uid)"
@@ -188,7 +203,7 @@ startup_status_a="/private/var/run/bloom/$login_uid_a/status/broker-startup.json
 
 if [[ -n "$upgrade_payload" ]]; then
   prior_digest="$release_digest"
-  upgrade_digest="$(<"$upgrade_payload/RELEASE_DIGEST")"
+  upgrade_digest="$(payload_release_digest "$upgrade_payload")"
   [[ "$upgrade_digest" != "$prior_digest" ]]
   "$installer" install / "$login_uid_a" "$login_user_a" "$upgrade_payload"
   for login_uid in "$login_uid_a" "$login_uid_b"; do
@@ -203,7 +218,7 @@ if [[ -n "$upgrade_payload" ]]; then
   tested_payload="$upgrade_payload"
 
   if [[ -n "$failing_upgrade_payload" ]]; then
-    failing_digest="$(<"$failing_upgrade_payload/RELEASE_DIGEST")"
+    failing_digest="$(payload_release_digest "$failing_upgrade_payload")"
     [[ "$failing_digest" != "$release_digest" ]]
     set +e
     "$installer" install \
