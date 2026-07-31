@@ -5,10 +5,12 @@ export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export CARGO_TARGET_DIR="$HOME/Library/Caches/bloom-w0-target"
 
 readonly shared_root="/Volumes/My Shared Files"
-readonly main_root="$shared_root/bloom"
-readonly broker_root="$shared_root/bloom-broker"
-readonly signer_root="$shared_root/bloom-signer"
 readonly output_root="$shared_root/output"
+readonly source_bundle_root="$output_root/source-bundles"
+readonly local_source_root="$HOME/Library/Caches/bloom-w0-sources"
+readonly main_root="$local_source_root/bloom"
+readonly broker_root="$local_source_root/bloom-broker"
+readonly signer_root="$local_source_root/bloom-signer"
 readonly staging_root="$output_root/triad-staging"
 readonly distribution_root="$output_root/triad-dist"
 readonly verified_root="$output_root/verified"
@@ -18,7 +20,7 @@ readonly release_key="$output_root/w0-release-key"
   echo "Tart W0 guest build requires Darwin" >&2
   exit 69
 }
-for path in "$main_root" "$broker_root" "$signer_root" "$output_root"; do
+for path in "$source_bundle_root" "$output_root"; do
   [[ -d "$path" ]] || {
     echo "missing Tart shared directory: $path" >&2
     exit 69
@@ -30,6 +32,49 @@ for command_name in cargo git jq python3 ssh-keygen tar; do
     exit 69
   }
 done
+
+refresh_local_source() {
+  local name="$1"
+  local bundle="$source_bundle_root/$name.bundle"
+  local target="$local_source_root/$name"
+  local temporary="$local_source_root/.$name.$$.new"
+  local replacement_path
+  [[ -f "$bundle" && ! -L "$bundle" ]] || {
+    echo "missing Tart source bundle: $bundle" >&2
+    return 69
+  }
+  [[ ! -L "$local_source_root" ]] || {
+    echo "unsafe Tart local source-cache symlink: $local_source_root" >&2
+    return 65
+  }
+  mkdir -p "$local_source_root"
+  [[ -d "$local_source_root" && ! -L "$local_source_root" ]] || {
+    echo "unsafe Tart local source-cache root: $local_source_root" >&2
+    return 65
+  }
+  for replacement_path in "$temporary" "$target"; do
+    [[ ! -L "$replacement_path" ]] || {
+      echo "unsafe Tart local source replacement symlink: $replacement_path" >&2
+      return 65
+    }
+  done
+  if [[ -e "$temporary" ]]; then
+    chmod -R u+w "$temporary"
+    find "$temporary" -depth -delete
+  fi
+  git clone --quiet "$bundle" "$temporary"
+  git -C "$temporary" fsck --no-dangling >/dev/null
+  if [[ -e "$target" ]]; then
+    chmod -R u+w "$target"
+    find "$target" -depth -delete
+  fi
+  mv "$temporary" "$target"
+  chmod -R a-w "$target"
+}
+
+refresh_local_source bloom
+refresh_local_source bloom-broker
+refresh_local_source bloom-signer
 
 mkdir -p \
   "$staging_root/bin" \

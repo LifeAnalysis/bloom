@@ -17,7 +17,7 @@ run_vm_log="$local_output_root/run-vm.log"
 build_log="$local_output_root/build.log"
 w0_log="$local_output_root/w0.log"
 
-for command_name in tart jq sshpass ssh nc; do
+for command_name in tart jq sshpass ssh nc git; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "missing local Tart W0 dependency: $command_name" >&2
     exit 69
@@ -77,6 +77,58 @@ case "$development_base_status" in
 esac
 
 mkdir -p "$local_output_root"
+
+source_bundle_root="$local_output_root/source-bundles"
+mkdir -p "$source_bundle_root"
+
+prepare_source_bundle() {
+  local repository_root="$1"
+  local bundle_name="$2"
+  local tracked_status revision temporary bundle_path bundle_heads
+  local bundled_revision bundled_ref extra
+  if ! tracked_status="$(
+    git -C "$repository_root" status --porcelain --untracked-files=no
+  )"
+  then
+    echo "failed to inspect Tart source repository: $repository_root" >&2
+    return 65
+  fi
+  if [[ -n "$tracked_status" ]]; then
+    echo "tracked source changes must be committed before Tart validation: $repository_root" >&2
+    return 65
+  fi
+  if ! revision="$(git -C "$repository_root" rev-parse HEAD)"; then
+    echo "failed to resolve Tart source revision: $repository_root" >&2
+    return 65
+  fi
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "invalid source revision for Tart validation: $repository_root" >&2
+    return 65
+  }
+  bundle_path="$source_bundle_root/$bundle_name.bundle"
+  temporary="$source_bundle_root/.$bundle_name.bundle.$$.new"
+  git -C "$repository_root" bundle create "$temporary" HEAD
+  git -C "$repository_root" bundle verify "$temporary" >/dev/null
+  if ! bundle_heads="$(
+    git -C "$repository_root" bundle list-heads "$temporary"
+  )"
+  then
+    echo "failed to enumerate Tart source bundle heads: $repository_root" >&2
+    return 65
+  fi
+  read -r bundled_revision bundled_ref extra <<<"$bundle_heads"
+  if [[ "$bundled_revision" != "$revision" || "$bundled_ref" != HEAD || -n "$extra" ]] ||
+    [[ "$bundle_heads" == *$'\n'* ]]
+  then
+    echo "Tart source bundle is not bound to the captured HEAD: $repository_root" >&2
+    return 65
+  fi
+  mv -f "$temporary" "$bundle_path"
+}
+
+prepare_source_bundle "$main_root" bloom
+prepare_source_bundle "$broker_root" bloom-broker
+prepare_source_bundle "$signer_root" bloom-signer
 
 ssh_options=(
   -o StrictHostKeyChecking=no
@@ -147,9 +199,6 @@ start_vm() {
     --no-graphics \
     --no-audio \
     --no-clipboard \
-    --dir="bloom:$main_root:ro" \
-    --dir="bloom-broker:$broker_root:ro" \
-    --dir="bloom-signer:$signer_root:ro" \
     --dir="output:$local_output_root" \
     "$vm_name" >"$log_path" 2>&1 &
   run_pid=$!
