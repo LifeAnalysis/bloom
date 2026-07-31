@@ -615,6 +615,7 @@ grep -Fi \
 broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
 broker_log="/private/var/db/bloom/$login_uid/broker/broker.log"
 broker_startup_status="/private/var/run/bloom/$login_uid/status/broker-startup.json"
+containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
 launchctl bootout "$broker_label"
 /usr/bin/nc -lk 127.0.0.1 18734 >/dev/null 2>&1 &
 foreign_listener_pid=$!
@@ -625,6 +626,17 @@ while [[ $SECONDS -lt $deadline ]]; do
   sleep 0.05
 done
 kill -0 "$foreign_listener_pid"
+# Broker has been deliberately unloaded, so the containment monitor cannot
+# publish a new healthy attestation for that enrollment. Wait beyond the exact
+# configured freshness bound before restarting Broker. The stale prior
+# Bloom-owner observation must not classify this non-Bloom listener as another
+# login session.
+containment_maximum_age_ms="$(
+  plutil -extract network_containment.maximum_age_ms raw -o - \
+    "/Library/Application Support/BloomTriad/config/$login_uid/broker/config.json"
+)"
+[[ "$containment_maximum_age_ms" =~ ^[1-9][0-9]*$ ]]
+sleep "$(( (containment_maximum_age_ms + 999) / 1000 + 1 ))"
 launchctl bootstrap system "$broker_plist"
 deadline=$((SECONDS + 15))
 while [[ $SECONDS -lt $deadline ]]; do
@@ -779,7 +791,6 @@ assert_udp_blocked "bloom-signer-$login_uid" -4 127.0.0.1 18737
 assert_udp_blocked "bloom-signer-$login_uid" -6 ::1 18738
 assert_udp_blocked "bloom-broker-$login_uid" -4 "$host_ipv4" 18739
 
-containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
 assert_metadata "$containment_status" "0:0:644"
 deadline=$((SECONDS + 20))
 while [[ $SECONDS -lt $deadline ]]; do
