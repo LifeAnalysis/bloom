@@ -2279,8 +2279,14 @@ fn component_route_type_import(name: &str) -> Option<&'static str> {
 }
 
 fn component_import_caps(name: &str) -> Option<&'static [&'static str]> {
-    if name == "bloom:sign/signing@0.2.0" {
+    if matches!(
+        name,
+        "bloom:sign/signing@0.2.0" | "bloom:sign/signing@0.3.0"
+    ) {
         return Some(&["bloom:sign"]);
+    }
+    if name == "bloom:key/derive@0.1.0" {
+        return Some(&["bloom:key.derive"]);
     }
     bloom_petal_contract::capabilities_for_import(name)
 }
@@ -2291,6 +2297,8 @@ enum ComponentHostInterface {
     StoreKv,
     SignSigningV1,
     SignSigningV2,
+    SignSigningV3,
+    KeyDerive,
     TxOutbox,
     ChainRead,
     VfsReadwrite,
@@ -2300,6 +2308,12 @@ enum ComponentHostInterface {
 fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
     if name == "bloom:sign/signing@0.2.0" {
         return Some(ComponentHostInterface::SignSigningV2);
+    }
+    if name == "bloom:sign/signing@0.3.0" {
+        return Some(ComponentHostInterface::SignSigningV3);
+    }
+    if name == "bloom:key/derive@0.1.0" {
+        return Some(ComponentHostInterface::KeyDerive);
     }
     match bloom_petal_contract::host_interface(name)? {
         ContractHostInterface::HttpFetch => Some(ComponentHostInterface::HttpFetch),
@@ -2540,6 +2554,8 @@ enum HostTypeExport {
     SignResultStructured,
     SignRequestStructured,
     PayloadSignRequestStructured,
+    ScopedPayloadSignRequestStructured,
+    PetalSignSelector,
     SignBatchResultStructured,
 }
 
@@ -2555,6 +2571,8 @@ enum HostFuncExport {
     SignHashStructured,
     SignHashesStructured,
     SignPayloadStructured,
+    ScopedSignPayloadStructured,
+    PetalKeyRequest,
     EvmTxStage,
     EvmTxConfirm,
     EvmTxInspect,
@@ -2681,11 +2699,15 @@ fn host_type_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         }
         (ComponentHostInterface::TxOutbox, "inspection") => Some(HostTypeExport::OutboxInspection),
         (
-            ComponentHostInterface::SignSigningV1 | ComponentHostInterface::SignSigningV2,
+            ComponentHostInterface::SignSigningV1
+            | ComponentHostInterface::SignSigningV2
+            | ComponentHostInterface::SignSigningV3,
             "approval-required",
         ) => Some(HostTypeExport::SignApprovalRequired),
         (
-            ComponentHostInterface::SignSigningV1 | ComponentHostInterface::SignSigningV2,
+            ComponentHostInterface::SignSigningV1
+            | ComponentHostInterface::SignSigningV2
+            | ComponentHostInterface::SignSigningV3,
             "sign-result",
         ) => Some(HostTypeExport::SignResultStructured),
         (ComponentHostInterface::SignSigningV1, "sign-request") => {
@@ -2693,6 +2715,12 @@ fn host_type_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         }
         (ComponentHostInterface::SignSigningV2, "payload-sign-request") => {
             Some(HostTypeExport::PayloadSignRequestStructured)
+        }
+        (ComponentHostInterface::SignSigningV3, "payload-sign-request") => {
+            Some(HostTypeExport::ScopedPayloadSignRequestStructured)
+        }
+        (ComponentHostInterface::SignSigningV3, "selector") => {
+            Some(HostTypeExport::PetalSignSelector)
         }
         (ComponentHostInterface::SignSigningV1, "sign-batch-result") => {
             Some(HostTypeExport::SignBatchResultStructured)
@@ -2721,6 +2749,10 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         (ComponentHostInterface::SignSigningV2, "sign-payload") => {
             Some(HostFuncExport::SignPayloadStructured)
         }
+        (ComponentHostInterface::SignSigningV3, "sign-payload") => {
+            Some(HostFuncExport::ScopedSignPayloadStructured)
+        }
+        (ComponentHostInterface::KeyDerive, "request") => Some(HostFuncExport::PetalKeyRequest),
         (ComponentHostInterface::TxOutbox, "stage") => Some(HostFuncExport::EvmTxStage),
         (ComponentHostInterface::TxOutbox, "confirm") => Some(HostFuncExport::EvmTxConfirm),
         (ComponentHostInterface::TxOutbox, "inspect") => Some(HostFuncExport::EvmTxInspect),
@@ -2761,6 +2793,10 @@ fn host_type_export_matches(
         HostTypeExport::PayloadSignRequestStructured => {
             is_payload_sign_request_petal(&ty, types, 0)
         }
+        HostTypeExport::ScopedPayloadSignRequestStructured => {
+            is_scoped_payload_sign_request_petal(&ty, types, 0)
+        }
+        HostTypeExport::PetalSignSelector => is_exact_reusable_selector(&ty, types, 0),
         HostTypeExport::SignBatchResultStructured => is_sign_batch_result_petal(&ty, types, 0),
     }
 }
@@ -2859,6 +2895,17 @@ fn host_func_export_matches(
         HostFuncExport::SignPayloadStructured => {
             params_match(params, types, &[("request", is_payload_sign_request_petal)])
                 && result_matches(&ty.result, types, HostOkType::SignResultStructured)
+        }
+        HostFuncExport::ScopedSignPayloadStructured => {
+            params_match(
+                params,
+                types,
+                &[("request", is_scoped_payload_sign_request_petal)],
+            ) && result_matches(&ty.result, types, HostOkType::SignResultStructured)
+        }
+        HostFuncExport::PetalKeyRequest => {
+            params_match(params, types, &[("request", is_byte_list)])
+                && result_matches(&ty.result, types, HostOkType::Bytes)
         }
         HostFuncExport::EvmTxStage => {
             params_match(params, types, &[("tx", is_evm_transaction)])
@@ -3068,6 +3115,58 @@ fn is_payload_sign_request_petal(
             && is_option_of(&fields[8].1, types, is_byte_list, depth)
             && fields[9].0 == "advisory"
             && is_option_of(&fields[9].1, types, is_byte_list, depth)
+    })
+}
+
+fn is_scoped_payload_sign_request_petal(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        let fields = fields.as_ref();
+        fields.len() == 12
+            && fields[0].0 == "wallet"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "preimage"
+            && is_byte_list(&fields[1].1, types, depth)
+            && fields[2].0 == "claimed-hash"
+            && is_byte_list(&fields[2].1, types, depth)
+            && fields[3].0 == "signature-algorithm"
+            && is_string(&fields[3].1)
+            && fields[4].0 == "operation-class"
+            && is_string(&fields[4].1)
+            && fields[5].0 == "petal-use-claim-jcs"
+            && is_byte_list(&fields[5].1, types, depth)
+            && fields[6].0 == "claim-assurance-evidence"
+            && is_option_of(&fields[6].1, types, is_byte_list, depth)
+            && fields[7].0 == "approval-hint"
+            && is_option_of(&fields[7].1, types, is_string_type, depth)
+            && fields[8].0 == "action"
+            && is_option_of(&fields[8].1, types, is_byte_list, depth)
+            && fields[9].0 == "advisory"
+            && is_option_of(&fields[9].1, types, is_byte_list, depth)
+            && fields[10].0 == "selector"
+            && is_exact_reusable_selector(&fields[10].1, types, depth)
+            && fields[11].0 == "key-ref-jcs"
+            && is_option_of(&fields[11].1, types, is_byte_list, depth)
+    })
+}
+
+fn is_exact_reusable_selector(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, _, _| {
+        matches!(
+            defined,
+            ComponentDefinedType::Enum(names)
+                if names.as_ref() == ["exact", "reusable"]
+        )
     })
 }
 
@@ -5945,8 +6044,43 @@ paths = ["/*"]
             component_host_interface("bloom:sign/signing@0.2.0"),
             Some(ComponentHostInterface::SignSigningV2)
         ));
+        assert_eq!(
+            component_import_caps("bloom:sign/signing@0.3.0"),
+            Some(&["bloom:sign"][..])
+        );
+        assert!(matches!(
+            component_host_interface("bloom:sign/signing@0.3.0"),
+            Some(ComponentHostInterface::SignSigningV3)
+        ));
         assert!(component_import_caps("bloom:sign/signing@9.9.9").is_none());
         assert!(component_host_interface("bloom:sign/signing@9.9.9").is_none());
+    }
+
+    #[test]
+    fn petal_component_key_derivation_version_and_capability_are_explicit() {
+        assert_eq!(
+            component_import_caps("bloom:key/derive@0.1.0"),
+            Some(&["bloom:key.derive"][..])
+        );
+        assert!(matches!(
+            component_host_interface("bloom:key/derive@0.1.0"),
+            Some(ComponentHostInterface::KeyDerive)
+        ));
+        assert!(component_import_caps("bloom:key/derive@0.2.0").is_none());
+        assert!(component_host_interface("bloom:key/derive@0.2.0").is_none());
+        assert!(host_import_instance_matches(
+            ComponentHostInterface::KeyDerive,
+            r#"(component
+              (type $interface
+                (instance
+                  (type $bytes (list u8))
+                  (type $outcome (result $bytes (error string)))
+                  (type $request
+                    (func (param "request" $bytes) (result $outcome)))
+                  (export "request" (func (type $request)))))
+              (import "bloom:key/derive@0.1.0"
+                (instance (type $interface))))"#,
+        ));
     }
 
     #[test]

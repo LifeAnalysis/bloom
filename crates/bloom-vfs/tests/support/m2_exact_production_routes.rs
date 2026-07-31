@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use super::Keystore;
@@ -8,7 +7,6 @@ use bloom_machine_client::{
     MachineBrokerClient, ProjectionFreshness, ProjectionVerification, WalletProjection,
     WalletProjectionReader,
 };
-use bloom_proto::{HyperliquidPolicy, Policy};
 use bloom_triad_protocol::{
     ApprovalPrepareState, ApprovalSubject, Base64UrlBytes, CanonicalWalletPolicy, CredentialPublic,
     CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef, KeySpec, MachineBrokerRequest,
@@ -342,80 +340,32 @@ async fn production_x402_route_prepares_then_signs_through_broker() {
 }
 
 #[tokio::test]
-async fn production_hyperliquid_master_actions_use_exact_broker_routes() {
+async fn production_native_hyperliquid_writes_fail_closed_without_broker_calls() {
     let temporary = tempfile::tempdir().unwrap();
     let keystore = Keystore::new(temporary.path().join("keystore")).unwrap();
     keystore.create_local("alice", "pw").unwrap();
     let address = format!("{:#x}", keystore.info_unverified("alice").unwrap().address);
-    let destination = "0x2222222222222222222222222222222222222222".to_string();
-    let policy = Policy {
-        hyperliquid: HyperliquidPolicy {
-            allowed_assets: BTreeSet::from(["BTC".into()]),
-            allowed_order_types: BTreeSet::from(["limit".into()]),
-            max_notional_usd: Some(25_000_000),
-            max_position_usd: Some(25_000_000),
-            max_loss_usd: Some(25_000_000),
-            transfer_cap_usd: Some(25_000_000),
-            allowed_usd_send_destinations: BTreeSet::from([destination.clone()]),
-            max_session_secs: Some(300),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    keystore
-        .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
-        .unwrap();
-    let (wallet, projections) = projection(address);
-    let (signer, broker) = exact_signer(wallet);
+    let (wallet, _projections) = projection(address);
+    let (_signer, broker) = exact_signer(wallet);
     let endpoint = spawn_http_fixture("hyperliquid").await;
     let mainnet =
         HyperliquidClient::new(HyperliquidNetwork::Mainnet).with_base_url(endpoint.clone());
     let testnet = HyperliquidClient::new(HyperliquidNetwork::Testnet).with_base_url(endpoint);
-    let handler = HyperliquidHandler::new(mainnet, testnet, keystore)
-        .with_store_root(temporary.path().join("hyperliquid"))
-        .with_exact_signing(Some(signer), projections);
+    let _ = keystore;
+    let handler = HyperliquidHandler::new(mainnet, testnet)
+        .with_store_root(temporary.path().join("hyperliquid"));
 
     let send_path = VfsPath::parse("/testnet/exchange/alice/send_asset.json").unwrap();
-    let send = serde_json::json!({"destination": destination, "amount": "1"});
-    assert!(matches!(
-        handler
-            .write(&send_path, serde_json::to_vec(&send).unwrap().as_slice())
-            .await,
-        Err(HandlerError::PermissionDenied)
-    ));
-    handler
-        .write(&send_path, serde_json::to_vec(&send).unwrap().as_slice())
-        .await
-        .unwrap();
+    let send_error = handler.write(&send_path, b"{}").await.unwrap_err();
+    assert!(
+        matches!(send_error, HandlerError::Unsupported(message) if message.contains("Hyperliquid Petal"))
+    );
 
     let session_path = VfsPath::parse("/testnet/agent_sessions/alice/new.json").unwrap();
-    let session = serde_json::json!({"id": "m2-session", "agent_name": "m2-test"});
-    assert!(matches!(
-        handler
-            .write(
-                &session_path,
-                serde_json::to_vec(&session).unwrap().as_slice()
-            )
-            .await,
-        Err(HandlerError::PermissionDenied)
-    ));
-    handler
-        .write(
-            &session_path,
-            serde_json::to_vec(&session).unwrap().as_slice(),
-        )
-        .await
-        .unwrap();
-
-    let requests = broker.requests.lock().unwrap();
-    let classes = operation_classes(&requests);
-    assert!(classes.contains(&"hyperliquid.usd-send".into()));
-    assert!(classes.contains(&"hyperliquid.approve-agent".into()));
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
-            .count(),
-        2
+    let session_error = handler.write(&session_path, b"{}").await.unwrap_err();
+    assert!(
+        matches!(session_error, HandlerError::Unsupported(message) if message.contains("Hyperliquid Petal"))
     );
+
+    assert!(broker.requests.lock().unwrap().is_empty());
 }

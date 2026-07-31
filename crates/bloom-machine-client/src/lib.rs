@@ -171,9 +171,60 @@ impl MachineBrokerClient {
         &self,
         request: TrustedPetalSignRequest,
     ) -> Result<SigningResult, ProtocolError> {
+        self.sign_petal_payload_for_key(request, None).await
+    }
+
+    /// Sign a validated payload-bearing Petal request with an explicitly
+    /// selected Signer-owned delegated key over the existing `signing.sign`
+    /// method. The public key projection is fetched from Broker so Machine
+    /// never infers delegated-key suite support locally.
+    pub async fn sign_petal_payload_with_key(
+        &self,
+        request: TrustedPetalSignRequest,
+        key_ref: KeyRef,
+    ) -> Result<SigningResult, ProtocolError> {
+        self.sign_petal_payload_for_key(request, Some(key_ref))
+            .await
+    }
+
+    async fn sign_petal_payload_for_key(
+        &self,
+        request: TrustedPetalSignRequest,
+        selected_key_ref: Option<KeyRef>,
+    ) -> Result<SigningResult, ProtocolError> {
         request.validate()?;
+        if request.selector == bloom_triad_protocol::PetalSignSelector::Exact
+            && selected_key_ref.is_none()
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "exact Petal signing requires an explicit Signer-owned KeyRef",
+            ));
+        }
         let wallet = self.wallet(request.wallet_id.clone()).await?;
-        let key_ref = unique_key_for_suite(&wallet.key_refs, request.crypto_suite)?;
+        let key_ref = match selected_key_ref {
+            Some(key_ref) => {
+                let key = self
+                    .key(KeyRequest {
+                        key_ref: key_ref.clone(),
+                    })
+                    .await?;
+                if key.key_ref != key_ref {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::KeyrefMismatch,
+                        "Broker returned public metadata for a different delegated key",
+                    ));
+                }
+                if !key.supported_crypto_suites.contains(&request.crypto_suite) {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::SuiteNotAllowed,
+                        "selected delegated key does not support the requested CryptoSuite",
+                    ));
+                }
+                key_ref
+            }
+            None => unique_key_for_suite(&wallet.key_refs, request.crypto_suite)?,
+        };
         let payload_digest = Digest32::from_bytes(Sha256::digest(&request.preimage).into());
         let ordered_hash = suite_hash(request.crypto_suite, &request.preimage);
         let ProvenanceSubject::Petal {
@@ -206,8 +257,19 @@ impl MachineBrokerClient {
             )
         })?;
         let operation_id = request.operation_id()?;
-        let claim_digest = jcs_digest(&request.claim)?;
-        let assurance_digest = jcs_digest(&request.claim.claim_assurance)?;
+        let (claim_digest, assurance_digest, petal_use_claim, claim_assurance_evidence) =
+            match request.selector {
+                bloom_triad_protocol::PetalSignSelector::Exact => (None, None, None, None),
+                bloom_triad_protocol::PetalSignSelector::Reusable => (
+                    Some(jcs_digest(&request.claim)?),
+                    Some(jcs_digest(&request.claim.claim_assurance)?),
+                    Some(request.claim),
+                    request
+                        .claim_assurance_evidence
+                        .as_deref()
+                        .map(Base64UrlBytes::from_bytes),
+                ),
+            };
         let operation_digest = SignOperationIdentity {
             operation_id: operation_id.clone(),
             approval_id: approval_id.clone(),
@@ -215,8 +277,8 @@ impl MachineBrokerClient {
             crypto_suite: request.crypto_suite,
             ordered_payload_digests: vec![payload_digest],
             ordered_hashes: vec![ordered_hash],
-            petal_use_claim_digest: Some(claim_digest),
-            claim_assurance_digest: Some(assurance_digest),
+            petal_use_claim_digest: claim_digest,
+            claim_assurance_digest: assurance_digest,
             policy_version: wallet.policy_version,
             policy_digest: wallet.policy_digest,
         }
@@ -230,11 +292,8 @@ impl MachineBrokerClient {
             payloads: SigningPayloads::Single {
                 payload: Base64UrlBytes::from_bytes(&request.preimage),
             },
-            petal_use_claim: Some(request.claim),
-            claim_assurance_evidence: request
-                .claim_assurance_evidence
-                .as_deref()
-                .map(Base64UrlBytes::from_bytes),
+            petal_use_claim,
+            claim_assurance_evidence,
             provenance: request.trusted_provenance,
         })
         .await
@@ -652,6 +711,7 @@ pub struct TrustedPetalSignRequest {
     pub claimed_hash: Digest32,
     pub crypto_suite: CryptoSuite,
     pub operation_class: Token,
+    pub selector: bloom_triad_protocol::PetalSignSelector,
     pub claim: PetalUseClaim,
     pub claim_assurance_evidence: Option<Vec<u8>>,
     pub approval_id: Option<Digest32>,
@@ -1146,6 +1206,7 @@ impl TrustedPetalSignRequest {
             claimed_hash: &'a Digest32,
             crypto_suite: CryptoSuite,
             operation_class: &'a Token,
+            selector: bloom_triad_protocol::PetalSignSelector,
             claim_digest: Digest32,
             trusted_provenance: &'a ProvenanceSubject,
             frozen_action_digest: Option<Digest32>,
@@ -1158,6 +1219,7 @@ impl TrustedPetalSignRequest {
             claimed_hash: &self.claimed_hash,
             crypto_suite: self.crypto_suite,
             operation_class: &self.operation_class,
+            selector: self.selector,
             claim_digest: jcs_digest(&self.claim)?,
             trusted_provenance: &self.trusted_provenance,
             frozen_action_digest: self
@@ -1303,6 +1365,24 @@ mod tests {
                     MachineBrokerRequest::WalletGetPublic(_) => {
                         Ok(MachineBrokerResponse::WalletGetPublic(self.wallet.clone()))
                     }
+                    MachineBrokerRequest::KeyGetPublic(request) => {
+                        let mut returned_key_ref = request.key_ref;
+                        let supported_crypto_suites =
+                            if returned_key_ref.locator.contains("unsupported-suite") {
+                                vec![]
+                            } else {
+                                vec![CryptoSuite::Secp256k1Sha256Recoverable]
+                            };
+                        if returned_key_ref.locator.contains("wrong-key") {
+                            returned_key_ref.locator = "wallet/delegated/substituted".into();
+                        }
+                        Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
+                            key_ref: returned_key_ref,
+                            canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
+                            addresses: vec!["0x0000000000000000000000000000000000000001".into()],
+                            supported_crypto_suites,
+                        }))
+                    }
                     MachineBrokerRequest::SigningSign(request) => {
                         Ok(MachineBrokerResponse::SigningSign(SigningResult {
                             operation_id: request.operation_id,
@@ -1396,6 +1476,7 @@ mod tests {
             claimed_hash: payload_digest.clone(),
             crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
             operation_class: token("order.place"),
+            selector: bloom_triad_protocol::PetalSignSelector::Reusable,
             claim: PetalUseClaim {
                 package_hash: digest(40),
                 route: "orders/place".into(),
@@ -1409,7 +1490,7 @@ mod tests {
                 nonce: RequestNonce::from_bytes([5; 16]),
                 claim_assurance: bloom_triad_protocol::ClaimAssurance::MachineAsserted,
             },
-            claim_assurance_evidence: None,
+            claim_assurance_evidence: Some(b"machine evidence".to_vec()),
             approval_id: Some(digest(50)),
             trusted_provenance: ProvenanceSubject::Petal {
                 package_hash: digest(40),
@@ -1435,6 +1516,149 @@ mod tests {
             SigningPayloads::Single {
                 payload: Base64UrlBytes::from_bytes(&payload)
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn petal_payload_can_use_an_explicit_broker_validated_delegated_key() {
+        let root_key_ref = key_ref();
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                key_refs: vec![root_key_ref],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        let payload = b"delegated petal action".to_vec();
+        let payload_digest = Digest32::from_bytes(Sha256::digest(&payload).into());
+        let mut delegated_key_ref = key_ref();
+        delegated_key_ref.locator = "wallet/delegated/1".into();
+        let request = TrustedPetalSignRequest {
+            wallet_id: token("wallet"),
+            preimage: payload,
+            claimed_hash: payload_digest.clone(),
+            crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+            operation_class: token("order.cancel"),
+            selector: bloom_triad_protocol::PetalSignSelector::Reusable,
+            claim: PetalUseClaim {
+                package_hash: digest(40),
+                route: "orders/cancel".into(),
+                operation_class: token("order.cancel"),
+                crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+                payload_digest: payload_digest.clone(),
+                ordered_hashes: vec![payload_digest],
+                declared_debits: vec![],
+                declared_destinations: vec![],
+                declared_fee: DeclaredFee::None,
+                nonce: RequestNonce::from_bytes([5; 16]),
+                claim_assurance: bloom_triad_protocol::ClaimAssurance::MachineAsserted,
+            },
+            claim_assurance_evidence: Some(b"machine evidence".to_vec()),
+            approval_id: Some(digest(50)),
+            trusted_provenance: ProvenanceSubject::Petal {
+                package_hash: digest(40),
+                route: "orders/cancel".into(),
+            },
+            frozen_action: Some(b"cancel order".to_vec()),
+            frozen_advisory: None,
+        };
+
+        client
+            .sign_petal_payload_with_key(request.clone(), delegated_key_ref.clone())
+            .await
+            .unwrap();
+
+        let requests = broker.requests.lock().unwrap();
+        assert!(matches!(
+            &requests[0],
+            MachineBrokerRequest::WalletGetPublic(_)
+        ));
+        let MachineBrokerRequest::KeyGetPublic(key_request) = &requests[1] else {
+            panic!("explicit delegated signing must fetch its public key projection");
+        };
+        assert_eq!(key_request.key_ref, delegated_key_ref);
+        let MachineBrokerRequest::SigningSign(sign_request) = &requests[2] else {
+            panic!("explicit delegated signing must use signing.sign");
+        };
+        assert_eq!(sign_request.key_ref, delegated_key_ref);
+        assert_eq!(sign_request.petal_use_claim.as_ref(), Some(&request.claim));
+        assert_eq!(
+            sign_request
+                .claim_assurance_evidence
+                .as_ref()
+                .map(Base64UrlBytes::decode),
+            Some(b"machine evidence".to_vec())
+        );
+        let reusable_operation_id = sign_request.operation_id.clone();
+        drop(requests);
+
+        broker.requests.lock().unwrap().clear();
+        let mut exact_request = request.clone();
+        exact_request.selector = bloom_triad_protocol::PetalSignSelector::Exact;
+        client
+            .sign_petal_payload_with_key(exact_request, delegated_key_ref.clone())
+            .await
+            .unwrap();
+        let requests = broker.requests.lock().unwrap();
+        let MachineBrokerRequest::SigningSign(exact_sign_request) = &requests[2] else {
+            panic!("exact explicit delegated signing must use signing.sign");
+        };
+        assert_eq!(exact_sign_request.key_ref, delegated_key_ref);
+        assert!(exact_sign_request.petal_use_claim.is_none());
+        assert!(exact_sign_request.claim_assurance_evidence.is_none());
+        assert_ne!(exact_sign_request.operation_id, reusable_operation_id);
+        let expected_exact_digest = SignOperationIdentity {
+            operation_id: exact_sign_request.operation_id.clone(),
+            approval_id: digest(50),
+            key_ref: delegated_key_ref.clone(),
+            crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+            ordered_payload_digests: vec![Digest32::from_bytes(
+                Sha256::digest(b"delegated petal action").into(),
+            )],
+            ordered_hashes: vec![Digest32::from_bytes(
+                Sha256::digest(b"delegated petal action").into(),
+            )],
+            petal_use_claim_digest: None,
+            claim_assurance_digest: None,
+            policy_version: DecimalU64::new(7),
+            policy_digest: digest(7),
+        }
+        .digest()
+        .unwrap();
+        assert_eq!(exact_sign_request.operation_digest, expected_exact_digest);
+        drop(requests);
+        broker.requests.lock().unwrap().clear();
+
+        let mut unsupported_key_ref = key_ref();
+        unsupported_key_ref.locator = "wallet/delegated/unsupported-suite".into();
+        let error = client
+            .sign_petal_payload_with_key(request.clone(), unsupported_key_ref)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::SuiteNotAllowed);
+        assert_eq!(
+            broker.requests.lock().unwrap().len(),
+            2,
+            "suite rejection must happen before signing.sign"
+        );
+
+        let mut substituted_key_ref = key_ref();
+        substituted_key_ref.locator = "wallet/delegated/wrong-key".into();
+        let error = client
+            .sign_petal_payload_with_key(request, substituted_key_ref)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        assert_eq!(
+            broker.requests.lock().unwrap().len(),
+            4,
+            "substituted key metadata must be rejected before signing.sign"
         );
     }
 
@@ -1572,6 +1796,7 @@ mod tests {
                 claimed_hash: hash.clone(),
                 crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
                 operation_class: token("order.place"),
+                selector: bloom_triad_protocol::PetalSignSelector::Reusable,
                 claim: PetalUseClaim {
                     package_hash: digest(41),
                     route: "forged/route".into(),
@@ -1759,6 +1984,7 @@ mod tests {
                 claimed_hash: hash.clone(),
                 crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
                 operation_class: token("order.place"),
+                selector: bloom_triad_protocol::PetalSignSelector::Reusable,
                 claim: PetalUseClaim {
                     package_hash: digest(40),
                     route: "orders/place".into(),

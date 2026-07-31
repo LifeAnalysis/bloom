@@ -496,6 +496,7 @@ async fn launch_custody_ceremony(
                 expected_input_class: bloom_triad_protocol::Token::new(expected_input_class)
                     .context("custody input class")?,
                 browser_output_recipient_key: None,
+                petal_key_scope: None,
             },
         )
         .await

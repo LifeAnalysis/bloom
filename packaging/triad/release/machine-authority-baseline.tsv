@@ -5,7 +5,6 @@ AuthServices	crates/bloom-daemon/src/lib.rs	11
 AuthServices	crates/bloom-daemon/src/sealed_ceremony.rs	2
 AuthServices	crates/bloom-daemon/src/sign_hash.rs	4
 AuthServices	crates/bloom-vfs/src/auth.rs	2
-AuthServices	crates/bloom-vfs/src/handlers/hyperliquid.rs	7
 AuthServices	crates/bloom-vfs/src/handlers/requests.rs	11
 AuthServices	crates/bloom-vfs/src/handlers/wallets.rs	13
 AuthServices	crates/bloom-vfs/src/lib.rs	1
@@ -14,7 +13,6 @@ ApprovalVerifier	crates/bloom-daemon/src/lib.rs	2
 ApprovalVerifier	crates/bloom-daemon/src/registration.rs	2
 ApprovalVerifier	crates/bloom-tx/src/tx_engine.rs	5
 ApprovalVerifier	crates/bloom-vfs/src/auth.rs	6
-ApprovalVerifier	crates/bloom-vfs/src/handlers/hyperliquid.rs	4
 ApprovalVerifier	crates/bloom-vfs/src/handlers/requests.rs	2
 ApprovalVerifier	crates/bloom-vfs/src/handlers/wallets.rs	3
 AuthStore	crates/bloom-daemon/src/ceremony_server.rs	8
@@ -22,27 +20,22 @@ AuthStore	crates/bloom-daemon/src/lib.rs	6
 AuthStore	crates/bloom-daemon/src/registration.rs	2
 AuthStore	crates/bloom-tx/src/tx_engine.rs	5
 AuthStore	crates/bloom-vfs/src/auth.rs	12
-AuthStore	crates/bloom-vfs/src/handlers/hyperliquid.rs	6
 AuthStore	crates/bloom-vfs/src/handlers/requests.rs	5
 AuthStore	crates/bloom-vfs/src/handlers/wallets.rs	6
 AuthStoreWriter	crates/bloom-daemon/src/ceremony_server.rs	2
 AuthStoreWriter	crates/bloom-tx/src/tx_engine.rs	5
 AuthStoreWriter	crates/bloom-vfs/src/auth.rs	6
-AuthStoreWriter	crates/bloom-vfs/src/handlers/hyperliquid.rs	2
 AuthStoreWriter	crates/bloom-vfs/src/handlers/requests.rs	2
 AuthStoreWriter	crates/bloom-vfs/src/handlers/wallets.rs	3
-EphemeralAgentKey	crates/bloom-vfs/src/handlers/hyperliquid.rs	14
 GrantStore	crates/bloom-daemon/src/ceremony_server.rs	1
 GrantStore	crates/bloom-daemon/src/lib.rs	2
 GrantStore	crates/bloom-daemon/src/sign_hash.rs	7
 GrantStore	crates/bloom-tx/src/tx_engine.rs	8
 GrantStore	crates/bloom-vfs/src/auth.rs	6
-GrantStore	crates/bloom-vfs/src/handlers/hyperliquid.rs	2
 GrantStore	crates/bloom-vfs/src/handlers/requests.rs	12
 GrantStore	crates/bloom-vfs/src/handlers/wallets.rs	7
 InMemoryGrantStore	crates/bloom-daemon/src/lib.rs	1
 InMemoryGrantStore	crates/bloom-daemon/src/sign_hash.rs	5
-InMemoryGrantStore	crates/bloom-vfs/src/handlers/hyperliquid.rs	2
 InMemoryGrantStore	crates/bloom-vfs/src/handlers/requests.rs	3
 KeystoreApprovalSignatureVerifier	crates/bloom-daemon/src/lib.rs	2
 KeystorePetalHost	crates/bloom-daemon/src/lib.rs	1
@@ -74,7 +67,6 @@ RegistrationCoordinator	crates/bloom-vfs/src/auth.rs	5
 StoreApprovalVerifier	crates/bloom-daemon/src/ceremony_server.rs	2
 StoreApprovalVerifier	crates/bloom-daemon/src/lib.rs	2
 StoreApprovalVerifier	crates/bloom-daemon/src/registration.rs	2
-StoreApprovalVerifier	crates/bloom-vfs/src/handlers/hyperliquid.rs	2
 bloom_auth	crates/bloom-daemon/src/ceremony_server.rs	6
 bloom_auth	crates/bloom-daemon/src/ceremony_server/wallet_registration.rs	2
 bloom_auth	crates/bloom-daemon/src/lib.rs	13
@@ -86,7 +78,6 @@ bloom_auth	crates/bloom-tx/src/oracle.rs	1
 bloom_auth	crates/bloom-tx/src/outbox.rs	3
 bloom_auth	crates/bloom-tx/src/tx_engine.rs	27
 bloom_auth	crates/bloom-vfs/src/auth.rs	1
-bloom_auth	crates/bloom-vfs/src/handlers/hyperliquid.rs	8
 bloom_auth	crates/bloom-vfs/src/handlers/outbox.rs	2
 bloom_auth	crates/bloom-vfs/src/handlers/requests.rs	23
 bloom_auth	crates/bloom-vfs/src/handlers/status.rs	2
@@ -99,7 +90,6 @@ bloom_keystore	crates/bloom-daemon/src/lib.rs	7
 bloom_keystore	crates/bloom-daemon/src/registration.rs	1
 bloom_keystore	crates/bloom-daemon/src/sealed_ceremony.rs	2
 bloom_keystore	crates/bloom-daemon/src/sign_hash.rs	3
-bloom_keystore	crates/bloom-vfs/src/handlers/hyperliquid.rs	1
 bloom_keystore	crates/bloom-vfs/src/handlers/requests.rs	2
 bloom_keystore	crates/bloom-vfs/src/handlers/status.rs	1
 bloom_keystore	crates/bloom-vfs/src/handlers/wallets.rs	9
@@ -113,7 +103,6 @@ ceremony_server	crates/bloom/src/main.rs	5
 local-integration	crates/bloom-daemon/Cargo.toml	2
 local-integration	crates/bloom-daemon/src/lib.rs	37
 local-integration	crates/bloom-vfs/Cargo.toml	1
-local-integration	crates/bloom-vfs/src/handlers/hyperliquid.rs	20
 local-integration	crates/bloom/Cargo.toml	2
 local-integration	crates/bloom/src/main.rs	11
 local-integration	crates/bloom/tests/cli.rs	4

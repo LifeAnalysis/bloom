@@ -30,6 +30,17 @@ pub enum SelectorKind {
     Petal,
 }
 
+/// Guest-selected approval shape for an explicitly scoped Petal signing key.
+/// This is intentionally distinct from the Broker's wire-level
+/// [`SelectorKind`]: `Reusable` maps to the Petal selector while `Exact` maps
+/// to the payload-digest selector.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PetalSignSelector {
+    Exact,
+    Reusable,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignOperationIdentity {

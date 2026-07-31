@@ -7,14 +7,23 @@
 //! Signing follows the official SDK shape for L1 actions: msgpack the action
 //! with stable struct field order, append nonce/vault/expiresAfter fields into
 //! a connection hash, then EIP-712 sign an `Agent(source, connectionId)`.
+//!
+//! The former native Machine signer is deliberately absent from the default
+//! production API:
+//! ```compile_fail
+//! use bloom_hyperliquid::HyperliquidSigner;
+//! ```
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, Signature, U256};
+#[cfg(test)]
 use alloy::signers::Signer;
+#[cfg(test)]
 use alloy::signers::local::PrivateKeySigner;
 use alloy_dyn_abi::eip712::TypedData;
 use serde::{Deserialize, Serialize};
@@ -229,11 +238,13 @@ impl SignatureJson {
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 pub struct HyperliquidSigner {
     signer: Arc<PrivateKeySigner>,
     address: Address,
 }
 
+#[cfg(test)]
 impl HyperliquidSigner {
     /// Construct a signer for Hyperliquid L1 exchange actions.
     ///
@@ -454,6 +465,7 @@ fn usd_send_typed_data(
     serde_json::from_value(value).map_err(HyperliquidError::Json)
 }
 
+#[cfg(test)]
 fn agent_typed_data(network: HyperliquidNetwork, connection_id: B256) -> Result<TypedData> {
     let value = json!({
         "types": {
@@ -747,6 +759,7 @@ pub fn signed_payload(
     Ok(value)
 }
 
+#[cfg(test)]
 pub async fn sign_submit_payload(
     signer: &HyperliquidSigner,
     network: HyperliquidNetwork,

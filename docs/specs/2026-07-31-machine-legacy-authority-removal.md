@@ -1,8 +1,8 @@
 # Machine Legacy Authority Removal
 
-**Status:** proposed goal specification; review required before implementation
+**Status:** approved goal specification; M3 amended for Petal-scoped sub-keys
 
-**Date:** 2026-07-31
+**Date:** 2026-07-31; M3 amendment 2026-07-31
 
 **Audience:** Bloom engineers, security reviewers, release engineers, and implementation agents
 
@@ -22,17 +22,21 @@ only producer of wallet-controlled signatures.
 The authority plane now exists, but Machine extraction is incomplete. Machine
 still opens the pre-triad keystore and approval database, exposes legacy
 approval services, uses legacy wallet records as public projections, and owns
-a Hyperliquid delegated signing key. Deleting the old crates before replacing
+legacy delegated signing keys. Deleting the old crates before replacing
 those consumers would break production reads, staging, simulation, requests,
 outbox handling, and venue integrations. Leaving them in place would fail the
 target architecture even where current signing calls happen to route through
 Broker.
 
 This document specifies the remaining extraction work. It refines W7, W8, and
-AC-04 of the parent architecture; it does not change the Machine-to-Broker or
-Broker-to-Signer method inventories in parent section 17. If this document and
-the parent conflict, the parent controls unless this document is explicitly
-ratified as an amendment.
+AC-04 of the parent architecture. The M3 amendment also defines generic
+Petal-scoped derived keys as the replacement for native venue-key custody. It
+does not add a Machine-to-Broker or Broker-to-Signer method: derivation uses
+the existing `key.derive_prepare`, custody ceremony, public-key projection,
+Sealed Approval, and `signing.sign` surfaces. It may extend the request and
+Signer registry data carried by those existing methods with the scope fields
+defined in section 9. This extension is ratified by this amendment. In every
+other conflict the parent controls.
 
 The superseded triad implementability review remains historical inventory
 only. It is not normative.
@@ -100,8 +104,8 @@ responsibility matrix. It must not execute in Machine.
 
 ### 3.2 Key material
 
-Key material includes root and child wallet keys, imported keys, Hyperliquid
-API-wallet keys, payment keys, decrypted signers, wrapping keys, PRF output,
+Key material includes root and child wallet keys, Petal-scoped sub-keys,
+exchange API-wallet keys, payment keys, decrypted signers, wrapping keys, PRF output,
 recovery secrets, and any secret from which those values can be recovered.
 
 The following are not wallet key material and remain permitted in Machine:
@@ -148,9 +152,12 @@ At the inventory baseline:
   the legacy daemon composition;
 - `local-integration` and `unsafe-debug-signer` retain Machine-owned signer
   paths; and
-- `HyperliquidHandler` generates, persists, decrypts, and uses
-  `EphemeralAgentKey` inside Machine. This is signing authority even though the
-  master-wallet `approveAgent` signature already passes through Broker.
+- the native `HyperliquidHandler` generates, persists, decrypts, and uses
+  `EphemeralAgentKey` inside Machine. This path is superseded by the
+  Hyperliquid Petal and is retired rather than promoted into the canonical
+  delegated-key architecture; and
+- Petals have no generic way to request a Signer-owned child whose use remains
+  cryptographically scoped to that Petal's installer-pinned identity.
 
 The normal and `--no-default-features` production dependency graphs still
 contain `bloom-keystore`, `bloom-auth`, `bloom-auth-api`, `bloom-vfs`, and
@@ -291,8 +298,8 @@ When Broker is unavailable:
 | Petal payload signing | payload-bearing Broker signing only; v0.1 remains fail-closed |
 | Petal transaction outbox | key-free wallet projection and Broker authority client |
 | Paid HTTP/x402/MPP requests | Broker approval and signing; no `PetalHost::sign_hash`, old grant, or keystore lookup |
-| Hyperliquid master-wallet actions | exact Broker approval and Signer signature |
-| Hyperliquid API-wallet session actions | Signer-owned delegated `KeyRef`; Machine never generates or opens an API-wallet key |
+| Generic Petal delegated-key actions | Signer-owned Petal-scoped `KeyRef`; Machine and guest receive public metadata only |
+| Native Hyperliquid authority and writes | retired or fail closed with a migration diagnostic; public read-only helpers may remain but no native signing or compatibility path exists |
 | `/next.md`, status, bump scanner, watchers | projection reader; stale/unavailable states explicit |
 | Central outbox action-ID allocation | Machine-owned operation index with no approval or grant semantics |
 | Custody CLI/VFS | existing Broker custody prepares, shared ceremony status/cancel, and custody result |
@@ -330,38 +337,151 @@ no independent approval state.
 The CLI follows the same vocabulary. “Grant,” “standing session,” and
 “policy-session” disappear from production help, docs, errors, and artifacts.
 
-## 9. Delegated venue keys
+## 9. Petal-scoped sub-keys
 
-An exchange API wallet or other delegated signer is still a private signing
-key and therefore belongs to Signer.
+A Petal may need a stable or short-lived signing identity distinct from the
+wallet root: an exchange API wallet, builder identity, payment key, session
+agent, or protocol-specific child. Such a sub-key remains wallet key material.
+Signer owns it; neither Petal nor Machine receives its private bytes, an
+encrypted export, a wrapping key, or a direct Signer capability.
 
-For Hyperliquid, the target flow is:
+### 9.1 Scope identity
 
-1. Machine requests a unique, policy-allowed Signer-owned child key through
-   the existing key preparation/derivation surface and receives only its
-   public `KeyRef` and address. A venue agent address is never reused after
-   deregistration; each session receives a fresh derivation path.
-2. Machine constructs the exact `approveAgent` payload naming that address.
-3. Broker obtains the user-approved owner signature through the normal exact
-   signing path.
-4. Subsequent agent actions use Broker `signing.sign` with the delegated
-   `KeyRef`, the active Sealed Approval, operation identity, and exact digest.
-5. Session stop or expiry revokes the approval at both Broker and Signer, so
-   the delegated `KeyRef` cannot sign another operation without a new explicit
-   authorization. Venue-side same-name replacement or expiry removes standing
-   venue authority according to the venue contract; replacing a named venue
-   slot uses a fresh derived address and must not cause Machine to reuse an old
-   private signer.
-6. Machine may persist public session metadata and signed venue responses, but
-   never the delegated private key or a decryptable blob containing it.
+The protocol defines a canonical `PetalKeyScope` containing at least:
 
-If the existing key derivation and signing contracts cannot represent a
-short-lived delegated key without weakening the parent invariants, this is a
-real protocol blocker and requires a reviewed parent-spec amendment. It is not
-permission to leave `EphemeralAgentKey` in Machine.
+```text
+wallet_id
+parent_key_ref
+package_hash
+route
+agent_id?                 # optional stable Petal-local instance identity
+purpose                   # short reviewed use, e.g. exchange-agent
+allowed_crypto_suites[]
+maximum_lifetime_ms
+custody_operation_id
+```
 
-The same rule applies to x402, MPP, exchange agents, builder keys with signing
-authority, and future venue-specific delegated credentials.
+Its domain-separated digest is the immutable scope identifier. `package_hash`
+and `route` are the same installer-pinned provenance identity used by
+`ApprovalSubject::Petal`, `ApprovalSelector::Petal`, and `PetalUseClaim`.
+Human-readable scope fields, not merely their digest, appear in Broker's exact
+custody review.
+
+### 9.2 Derivation and custody
+
+Petal requests enter through a versioned payload-bearing Petal host call, not
+through an arbitrary VFS write and not through a guest-supplied provenance
+object. The call accepts only:
+
+```text
+request_id               # stable Petal-chosen retry identity
+wallet_id
+purpose
+agent_id?
+allowed_crypto_suites[]
+maximum_lifetime_ms
+```
+
+The Petal runner injects the installed package hash and exact route from its
+trusted execution context, constructs the parent-bound scope, and rejects a
+guest field or serialized payload that attempts to override either value.
+Repeated calls with the same `request_id` and identical terms reconcile one
+custody operation; changed terms fail closed. The host result is either public
+`KeyRef` metadata, a stable pending operation identity, or a terminal error.
+It never returns private bytes, Browser HPKE material, or the ceremony session
+token to guest code.
+
+Machine projects the pending ceremony URL and expiry only in the originating
+owner-readable VFS/CLI status artifact, following parent AC-26. The Petal may
+poll the host call by stable request identity and receives public key metadata
+only after Broker reports a completed custody result.
+
+Machine then calls the existing `key.derive_prepare` method. The request
+carries the canonical
+`PetalKeyScope`; this is an extension of the existing request DTO, not a new
+method. Broker must:
+
+1. authenticate Machine and validate the package hash and route against the
+   installer-signed provenance catalog;
+2. evaluate wallet policy for Petal sub-key creation, lifetime, suites,
+   purpose, and replacement;
+3. construct the exact review and originate the custody ceremony; and
+4. forward the scope, review-manifest digest, and existing custody identity to
+   Signer.
+
+Signer independently verifies the exact scope digest, user ceremony proof,
+parent `KeyRef`, suite support, and that the parent root is enrolled to the
+named wallet. It allocates a fresh child in a Signer-owned namespace and
+durably records the child's full scope. A conflicting replay fails closed; an
+exact retry of the same custody operation is idempotent. Distinct successful
+custody operations never reuse a child path, `KeyRef`, or address.
+
+The custody result contains only public `KeyRef`/address metadata. Machine may
+cache that projection and return it to the originating Petal. Machine must not
+choose a derivation path, configure a derivation authority, or receive a
+namespace grant or private material from Browser.
+
+### 9.3 Use isolation
+
+Petal sub-key signing uses the existing payload-bearing
+`sealed_approval.prepare` and `signing.sign` surfaces. Every approval names the
+derived `KeyRef`; every operation carries the normal operation identity,
+payload, digest, `PetalUseClaim`, assurance, and installer-pinned provenance.
+
+Broker rejects a request unless the approval subject, selector, claim,
+provenance record, wallet, and requested `KeyRef` all match the recorded Petal
+scope. Signer independently loads the sub-key scope and rejects an approval
+unless its `ApprovalSubject::Petal` package hash, route, optional `agent_id`,
+wallet, key, suites, and validity are within that scope. An exact selector may
+be used for a one-shot Petal operation; a reusable Petal selector may be used
+only within its displayed limits and maximum scope lifetime.
+
+This is the meaning of “accessible only to the Petal”: no other package hash,
+route, first-party Machine/System subject, CLI subject, or unscoped approval
+can use the child, even if it learns the public `KeyRef`. Petals still cannot
+connect to Signer directly. The parent threat model remains unchanged: a fully
+compromised Machine can make false `machine_asserted` claims within the
+remaining capacity of an already approved Petal selector, but it cannot change
+the selector's pinned Petal identity or use the key outside that capacity.
+
+### 9.4 Lifecycle and revocation
+
+Approval expiry, revoke, `revoke_all`, policy-version change, provenance
+withdrawal, or scope expiry makes future signing fail at Broker and Signer.
+Revoking an approval need not delete the derived key; reuse requires another
+explicit approval for the identical pinned Petal scope. A Petal requesting a
+replacement identity receives a fresh derivation and must explicitly migrate
+any external authority. Machine cannot resurrect a tombstoned derivation or
+retarget an existing child to a different Petal.
+
+Signer audit and public projections expose the scope digest, public `KeyRef`,
+status, and non-secret lifecycle metadata. Machine persists no approval
+authority and no secret sub-key state.
+
+### 9.5 Native Hyperliquid retirement
+
+Hyperliquid is moving to a Petal and is not the reference implementation for
+this mechanism. The replacement Petal may request an exchange-agent sub-key
+under sections 9.1–9.4 and implement venue registration, bounded trading, and
+cleanup through ordinary Petal approvals and claims.
+
+Production Machine must retire or fail closed the native Hyperliquid authority
+and write surface rather than maintain a second venue-specific delegated-key
+protocol. Public read-only market/account helpers and a migration notice may
+remain, but native owner-key actions, `EphemeralAgentKey`, sealed agent-key
+blobs, local agent signing, and native session authorization are not permitted.
+No native Hyperliquid behavioral parity is required.
+
+Broker and Signer must contain no Hyperliquid-specific ceremony kind, input
+class, namespace, derivation terms, policy rule, signing branch, or stored
+metadata. They implement only the generic Petal scope. Hyperliquid registration,
+orders, cleanup, and venue policy belong to the replacement Petal. It is
+acceptable for the old native write surface to break immediately with a clear
+migration diagnostic; compatibility is not a reason to retain authority code.
+
+The same generic scope model applies to x402, MPP, exchange agents, builder
+keys, and future protocol-specific delegated credentials. A new consumer does
+not add a venue-specific custody or signing method.
 
 ## 10. Transaction and request engine extraction
 
@@ -401,7 +521,9 @@ The replacement is an out-of-process triad development harness that:
 - supports a genuine browser passkey for manual tests;
 - mounts the VFS and drives Bloom only through that mounted filesystem where a
   mounted test is requested;
-- preserves the bounded Hyperliquid and Polymarket mainnet safety profile; and
+- preserves the bounded Polymarket mainnet safety profile and may exercise
+  Hyperliquid only through its replacement Petal when that Petal is available;
+  and
 - never compiles private-key custody or approval verification into Machine.
 
 `bloom-broker-debug-driver` remains the deterministic software-credential
@@ -440,7 +562,8 @@ any legacy keystore record; stale-cache behavior passes.
 ### M2 — execution consumer extraction
 
 - Remove keystore and legacy auth inputs from transaction staging, outbox,
-  Petal transaction handling, paid requests, and Hyperliquid master actions.
+  Petal transaction handling, and paid requests; retire native Hyperliquid
+  rather than preserving its master-action implementation.
 - Replace the auth-backed action-ID map with the Machine operation index.
 - Prove every final signing digest uses Broker.
 
@@ -449,14 +572,28 @@ with no legacy authority store present on disk.
 
 ### M3 — delegated-key extraction
 
-- Move Hyperliquid API-wallet keys and every other delegated signer to Signer
-  `KeyRef` ownership.
-- Route delegated signing through Broker.
-- Remove decryptable delegated-key blobs from Machine storage.
+- Implement canonical Petal-scoped sub-key terms over the existing
+  `key.derive_prepare` method.
+- Add the versioned Petal host call and owner-readable pending-custody
+  projection; runtime provenance is injected and cannot be guest-overridden.
+- Make Broker validate installer provenance and wallet policy and render the
+  exact Petal scope before the custody ceremony.
+- Make Signer own derivation, bind the parent root to the wallet, persist the
+  immutable Petal scope, and enforce that scope independently on every sign.
+- Route exact and reusable Petal sub-key signing through the existing Broker
+  Sealed Approval and `signing.sign` methods.
+- Retire the native Hyperliquid implementation; do not migrate its owner or
+  agent keys into a venue-specific protocol.
+- Remove decryptable delegated-key blobs and private signer APIs from the
+  production Machine dependency surface.
 
-Completion: bounded Hyperliquid session and order tests pass while memory,
-filesystem, dependency, and fault-injection tests prove Machine never receives
-the delegated private key.
+Completion: a deterministic fixture Petal derives a fresh sub-key, receives
+only public metadata, signs through an approval bound to its package/route, and
+cannot use the key from a different Petal, System, CLI, wallet, expired scope,
+or revoked approval. Memory, filesystem, dependency, cross-wallet,
+cross-Petal, replay, restart, and fault-injection tests prove Machine never
+receives the private key and Signer never loses the scope binding. No native
+Hyperliquid behavioral parity is a completion condition.
 
 ### M4 — approval and policy-session removal
 
@@ -473,8 +610,10 @@ Machine restart loses no authority state because Machine owns none.
 ### M5 — developer harness migration
 
 - Make deterministic Broker debug-driver coverage replace daemon signer tests.
-- Make the out-of-process real-passkey mounted integration pass for Petals,
-  Hyperliquid, and Polymarket.
+- Make the out-of-process real-passkey mounted integration pass for Petals and
+  Polymarket, including generic Petal sub-key derivation and use. Exercise
+  Hyperliquid through its replacement Petal when that Petal is available; do
+  not preserve the native agent-session path as a harness dependency.
 - Delete Machine embedded ceremony, registration, signer-cache, local PRF, and
   unsafe debug signer code and features.
 
@@ -519,7 +658,8 @@ the following from Machine:
 - legacy `PetalHost::sign_hash` and hash-only production adapters;
 - `wallets/<wallet>/policy-session/*` and its documentation;
 - `auth/auth.sqlite` and old challenge/grant/session artifacts;
-- `EphemeralAgentKey` and sealed delegated-key storage in Hyperliquid VFS;
+- the native Hyperliquid handler, `EphemeralAgentKey`, sealed delegated-key
+  storage, agent sessions, and every native Hyperliquid signing path;
 - private signer fields and local signing branches in `bloom-tx`;
 - Keystore parameters on Wallets, Requests, Hyperliquid, status, Petal outbox,
   and background consumers; and
@@ -553,14 +693,17 @@ Petal execution, VFS, request state, or public projection caching.
   failure never opens a keystore, auth database, verifier, signer, or ceremony
   listener in Machine.
 - **MA-07 — signing route matrix:** Automated tests cover transactions, batch
-  transactions, Petal payloads, paid HTTP/x402/MPP, Hyperliquid owner actions,
-  Hyperliquid agent actions, outbox confirmation, background jobs, and every
-  CLI/VFS signing entry point. Each observes a Broker operation ID and Signer
-  receipt; direct or hash-only alternatives fail.
-- **MA-08 — delegated-key confinement:** Hyperliquid and future delegated-key
-  tests prove Machine receives only public `KeyRef` metadata and signatures.
-  Machine filesystem and crash dumps contain no delegated key or decryptable
-  key blob.
+  transactions, ordinary and sub-key Petal payloads, paid HTTP/x402/MPP,
+  outbox confirmation, background jobs, and every retained CLI/VFS signing
+  entry point. Each observes a Broker operation ID
+  and Signer receipt; direct or hash-only alternatives fail. Every retired
+  native Hyperliquid write fails closed and performs no signing.
+- **MA-08 — Petal sub-key confinement:** Cross-Petal, cross-route,
+  cross-wallet, System-subject, CLI-subject, expired-scope, revoked-approval,
+  replay, restart, and fault tests prove a scoped child signs only for its
+  pinned Petal identity. Machine receives only public `KeyRef` metadata and
+  signatures; its filesystem, memory diagnostics, and crash artifacts contain
+  no sub-key or decryptable key blob.
 - **MA-09 — legacy state absent:** A clean production start creates no legacy
   keystore, `auth.sqlite`, approval challenge, grant, policy-session, or signer
   cache state. Pre-existing legacy files are not opened or trusted.
@@ -655,8 +798,10 @@ triad architecture.
 Implement M0 through M6 in order. Keep Broker and Signer as the only production
 authorization, custody, and signing path. Replace legacy keystore reads with a
 key-free Machine public projection over existing Broker methods; remove the old
-policy-session/auth database model; move every delegated venue key, including
-Hyperliquid API wallets, into Signer-owned KeyRefs; preserve read/stage/simulate
+policy-session/auth database model; implement generic Signer-owned,
+Petal-scoped sub-keys whose private material is never exposed to Machine or the
+Petal; retire the native Hyperliquid authority implementation without adding any
+Hyperliquid-specific Broker or Signer behavior; preserve read/stage/simulate
 degraded operation without constructing legacy authority; replace embedded
 local integration with out-of-process deterministic and real-passkey triad
 harnesses; and enforce absence through dependency, artifact, feature, and
@@ -697,8 +842,8 @@ Ratification should explicitly confirm:
 
 1. the clean break from legacy authority state and `policy-session`;
 2. the proposed canonical mounted Sealed Approval paths in section 8;
-3. Signer-owned derived `KeyRef` as the required model for Hyperliquid and
-   other delegated signing keys;
+3. the generic Petal-scoped, Signer-owned derived `KeyRef` model and immediate
+   retirement of the native Hyperliquid authority implementation;
 4. replacement of embedded `local-integration` with an out-of-process real
    passkey triad harness; and
 5. removal of all three legacy crates from the normal production Machine graph,

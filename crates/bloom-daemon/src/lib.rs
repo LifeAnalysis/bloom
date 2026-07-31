@@ -18,6 +18,8 @@ pub mod sign_hash;
 mod ens_resolver;
 mod price_oracle;
 
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -81,12 +83,12 @@ use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
     AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, HyperliquidHandler,
-    OutboxHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler, ToolsHandler,
-    WalletsHandler, WatchHandler,
+    OutboxHandler, PetalKeyRequestsHandler, PricesHandler, RequestsHandler, SimulateHandler,
+    StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::{
     AuthServices as LegacyAuthority, BrokerExactPayloadSigner, FileOperationIndex, OperationIndex,
-    PathCache, Vfs,
+    PathCache, Vfs, VfsPath,
 };
 use bloom_watch::{WatchExecutor, WatchRegistry};
 use futures::StreamExt;
@@ -286,8 +288,50 @@ struct DaemonPetalHost {
     #[cfg(any(test, feature = "local-integration"))]
     petal_action_identities: std::sync::Mutex<PetalActionIdentityCache>,
     broker: Option<MachineBrokerClient>,
+    petal_key_state_root: Option<PathBuf>,
+    petal_key_lock: tokio::sync::Mutex<()>,
     #[cfg(feature = "unsafe-debug-signer")]
     unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
+}
+
+const PETAL_KEY_STATE_SCHEMA: &str = "bloom.machine.petal-key-request.v1";
+const PETAL_KEY_INPUT_CLASS: &str = "petal-key-scope-v1";
+
+/// Machine-owned public reconciliation record. The ceremony URL is retained
+/// here for an owner-readable status projection, but is never returned across
+/// the Petal host boundary.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct PetalKeyRequestState {
+    schema: String,
+    request_id: String,
+    scope: bloom_triad_protocol::PetalKeyScope,
+    scope_digest: bloom_triad_protocol::Digest32,
+    status: String,
+    ceremony_url: Option<String>,
+    ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64,
+    public_key: Option<bloom_triad_protocol::KeyPublic>,
+}
+
+impl PetalKeyRequestState {
+    fn guest_outcome(&self) -> Result<bloom_petals::PetalKeyOutcome, HostError> {
+        let operation_id = self.scope.custody_operation_id.as_str().to_string();
+        let scope_digest = self.scope_digest.as_str().to_string();
+        match &self.public_key {
+            None => Ok(bloom_petals::PetalKeyOutcome::Pending {
+                operation_id,
+                scope_digest,
+            }),
+            Some(key) => Ok(bloom_petals::PetalKeyOutcome::Ready {
+                operation_id,
+                scope_digest,
+                key_ref_jcs: serde_jcs::to_vec(&key.key_ref).map_err(|error| {
+                    HostError::Backend(format!("canonicalize public Petal KeyRef: {error}"))
+                })?,
+                addresses: key.addresses.clone(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -300,6 +344,17 @@ struct PetalTxOutbox {
 }
 
 impl DaemonPetalHost {
+    fn authorize_guest_vfs_path(path: &str) -> Result<(), HostError> {
+        let parsed = VfsPath::parse(path)
+            .map_err(|error| HostError::Invalid(format!("Petal VFS path: {error}")))?;
+        if parsed.first() == Some("petal-key-requests") {
+            return Err(HostError::Denied(
+                "petal-key-requests is an owner-only ceremony projection".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>, auth_services: LegacyAuthority) -> Self {
         #[cfg(not(any(test, feature = "local-integration")))]
         let _ = &auth_services;
@@ -321,6 +376,8 @@ impl DaemonPetalHost {
             #[cfg(any(test, feature = "local-integration"))]
             petal_action_identities: std::sync::Mutex::new(PetalActionIdentityCache::default()),
             broker: None,
+            petal_key_state_root: None,
+            petal_key_lock: tokio::sync::Mutex::new(()),
             #[cfg(feature = "unsafe-debug-signer")]
             unsafe_debug_signer: None,
         }
@@ -334,6 +391,85 @@ impl DaemonPetalHost {
     fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
         self.broker = broker;
         self
+    }
+
+    fn with_petal_key_state_root(mut self, root: PathBuf) -> Self {
+        self.petal_key_state_root = Some(root);
+        self
+    }
+
+    fn petal_key_state_path(
+        &self,
+        context: &PetalRouteContext,
+        request_id: &str,
+    ) -> Result<PathBuf, HostError> {
+        let root = self.petal_key_state_root.as_ref().ok_or_else(|| {
+            HostError::Backend("Petal key request state is not configured".into())
+        })?;
+        let identity = blake3::hash(
+            format!(
+                "bloom-petal-key-request-state/v1\0{}\0{}\0{}",
+                context.package_hash, context.route_id, request_id
+            )
+            .as_bytes(),
+        );
+        Ok(root.join(format!("{}.json", identity.to_hex())))
+    }
+
+    fn read_petal_key_state(path: &Path) -> Result<Option<PetalKeyRequestState>, HostError> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| HostError::Denied(format!("Petal key state is invalid: {error}"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(HostError::Backend(format!(
+                "read Petal key state {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn write_petal_key_state(path: &Path, state: &PetalKeyRequestState) -> Result<(), HostError> {
+        let parent = path.parent().ok_or_else(|| {
+            HostError::Backend("Petal key state path has no parent directory".into())
+        })?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            HostError::Backend(format!(
+                "create Petal key state directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        let temporary = path.with_extension("json.tmp");
+        let bytes = serde_jcs::to_vec(state)
+            .map_err(|error| HostError::Backend(format!("encode Petal key state: {error}")))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).map_err(|error| {
+            HostError::Backend(format!(
+                "open Petal key state {}: {error}",
+                temporary.display()
+            ))
+        })?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| {
+                HostError::Backend(format!(
+                    "write Petal key state {}: {error}",
+                    temporary.display()
+                ))
+            })?;
+        std::fs::rename(&temporary, path).map_err(|error| {
+            HostError::Backend(format!(
+                "commit Petal key state {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(())
     }
 
     #[cfg(feature = "unsafe-debug-signer")]
@@ -824,19 +960,249 @@ impl DaemonPetalHost {
 #[async_trait::async_trait]
 impl PetalHost for DaemonPetalHost {
     async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+        Self::authorize_guest_vfs_path(path)?;
         self.vfs.vfs_lookup(path).await
     }
 
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+        Self::authorize_guest_vfs_path(path)?;
         self.vfs.vfs_read(path).await
     }
 
     async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+        Self::authorize_guest_vfs_path(path)?;
         self.vfs.vfs_list(path).await
     }
 
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+        Self::authorize_guest_vfs_path(path)?;
         self.vfs.vfs_write(path, bytes).await
+    }
+
+    async fn petal_key_request(
+        &self,
+        req: bloom_petals::PetalKeyRequest,
+    ) -> Result<bloom_petals::PetalKeyOutcome, HostError> {
+        let _guard = self.petal_key_lock.lock().await;
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            HostError::Backend("SERVICE_UNAVAILABLE: Broker client is not configured".into())
+        })?;
+        let context = req.context.as_ref().ok_or_else(|| {
+            HostError::Denied("Petal key request requires trusted route provenance".into())
+        })?;
+        Self::petal_execution_origin(context)?;
+        if req.request_id.is_empty()
+            || req.request_id.len() > 256
+            || req.request_id.chars().any(char::is_control)
+        {
+            return Err(HostError::Invalid(
+                "Petal key request_id must contain 1-256 bytes without control characters".into(),
+            ));
+        }
+        let wallet_id = bloom_triad_protocol::Token::new(req.wallet_id.clone())
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let purpose = bloom_triad_protocol::Token::new(req.purpose.clone())
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        if req.maximum_lifetime_ms == 0 {
+            return Err(HostError::Invalid(
+                "Petal key maximum_lifetime_ms must be greater than zero".into(),
+            ));
+        }
+        let suites = req
+            .allowed_crypto_suites
+            .iter()
+            .map(|suite| {
+                serde_json::from_value::<bloom_triad_protocol::CryptoSuite>(
+                    serde_json::Value::String(suite.clone()),
+                )
+                .map_err(|_| HostError::Invalid(format!("unsupported crypto suite {suite:?}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if suites.is_empty() {
+            return Err(HostError::Invalid(
+                "Petal key request requires at least one crypto suite".into(),
+            ));
+        }
+
+        let wallet = broker.wallet(wallet_id.clone()).await.map_err(|error| {
+            HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+        })?;
+        let eligible_parents = wallet
+            .key_refs
+            .into_iter()
+            .filter(|key| {
+                key.derivation.is_none()
+                    && suites.iter().all(|suite| suite.key_spec() == key.key_spec)
+            })
+            .collect::<Vec<_>>();
+        let [parent_key_ref] = eligible_parents.as_slice() else {
+            return Err(HostError::Denied(
+                "wallet must expose exactly one parent KeyRef compatible with the requested suites"
+                    .into(),
+            ));
+        };
+        let operation_hash = blake3::hash(
+            format!(
+                "bloom-petal-key-custody-operation/v1\0{}\0{}\0{}",
+                context.package_hash, context.route_id, req.request_id
+            )
+            .as_bytes(),
+        );
+        let custody_operation_id =
+            bloom_triad_protocol::OperationId::from_bytes(*operation_hash.as_bytes());
+        let scope = bloom_triad_protocol::PetalKeyScope {
+            wallet_id: wallet_id.clone(),
+            parent_key_ref: parent_key_ref.clone(),
+            package_hash: bloom_triad_protocol::Digest32::new(context.package_hash.clone())
+                .map_err(|error| HostError::Invalid(error.to_string()))?,
+            route: context.route_id.clone(),
+            agent_id: req.agent_id.clone(),
+            purpose,
+            allowed_crypto_suites: suites,
+            maximum_lifetime_ms: bloom_triad_protocol::DecimalU64::new(req.maximum_lifetime_ms),
+            custody_operation_id: custody_operation_id.clone(),
+        };
+        let scope_digest = scope
+            .digest()
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let path = self.petal_key_state_path(context, &req.request_id)?;
+
+        if let Some(mut stored) = Self::read_petal_key_state(&path)? {
+            if stored.schema != PETAL_KEY_STATE_SCHEMA
+                || stored.request_id != req.request_id
+                || stored.scope != scope
+                || stored.scope_digest != scope_digest
+                || !matches!(
+                    (
+                        stored.status.as_str(),
+                        stored.public_key.is_some(),
+                        stored.ceremony_url.is_some()
+                    ),
+                    ("awaiting_user", false, true) | ("succeeded", true, false)
+                )
+            {
+                return Err(HostError::Denied(
+                    "Petal key request_id was already used with different terms".into(),
+                ));
+            }
+            match broker
+                .custody_result(bloom_triad_protocol::OperationRequest {
+                    operation_id: custody_operation_id.clone(),
+                })
+                .await
+            {
+                Ok(result) => {
+                    if result.ceremony_kind != bloom_triad_protocol::CeremonyKind::KeyDerive
+                        || result.custody_operation_id != custody_operation_id
+                        || result.wallet_id.as_ref() != Some(&wallet_id)
+                        || result.encrypted_browser_result.is_some()
+                    {
+                        return Err(HostError::Denied(
+                            "Broker returned a custody result outside the requested Petal scope"
+                                .into(),
+                        ));
+                    }
+                    let [derived_key_ref] = result.public_key_refs.as_slice() else {
+                        return Err(HostError::Denied(
+                            "Petal custody result must contain exactly one public KeyRef".into(),
+                        ));
+                    };
+                    let public = broker
+                        .key(bloom_triad_protocol::KeyRequest {
+                            key_ref: derived_key_ref.clone(),
+                        })
+                        .await
+                        .map_err(|error| {
+                            HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+                        })?;
+                    if public.key_ref != *derived_key_ref
+                        || !public
+                            .supported_crypto_suites
+                            .iter()
+                            .all(|suite| scope.allowed_crypto_suites.contains(suite))
+                    {
+                        return Err(HostError::Denied(
+                            "Broker returned public key metadata outside the Petal scope".into(),
+                        ));
+                    }
+                    if stored
+                        .public_key
+                        .as_ref()
+                        .is_some_and(|previous| previous != &public)
+                    {
+                        return Err(HostError::Denied(
+                            "persisted Petal public key conflicts with Broker custody result"
+                                .into(),
+                        ));
+                    }
+                    stored.public_key = Some(public);
+                    stored.status = "succeeded".into();
+                    stored.ceremony_url = None;
+                    Self::write_petal_key_state(&path, &stored)?;
+                    return stored.guest_outcome();
+                }
+                Err(error)
+                    if error.code == bloom_triad_protocol::ProtocolErrorCode::ApprovalNotFound =>
+                {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_millis() as u64)
+                        .unwrap_or(0);
+                    if stored.ceremony_expires_at_ms.get() <= now_ms {
+                        return Err(HostError::Denied(
+                            "Petal key custody ceremony expired before completion".into(),
+                        ));
+                    }
+                    return stored.guest_outcome();
+                }
+                Err(error) => {
+                    return Err(HostError::Denied(format!(
+                        "{}: {}",
+                        error.code.as_str(),
+                        error.message
+                    )));
+                }
+            }
+        }
+
+        let prepared = broker
+            .prepare_custody(
+                bloom_machine_client::CustodyPrepareMethod::KeyDerive,
+                bloom_triad_protocol::CustodyPrepareRequest {
+                    ceremony_kind: bloom_triad_protocol::CeremonyKind::KeyDerive,
+                    custody_operation_id: custody_operation_id.clone(),
+                    wallet_id: Some(wallet_id),
+                    key_ref: Some(parent_key_ref.clone()),
+                    exact_terms_digest: scope_digest.clone(),
+                    expected_input_class: bloom_triad_protocol::Token::new(PETAL_KEY_INPUT_CLASS)
+                        .expect("static Petal key input class is valid"),
+                    browser_output_recipient_key: None,
+                    petal_key_scope: Some(scope.clone()),
+                },
+            )
+            .await
+            .map_err(|error| {
+                HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+            })?;
+        if prepared.ceremony_kind != bloom_triad_protocol::CeremonyKind::KeyDerive
+            || prepared.custody_operation_id != custody_operation_id
+        {
+            return Err(HostError::Denied(
+                "Broker returned a mismatched Petal custody preparation".into(),
+            ));
+        }
+        let stored = PetalKeyRequestState {
+            schema: PETAL_KEY_STATE_SCHEMA.into(),
+            request_id: req.request_id,
+            scope,
+            scope_digest,
+            status: "awaiting_user".into(),
+            ceremony_url: Some(prepared.ceremony_url),
+            ceremony_expires_at_ms: prepared.ceremony_expires_at_ms,
+            public_key: None,
+        };
+        Self::write_petal_key_state(&path, &stored)?;
+        stored.guest_outcome()
     }
 
     async fn http_fetch(
@@ -1280,29 +1646,37 @@ impl PetalHost for DaemonPetalHost {
         let trusted_package_hash =
             bloom_triad_protocol::Digest32::new(context.package_hash.clone())
                 .map_err(|error| HostError::Invalid(error.to_string()))?;
-        let result = broker
-            .sign_petal_payload(TrustedPetalSignRequest {
-                wallet_id: bloom_triad_protocol::Token::new(req.wallet)
-                    .map_err(|error| HostError::Invalid(error.to_string()))?,
-                preimage: req.preimage,
-                claimed_hash: bloom_triad_protocol::Digest32::from_bytes(req.claimed_hash),
-                crypto_suite,
-                operation_class: bloom_triad_protocol::Token::new(req.operation_class)
-                    .map_err(|error| HostError::Invalid(error.to_string()))?,
-                claim,
-                claim_assurance_evidence: req.claim_assurance_evidence,
-                approval_id,
-                trusted_provenance: bloom_triad_protocol::ProvenanceSubject::Petal {
-                    package_hash: trusted_package_hash,
-                    route: context.route_id.clone(),
-                },
-                frozen_action: req.action,
-                frozen_advisory: req.advisory,
-            })
-            .await
-            .map_err(|error| {
-                HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
-            })?;
+        let selected_key_ref = req.key_ref;
+        let trusted_request = TrustedPetalSignRequest {
+            wallet_id: bloom_triad_protocol::Token::new(req.wallet)
+                .map_err(|error| HostError::Invalid(error.to_string()))?,
+            preimage: req.preimage,
+            claimed_hash: bloom_triad_protocol::Digest32::from_bytes(req.claimed_hash),
+            crypto_suite,
+            operation_class: bloom_triad_protocol::Token::new(req.operation_class)
+                .map_err(|error| HostError::Invalid(error.to_string()))?,
+            selector: req.selector,
+            claim,
+            claim_assurance_evidence: req.claim_assurance_evidence,
+            approval_id,
+            trusted_provenance: bloom_triad_protocol::ProvenanceSubject::Petal {
+                package_hash: trusted_package_hash,
+                route: context.route_id.clone(),
+            },
+            frozen_action: req.action,
+            frozen_advisory: req.advisory,
+        };
+        let result = match selected_key_ref {
+            Some(key_ref) => {
+                broker
+                    .sign_petal_payload_with_key(trusted_request, key_ref)
+                    .await
+            }
+            None => broker.sign_petal_payload(trusted_request).await,
+        }
+        .map_err(|error| {
+            HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+        })?;
         let [signature] = result.signatures.as_slice() else {
             return Err(HostError::Backend(
                 "Broker returned an invalid signature count".into(),
@@ -2451,6 +2825,7 @@ impl Daemon {
             auth_services.clone(),
         )
         .with_broker(broker.clone())
+        .with_petal_key_state_root(home.cache_dir().join("petal-key-requests"))
         .with_tx_outbox(PetalTxOutbox {
             tx_engine: tx_engine.clone(),
             chains: chains.clone(),
@@ -2472,6 +2847,12 @@ impl Daemon {
             Arc::new(move || render_installed_petals_doc(&petals_for_docs));
 
         let mut vfs_builder = Vfs::builder()
+            .mount(
+                "petal-key-requests",
+                Arc::new(PetalKeyRequestsHandler::new(
+                    home.cache_dir().join("petal-key-requests"),
+                )) as _,
+            )
             .mount(
                 "petals",
                 Arc::new(
@@ -2514,9 +2895,7 @@ impl Daemon {
             }
             debug!("daemon.hyperliquid_mounted");
             let handler = Arc::new(
-                HyperliquidHandler::new(mainnet, testnet, keystore.clone())
-                    .with_auth_services(auth_services.clone())
-                    .with_exact_signing(exact_payload_signer.clone(), wallet_projections.clone())
+                HyperliquidHandler::new(mainnet, testnet)
                     .with_store_root(home.root().join("hyperliquid")),
             );
             handler.clone().start_monitoring();
@@ -3245,8 +3624,131 @@ fn render_petal_discovery_markdown(installed: &[bloom_petals::package::PetalDisc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloom_triad_protocol::{MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService};
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Handler;
+
+    struct PetalKeyBrokerFixture {
+        completed: std::sync::atomic::AtomicBool,
+        prepares: std::sync::atomic::AtomicUsize,
+        parent: bloom_triad_protocol::KeyRef,
+        child: bloom_triad_protocol::KeyRef,
+    }
+
+    impl PetalKeyBrokerFixture {
+        fn new() -> Self {
+            let key_ref = |locator: &str, fingerprint: u8| bloom_triad_protocol::KeyRef {
+                backend: bloom_triad_protocol::Token::new("local").unwrap(),
+                backend_instance: bloom_triad_protocol::Token::new("default").unwrap(),
+                locator: locator.into(),
+                key_spec: bloom_triad_protocol::KeySpec::Secp256k1,
+                public_key_fingerprint: bloom_triad_protocol::Digest32::from_bytes(
+                    [fingerprint; 32],
+                ),
+                derivation: None,
+            };
+            let mut child = key_ref("wallet/primary/petals/7", 2);
+            child.derivation = Some(bloom_triad_protocol::DerivationRef::Bip32Secp256k1 {
+                root_key_id: bloom_triad_protocol::Token::new("primary-root").unwrap(),
+                path: "m/44'/60'/0'/18734/7".into(),
+            });
+            Self {
+                completed: std::sync::atomic::AtomicBool::new(false),
+                prepares: std::sync::atomic::AtomicUsize::new(0),
+                parent: key_ref("wallet/primary/root", 1),
+                child,
+            }
+        }
+    }
+
+    impl MachineBrokerService for PetalKeyBrokerFixture {
+        fn dispatch<'a>(
+            &'a self,
+            request: MachineBrokerRequest,
+        ) -> bloom_triad_protocol::ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async move {
+                match request {
+                    MachineBrokerRequest::WalletGetPublic(request) => {
+                        Ok(MachineBrokerResponse::WalletGetPublic(
+                            bloom_triad_protocol::WalletPublic {
+                                wallet_id: request.wallet_id,
+                                wallet_kind: bloom_triad_protocol::Token::new("local").unwrap(),
+                                // A previously derived Petal child is also in the public
+                                // projection. It must never make root selection ambiguous.
+                                key_refs: vec![self.parent.clone(), self.child.clone()],
+                                policy_version: bloom_triad_protocol::DecimalU64::new(1),
+                                policy_digest: bloom_triad_protocol::Digest32::from_bytes([3; 32]),
+                                wallet_revocation_epoch: bloom_triad_protocol::DecimalU64::new(0),
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::KeyDerivePrepare(request) => {
+                        self.prepares
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        request.validate_petal_key_scope_binding()?;
+                        Ok(MachineBrokerResponse::KeyDerivePrepare(
+                            bloom_triad_protocol::CustodyPrepareResponse {
+                                ceremony_kind: bloom_triad_protocol::CeremonyKind::KeyDerive,
+                                custody_operation_id: request.custody_operation_id,
+                                state: bloom_triad_protocol::CustodyPrepareState::AwaitingUser,
+                                ceremony_url: "http://127.0.0.1:18734/ceremony/owner-only".into(),
+                                ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(
+                                    u64::MAX,
+                                ),
+                                signer_contribution_digest:
+                                    bloom_triad_protocol::Digest32::from_bytes([4; 32]),
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::CustodyResult(request) => {
+                        if !self.completed.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err(bloom_triad_protocol::ProtocolError::new(
+                                bloom_triad_protocol::ProtocolErrorCode::ApprovalNotFound,
+                                "custody result not found",
+                            ));
+                        }
+                        Ok(MachineBrokerResponse::CustodyResult(
+                            bloom_triad_protocol::CustodyResult {
+                                ceremony_kind: bloom_triad_protocol::CeremonyKind::KeyDerive,
+                                custody_operation_id: request.operation_id,
+                                public_status: bloom_triad_protocol::CeremonyState::Succeeded,
+                                wallet_id: Some(
+                                    bloom_triad_protocol::Token::new("primary").unwrap(),
+                                ),
+                                public_key_refs: vec![self.child.clone()],
+                                credential_summaries: Vec::new(),
+                                initial_policy: None,
+                                receipt_digest: bloom_triad_protocol::Digest32::from_bytes([5; 32]),
+                                encrypted_browser_result: None,
+                                signer_key_id: bloom_triad_protocol::Token::new("signer").unwrap(),
+                                signer_signature: bloom_triad_protocol::Base64UrlBytes::from_bytes(
+                                    &[6; 64],
+                                ),
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::KeyGetPublic(request)
+                        if request.key_ref == self.child =>
+                    {
+                        Ok(MachineBrokerResponse::KeyGetPublic(
+                            bloom_triad_protocol::KeyPublic {
+                                key_ref: self.child.clone(),
+                                canonical_public_key:
+                                    bloom_triad_protocol::Base64UrlBytes::from_bytes(&[7; 33]),
+                                addresses: vec![
+                                    "0x1111111111111111111111111111111111111111".into(),
+                                ],
+                                supported_crypto_suites: vec![
+                                    bloom_triad_protocol::CryptoSuite::Secp256k1Keccak256Recoverable,
+                                ],
+                            },
+                        ))
+                    }
+                    other => panic!("unexpected Petal key Broker request: {other:?}"),
+                }
+            })
+        }
+    }
 
     #[test]
     fn approval_error_display_text_cannot_trigger_ceremony_routing() {
@@ -3332,6 +3834,160 @@ mod tests {
             panic!("expected denied error");
         };
         assert!(msg.contains("trusted Petal route context"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn petal_key_host_reconciles_retry_and_fails_closed_on_changed_or_tampered_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let fixture = Arc::new(PetalKeyBrokerFixture::new());
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            audit,
+            LegacyAuthority::default(),
+        )
+        .with_broker(Some(MachineBrokerClient::new(fixture.clone())))
+        .with_petal_key_state_root(dir.path().join("petal-key-requests"));
+        let context = PetalRouteContext {
+            petal_root: "exchange".into(),
+            package_hash: "aa".repeat(32),
+            route_id: "r000007".into(),
+            op: "write".into(),
+            path: "orders/new".into(),
+            params: Vec::new(),
+            actor: None,
+        };
+        let request = bloom_petals::PetalKeyRequest {
+            request_id: "agent-a".into(),
+            wallet_id: "primary".into(),
+            purpose: "exchange-agent".into(),
+            agent_id: Some("desk-a".into()),
+            allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
+            maximum_lifetime_ms: 60_000,
+            context: Some(context.clone()),
+        };
+
+        let pending = host.petal_key_request(request.clone()).await.unwrap();
+        let pending_json = serde_json::to_value(&pending).unwrap();
+        assert_eq!(pending_json["state"], "pending");
+        assert!(pending_json.get("ceremony_url").is_none());
+        assert_eq!(
+            fixture.prepares.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            host.petal_key_request(request.clone()).await.unwrap(),
+            pending
+        );
+        assert_eq!(
+            fixture.prepares.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an exact retry must reconcile the original custody operation"
+        );
+
+        let mut changed = request.clone();
+        changed.purpose = "payment-key".into();
+        let changed_error = host.petal_key_request(changed).await.unwrap_err();
+        assert!(changed_error.to_string().contains("different terms"));
+
+        let state_path = host
+            .petal_key_state_path(&context, &request.request_id)
+            .unwrap();
+        let owner_status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            owner_status["ceremony_url"],
+            "http://127.0.0.1:18734/ceremony/owner-only"
+        );
+        assert_eq!(owner_status["status"], "awaiting_user");
+        let owner_vfs = Vfs::builder()
+            .mount(
+                "petal-key-requests",
+                Arc::new(PetalKeyRequestsHandler::new(
+                    dir.path().join("petal-key-requests"),
+                )),
+            )
+            .build();
+        let mounted_path = VfsPath::parse(&format!(
+            "petal-key-requests/{}",
+            state_path.file_name().unwrap().to_str().unwrap()
+        ))
+        .unwrap();
+        let mounted_status: serde_json::Value =
+            serde_json::from_slice(&owner_vfs.read(&mounted_path).await.unwrap()).unwrap();
+        assert_eq!(mounted_status["ceremony_url"], owner_status["ceremony_url"]);
+
+        fixture
+            .completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ready = host.petal_key_request(request.clone()).await.unwrap();
+        let ready_json = serde_json::to_value(&ready).unwrap();
+        assert_eq!(ready_json["state"], "ready");
+        assert!(ready_json.get("ceremony_url").is_none());
+        assert!(ready_json.get("private_key").is_none());
+        let completed_owner_status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(completed_owner_status["status"], "succeeded");
+        assert!(completed_owner_status["ceremony_url"].is_null());
+
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        tampered["scope"]["route"] = serde_json::json!("r999999");
+        std::fs::write(&state_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        let tamper_error = host.petal_key_request(request).await.unwrap_err();
+        assert!(tamper_error.to_string().contains("different terms"));
+    }
+
+    #[tokio::test]
+    async fn petal_guest_vfs_cannot_reach_owner_only_key_ceremony_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("petal-key-requests");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let record = format!("{}.json", "ab".repeat(32));
+        let owner_record = br#"{"status":"awaiting_user","ceremony_url":"http://127.0.0.1:18734/ceremony/secret"}"#;
+        std::fs::write(state_root.join(&record), owner_record).unwrap();
+
+        let owner_vfs = Arc::new(
+            Vfs::builder()
+                .mount(
+                    "petal-key-requests",
+                    Arc::new(PetalKeyRequestsHandler::new(state_root)),
+                )
+                .build(),
+        );
+        let owner_path = VfsPath::parse(&format!("petal-key-requests/{record}")).unwrap();
+        assert_eq!(owner_vfs.read(&owner_path).await.unwrap(), owner_record);
+
+        let late_vfs = Arc::new(LateVfsHost::new());
+        late_vfs.set(owner_vfs);
+        let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
+        let guest = DaemonPetalHost::new(late_vfs, audit, LegacyAuthority::default());
+
+        let operations = [
+            guest.vfs_lookup("petal-key-requests").await.map(|_| ()),
+            guest.vfs_list("petal-key-requests").await.map(|_| ()),
+            guest
+                .vfs_read(&format!("petal-key-requests/{record}"))
+                .await
+                .map(|_| ()),
+            guest
+                .vfs_write(&format!("petal-key-requests/{record}"), b"replace")
+                .await,
+            guest
+                .vfs_read(&format!("public/../petal-key-requests/{record}"))
+                .await
+                .map(|_| ()),
+        ];
+        for result in operations {
+            assert!(
+                matches!(result, Err(HostError::Denied(ref message)) if message.contains("owner-only"))
+            );
+        }
+        assert_eq!(
+            std::fs::read(directory.path().join("petal-key-requests").join(record)).unwrap(),
+            owner_record,
+            "denied guest write must not modify the owner projection"
+        );
     }
 
     #[test]

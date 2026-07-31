@@ -5,6 +5,8 @@
 
 use crate::host::HostError;
 
+use serde::{Deserialize, Serialize};
+
 const MAX_STRING_LEN: usize = 64 * 1024;
 const MAX_HEADERS: usize = 256;
 const MAX_LIST_ENTRIES: usize = 8192;
@@ -49,6 +51,12 @@ pub struct PayloadSignRequest {
     pub approval_hint: Option<String>,
     pub action: Option<Vec<u8>>,
     pub advisory: Option<Vec<u8>>,
+    /// v0.2 always supplies `Reusable`; v0.3 requires the guest to choose an
+    /// exact or reusable approval selector explicitly.
+    pub selector: bloom_triad_protocol::PetalSignSelector,
+    /// Explicit Signer-owned sub-key selected by the v0.3 interface. The
+    /// v0.2 interface always leaves this absent and retains root-key behavior.
+    pub key_ref: Option<bloom_triad_protocol::KeyRef>,
     pub context: Option<PetalRouteContext>,
 }
 
@@ -124,6 +132,65 @@ pub struct PetalRouteContext {
     pub path: String,
     pub params: Vec<(String, String)>,
     pub actor: Option<String>,
+}
+
+/// Guest-supplied, provenance-free request for a Signer-owned Petal sub-key.
+///
+/// The component ABI carries this as JSON bytes so the interface can evolve
+/// without ever adding package or route fields to the guest-controlled WIT
+/// record. The runner injects [`PetalRouteContext`] after decoding.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PetalKeyGuestRequest {
+    pub request_id: String,
+    pub wallet_id: String,
+    pub purpose: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub allowed_crypto_suites: Vec<String>,
+    pub maximum_lifetime_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PetalKeyRequest {
+    pub request_id: String,
+    pub wallet_id: String,
+    pub purpose: String,
+    pub agent_id: Option<String>,
+    pub allowed_crypto_suites: Vec<String>,
+    pub maximum_lifetime_ms: u64,
+    pub context: Option<PetalRouteContext>,
+}
+
+impl From<PetalKeyGuestRequest> for PetalKeyRequest {
+    fn from(guest: PetalKeyGuestRequest) -> Self {
+        Self {
+            request_id: guest.request_id,
+            wallet_id: guest.wallet_id,
+            purpose: guest.purpose,
+            agent_id: guest.agent_id,
+            allowed_crypto_suites: guest.allowed_crypto_suites,
+            maximum_lifetime_ms: guest.maximum_lifetime_ms,
+            context: None,
+        }
+    }
+}
+
+/// Public-only result of a Petal sub-key request.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PetalKeyOutcome {
+    Pending {
+        operation_id: String,
+        scope_digest: String,
+    },
+    Ready {
+        operation_id: String,
+        scope_digest: String,
+        /// Canonical JSON encoding of the public `KeyRef`.
+        key_ref_jcs: Vec<u8>,
+        addresses: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

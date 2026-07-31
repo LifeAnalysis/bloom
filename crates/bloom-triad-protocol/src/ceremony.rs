@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ActivationMode, Base64UrlBytes, ClaimAssurance, CryptoSuite, DecimalU64, Digest32,
-    HpkeEnvelope, KeyRef, OperationId, PetalUseClaim, SealedApprovalTerms, Token,
+    HpkeEnvelope, KeyRef, OperationId, PetalKeyScope, PetalUseClaim, ProtocolError,
+    ProtocolErrorCode, SealedApprovalTerms, Token,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -371,6 +372,57 @@ pub struct CustodyPrepareRequest {
     pub exact_terms_digest: Digest32,
     pub expected_input_class: Token,
     pub browser_output_recipient_key: Option<Base64UrlBytes>,
+    #[serde(default)]
+    pub petal_key_scope: Option<PetalKeyScope>,
+}
+
+impl CustodyPrepareRequest {
+    /// Validate the full Petal scope carried by the existing key-derivation
+    /// surface. Broker and Signer both call this before accepting the scope.
+    pub fn validate_petal_key_scope_binding(&self) -> Result<(), ProtocolError> {
+        let Some(scope) = &self.petal_key_scope else {
+            return Ok(());
+        };
+
+        if self.ceremony_kind != CeremonyKind::KeyDerive {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::CeremonyKindMismatch,
+                "Petal key scope is valid only for key-derive custody",
+            ));
+        }
+        scope.validate()?;
+        if scope.custody_operation_id != self.custody_operation_id {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::OperationIdConflict,
+                "Petal key scope custody operation does not match the request",
+            ));
+        }
+        if self.wallet_id.as_ref() != Some(&scope.wallet_id) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "Petal key scope wallet does not match the custody request",
+            ));
+        }
+        if self.key_ref.as_ref() != Some(&scope.parent_key_ref) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "Petal key scope parent KeyRef does not match the custody request",
+            ));
+        }
+        if self.exact_terms_digest != scope.digest()? {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::OperationIdConflict,
+                "key-derive exact terms digest does not match the Petal key scope",
+            ));
+        }
+        if self.browser_output_recipient_key.is_some() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Petal key derivation cannot return Browser-provided key material",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -387,6 +439,8 @@ pub struct CustodySignerContribution {
     pub required_user_verification: bool,
     pub hpke_recipient_key: Base64UrlBytes,
     pub browser_output_recipient_key: Option<Base64UrlBytes>,
+    #[serde(default)]
+    pub petal_key_scope: Option<PetalKeyScope>,
     pub expires_at_ms: DecimalU64,
     pub signer_key_id: Token,
     pub signer_signature: Base64UrlBytes,
@@ -446,6 +500,36 @@ pub enum SignerCeremonyCompleteResponse {
 }
 
 impl CustodySignerContribution {
+    /// Verify that the Signer-signed contribution carries exactly the Petal
+    /// scope accepted on the corresponding Machine-to-Broker request.
+    pub fn validate_petal_key_scope_binding(
+        &self,
+        request: &CustodyPrepareRequest,
+    ) -> Result<(), ProtocolError> {
+        request.validate_petal_key_scope_binding()?;
+        if request.petal_key_scope.is_none() {
+            if self.petal_key_scope.is_some() {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "Signer introduced a Petal key scope on an unscoped custody request",
+                ));
+            }
+            return Ok(());
+        }
+        if self.ceremony_kind != request.ceremony_kind
+            || self.custody_operation_id != request.custody_operation_id
+            || self.wallet_id != request.wallet_id
+            || self.key_ref != request.key_ref
+            || self.petal_key_scope != request.petal_key_scope
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::OperationIdConflict,
+                "Signer custody contribution does not match the requested Petal key scope",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, crate::ProtocolError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
@@ -460,6 +544,7 @@ impl CustodySignerContribution {
             required_user_verification: bool,
             hpke_recipient_key: &'a Base64UrlBytes,
             browser_output_recipient_key: &'a Option<Base64UrlBytes>,
+            petal_key_scope: &'a Option<PetalKeyScope>,
             expires_at_ms: &'a DecimalU64,
             signer_key_id: &'a Token,
         }
@@ -475,6 +560,7 @@ impl CustodySignerContribution {
             required_user_verification: self.required_user_verification,
             hpke_recipient_key: &self.hpke_recipient_key,
             browser_output_recipient_key: &self.browser_output_recipient_key,
+            petal_key_scope: &self.petal_key_scope,
             expires_at_ms: &self.expires_at_ms,
             signer_key_id: &self.signer_key_id,
         })
@@ -688,7 +774,53 @@ fn canonical_error(error: impl std::fmt::Display) -> crate::ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CeremonyState;
+    use crate::{CeremonyState, DerivationRef, KeySpec};
+
+    fn digest(byte: u8) -> Digest32 {
+        Digest32::from_bytes([byte; 32])
+    }
+
+    fn operation(byte: u8) -> OperationId {
+        OperationId::from_bytes([byte; 32])
+    }
+
+    fn petal_scope() -> PetalKeyScope {
+        PetalKeyScope {
+            wallet_id: Token::new("primary").unwrap(),
+            parent_key_ref: KeyRef {
+                backend: Token::new("local").unwrap(),
+                backend_instance: Token::new("default").unwrap(),
+                locator: "wallet/primary/root".into(),
+                key_spec: KeySpec::Secp256k1,
+                public_key_fingerprint: digest(1),
+                derivation: Some(DerivationRef::Bip32Secp256k1 {
+                    root_key_id: Token::new("primary-root").unwrap(),
+                    path: "m/44'/60'/0'".into(),
+                }),
+            },
+            package_hash: digest(2),
+            route: "/petals/exchange/orders".into(),
+            agent_id: Some("desk-a".into()),
+            purpose: Token::new("exchange-agent").unwrap(),
+            allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+            maximum_lifetime_ms: DecimalU64::new(86_400_000),
+            custody_operation_id: operation(3),
+        }
+    }
+
+    fn scoped_prepare() -> CustodyPrepareRequest {
+        let scope = petal_scope();
+        CustodyPrepareRequest {
+            ceremony_kind: CeremonyKind::KeyDerive,
+            custody_operation_id: scope.custody_operation_id.clone(),
+            wallet_id: Some(scope.wallet_id.clone()),
+            key_ref: Some(scope.parent_key_ref.clone()),
+            exact_terms_digest: scope.digest().unwrap(),
+            expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
+            browser_output_recipient_key: None,
+            petal_key_scope: Some(scope),
+        }
+    }
 
     #[test]
     fn custody_success_states_match_section_13_6() {
@@ -717,6 +849,73 @@ mod tests {
         assert_eq!(
             CeremonyKind::SealedApproval.successful_terminal_state(),
             None
+        );
+    }
+
+    #[test]
+    fn petal_key_scope_is_exactly_bound_to_key_derive_request() {
+        assert!(scoped_prepare().validate_petal_key_scope_binding().is_ok());
+
+        let mut request = scoped_prepare();
+        request.petal_key_scope.as_mut().unwrap().route = "/petals/exchange/cancel".into();
+        assert_eq!(
+            request.validate_petal_key_scope_binding().unwrap_err().code,
+            ProtocolErrorCode::OperationIdConflict
+        );
+    }
+
+    #[test]
+    fn petal_scope_rejects_cross_operation_and_non_derivation_reuse() {
+        let mut request = scoped_prepare();
+        request.custody_operation_id = operation(9);
+        assert_eq!(
+            request.validate_petal_key_scope_binding().unwrap_err().code,
+            ProtocolErrorCode::OperationIdConflict
+        );
+
+        let mut request = scoped_prepare();
+        request.ceremony_kind = CeremonyKind::WalletImport;
+        assert_eq!(
+            request.validate_petal_key_scope_binding().unwrap_err().code,
+            ProtocolErrorCode::CeremonyKindMismatch
+        );
+    }
+
+    #[test]
+    fn signed_custody_contribution_binds_full_petal_scope() {
+        let scope = petal_scope();
+        let contribution = CustodySignerContribution {
+            ceremony_id: digest(4),
+            ceremony_kind: CeremonyKind::KeyDerive,
+            custody_operation_id: scope.custody_operation_id.clone(),
+            signer_nonce: digest(5),
+            review_manifest_digest: digest(6),
+            wallet_id: Some(scope.wallet_id.clone()),
+            key_ref: Some(scope.parent_key_ref.clone()),
+            expected_input_class: Token::new("petal-key-scope-v1").unwrap(),
+            required_user_verification: true,
+            hpke_recipient_key: Base64UrlBytes::from_bytes(&[7; 32]),
+            browser_output_recipient_key: None,
+            petal_key_scope: Some(scope),
+            expires_at_ms: DecimalU64::new(1000),
+            signer_key_id: Token::new("signer-identity").unwrap(),
+            signer_signature: Base64UrlBytes::from_bytes(&[8; 64]),
+        };
+        assert!(
+            contribution
+                .validate_petal_key_scope_binding(&scoped_prepare())
+                .is_ok()
+        );
+        let original = contribution.unsigned_canonical_bytes().unwrap();
+        let mut tampered = contribution;
+        tampered.petal_key_scope.as_mut().unwrap().purpose = Token::new("payment-key").unwrap();
+        assert_ne!(original, tampered.unsigned_canonical_bytes().unwrap());
+        assert_eq!(
+            tampered
+                .validate_petal_key_scope_binding(&scoped_prepare())
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::OperationIdConflict
         );
     }
 }

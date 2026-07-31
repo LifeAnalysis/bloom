@@ -10,8 +10,8 @@ use async_trait::async_trait;
 
 use crate::abi::{
     ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest,
-    HttpRequest, HttpResponse, PayloadSignRequest, PetalRouteContext, SignBatchOutcome,
-    SignBatchRequest, SignOutcome, SignRequest,
+    HttpRequest, HttpResponse, PayloadSignRequest, PetalKeyOutcome, PetalKeyRequest,
+    PetalRouteContext, SignBatchOutcome, SignBatchRequest, SignOutcome, SignRequest,
 };
 use crate::policy::NetPolicy;
 
@@ -121,6 +121,13 @@ pub trait PetalHost: Send + Sync {
         _req: PayloadSignRequest,
     ) -> Result<SignOutcome, HostError> {
         Err(HostError::Denied("sign_payload".into()))
+    }
+
+    /// Request or poll a Signer-owned sub-key. Implementations must use the
+    /// trusted route context injected by the runner and return public metadata
+    /// only.
+    async fn petal_key_request(&self, _req: PetalKeyRequest) -> Result<PetalKeyOutcome, HostError> {
+        Err(HostError::Denied("petal_key_request".into()))
     }
 
     /// Stage a generic EVM transaction in the daemon outbox. Hosts default to
