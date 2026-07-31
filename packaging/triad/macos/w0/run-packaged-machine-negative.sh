@@ -97,7 +97,21 @@ chown "$signer_uid" "$runtime/hostile-signer"
 chown -R "$login_uid" "$clean_home"
 chmod 0755 "$work" "$runtime" "$runtime/machine-broker" "$runtime/hostile-signer"
 chmod 0700 "$clean_home"
-printf '[petals]\npreinstalled = []\n' |
+# Keep the clean test home intentionally small, but valid. Degraded authority
+# operation means Broker/Signer may be unavailable; it does not bypass normal
+# Machine configuration validation. The unreachable local RPC keeps this test
+# deterministic and prevents external network dependence.
+printf '%s\n' \
+  'default_chain = "anvil"' \
+  '' \
+  '[petals]' \
+  'preinstalled = []' \
+  '' \
+  '[chains.anvil]' \
+  'name = "anvil"' \
+  'chain_id = 31337' \
+  'rpc_urls = ["http://127.0.0.1:1"]' \
+  'allow_broadcast = false' |
   sudo -u "$login_user" /usr/bin/tee "$clean_home/config.toml" >/dev/null
 chmod 0600 "$clean_home/config.toml"
 
