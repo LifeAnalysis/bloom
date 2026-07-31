@@ -16,7 +16,7 @@ use url::Url;
 /// Approvals architecture). No credential material, PRF output, or raw
 /// signatures are ever carried here — only public request/payment metadata and
 /// digests.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PaidHttpSigningFacts {
     pub request_id: String,
     pub method: String,
@@ -55,6 +55,18 @@ pub struct PaidHttpSigningFacts {
 /// grant enforcement out of the protocol crates.
 #[async_trait::async_trait]
 pub trait PaidHttpHostSigner: Send + Sync {
+    /// Sign an exact payload-bearing request. `signing_hash` must equal the
+    /// selected suite's hash of `preimage`; the authority service verifies
+    /// that binding before approval or signing.
+    async fn sign_paid_http_payload(
+        &self,
+        intent: &str,
+        signing_slot: &str,
+        preimage: &[u8],
+        signing_hash: [u8; 32],
+        facts: &PaidHttpSigningFacts,
+    ) -> Result<[u8; 65], String>;
+
     /// Sign `signing_hash` under the live paid-HTTP grant for `intent`
     /// (e.g. `"x402.sign"` or `"paid-http.mpp.sign"`). Returns the 65-byte
     /// secp256k1 signature, or an error string if no live grant authorizes it.

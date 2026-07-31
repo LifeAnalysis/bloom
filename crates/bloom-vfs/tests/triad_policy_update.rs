@@ -19,6 +19,9 @@ use bloom_tx::{outbox::Outbox, tx_engine::TxEngine};
 use bloom_vfs::{Handler, HandlerError, VfsPath, handlers::wallets::WalletsHandler};
 use sha2::{Digest as _, Sha256};
 
+#[path = "support/m2_exact_production_routes.rs"]
+mod m2_exact_production_routes;
+
 struct FixtureState {
     operation_id: Option<OperationId>,
     proposed_policy: Option<Vec<u8>>,

@@ -309,6 +309,32 @@ impl WalletsHandler {
     }
 
     #[cfg(not(test))]
+    async fn planning_wallet_inputs(
+        &self,
+        wallet: &str,
+        chain: &str,
+    ) -> Result<(alloy::primitives::Address, Policy), HandlerError> {
+        let projection = self.wallet_projection(wallet).await?;
+        let address = projection
+            .primary_address()
+            .map_err(err_be)?
+            .parse()
+            .map_err(|error| HandlerError::invalid(format!("wallet address: {error}")))?;
+        let policy = crate::advisory_evm_policy(&projection, chain).map_err(err_be)?;
+        Ok((address, policy))
+    }
+
+    #[cfg(test)]
+    async fn planning_wallet_inputs(
+        &self,
+        wallet: &str,
+        _chain: &str,
+    ) -> Result<(alloy::primitives::Address, Policy), HandlerError> {
+        let info = self.keystore.info(wallet).map_err(err_be)?;
+        Ok((info.address, info.policy))
+    }
+
+    #[cfg(not(test))]
     fn projection_addresses_json(
         &self,
         projection: &WalletProjection,
@@ -2446,7 +2472,7 @@ impl Handler for WalletsHandler {
                     && pending == "pending"
                     && fname == "confirm.override" =>
             {
-                let info = self.keystore.info(wallet).map_err(err_be)?;
+                let (_, policy) = self.planning_wallet_inputs(wallet, chain).await?;
                 let client = self
                     .chains
                     .get(chain)
@@ -2458,7 +2484,7 @@ impl Handler for WalletsHandler {
                         chain,
                         id,
                         &client,
-                        &info.policy,
+                        &policy,
                         true,
                     )
                     .await
@@ -3315,7 +3341,10 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
+        #[cfg(test)]
         let _info = self.keystore.info_unverified(wallet).map_err(err_be)?;
+        #[cfg(not(test))]
+        let _projection = self.wallet_projection(wallet).await?;
         let _client = self
             .chains
             .get(chain)
@@ -3423,7 +3452,7 @@ impl WalletsHandler {
         rest: &[String],
         data: &[u8],
     ) -> Result<(), HandlerError> {
-        let info = self.keystore.info(wallet).map_err(err_be)?;
+        let (wallet_address, policy) = self.planning_wallet_inputs(wallet, chain).await?;
         let client = self
             .chains
             .get(chain)
@@ -3439,10 +3468,10 @@ impl WalletsHandler {
                     .stage(
                         self.write_permit()?,
                         wallet,
-                        info.address,
+                        wallet_address,
                         intent,
                         &client,
-                        &info.policy,
+                        &policy,
                         Some(&self.address_book),
                     )
                     .await
@@ -3474,7 +3503,7 @@ impl WalletsHandler {
                     return Ok(());
                 }
                 let confirm_text = if fname == "confirm.override" {
-                    info.policy.override_sentinel()
+                    policy.override_sentinel()
                 } else {
                     first_confirm_line(confirm_text)
                 };
@@ -3486,7 +3515,7 @@ impl WalletsHandler {
                         chain,
                         id,
                         &client,
-                        &info.policy,
+                        &policy,
                         confirm_text,
                     )
                     .await
@@ -3519,7 +3548,7 @@ impl WalletsHandler {
                         id,
                         &client,
                         10,
-                        &info.policy,
+                        &policy,
                     )
                     .await
                     .map_err(err_be)?;
@@ -3555,7 +3584,7 @@ impl WalletsHandler {
                         10,
                         Some(intent),
                         Some(self.address_book.as_ref()),
-                        &info.policy,
+                        &policy,
                     )
                     .await
                     .map_err(err_be)?;

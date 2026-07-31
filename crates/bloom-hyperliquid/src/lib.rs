@@ -278,7 +278,21 @@ pub fn usd_send_action_and_hash(
     amount: &str,
     nonce: u64,
 ) -> Result<(Value, B256)> {
+    let (action, _, hash) = usd_send_action_signing_payload(network, destination, amount, nonce)?;
+    Ok((action, hash))
+}
+
+/// Build the exact EIP-712 signing preimage together with its expected hash.
+/// Machine sends these bytes to Broker; it never asks a local signer to sign a
+/// bare digest.
+pub fn usd_send_action_signing_payload(
+    network: HyperliquidNetwork,
+    destination: Address,
+    amount: &str,
+    nonce: u64,
+) -> Result<(Value, Vec<u8>, B256)> {
     let typed = usd_send_typed_data(network, destination, amount, nonce)?;
+    let preimage = eip712_preimage(&typed)?;
     let hash = typed
         .eip712_signing_hash()
         .map_err(|e| HyperliquidError::signing(format!("eip712: {e}")))?;
@@ -290,7 +304,7 @@ pub fn usd_send_action_and_hash(
         "amount": amount,
         "time": nonce,
     });
-    Ok((action, hash))
+    Ok((action, preimage, hash))
 }
 
 pub fn approve_agent_action_and_hash(
@@ -299,8 +313,20 @@ pub fn approve_agent_action_and_hash(
     agent_name: Option<&str>,
     nonce: u64,
 ) -> Result<(Value, B256)> {
+    let (action, _, hash) =
+        approve_agent_action_signing_payload(network, agent_address, agent_name, nonce)?;
+    Ok((action, hash))
+}
+
+pub fn approve_agent_action_signing_payload(
+    network: HyperliquidNetwork,
+    agent_address: Address,
+    agent_name: Option<&str>,
+    nonce: u64,
+) -> Result<(Value, Vec<u8>, B256)> {
     let agent_name = agent_name.unwrap_or("");
     let typed = approve_agent_typed_data(network, agent_address, agent_name, nonce)?;
+    let preimage = eip712_preimage(&typed)?;
     let hash = typed
         .eip712_signing_hash()
         .map_err(|e| HyperliquidError::signing(format!("eip712: {e}")))?;
@@ -312,7 +338,20 @@ pub fn approve_agent_action_and_hash(
         "agentName": agent_name,
         "nonce": nonce,
     });
-    Ok((action, hash))
+    Ok((action, preimage, hash))
+}
+
+fn eip712_preimage(typed: &TypedData) -> Result<Vec<u8>> {
+    let mut preimage = Vec::with_capacity(66);
+    preimage.extend_from_slice(&[0x19, 0x01]);
+    preimage.extend_from_slice(typed.domain().separator().as_slice());
+    preimage.extend_from_slice(
+        typed
+            .hash_struct()
+            .map_err(|error| HyperliquidError::signing(format!("eip712: {error}")))?
+            .as_slice(),
+    );
+    Ok(preimage)
 }
 
 pub fn signature_json_from_raw(raw: &[u8]) -> Result<SignatureJson> {
@@ -874,8 +913,9 @@ mod tests {
             .unwrap();
         let nonce = 1_700_000_001_000u64;
 
-        let (action, hash) =
-            usd_send_action_and_hash(HyperliquidNetwork::Mainnet, dest, "100", nonce).unwrap();
+        let (action, preimage, hash) =
+            usd_send_action_signing_payload(HyperliquidNetwork::Mainnet, dest, "100", nonce)
+                .unwrap();
 
         assert_eq!(action["type"], "usdSend");
         assert_eq!(action["hyperliquidChain"], "Mainnet");
@@ -889,6 +929,7 @@ mod tests {
 
         let typed = usd_send_typed_data(HyperliquidNetwork::Mainnet, dest, "100", nonce).unwrap();
         assert_eq!(hash, typed.eip712_signing_hash().unwrap());
+        assert_eq!(hash, alloy::primitives::keccak256(&preimage));
         let sig = SignatureJson::from_signature(&owner.sign_hash(&hash).await.unwrap());
         let recovered = format!("0x{}{}{:02x}", &sig.r[2..], &sig.s[2..], sig.v)
             .parse::<Signature>()
@@ -909,9 +950,13 @@ mod tests {
             .unwrap();
         let nonce = 1_700_000_000_000u64;
 
-        let (action, hash) =
-            approve_agent_action_and_hash(HyperliquidNetwork::Mainnet, agent, Some("bot"), nonce)
-                .unwrap();
+        let (action, preimage, hash) = approve_agent_action_signing_payload(
+            HyperliquidNetwork::Mainnet,
+            agent,
+            Some("bot"),
+            nonce,
+        )
+        .unwrap();
 
         // Mainnet user-signed actions sign on Arbitrum One (0xa4b1) per docs.
         assert_eq!(action["type"], "approveAgent");
@@ -932,6 +977,7 @@ mod tests {
         let typed =
             approve_agent_typed_data(HyperliquidNetwork::Mainnet, agent, "bot", nonce).unwrap();
         assert_eq!(hash, typed.eip712_signing_hash().unwrap());
+        assert_eq!(hash, alloy::primitives::keccak256(&preimage));
         let sig = SignatureJson::from_signature(&owner.sign_hash(&hash).await.unwrap());
         let recovered = format!("0x{}{}{:02x}", &sig.r[2..], &sig.s[2..], sig.v)
             .parse::<Signature>()

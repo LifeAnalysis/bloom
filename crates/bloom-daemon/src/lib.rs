@@ -30,6 +30,7 @@ use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 #[cfg(any(test, feature = "local-integration"))]
 use base64::Engine as _;
+#[cfg(any(test, feature = "local-integration"))]
 use bloom_auth::{AuthStore, StoreApprovalVerifier};
 use bloom_auth_api::PETAL_PETAL_ID_PREFIX;
 #[cfg(any(test, feature = "local-integration"))]
@@ -44,7 +45,10 @@ use bloom_evm::{ChainClient, ChainRegistry};
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
-use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
+use bloom_keystore::Keystore;
+#[cfg(any(test, feature = "local-integration"))]
+use bloom_keystore::KeystoreApprovalSignatureVerifier;
+use bloom_keystore::petal_host::SignerCache as LegacyCache;
 use bloom_machine_client::{
     CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient,
     TrustedPetalSignRequest, WalletProjectionReader,
@@ -80,7 +84,10 @@ use bloom_vfs::handlers::{
     OutboxHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler, ToolsHandler,
     WalletsHandler, WatchHandler,
 };
-use bloom_vfs::{AuthServices, PathCache, Vfs};
+use bloom_vfs::{
+    AuthServices as LegacyAuthority, BrokerExactPayloadSigner, FileOperationIndex, OperationIndex,
+    PathCache, Vfs,
+};
 use bloom_watch::{WatchExecutor, WatchRegistry};
 use futures::StreamExt;
 #[cfg(any(test, feature = "local-integration"))]
@@ -90,23 +97,20 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use std::sync::Mutex;
-
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
 #[cfg(any(test, feature = "local-integration"))]
-const PETAL_ACTION_TTL_MS: u64 = 120_000;
+mod embedded_authority_constants {
+    pub(super) const PETAL_ACTION_TTL_MS: u64 = 120_000;
+    pub(super) const MAX_ACTIVE_PETAL_ACTION_IDENTITIES: usize = 4_096;
+    pub(super) const PETAL_SIGNING_SUBJECT_KIND: &str = "petal_sign_hash";
+    pub(super) const PETAL_SIGNING_SUBJECT_SCHEMA_V1: &str = "bloom.petal.sign_hash_subject.v1";
+    pub(super) const PETAL_SIGNING_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash.action.v1";
+    pub(super) const PETAL_SIGNING_BATCH_ACTION_DOMAIN: &[u8] =
+        b"bloom.petal.sign_hash_batch.action.v1";
+    pub(super) const MAX_PETAL_SIGN_BATCH: usize = 16;
+}
 #[cfg(any(test, feature = "local-integration"))]
-const MAX_ACTIVE_PETAL_ACTION_IDENTITIES: usize = 4_096;
-#[cfg(any(test, feature = "local-integration"))]
-const PETAL_SIGNING_SUBJECT_KIND: &str = "petal_sign_hash";
-#[cfg(any(test, feature = "local-integration"))]
-const PETAL_SIGNING_SUBJECT_SCHEMA_V1: &str = "bloom.petal.sign_hash_subject.v1";
-#[cfg(any(test, feature = "local-integration"))]
-const PETAL_SIGNING_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash.action.v1";
-#[cfg(any(test, feature = "local-integration"))]
-const PETAL_SIGNING_BATCH_ACTION_DOMAIN: &[u8] = b"bloom.petal.sign_hash_batch.action.v1";
-#[cfg(any(test, feature = "local-integration"))]
-const MAX_PETAL_SIGN_BATCH: usize = 16;
+use embedded_authority_constants::*;
 
 #[cfg(any(test, feature = "local-integration"))]
 #[derive(Clone)]
@@ -166,19 +170,18 @@ impl PetalActionIdentityCache {
     }
 }
 
-/// Concrete adapter that bridges [`CentralOutbox`] (filesystem) and
-/// [`AuthStore`] (action_id_map) to satisfy [`CentralOutboxProjection`]
-/// for the EVM tx-engine outbox.
+/// Concrete adapter that bridges the Machine-owned central outbox and
+/// purpose-specific operation index for the EVM tx-engine outbox.
 struct EvmOutboxProjection {
     central: CentralOutbox,
-    auth: Mutex<AuthStore>,
+    operations: Arc<dyn OperationIndex>,
 }
 
 impl EvmOutboxProjection {
-    fn new(central: CentralOutbox, auth: AuthStore) -> Self {
+    fn new(central: CentralOutbox, operations: Arc<dyn OperationIndex>) -> Self {
         Self {
             central,
-            auth: Mutex::new(auth),
+            operations,
         }
     }
 }
@@ -191,9 +194,8 @@ impl CentralOutboxProjection for EvmOutboxProjection {
         wallet: &str,
         staged_at_ms: u64,
     ) -> Result<String, String> {
-        let mut auth = self.auth.lock().map_err(|e| e.to_string())?;
-        auth.allocate_action_id(surface, venue_local_id, wallet, staged_at_ms)
-            .map_err(|e| e.to_string())
+        self.operations
+            .allocate(surface, venue_local_id, wallet, staged_at_ms)
     }
 
     fn stage_action(
@@ -276,13 +278,13 @@ struct DaemonPetalHost {
     http: reqwest::Client,
     audit: Arc<AuditLog>,
     #[cfg(any(test, feature = "local-integration"))]
-    auth_services: AuthServices,
+    auth_services: LegacyAuthority,
     tx_outbox: Option<PetalTxOutbox>,
     tx_stage_lock: tokio::sync::Mutex<()>,
     #[cfg(any(test, feature = "local-integration"))]
     sign_batch_lock: tokio::sync::Mutex<()>,
     #[cfg(any(test, feature = "local-integration"))]
-    petal_action_identities: Mutex<PetalActionIdentityCache>,
+    petal_action_identities: std::sync::Mutex<PetalActionIdentityCache>,
     broker: Option<MachineBrokerClient>,
     #[cfg(feature = "unsafe-debug-signer")]
     unsafe_debug_signer: Option<(String, Arc<PrivateKeySigner>)>,
@@ -292,14 +294,13 @@ struct DaemonPetalHost {
 struct PetalTxOutbox {
     tx_engine: TxEngine,
     chains: ChainRegistry,
-    keystore: Keystore,
     wallet_projections: Arc<dyn WalletProjectionReader>,
     address_book: Arc<AddressBook>,
     write_permit: Option<Arc<HomeWritePermit>>,
 }
 
 impl DaemonPetalHost {
-    fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>, auth_services: AuthServices) -> Self {
+    fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>, auth_services: LegacyAuthority) -> Self {
         #[cfg(not(any(test, feature = "local-integration")))]
         let _ = &auth_services;
         let http = reqwest::Client::builder()
@@ -318,7 +319,7 @@ impl DaemonPetalHost {
             #[cfg(any(test, feature = "local-integration"))]
             sign_batch_lock: tokio::sync::Mutex::new(()),
             #[cfg(any(test, feature = "local-integration"))]
-            petal_action_identities: Mutex::new(PetalActionIdentityCache::default()),
+            petal_action_identities: std::sync::Mutex::new(PetalActionIdentityCache::default()),
             broker: None,
             #[cfg(feature = "unsafe-debug-signer")]
             unsafe_debug_signer: None,
@@ -1363,11 +1364,8 @@ impl PetalHost for DaemonPetalHost {
             .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?
             .parse::<Address>()
             .map_err(|error| HostError::Invalid(format!("wallet address: {error}")))?;
-        let wallet_policy = service
-            .keystore
-            .info(&req.wallet)
-            .map_err(|e| HostError::Invalid(format!("legacy planning policy: {e}")))?
-            .policy;
+        let wallet_policy = bloom_vfs::advisory_evm_policy(&wallet_projection, &req.chain)
+            .map_err(|error| HostError::Invalid(format!("wallet policy: {error}")))?;
         let chain = service
             .chains
             .get(&req.chain)
@@ -1481,10 +1479,15 @@ impl PetalHost for DaemonPetalHost {
                 "outbox entry was not staged by this trusted Petal".into(),
             ));
         }
-        let wallet_info = service
-            .keystore
-            .info(&wallet)
-            .map_err(|e| HostError::Invalid(format!("wallet: {e}")))?;
+        let wallet_id = bloom_triad_protocol::Token::new(wallet.clone())
+            .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?;
+        let wallet_projection = service
+            .wallet_projections
+            .get_wallet(&wallet_id)
+            .await
+            .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?;
+        let wallet_policy = bloom_vfs::advisory_evm_policy(&wallet_projection, &chain_name)
+            .map_err(|error| HostError::Invalid(format!("wallet policy: {error}")))?;
         let chain = service
             .chains
             .get(&chain_name)
@@ -1497,7 +1500,7 @@ impl PetalHost for DaemonPetalHost {
                 &chain_name,
                 &outbox_id,
                 &chain,
-                &wallet_info.policy,
+                &wallet_policy,
                 acknowledge_warnings,
             )
             .await
@@ -1849,8 +1852,8 @@ pub struct Daemon {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
-    pub auth_services: AuthServices,
-    pub signer_cache: Arc<bloom_keystore::petal_host::SignerCache>,
+    pub auth_services: LegacyAuthority,
+    pub signer_cache: Arc<LegacyCache>,
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
@@ -2108,23 +2111,24 @@ impl Daemon {
             }
         };
 
-        // Open auth store early so we can also wire the EVM → central
-        // outbox projection.  Two connections to the same SQLite file:
-        // one for the verifier (owned), one for the projection (behind
-        // a Mutex).
+        // The central outbox's idempotent identity map is Machine state, not
+        // approval state. Keep it in a schema that cannot carry grants,
+        // challenges, credentials, or signing secrets.
+        #[cfg(any(test, feature = "local-integration"))]
         let auth_db_path = home.root().join("auth").join("auth.sqlite");
-        let projection_auth = AuthStore::open(&auth_db_path)
-            .map_err(|e| DaemonError::Audit(format!("auth store (projection): {e}")))?;
+        let operation_index: Arc<dyn OperationIndex> = Arc::new(FileOperationIndex::new(
+            home.root().join("operations/index.json"),
+        ));
         let central = CentralOutbox::new(home.root().join("central_outbox"));
         let projection: Arc<dyn CentralOutboxProjection> =
-            Arc::new(EvmOutboxProjection::new(central, projection_auth));
+            Arc::new(EvmOutboxProjection::new(central, operation_index.clone()));
         let outbox = Outbox::new_with_projection(home.outbox_dir(), projection)
             .map_err(|e| DaemonError::Outbox(e.to_string()))?;
         let mut tx_engine = TxEngine::new(outbox, config.stage_ttl.as_millis());
-        match (&broker, provenance_catalog) {
+        match (&broker, &provenance_catalog) {
             (Some(broker), Some(catalog)) => {
                 tx_engine = tx_engine
-                    .with_triad_signing(broker.clone(), catalog)
+                    .with_triad_signing(broker.clone(), catalog.clone())
                     .map_err(|error| DaemonError::Audit(error.to_string()))?;
             }
             (None, None) => {}
@@ -2135,6 +2139,14 @@ impl Daemon {
                 ));
             }
         }
+        let exact_payload_signer = match (&broker, &provenance_catalog) {
+            (Some(broker), Some(catalog)) => Some(BrokerExactPayloadSigner::new(
+                broker.clone(),
+                catalog.clone(),
+            )),
+            (None, None) => None,
+            _ => unreachable!("Broker/catalog pairing validated above"),
+        };
         #[cfg(feature = "unsafe-debug-signer")]
         if let Some((wallet, signer)) = &unsafe_debug_signer {
             tx_engine = tx_engine.with_unsafe_debug_signer(wallet.clone(), signer.clone());
@@ -2167,64 +2179,53 @@ impl Daemon {
         let audit =
             AuditLog::open(home.audit_path()).map_err(|e| DaemonError::Audit(e.to_string()))?;
         let audit_arc = Arc::new(audit.clone());
-        let auth_store = AuthStore::open(&auth_db_path)
-            .map_err(|e| DaemonError::Audit(format!("auth store: {e}")))?;
-        let auth_verifier = Arc::new(StoreApprovalVerifier::new(
-            auth_store,
-            KeystoreApprovalSignatureVerifier::new(keystore.clone()),
-        ));
-        tx_engine = tx_engine.with_auth_services(auth_verifier.clone(), auth_verifier.clone());
-        let auth_services = AuthServices::new(
-            Some(auth_verifier.clone()),
-            Some(auth_verifier.clone()),
-            Some(auth_verifier.clone()),
-        );
-        // Legacy grant state remains available while the old ceremony
-        // projections are removed. A triad production build must never wire
-        // the keystore-backed, hash-only PetalHost into Machine: payload
-        // signing is exclusively dispatched through `MachineBrokerClient`.
-        let grant_store: Arc<dyn bloom_auth_api::GrantStore> =
-            Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
-        let attestation_registry: Arc<dyn bloom_auth_api::SigningAttestationSchemaRegistry> =
-            Arc::new(bloom_auth_api::DefaultAttestationRegistry::new());
-        let signer_cache = Arc::new(bloom_keystore::petal_host::SignerCache::new());
         #[cfg(any(test, feature = "local-integration"))]
-        let petal_host: Arc<dyn bloom_auth_api::PetalHost> = Arc::new(
-            bloom_keystore::petal_host::KeystorePetalHost::new(
-                Arc::new(keystore.clone()),
-                grant_store.clone(),
-                attestation_registry.clone(),
-                audit_arc.clone(),
-            )
-            .with_signer_cache(signer_cache.clone()),
-        );
-        #[cfg(any(test, feature = "local-integration"))]
-        {
+        let (auth_services, signer_cache) = {
+            let auth_store = AuthStore::open(&auth_db_path)
+                .map_err(|e| DaemonError::Audit(format!("auth store: {e}")))?;
+            let auth_verifier = Arc::new(StoreApprovalVerifier::new(
+                auth_store,
+                KeystoreApprovalSignatureVerifier::new(keystore.clone()),
+            ));
+            tx_engine = tx_engine.with_auth_services(auth_verifier.clone(), auth_verifier.clone());
+            let grant_store: Arc<dyn bloom_auth_api::GrantStore> =
+                Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
+            let attestation_registry: Arc<dyn bloom_auth_api::SigningAttestationSchemaRegistry> =
+                Arc::new(bloom_auth_api::DefaultAttestationRegistry::new());
+            let signer_cache = Arc::new(LegacyCache::new());
+            let petal_host: Arc<dyn bloom_auth_api::PetalHost> = Arc::new(
+                bloom_keystore::petal_host::KeystorePetalHost::new(
+                    Arc::new(keystore.clone()),
+                    grant_store.clone(),
+                    attestation_registry.clone(),
+                    audit_arc.clone(),
+                )
+                .with_signer_cache(signer_cache.clone()),
+            );
             tx_engine =
                 tx_engine.with_host_signing_services(grant_store.clone(), petal_host.clone());
-        }
-
-        // The legacy Machine-owned registration coordinator remains available
-        // only to unit tests while its fixtures are migrated. Production
-        // registration is prepared through Broker and the Machine never owns
-        // the ceremony listener.
-        #[cfg(any(test, feature = "local-integration"))]
-        let registration_coordinator: Arc<
-            dyn bloom_auth_api::WalletRegistrationCoordinator,
-        > = Arc::new(registration::RegistrationCoordinator::new(
-            keystore.clone(),
-            auth_verifier.clone(),
-            audit_arc.clone(),
-            home.keystore_dir(),
-        ));
-
-        let auth_services = auth_services
+            let registration_coordinator: Arc<dyn bloom_auth_api::WalletRegistrationCoordinator> =
+                Arc::new(registration::RegistrationCoordinator::new(
+                    keystore.clone(),
+                    auth_verifier.clone(),
+                    audit_arc.clone(),
+                    home.keystore_dir(),
+                ));
+            let auth_services = LegacyAuthority::new(
+                Some(auth_verifier.clone()),
+                Some(auth_verifier.clone()),
+                Some(auth_verifier),
+            )
             .with_grant_store(grant_store)
-            .with_attestation_registry(attestation_registry);
-        #[cfg(any(test, feature = "local-integration"))]
-        let auth_services = auth_services
+            .with_attestation_registry(attestation_registry)
             .with_petal_host(petal_host)
             .with_registration_coordinator(registration_coordinator);
+            (auth_services, signer_cache)
+        };
+        #[cfg(not(any(test, feature = "local-integration")))]
+        let auth_services: LegacyAuthority = Default::default();
+        #[cfg(not(any(test, feature = "local-integration")))]
+        let signer_cache: Arc<LegacyCache> = Arc::new(Default::default());
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
@@ -2453,7 +2454,6 @@ impl Daemon {
         .with_tx_outbox(PetalTxOutbox {
             tx_engine: tx_engine.clone(),
             chains: chains.clone(),
-            keystore: keystore.clone(),
             wallet_projections: wallet_projections.clone(),
             address_book: address_book_arc.clone(),
             write_permit: home_write_permit.clone(),
@@ -2516,6 +2516,7 @@ impl Daemon {
             let handler = Arc::new(
                 HyperliquidHandler::new(mainnet, testnet, keystore.clone())
                     .with_auth_services(auth_services.clone())
+                    .with_exact_signing(exact_payload_signer.clone(), wallet_projections.clone())
                     .with_store_root(home.root().join("hyperliquid")),
             );
             handler.clone().start_monitoring();
@@ -2552,12 +2553,13 @@ impl Daemon {
             .mount(
                 "requests",
                 Arc::new(
-                    RequestsHandler::new(
+                    RequestsHandler::new_projected(
                         home.root().to_path_buf(),
-                        keystore.clone(),
                         config.default_wallet.clone(),
+                        wallet_projections.clone(),
                     )
-                    .with_auth_services(auth_services.clone())
+                    .with_operation_index(operation_index.clone())
+                    .with_exact_signer(exact_payload_signer.clone())
                     .with_paid_http_rpc_resolver(paid_http_rpc_resolver.clone()),
                 ) as _,
             )
@@ -3312,8 +3314,11 @@ mod tests {
     async fn daemon_petal_host_sign_hash_rejects_calls_without_trusted_petal_context() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host =
-            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            audit,
+            LegacyAuthority::default(),
+        );
         let err = host
             .sign_hash(SignRequest {
                 wallet: "alice".into(),
@@ -3333,8 +3338,11 @@ mod tests {
     fn daemon_petal_host_seals_petal_signing_action_from_trusted_route_context() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host =
-            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            audit,
+            LegacyAuthority::default(),
+        );
         let req = SignRequest {
             wallet: "alice".into(),
             hash32: [7; 32],
@@ -3392,8 +3400,11 @@ mod tests {
     fn petal_signing_identity_is_stable_until_expiry() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host =
-            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            audit,
+            LegacyAuthority::default(),
+        );
         let req = SignRequest {
             wallet: "alice".into(),
             hash32: [7; 32],
@@ -3440,8 +3451,11 @@ mod tests {
     fn petal_signing_identity_binds_the_complete_request_scope() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host =
-            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            audit,
+            LegacyAuthority::default(),
+        );
         let req = SignRequest {
             wallet: "alice".into(),
             hash32: [7; 32],
@@ -3483,8 +3497,11 @@ mod tests {
     fn daemon_petal_host_seals_exact_ordered_hardened_signing_batch() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host =
-            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            audit,
+            LegacyAuthority::default(),
+        );
         let context = PetalRouteContext {
             petal_root: "polymarket".into(),
             package_hash: "b".repeat(64),
@@ -3546,8 +3563,11 @@ mod tests {
     fn invalid_signing_batches_cannot_consume_identity_capacity() {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let host =
-            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit, AuthServices::default());
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            audit,
+            LegacyAuthority::default(),
+        );
         let context = PetalRouteContext {
             petal_root: "example".into(),
             package_hash: "b".repeat(64),
@@ -3639,7 +3659,6 @@ mod tests {
         .with_tx_outbox(PetalTxOutbox {
             tx_engine: daemon.tx_engine.clone(),
             chains: daemon.chains.clone(),
-            keystore: daemon.keystore.clone(),
             wallet_projections: daemon.wallet_projections.clone(),
             address_book: daemon.address_book.clone(),
             write_permit: daemon.home_write_permit.clone(),

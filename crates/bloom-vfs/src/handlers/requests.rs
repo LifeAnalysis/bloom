@@ -8,19 +8,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+#[cfg(test)]
 use base64::Engine as _;
+#[cfg(test)]
 use base64::engine::general_purpose::STANDARD as B64_STD;
+#[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use bloom_auth_api::{
-    ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms,
-    ExecutorKind, PolicyCheckClass, PolicyCheckResult, SealedAction, SealedApprovalGrant,
-    SignedApproval, petal_identity,
-};
 #[cfg(test)]
 use bloom_auth_api::{
-    PetalHost, SIGNING_ATTESTATION_SCHEMA_V1, SignHashRequest, SigningAttestation,
+    ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms,
+    ExecutorKind, PetalHost, PolicyCheckClass, PolicyCheckResult, SIGNING_ATTESTATION_SCHEMA_V1,
+    SealedAction, SealedApprovalGrant, SignHashRequest, SignedApproval, SigningAttestation,
+    petal_identity,
 };
+#[cfg(test)]
 use bloom_keystore::Keystore;
+#[cfg(not(test))]
+use bloom_machine_client::WalletProjectionReader;
 use bloom_paid_http::{
     EmptyPaidHttpChainRpcResolver, NormalizedChallenge, PaidHttpChainRpcResolver,
     PaidHttpHostSigner, PaidHttpSigningFacts, ParsedRequest, PaymentRequirement, PolicyCheck,
@@ -40,6 +44,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
+use crate::BrokerExactPayloadSigner;
+#[cfg(not(test))]
+use crate::ExactPayloadOutcome;
+#[cfg(not(test))]
+use crate::FileOperationIndex;
+use crate::OperationIndex;
+#[cfg(test)]
 use crate::auth::AuthServices;
 use crate::handler::{
     Entry, EntryKind, Handler, HandlerError, entry_for_fs_path, entry_from_fs_dir_entry,
@@ -47,42 +58,105 @@ use crate::handler::{
 };
 use crate::path::VfsPath;
 
+#[cfg(test)]
 const APPROVAL_FILE: &str = "approval.json";
 const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
+#[cfg(test)]
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 const PAID_HTTP_X402_SIGN_INTENT: &str = "x402.sign";
 const PAID_HTTP_MPP_SIGN_INTENT: &str = "paid-http.mpp.sign";
 
+#[cfg(test)]
+struct VenueLocalTestOperationIndex;
+
+#[cfg(test)]
+impl OperationIndex for VenueLocalTestOperationIndex {
+    fn allocate(
+        &self,
+        _surface: &str,
+        venue_local_id: &str,
+        _wallet: &str,
+        _created_ms: u64,
+    ) -> Result<String, String> {
+        Ok(venue_local_id.to_owned())
+    }
+}
+
 #[derive(Clone)]
 pub struct RequestsHandler {
     root: PathBuf,
+    #[cfg(test)]
     keystore: Keystore,
     default_wallet: Option<String>,
     client: reqwest::Client,
     x402_signer: Arc<dyn X402PaymentSigner>,
     paid_http_rpc_resolver: Arc<dyn PaidHttpChainRpcResolver>,
+    #[cfg(test)]
     auth_services: AuthServices,
+    operation_index: Arc<dyn OperationIndex>,
+    #[cfg(not(test))]
+    wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
+    exact_signer: Option<BrokerExactPayloadSigner>,
 }
 
 impl RequestsHandler {
+    #[cfg(test)]
     pub fn new(
         root: impl Into<PathBuf>,
         keystore: Keystore,
         default_wallet: Option<String>,
     ) -> Self {
+        let root = root.into();
+        #[cfg(not(test))]
+        let operation_index: Arc<dyn OperationIndex> =
+            Arc::new(FileOperationIndex::new(root.join("operations/index.json")));
+        #[cfg(test)]
+        let operation_index: Arc<dyn OperationIndex> = Arc::new(VenueLocalTestOperationIndex);
         Self {
-            root: root.into(),
+            operation_index,
+            root,
             keystore: keystore.clone(),
             default_wallet,
             client: reqwest::Client::new(),
             x402_signer: Arc::new(HostX402PaymentSigner::new()),
             paid_http_rpc_resolver: Arc::new(EmptyPaidHttpChainRpcResolver),
-            auth_services: AuthServices::default(),
+            auth_services: Default::default(),
+            exact_signer: None,
         }
     }
 
+    #[cfg(not(test))]
+    pub fn new_projected(
+        root: impl Into<PathBuf>,
+        default_wallet: Option<String>,
+        wallet_projections: Arc<dyn WalletProjectionReader>,
+    ) -> Self {
+        let root = root.into();
+        Self {
+            operation_index: Arc::new(FileOperationIndex::new(root.join("operations/index.json"))),
+            root,
+            default_wallet,
+            client: reqwest::Client::new(),
+            x402_signer: Arc::new(HostX402PaymentSigner::new()),
+            paid_http_rpc_resolver: Arc::new(EmptyPaidHttpChainRpcResolver),
+            wallet_projections: Some(wallet_projections),
+            exact_signer: None,
+        }
+    }
+
+    #[cfg(test)]
     pub fn with_auth_services(mut self, auth_services: AuthServices) -> Self {
         self.auth_services = auth_services;
+        self
+    }
+
+    pub fn with_operation_index(mut self, operation_index: Arc<dyn OperationIndex>) -> Self {
+        self.operation_index = operation_index;
+        self
+    }
+
+    pub fn with_exact_signer(mut self, signer: Option<BrokerExactPayloadSigner>) -> Self {
+        self.exact_signer = signer;
         self
     }
 
@@ -159,7 +233,7 @@ impl RequestsHandler {
             .map_err(|_| HandlerError::invalid("request input must be UTF-8"))?;
         let request = parse_request(text).map_err(HandlerError::invalid)?;
         let id = new_request_id();
-        let wallet = match self.select_wallet(request.wallet.as_deref()) {
+        let wallet = match self.select_wallet(request.wallet.as_deref()).await {
             Ok(wallet) => wallet,
             Err(err) => {
                 self.write_failed_request(&id, &request, "", &err.to_string())?;
@@ -199,7 +273,7 @@ impl RequestsHandler {
 
         if status == 402 {
             let challenge = normalize_challenge(&headers, &body, &request.url);
-            let policy = self.wallet_policy(&wallet)?;
+            let policy = self.wallet_policy(&wallet).await?;
             let spent_24h_usd = self.sum_paid_usd_last_24h(&wallet)?;
             let policy_requirement = select_payment_requirement(&challenge, &policy, &host)
                 .or_else(|| challenge.accepts.first().cloned())
@@ -318,49 +392,140 @@ impl RequestsHandler {
         }
     }
 
-    fn select_wallet(&self, explicit: Option<&str>) -> Result<String, HandlerError> {
-        if let Some(w) = explicit.filter(|s| !s.trim().is_empty()) {
-            self.keystore
-                .info(w)
-                .map_err(|e| HandlerError::invalid(e.to_string()))?;
-            return Ok(w.to_string());
-        }
-        if let Some(w) = self
-            .default_wallet
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
+    async fn select_wallet(&self, explicit: Option<&str>) -> Result<String, HandlerError> {
+        #[cfg(test)]
         {
-            self.keystore.info(w).map_err(|e| {
-                HandlerError::invalid(format!(
-                    "configured default_wallet '{w}' is not usable: {e}"
-                ))
-            })?;
-            return Ok(w.to_string());
+            if let Some(w) = explicit.filter(|s| !s.trim().is_empty()) {
+                self.keystore
+                    .info(w)
+                    .map_err(|e| HandlerError::invalid(e.to_string()))?;
+                return Ok(w.to_string());
+            }
+            if let Some(w) = self
+                .default_wallet
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+            {
+                self.keystore.info(w).map_err(|e| {
+                    HandlerError::invalid(format!(
+                        "configured default_wallet '{w}' is not usable: {e}"
+                    ))
+                })?;
+                return Ok(w.to_string());
+            }
+            let wallets = self
+                .keystore
+                .list()
+                .map_err(|e| HandlerError::backend(e.to_string()))?;
+            return match wallets.as_slice() {
+                [only] => Ok(only.name.clone()),
+                [] => Err(HandlerError::invalid(
+                    "No wallet specified and no wallets are available. Create a wallet or set wallet = \"<name>\" in the request.",
+                )),
+                many => Err(HandlerError::invalid(format!(
+                    "No wallet specified and multiple wallets are available. Set wallet = \"<name>\" in the request or configure default_wallet. Available wallets: {}",
+                    many.iter()
+                        .map(|w| w.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))),
+            };
         }
-        let wallets = self
-            .keystore
-            .list()
-            .map_err(|e| HandlerError::backend(e.to_string()))?;
-        match wallets.as_slice() {
-            [only] => Ok(only.name.clone()),
-            [] => Err(HandlerError::invalid(
-                "No wallet specified and no wallets are available. Create a wallet or set wallet = \"<name>\" in the request.",
-            )),
-            many => Err(HandlerError::invalid(format!(
-                "No wallet specified and multiple wallets are available. Set wallet = \"<name>\" in the request or configure default_wallet. Available wallets: {}",
-                many.iter()
-                    .map(|w| w.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))),
+        #[cfg(not(test))]
+        {
+            let projections = self.wallet_projections.as_ref().ok_or_else(|| {
+                HandlerError::backend("SERVICE_UNAVAILABLE: wallet projections are not configured")
+            })?;
+            if let Some(wallet) = explicit.filter(|value| !value.trim().is_empty()).or(self
+                .default_wallet
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()))
+            {
+                let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+                    .map_err(|error| HandlerError::invalid(error.to_string()))?;
+                projections
+                    .get_wallet(&wallet_id)
+                    .await
+                    .map_err(|error| HandlerError::backend(error.to_string()))?;
+                return Ok(wallet.to_owned());
+            }
+            let wallets = projections
+                .list_wallets()
+                .await
+                .map_err(|error| HandlerError::backend(error.to_string()))?;
+            match wallets.as_slice() {
+                [only] => Ok(only.wallet.wallet_id.as_str().to_owned()),
+                [] => Err(HandlerError::invalid(
+                    "No wallet specified and no projected wallets are available. Create a wallet or set wallet = \"<name>\" in the request.",
+                )),
+                many => Err(HandlerError::invalid(format!(
+                    "No wallet specified and multiple projected wallets are available. Set wallet = \"<name>\" in the request or configure default_wallet. Available wallets: {}",
+                    many.iter()
+                        .map(|projection| projection.wallet.wallet_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))),
+            }
         }
     }
 
-    fn wallet_policy(&self, wallet: &str) -> Result<Policy, HandlerError> {
-        self.keystore
-            .info(wallet)
-            .map(|i| i.policy)
-            .map_err(|e| HandlerError::backend(e.to_string()))
+    async fn wallet_policy(&self, wallet: &str) -> Result<Policy, HandlerError> {
+        #[cfg(test)]
+        {
+            self.keystore
+                .info(wallet)
+                .map(|i| i.policy)
+                .map_err(|e| HandlerError::backend(e.to_string()))
+        }
+        #[cfg(not(test))]
+        {
+            let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+                .map_err(|error| HandlerError::invalid(error.to_string()))?;
+            let projection = self
+                .wallet_projections
+                .as_ref()
+                .ok_or_else(|| {
+                    HandlerError::backend(
+                        "SERVICE_UNAVAILABLE: wallet projections are not configured",
+                    )
+                })?
+                .get_wallet(&wallet_id)
+                .await
+                .map_err(|error| HandlerError::backend(error.to_string()))?;
+            crate::advisory_paid_http_policy(&projection).map_err(HandlerError::backend)
+        }
+    }
+
+    async fn wallet_address(
+        &self,
+        wallet: &str,
+    ) -> Result<alloy::primitives::Address, HandlerError> {
+        #[cfg(test)]
+        {
+            self.keystore
+                .info(wallet)
+                .map(|info| info.address)
+                .map_err(|error| HandlerError::backend(error.to_string()))
+        }
+        #[cfg(not(test))]
+        {
+            let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+                .map_err(|error| HandlerError::invalid(error.to_string()))?;
+            self.wallet_projections
+                .as_ref()
+                .ok_or_else(|| {
+                    HandlerError::backend(
+                        "SERVICE_UNAVAILABLE: wallet projections are not configured",
+                    )
+                })?
+                .get_wallet(&wallet_id)
+                .await
+                .map_err(|error| HandlerError::backend(error.to_string()))?
+                .primary_address()
+                .map_err(|error| HandlerError::backend(error.to_string()))?
+                .parse()
+                .map_err(|error| HandlerError::invalid(format!("wallet address: {error}")))
+        }
     }
 
     fn sum_paid_usd_last_24h(&self, wallet: &str) -> Result<f64, HandlerError> {
@@ -443,30 +608,64 @@ impl RequestsHandler {
         &self,
         subject: PaidHttpAuthSubject<'_>,
     ) -> Result<String, HandlerError> {
-        let Some(writer) = self.auth_services.writer() else {
-            return Ok(subject.id.to_string());
-        };
-        let action_id = writer
-            .allocate_action_id("requests", subject.id, subject.wallet, now_ms())
-            .await
+        let action_id = self
+            .operation_index
+            .allocate("requests", subject.id, subject.wallet, now_ms())
             .map_err(|e| HandlerError::backend(format!("allocate paid-http action id: {e}")))?;
-        let envelope = paid_http_canonical_envelope(subject, &action_id)?;
-        let action = paid_http_sealed_action(envelope, subject, now_ms())?;
-        let staged = writer
-            .stage_action(action, now_ms())
-            .await
-            .map_err(|e| HandlerError::backend(format!("stage paid-http sealed action: {e}")))?;
-        fs::write(
-            self.req_dir("pending", subject.id).join("intent_hash"),
-            format!("{}\n", staged.intent_hash),
-        )?;
-        fs::write(
-            self.req_dir("pending", subject.id).join("action_id"),
-            format!("{action_id}\n"),
-        )?;
-        Ok(action_id)
+        #[cfg(not(test))]
+        {
+            let subject_value = paid_http_sealed_subject(subject);
+            let policy_bytes = serde_jcs::to_vec(subject.policy)
+                .map_err(|error| HandlerError::backend(error.to_string()))?;
+            let snapshot = MachinePaidHttpExecutionSnapshot {
+                schema: "bloom.machine_paid_http_execution.v1".into(),
+                action_id: action_id.clone(),
+                wallet: subject.wallet.to_owned(),
+                subject: subject_value,
+                policy: subject.policy.clone(),
+                policy_snapshot_digest: bloom_tools::sha256_hex(&policy_bytes),
+            };
+            write_json(
+                self.req_dir("pending", subject.id)
+                    .join("private/execution.json"),
+                &snapshot,
+            )?;
+        }
+        #[cfg(not(test))]
+        {
+            fs::write(
+                self.req_dir("pending", subject.id).join("action_id"),
+                format!("{action_id}\n"),
+            )?;
+            return Ok(action_id);
+        }
+        #[cfg(test)]
+        {
+            let Some(writer) = self.auth_services.writer() else {
+                fs::write(
+                    self.req_dir("pending", subject.id).join("action_id"),
+                    format!("{action_id}\n"),
+                )?;
+                return Ok(action_id);
+            };
+            let envelope = paid_http_canonical_envelope(subject, &action_id)?;
+            let action = paid_http_sealed_action(envelope, subject, now_ms())?;
+            let staged = writer.stage_action(action, now_ms()).await.map_err(|e| {
+                HandlerError::backend(format!("stage paid-http sealed action: {e}"))
+            })?;
+            fs::write(
+                self.req_dir("pending", subject.id).join("intent_hash"),
+                format!("{}\n", staged.intent_hash),
+            )?;
+            fs::write(
+                self.req_dir("pending", subject.id).join("action_id"),
+                format!("{action_id}\n"),
+            )?;
+            Ok(action_id)
+        }
     }
 
+    #[cfg(test)]
     async fn ensure_sealed_confirm_approval(
         &self,
         pending: &Path,
@@ -501,6 +700,21 @@ impl RequestsHandler {
         Err(HandlerError::PermissionDenied)
     }
 
+    #[cfg(not(test))]
+    async fn ensure_sealed_confirm_approval(
+        &self,
+        _pending: &Path,
+        _id: &str,
+    ) -> Result<(), HandlerError> {
+        if self.exact_signer.is_none() {
+            return Err(HandlerError::Unsupported(
+                "request confirm requires Broker exact signing".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn active_paid_http_grant(
         &self,
         request_id: &str,
@@ -527,6 +741,7 @@ impl RequestsHandler {
             .map_err(|e| HandlerError::backend(format!("lookup paid-http grant: {e}")))
     }
 
+    #[cfg(test)]
     async fn sealed_execution_inputs(
         &self,
         pending: &Path,
@@ -594,22 +809,60 @@ impl RequestsHandler {
         })
     }
 
+    #[cfg(not(test))]
+    async fn sealed_execution_inputs(
+        &self,
+        pending: &Path,
+        request_id: &str,
+    ) -> Result<PaidHttpExecutionInputs, HandlerError> {
+        let snapshot: MachinePaidHttpExecutionSnapshot =
+            read_json(pending.join("private/execution.json"))?;
+        if snapshot.schema != "bloom.machine_paid_http_execution.v1"
+            || snapshot.action_id != self.request_action_id(request_id).await?
+        {
+            return Err(HandlerError::invalid(
+                "paid-http execution snapshot identity is invalid; re-stage the request",
+            ));
+        }
+        snapshot
+            .subject
+            .validate_basic(request_id, &snapshot.wallet)?;
+        validate_pending_projection_matches_subject(pending, &snapshot.subject)?;
+        let mut request = snapshot.subject.to_request(&snapshot.wallet)?;
+        if let Some(body_sha256) = snapshot.subject.body_sha256.as_deref() {
+            let body = fs::read_to_string(pending.join("private/request_body"))?;
+            if bloom_tools::sha256_hex(body.as_bytes()) != body_sha256 {
+                return Err(HandlerError::invalid(
+                    "private/request_body does not match the staged request body hash",
+                ));
+            }
+            request.body = Some(body);
+        }
+        Ok(PaidHttpExecutionInputs {
+            request,
+            host: snapshot.subject.host,
+            challenge: snapshot.subject.challenge,
+            requirement: snapshot.subject.selected_requirement,
+            checks: snapshot.subject.policy_checks,
+            dry_run: snapshot.subject.dry_run,
+            policy: snapshot.policy,
+            policy_snapshot_digest: snapshot.policy_snapshot_digest,
+        })
+    }
+
     async fn request_action_id(&self, request_id: &str) -> Result<String, HandlerError> {
-        let Some(writer) = self.auth_services.writer() else {
-            return Ok(request_id.to_string());
-        };
         let pending = self.req_dir("pending", request_id);
         let request = parsed_request_from_dir(&pending)?;
         let wallet = request
             .wallet
             .as_deref()
             .ok_or_else(|| HandlerError::backend("request.toml missing wallet"))?;
-        writer
-            .allocate_action_id("requests", request_id, wallet, now_ms())
-            .await
+        self.operation_index
+            .allocate("requests", request_id, wallet, now_ms())
             .map_err(|e| HandlerError::backend(format!("lookup paid-http action id: {e}")))
     }
 
+    #[cfg(test)]
     async fn consume_paid_http_grant(
         &self,
         request_id: &str,
@@ -646,8 +899,15 @@ impl RequestsHandler {
     fn paid_http_host_signer(&self, wallet: &str, action_id: &str) -> Arc<dyn PaidHttpHostSigner> {
         #[cfg(not(test))]
         {
-            let _ = (wallet, action_id);
-            Arc::new(UnwiredPaidHttpHostSigner)
+            match &self.exact_signer {
+                Some(signer) => Arc::new(BrokerPaidHttpHostSigner {
+                    signer: signer.clone(),
+                    wallet: wallet.to_owned(),
+                    action_id: action_id.to_owned(),
+                    requests_root: self.requests_root(),
+                }),
+                None => Arc::new(UnwiredPaidHttpHostSigner),
+            }
         }
         #[cfg(test)]
         match self.auth_services.petal_host() {
@@ -660,6 +920,7 @@ impl RequestsHandler {
         }
     }
 
+    #[cfg(test)]
     async fn issue_sealed_confirm_challenge(
         &self,
         id: &str,
@@ -715,7 +976,7 @@ impl RequestsHandler {
         let host = sealed_inputs.host;
         let mut challenge = sealed_inputs.challenge;
         validate_session_state_target(&challenge, id)?;
-        let live_policy = self.wallet_policy(&wallet)?;
+        let live_policy = self.wallet_policy(&wallet).await?;
         let policy = sealed_inputs.policy;
         let sentinel = policy.override_sentinel().to_ascii_lowercase();
         if !matches!(value.as_str(), "y" | "yes" | "confirm") && value != sentinel.as_str() {
@@ -763,11 +1024,7 @@ impl RequestsHandler {
             checks.extend(live_checks.into_iter().filter(|c| c.result == "deny"));
             self.ensure_sealed_confirm_approval(&pending, id).await?;
             let action_id = self.request_action_id(id).await?;
-            let wallet_address = self
-                .keystore
-                .info(&wallet)
-                .map_err(|e| HandlerError::backend(format!("wallet address unavailable: {e}")))?
-                .address;
+            let wallet_address = self.wallet_address(&wallet).await?;
             let policy_snapshot_digest = Some(sealed_inputs.policy_snapshot_digest.clone());
             let mut requirement = sealed_inputs.requirement.clone();
             if requirement.resource.is_none() {
@@ -788,6 +1045,7 @@ impl RequestsHandler {
                 wallet_address,
                 host_signer,
                 facts,
+                draft_path: Some(pending.join("private/mpp-unsigned-draft")),
             };
             let result = confirm_with_backend(
                 &self.root,
@@ -856,11 +1114,7 @@ impl RequestsHandler {
         // one signature allowance is consumed atomically inside host signing;
         // there is no separate bookkeeping consume around a direct signature.
         let action_id = self.request_action_id(id).await?;
-        let wallet_address = self
-            .keystore
-            .info(&wallet)
-            .map_err(|e| HandlerError::backend(format!("wallet address unavailable: {e}")))?
-            .address;
+        let wallet_address = self.wallet_address(&wallet).await?;
         let policy_snapshot_digest = Some(sealed_inputs.policy_snapshot_digest);
         let host_signer = self.paid_http_host_signer(&wallet, &action_id);
         let facts = paid_http_x402_facts(
@@ -883,6 +1137,7 @@ impl RequestsHandler {
                 wallet_address,
                 host_signer: &host_signer,
                 facts: &facts,
+                draft_path: &pending.join("private/x402-unsigned-draft"),
             })
             .await
             .map_err(HandlerError::backend)?;
@@ -946,6 +1201,20 @@ struct PaidHttpPetalHostSigner {
 #[async_trait]
 #[cfg(test)]
 impl PaidHttpHostSigner for PaidHttpPetalHostSigner {
+    async fn sign_paid_http_payload(
+        &self,
+        intent: &str,
+        _signing_slot: &str,
+        preimage: &[u8],
+        signing_hash: [u8; 32],
+        facts: &PaidHttpSigningFacts,
+    ) -> Result<[u8; 65], String> {
+        if alloy::primitives::keccak256(preimage).as_slice() != signing_hash {
+            return Err("paid-http exact preimage does not match signing hash".into());
+        }
+        self.sign_paid_http_hash(intent, signing_hash, facts).await
+    }
+
     async fn sign_paid_http_hash(
         &self,
         intent: &str,
@@ -983,6 +1252,17 @@ struct UnwiredPaidHttpHostSigner;
 
 #[async_trait]
 impl PaidHttpHostSigner for UnwiredPaidHttpHostSigner {
+    async fn sign_paid_http_payload(
+        &self,
+        _intent: &str,
+        _signing_slot: &str,
+        _preimage: &[u8],
+        _signing_hash: [u8; 32],
+        _facts: &PaidHttpSigningFacts,
+    ) -> Result<[u8; 65], String> {
+        Err("Broker exact paid-http signing is unavailable".to_string())
+    }
+
     async fn sign_paid_http_hash(
         &self,
         _intent: &str,
@@ -994,6 +1274,96 @@ impl PaidHttpHostSigner for UnwiredPaidHttpHostSigner {
              payload-bearing Machine-to-Broker signing protocol"
                 .to_string(),
         )
+    }
+}
+
+#[cfg(not(test))]
+struct BrokerPaidHttpHostSigner {
+    signer: BrokerExactPayloadSigner,
+    wallet: String,
+    action_id: String,
+    requests_root: PathBuf,
+}
+
+#[async_trait]
+#[cfg(not(test))]
+impl PaidHttpHostSigner for BrokerPaidHttpHostSigner {
+    async fn sign_paid_http_payload(
+        &self,
+        intent: &str,
+        signing_slot: &str,
+        preimage: &[u8],
+        signing_hash: [u8; 32],
+        facts: &PaidHttpSigningFacts,
+    ) -> Result<[u8; 65], String> {
+        let operation_class = match intent {
+            PAID_HTTP_X402_SIGN_INTENT => "paid-http.x402",
+            PAID_HTTP_MPP_SIGN_INTENT => "paid-http.mpp",
+            _ => return Err(format!("unsupported paid-http signing intent {intent}")),
+        };
+        let request_id = safe_fs_component(&facts.request_id, "paid-http request id")
+            .map_err(|error| error.to_string())?;
+        let request_dir = self.requests_root.join("pending").join(request_id);
+        let signing_slot = safe_fs_component(signing_slot, "paid-http signing slot")
+            .map_err(|error| error.to_string())?;
+        let state_path = request_dir
+            .join("private/exact-signing")
+            .join(format!("{signing_slot}.json"));
+        let signing_action_id = format!("{}-{signing_slot}", self.action_id);
+        let facts_json = serde_json::to_value(facts).map_err(|error| error.to_string())?;
+        match self
+            .signer
+            .sign_or_prepare(
+                &state_path,
+                &signing_action_id,
+                &self.wallet,
+                operation_class,
+                preimage,
+                bloom_triad_protocol::Digest32::from_bytes(signing_hash),
+                &facts_json,
+            )
+            .await?
+        {
+            ExactPayloadOutcome::ApprovalRequired {
+                approval_id,
+                ceremony_url,
+                ceremony_expires_at_ms,
+            } => {
+                let challenge = json!({
+                    "schema": "bloom.broker_approval_challenge.v1",
+                    "action_id": signing_action_id,
+                    "wallet": self.wallet,
+                    "approval_id": approval_id,
+                    "ceremony_url": ceremony_url,
+                    "expiry_ms": ceremony_expires_at_ms,
+                });
+                fs::write(
+                    request_dir.join(APPROVAL_CHALLENGE_FILE),
+                    serde_json::to_vec_pretty(&challenge).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                Err("paid-http Broker approval required".into())
+            }
+            ExactPayloadOutcome::Signed(raw) => {
+                let signature = <[u8; 65]>::try_from(raw.as_slice()).map_err(|_| {
+                    format!(
+                        "Broker paid-http signature is {} bytes, expected 65",
+                        raw.len()
+                    )
+                })?;
+                let _ = fs::remove_file(request_dir.join(APPROVAL_CHALLENGE_FILE));
+                Ok(signature)
+            }
+        }
+    }
+
+    async fn sign_paid_http_hash(
+        &self,
+        _intent: &str,
+        _signing_hash: [u8; 32],
+        _facts: &PaidHttpSigningFacts,
+    ) -> Result<[u8; 65], String> {
+        Err("legacy hash-only paid-http signing is disabled".into())
     }
 }
 
@@ -1420,6 +1790,7 @@ struct ConfirmResult {
 
 #[derive(Default)]
 struct ConfirmBackendOptions<'a> {
+    #[cfg(test)]
     grant_consumer: Option<(&'a RequestsHandler, &'a str, &'a str)>,
     policy_override: Option<&'a Policy>,
     checks_override: Option<Vec<PolicyCheck>>,
@@ -1538,6 +1909,7 @@ async fn confirm_with_backend(
         .prepare(&challenge, &request, &wallet, policy, id)
         .await
         .map_err(HandlerError::backend)?;
+    #[cfg(test)]
     if let Some((handler, grant_wallet, sign_intent)) = options.grant_consumer {
         let _grant = handler
             .consume_paid_http_grant(id, grant_wallet, sign_intent)
@@ -1669,6 +2041,7 @@ fn validate_pending_projection_matches_subject(
     Ok(())
 }
 
+#[cfg(test)]
 fn policy_from_paid_http_snapshot(snapshot: &bloom_auth_api::PetalPolicySnapshot) -> Policy {
     let mut policy = Policy::default();
     policy.payments.enabled = true;
@@ -1691,6 +2064,7 @@ fn policy_from_paid_http_snapshot(snapshot: &bloom_auth_api::PetalPolicySnapshot
     policy
 }
 
+#[cfg(test)]
 fn snapshot_f64(snapshot: &bloom_auth_api::PetalPolicySnapshot, key: &str) -> Option<f64> {
     snapshot.caps.get(key).and_then(json_number)
 }
@@ -2218,6 +2592,17 @@ struct PaidHttpExecutionInputs {
     policy_snapshot_digest: String,
 }
 
+#[cfg(not(test))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MachinePaidHttpExecutionSnapshot {
+    schema: String,
+    action_id: String,
+    wallet: String,
+    subject: PaidHttpSealedSubject,
+    policy: Policy,
+    policy_snapshot_digest: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PaidHttpSealedSubject {
     schema: String,
@@ -2286,6 +2671,7 @@ struct PaidHttpAuthSubject<'a> {
     dry_run: bool,
 }
 
+#[cfg(test)]
 fn paid_http_canonical_envelope(
     input: PaidHttpAuthSubject<'_>,
     action_id: &str,
@@ -2297,7 +2683,33 @@ fn paid_http_canonical_envelope(
         .or(input.challenge.network.as_deref())
         .unwrap_or("unknown")
         .to_string();
-    let subject = serde_json::to_vec(&PaidHttpSealedSubject {
+    let subject = serde_json::to_vec(&paid_http_sealed_subject(input))
+        .map_err(|e| HandlerError::backend(e.to_string()))?;
+    Ok(CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
+            wallet: input.wallet.to_string(),
+            surface: "requests".into(),
+            action_id: action_id.to_string(),
+            petal_id: petal_identity::PETAL_ID_PAID_HTTP.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
+            network,
+            account: "default".into(),
+            action_kind: "paid_http_confirm".into(),
+            value_movement: true,
+            authority_change: false,
+            expires_ms: 0,
+        },
+        "paid_http",
+        "bloom.paid_http_subject.v1",
+        subject,
+    ))
+}
+
+fn paid_http_sealed_subject(input: PaidHttpAuthSubject<'_>) -> PaidHttpSealedSubject {
+    PaidHttpSealedSubject {
         schema: "bloom.paid_http_subject.v1".into(),
         request_id: input.id.to_string(),
         method: input.request.method.clone(),
@@ -2314,34 +2726,10 @@ fn paid_http_canonical_envelope(
         selected_requirement: input.requirement.clone(),
         policy_checks: input.checks.to_vec(),
         dry_run: input.dry_run,
-    })
-    .map_err(|e| HandlerError::backend(e.to_string()))?;
-    Ok(CanonicalEnvelope::new(
-        CanonicalIntentHeader {
-            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
-            wallet: input.wallet.to_string(),
-            surface: "requests".into(),
-            action_id: action_id.to_string(),
-            petal_id: petal_identity::PETAL_ID_PAID_HTTP.into(),
-            petal_digest: petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP.into(),
-            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
-            executor_kind: ExecutorKind::FirstParty,
-            network,
-            account: "default".into(),
-            action_kind: "paid_http_confirm".into(),
-            value_movement: true,
-            authority_change: false,
-            // Must stay deterministic if the same request is re-sealed.
-            // TODO(ws-G): commit a real confirm expiry when paid-http staging
-            // computes venue terms.
-            expires_ms: 0,
-        },
-        "paid_http",
-        "bloom.paid_http_subject.v1",
-        subject,
-    ))
+    }
 }
 
+#[cfg(test)]
 fn paid_http_sealed_action(
     envelope: CanonicalEnvelope,
     input: PaidHttpAuthSubject<'_>,
@@ -2486,6 +2874,7 @@ fn paid_http_sealed_action(
     .map_err(|e| HandlerError::backend(format!("seal paid-http action: {e}")))
 }
 
+#[cfg(test)]
 fn paid_http_sign_intent(challenge: &NormalizedChallenge) -> &'static str {
     if challenge.protocol == "mpp" {
         PAID_HTTP_MPP_SIGN_INTENT
@@ -3131,6 +3520,7 @@ mod tests {
         assert_eq!(
             handler
                 .wallet_policy("alice")
+                .await
                 .unwrap()
                 .payments
                 .http
@@ -5237,51 +5627,11 @@ inline = '{"prompt":"hi"}'
         );
     }
 
-    struct FixedTempoRpcResolver;
-
-    impl PaidHttpChainRpcResolver for FixedTempoRpcResolver {
-        fn http_rpc_urls_for_chain_id(&self, chain_id: u64) -> Vec<String> {
-            if chain_id == 42431 {
-                vec!["https://rpc.example.com".into()]
-            } else {
-                Vec::new()
-            }
-        }
-    }
-
-    fn zero_amount_tempo_charge_challenge() -> NormalizedChallenge {
-        let request = mpp::Base64UrlJson::from_value(&json!({
-            "amount": "0",
-            "currency": "0x20c0000000000000000000000000000000000000",
-            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
-            "methodDetails": { "chainId": 42431 }
-        }))
-        .unwrap();
-        let challenge = mpp::PaymentChallenge::new(
-            "challenge-mpp-host",
-            "merchant.test",
-            "tempo",
-            "charge",
-            request,
-        );
-        let header = mpp::format_www_authenticate(&challenge).unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            reqwest::header::WWW_AUTHENTICATE,
-            HeaderValue::from_str(&header).unwrap(),
-        );
-        normalize_challenge(
-            &headers,
-            b"",
-            &Url::parse("https://merchant.test/pay").unwrap(),
-        )
-    }
-
     #[tokio::test]
     async fn mpp_host_signing_is_grant_gated_and_consumes_one_allowance() {
         use bloom_auth_api::GrantStore as _;
         let dir = tempfile::tempdir().unwrap();
-        let (petal_host, grant_store, address) = wired_petal_host(dir.path());
+        let (petal_host, grant_store, _address) = wired_petal_host(dir.path());
         let now = now_ms();
         let action =
             paid_http_test_sealed_action("alice", "act-mpp", &[PAID_HTTP_MPP_SIGN_INTENT], 1, now);
@@ -5290,31 +5640,25 @@ inline = '{"prompt":"hi"}'
             wallet: "alice".into(),
             action_id: "act-mpp".into(),
         });
-        let backend = RealMppBackend::new(
-            reqwest::Client::new(),
-            Arc::new(FixedTempoRpcResolver),
-            address,
-            host_signer,
-            PaidHttpSigningFacts {
-                protocol: "mpp".into(),
-                request_id: "req_mpp_host".into(),
-                method: "GET".into(),
-                url: "https://merchant.test/pay".into(),
-                host: "merchant.test".into(),
-                policy_snapshot_digest: Some(action.petal_policy_digest.clone()),
-                ..Default::default()
-            },
-        );
-        let challenge = zero_amount_tempo_charge_challenge();
-        let request = parse_request("GET https://merchant.test/pay wallet=alice").unwrap();
+        let facts = PaidHttpSigningFacts {
+            protocol: "mpp".into(),
+            request_id: "req_mpp_host".into(),
+            method: "GET".into(),
+            url: "https://merchant.test/pay".into(),
+            host: "merchant.test".into(),
+            policy_snapshot_digest: Some(action.petal_policy_digest.clone()),
+            ..Default::default()
+        };
+        let preimage = b"test-only exact MPP preimage";
+        let signing_hash: [u8; 32] = alloy::primitives::keccak256(preimage).into();
 
-        let err = match backend
-            .prepare(
-                &challenge,
-                &request,
-                "alice",
-                &Policy::default(),
-                "req_mpp_host",
+        let err = match host_signer
+            .sign_paid_http_payload(
+                PAID_HTTP_MPP_SIGN_INTENT,
+                "charge-transaction",
+                preimage,
+                signing_hash,
+                &facts,
             )
             .await
         {
@@ -5328,30 +5672,25 @@ inline = '{"prompt":"hi"}'
             .await
             .unwrap();
 
-        let execution = backend
-            .prepare(
-                &challenge,
-                &request,
-                "alice",
-                &Policy::default(),
-                "req_mpp_host",
+        let signature = host_signer
+            .sign_paid_http_payload(
+                PAID_HTTP_MPP_SIGN_INTENT,
+                "charge-transaction",
+                preimage,
+                signing_hash,
+                &facts,
             )
             .await
-            .expect("MPP host signer should mint a proof credential under a live grant");
-        assert_eq!(execution.header_name, "Authorization");
-        assert!(execution.header_value.starts_with("Payment "));
-        assert_eq!(
-            execution.credential_metadata["secret_material_in_vfs"],
-            false
-        );
+            .expect("MPP host signer should sign an exact preimage under a live grant");
+        assert_eq!(signature.len(), 65);
 
-        let err = match backend
-            .prepare(
-                &challenge,
-                &request,
-                "alice",
-                &Policy::default(),
-                "req_mpp_host",
+        let err = match host_signer
+            .sign_paid_http_payload(
+                PAID_HTTP_MPP_SIGN_INTENT,
+                "charge-transaction",
+                preimage,
+                signing_hash,
+                &facts,
             )
             .await
         {
@@ -5365,7 +5704,7 @@ inline = '{"prompt":"hi"}'
     async fn mpp_host_signing_denies_intent_outside_grant_terms() {
         use bloom_auth_api::GrantStore as _;
         let dir = tempfile::tempdir().unwrap();
-        let (petal_host, grant_store, address) = wired_petal_host(dir.path());
+        let (petal_host, grant_store, _address) = wired_petal_host(dir.path());
         let now = now_ms();
         let action = paid_http_test_sealed_action("alice", "act-mpp-wrong", &["x402.sign"], 1, now);
         grant_store
@@ -5377,31 +5716,25 @@ inline = '{"prompt":"hi"}'
             wallet: "alice".into(),
             action_id: "act-mpp-wrong".into(),
         });
-        let backend = RealMppBackend::new(
-            reqwest::Client::new(),
-            Arc::new(FixedTempoRpcResolver),
-            address,
-            host_signer,
-            PaidHttpSigningFacts {
-                protocol: "mpp".into(),
-                request_id: "req_mpp_wrong_intent".into(),
-                method: "GET".into(),
-                url: "https://merchant.test/pay".into(),
-                host: "merchant.test".into(),
-                policy_snapshot_digest: Some(action.petal_policy_digest.clone()),
-                ..Default::default()
-            },
-        );
-        let challenge = zero_amount_tempo_charge_challenge();
-        let request = parse_request("GET https://merchant.test/pay wallet=alice").unwrap();
+        let facts = PaidHttpSigningFacts {
+            protocol: "mpp".into(),
+            request_id: "req_mpp_wrong_intent".into(),
+            method: "GET".into(),
+            url: "https://merchant.test/pay".into(),
+            host: "merchant.test".into(),
+            policy_snapshot_digest: Some(action.petal_policy_digest.clone()),
+            ..Default::default()
+        };
+        let preimage = b"test-only exact MPP preimage";
+        let signing_hash: [u8; 32] = alloy::primitives::keccak256(preimage).into();
 
-        let err = match backend
-            .prepare(
-                &challenge,
-                &request,
-                "alice",
-                &Policy::default(),
-                "req_mpp_wrong_intent",
+        let err = match host_signer
+            .sign_paid_http_payload(
+                PAID_HTTP_MPP_SIGN_INTENT,
+                "charge-transaction",
+                preimage,
+                signing_hash,
+                &facts,
             )
             .await
         {
