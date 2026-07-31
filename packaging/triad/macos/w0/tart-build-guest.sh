@@ -69,7 +69,6 @@ refresh_local_source() {
     find "$target" -depth -delete
   fi
   mv "$temporary" "$target"
-  chmod -R a-w "$target"
 }
 
 refresh_local_source bloom

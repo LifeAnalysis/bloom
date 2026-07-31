@@ -190,8 +190,9 @@ source_revision() {
 }
 
 assert_source() {
-  root="$1"
-  revision_key="$2"
+  local root="$1"
+  local revision_key="$2"
+  local expected_revision tracked_status
   expected_revision="$(source_revision "$revision_key")"
   [[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]]
   [[ "$(sudo -H -u "$login_user" /usr/bin/git -C "$root" rev-parse HEAD)" == \
@@ -199,10 +200,15 @@ assert_source() {
     echo "$revision_key source does not match the installed payload" >&2
     exit 65
   }
-  [[ -z "$(
+  if ! tracked_status="$(
     sudo -H -u "$login_user" \
       /usr/bin/git -C "$root" status --porcelain --untracked-files=no
-  )" ]] || {
+  )"
+  then
+    echo "$revision_key source cleanliness inspection failed" >&2
+    exit 65
+  fi
+  [[ -z "$tracked_status" ]] || {
     echo "$revision_key source has tracked modifications" >&2
     exit 65
   }
@@ -263,6 +269,13 @@ run_as_login test \
   --manifest-path "$signer_root/Cargo.toml" \
   --workspace \
   --locked
+
+# The local APFS clones are the exact commit-bound sources used to build the
+# package. Recheck them after every acceptance executable has run so a test
+# cannot silently mutate tracked source and weaken the provenance claim.
+assert_source "$main_root" BLOOM_MACHINE_SHA
+assert_source "$broker_root" BLOOM_BROKER_SHA
+assert_source "$signer_root" BLOOM_SIGNER_SHA
 
 # Recheck the installed boundary after all fault-injection executables finish.
 assert_installed_process bloom-broker "$broker_uid" "$release_root/bloom-broker"
