@@ -889,7 +889,7 @@ not part of M0--M6 unless separately ratified.
 
 ## 21. Implementation decision log
 
-### 2026-07-31 — AC-18 authenticated journal-head transport
+### 2026-07-31 — AC-18 authenticated journal-head transport (superseded)
 
 The existing authenticated envelope carries an optional
 `sender_journal_head`, covered by the envelope application signature. Protocol
@@ -899,9 +899,74 @@ signed by the sender application identity already pinned in the edge manifest;
 its `service_id` and `key_id` must equal the authenticated envelope sender and
 application key. Machine therefore cannot inject a peer checkpoint head.
 
+This decision did not conform to parent section 20, which requires every
+recipient to retain its peer's signed head after every cross-service security
+mutation. It is superseded by the decision below and must not be used as an
+acceptance basis.
+
+### 2026-07-31 — AC-18 authenticated heads on both authority edges
+
+Protocol minor 1 requires the existing `sender_journal_head` envelope field in
+both directions on Machine-Broker and Broker-Signer. Control, login-session,
+and revocation edges continue to forbid it. No RPC method or domain request or
+response field is added.
+
+The edge-specific transport builder obtains the head from the sending
+service's verified local journal; an RPC caller cannot supply or override it.
+The head remains separately signed by the sender application identity already
+pinned in the edge manifest, and its `service_id` and `key_id` must equal the
+authenticated envelope sender and application key. This preserves the original
+anti-injection property without exempting Machine-Broker from parent section
+20.
+
+For a security mutation, the recipient checkpoints the authenticated request
+head before dispatch and the caller checkpoints the authenticated response
+head before publishing success or committing its correlated result. A
+checkpoint failure latches local security mutations closed while status and
+read-only methods continue from the last fully verified local head. Read-only
+traffic also carries heads. Each long-running caller performs an authenticated
+readiness exchange at least every 60 seconds while its peer is reachable, so an
+idle edge still checkpoints both heads without a new method. Packaging
+provisions a principal-private checkpoint root for each service and pins every
+allowed current and historical peer application key; restore may not lower an
+observed peer sequence. Application-identity rotation records the old public
+key in packaging-owned immutable history before replacing the current pin, so
+existing checkpoint entries remain verifiable. The service audit-key rotation
+itself retains section 20's final-old-head/first-new-head cross-signing rule.
+
+Live transport authentication remains a single-current-key decision. Only the
+current application key in the active edge manifest may authenticate a new
+envelope or newly observed head. Historical application keys are
+verification-only: they may verify checkpoint entries and rotation continuity
+created while that key was current, but they must never authenticate a new
+connection, envelope, or head after retirement. Removing, substituting, or
+rolling back packaging-owned history fails checkpoint verification closed; it
+does not make a retired key live again.
+
+Packaging-owned application-key history also records the exact handover tuple
+`(service_id, old_key_id, new_key_id, sequence, head_hash)`. This authorizes the
+first new-key head to repeat the last old-key `(sequence, head_hash)` exactly
+once when the service journal did not advance during transport-key rotation.
+No other equal-sequence key change is valid. A different hash, a second use of
+the transition, a transition not matching the last retained old-key head, or a
+head signed by the retired key after handover is a checkpoint fork and fails
+closed. This narrow packaging-authorized handover does not replace the
+separate dual-signature continuity required when the service audit key itself
+rotates.
+
 Minor 0 remains decodable only on edges whose contract does not require a
-journal head. Broker-Signer rejects minor 0 rather than negotiating away the
-checkpoint binding. No RPC method was added. Broker and Signer runtime work
-must use the minor-1 envelope helpers, checkpoint the authenticated peer head
-before dispatching or publishing security-mutation success, and degrade to
-read-only on checkpoint failure.
+journal head. Both Machine-Broker and Broker-Signer reject minor 0 rather than
+negotiating away checkpoint coverage. Conformance and golden vectors must cover
+missing heads, wrong service/key identity, invalid signatures, rollback,
+checkpoint-write failure before mutation dispatch, and response-checkpoint
+failure before success publication on both edges. Runtime tests additionally
+prove, on each authority edge:
+
+- an idle authenticated readiness timer persists both heads within 60 seconds;
+- local-audit or checkpoint degradation leaves reads/status available while
+  mutations remain latched;
+- restart after application-identity rotation verifies old checkpoint entries
+  only through packaging history and rejects missing, substituted, rolled-back,
+  or live-reused historical keys; and
+- equal-sequence/different-hash or different-key forks are rejected as well as
+  lower-sequence rollback.
