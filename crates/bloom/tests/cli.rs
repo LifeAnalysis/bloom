@@ -984,6 +984,42 @@ fn wallet_list_ignores_legacy_keystore_without_a_broker_projection() {
 }
 
 #[test]
+fn wallet_projection_prints_only_the_authenticated_key_free_cache() {
+    let home = fresh_home();
+    seed_wallet_projection_fixture(home.path(), "alice");
+    let output = bloom_cmd(home.path())
+        .args(["wallet", "projection", "alice"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let projection: WalletProjection = serde_json::from_slice(&output).unwrap();
+    assert_eq!(projection.wallet.wallet_id.as_str(), "alice");
+    assert_eq!(projection.keys.len(), 1);
+    assert!(projection.credentials.is_empty());
+    assert_eq!(
+        projection.verification,
+        ProjectionVerification::AuthenticatedBroker
+    );
+    assert_eq!(projection.freshness, ProjectionFreshness::Stale);
+    assert!(!home.path().join("keystore").exists());
+    assert!(!home.path().join("auth").exists());
+}
+
+#[test]
+fn wallet_projection_ignores_a_legacy_keystore_record() {
+    let home = fresh_home();
+    seed_legacy_wallet_fixture(home.path(), "alice");
+    bloom_cmd(home.path())
+        .args(["wallet", "projection", "alice"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("has no cached projection"));
+}
+
+#[test]
 fn wallet_new_requires_broker_and_never_creates_machine_key_material() {
     let home = fresh_home();
     bloom_cmd(home.path())

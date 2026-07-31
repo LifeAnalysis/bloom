@@ -24,6 +24,10 @@ use crate::MachineBrokerClient;
 const CACHE_SCHEMA: &str = "bloom.machine-wallet-projections.v1";
 const SOURCE_PROTOCOL: &str = "bloom.machine-broker.v1";
 const LIVE_REFRESH_FRESHNESS_MS: u64 = 30_000;
+// Kernel-mounted reads commonly render the same dynamic file for GETATTR and
+// then READ. Coalesce only that burst; authority changes remain observable on
+// the next ordinary interaction rather than waiting for the stale-read TTL.
+const LIVE_REFRESH_COALESCE_MS: u64 = 100;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -276,6 +280,18 @@ impl CachedWalletProjectionReader {
         Ok(projections)
     }
 
+    async fn refresh_coalesced(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
+        let refreshed_at = self.last_live_refresh_ms.load(Ordering::SeqCst);
+        if refreshed_at != 0 && now_ms()?.saturating_sub(refreshed_at) <= LIVE_REFRESH_COALESCE_MS {
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| unavailable("Machine projection cache mutex poisoned"))?;
+            return Ok(cache.live(false));
+        }
+        self.refresh().await
+    }
+
     fn cached(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
         let cache = self
             .cache
@@ -302,7 +318,7 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
     }
 
     async fn get_wallet(&self, wallet_id: &Token) -> Result<WalletProjection, ProtocolError> {
-        let broker_error = match self.refresh().await {
+        let broker_error = match self.refresh_coalesced().await {
             Ok(projections) => {
                 return projections
                     .into_iter()

@@ -1307,6 +1307,7 @@ impl WalletsHandler {
             Entry::file("addresses.json"),
             Entry::file("public_key"),
             Entry::file("kind"),
+            Entry::file("projection.json"),
             Entry::file("policy.toml"),
             Entry::writable_file("policy.json"),
             Entry::dir("chains"),
@@ -1698,7 +1699,7 @@ impl WalletsHandler {
         }
         match segs[1].as_str() {
             "address" | "address.qr.png" | "address.qr.svg" | "addresses.json" | "public_key"
-            | "kind" => Ok(Entry::file(&segs[1])),
+            | "kind" | "projection.json" => Ok(Entry::file(&segs[1])),
             "policy.toml" => Ok(Entry::file("policy.toml")),
             "policy.json" => Ok(Entry::writable_file("policy.json")),
             "sign" => match segs.len() {
@@ -1902,6 +1903,12 @@ impl WalletsHandler {
             "kind" => {
                 let projection = self.wallet_projection(wallet).await?;
                 Ok(format!("{}\n", projection.wallet.wallet_kind.as_str()).into_bytes())
+            }
+            "projection.json" => {
+                let projection = self.wallet_projection(wallet).await?;
+                let mut out = serde_json::to_vec_pretty(&projection).map_err(err_be)?;
+                out.push(b'\n');
+                Ok(out)
             }
             #[cfg(test)]
             "policy.toml" => {

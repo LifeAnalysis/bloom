@@ -1098,6 +1098,10 @@ enum WalletCmd {
     Import { name: String },
     /// List configured wallets.
     List,
+    /// Print the authenticated, key-free Broker projection for a wallet.
+    /// This contains public keys, public credential descriptors, and the
+    /// signed policy snapshot; it never contains custody material.
+    Projection { name: String },
     /// Print a wallet's deposit address. Default output is the bare checksummed
     /// address (one line, scriptable); `--qr` adds a scannable QR block above it,
     /// and `--qr-out <path>` writes a scannable SVG of the address to a file.
@@ -1843,6 +1847,18 @@ async fn run(cli: Cli) -> Result<()> {
                     projection.wallet.wallet_kind
                 );
             }
+            Ok(())
+        }
+        Cmd::Wallet(WalletCmd::Projection { name }) => {
+            let reader = configured_wallet_projection_reader(&home)?;
+            let wallet_id = bloom_triad_protocol::Token::new(name)
+                .context("wallet ID must be a protocol token")?;
+            let projection = reader.get_wallet(&wallet_id).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&projection)
+                    .context("encode public wallet projection")?
+            );
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Address { name, qr, qr_out }) => {
