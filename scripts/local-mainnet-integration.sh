@@ -49,7 +49,7 @@ Safety properties:
   * Hyperliquid is one perp asset, limit only, <= $25 notional, <= 5 minutes.
   * Polymarket is FAK/FOK only and <= $25 maximum consideration.
   * Exact plans and policy checks print before any passkey prompt.
-  * The runner never edits wallet keys or policy. It verifies them afterward.
+  * The runner never directly reads or edits wallet keys or policy files.
   * The special binary refuses to serve unless --local-integration is explicit.
 
 Environment:
@@ -98,7 +98,6 @@ case "$wallet" in
 esac
 
 command -v jq >/dev/null 2>&1 || die "jq is required (brew install jq)"
-command -v shasum >/dev/null 2>&1 || die "shasum is required"
 browser_open="${BLOOM_INTEGRATION_OPEN:-open}"
 startup_timeout_secs="${BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS:-300}"
 case "$startup_timeout_secs" in
@@ -161,69 +160,64 @@ if [ "$live" -eq 1 ]; then
   [ -t 0 ] || die "live mode requires an interactive terminal"
 fi
 
-wallet_dir="${home_dir}/keystore/${wallet}"
-[ -d "$wallet_dir" ] || die "wallet not found at ${wallet_dir}"
-[ "$(tr -d '[:space:]' < "${wallet_dir}/kind")" = "passkey" ] ||
-  die "wallet '$wallet' is not a passkey wallet"
-for file in encrypted.key prf.salt passkey.json policy.toml policy.toml.sig; do
-  [ -f "${wallet_dir}/${file}" ] || die "passkey wallet is missing ${file}"
-done
-
 run_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-mainnet-integration.XXXXXX")"
 socket="${run_dir}/bloom.sock"
+mount_dir="${run_dir}/mount"
 server_log="${run_dir}/serve.log"
-fingerprint_before="${run_dir}/wallet.before"
-fingerprint_after="${run_dir}/wallet.after"
 server_pid=""
 session_active=0
 session_id="manual-mainnet-integration-$(date +%s)-$$"
+mkdir "$mount_dir"
 
-wallet_fingerprint() {
-  (
-    cd "$wallet_dir"
-    for file in address encrypted.key kind policy.toml policy.toml.sig prf.salt public.key; do
-      if [ -f "$file" ]; then
-        shasum -a 256 "$file"
-      fi
-    done
-    # A hardware authenticator may legitimately advance only its anti-clone
-    # counter. Hash every other passkey field so that update is narrowly
-    # tolerated without concealing credential replacement.
-    jq -S 'walk(if type == "object" then del(.counter) else . end)' passkey.json |
-      shasum -a 256 | sed 's/  -$/  passkey.json (counter ignored)/'
-  )
+mounted_path() {
+  case "$1" in
+    /*) printf '%s%s\n' "$mount_dir" "$1" ;;
+    *) die "internal VFS path is not absolute: $1" ;;
+  esac
+}
+
+vcat() {
+  local mounted_body
+  mounted_body="$(cat "$(mounted_path "$1")")"
+  [ -n "$mounted_body" ] || die "mounted VFS read returned no data: $1"
+  printf '%s\n' "$mounted_body"
+}
+
+vwrite() {
+  printf '%s\n' "$2" > "$(mounted_path "$1")"
+}
+
+# A command write which stages a ceremony is allowed to return either EACCES
+# or success. macOS NFS can defer the handler denial; the authoritative result
+# is the challenge/status file subsequently read through the same mount.
+vwrite_staging() {
+  vwrite "$1" "$2" 2>/dev/null || true
+}
+
+vls_names() {
+  LC_ALL=C command ls -1 "$(mounted_path "$1")"
 }
 
 cleanup() {
   status=$?
   trap - EXIT INT TERM
-  if [ "$session_active" -eq 1 ] && [ -S "$socket" ] && [ -x "${bloom_bin:-}" ]; then
-    "$bloom_bin" --quiet --home "$home_dir" --connect "unix:${socket}" vfs write \
-      "/hyperliquid/mainnet/agent_sessions/${wallet}/${session_id}/cancel_all" \
-      --data '{}' >/dev/null 2>&1 || true
-    "$bloom_bin" --quiet --home "$home_dir" --connect "unix:${socket}" vfs write \
-      "/hyperliquid/mainnet/agent_sessions/${wallet}/${session_id}/stop" \
-      --data '{}' >/dev/null 2>&1 || true
+  if [ "$session_active" -eq 1 ] && [ -S "$socket" ]; then
+    vwrite "/hyperliquid/mainnet/agent_sessions/${wallet}/${session_id}/cancel_all" \
+      '{}' >/dev/null 2>&1 || true
+    vwrite "/hyperliquid/mainnet/agent_sessions/${wallet}/${session_id}/stop" \
+      '{}' >/dev/null 2>&1 || true
   fi
   if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
-  wallet_fingerprint > "$fingerprint_after" || status=1
-  if ! cmp -s "$fingerprint_before" "$fingerprint_after"; then
-    printf '%s\n' \
-      "FATAL: immutable wallet material changed during the integration run." \
-      "The temporary diagnostics are retained at: ${run_dir}" >&2
-    diff -u "$fingerprint_before" "$fingerprint_after" >&2 || true
-    status=1
-  elif [ "$status" -eq 0 ]; then
+  if [ "$status" -eq 0 ]; then
     rm -rf "$run_dir"
   else
     printf 'diagnostics retained at: %s\n' "$run_dir" >&2
   fi
   exit "$status"
 }
-wallet_fingerprint > "$fingerprint_before"
 trap cleanup EXIT INT TERM
 
 if [ -n "${BLOOM_INTEGRATION_BIN:-}" ]; then
@@ -232,13 +226,14 @@ if [ -n "${BLOOM_INTEGRATION_BIN:-}" ]; then
 else
   (
     cd "$repo_root"
-    cargo build -p bloom --no-default-features --features local-integration
+    cargo build -p bloom --no-default-features --features local-integration,mount
   )
   bloom_bin="${repo_root}/target/debug/bloom"
 fi
 
 "$bloom_bin" --home "$home_dir" serve \
-  --endpoint "unix:${socket}" --local-integration >"$server_log" 2>&1 &
+  --endpoint "unix:${socket}" --mount "$mount_dir" \
+  --local-integration >"$server_log" 2>&1 &
 server_pid=$!
 
 startup_started_at="$(date +%s)"
@@ -265,18 +260,6 @@ while [ ! -S "$socket" ]; do
   fi
   sleep 0.2
 done
-
-bloom() {
-  "$bloom_bin" --quiet --home "$home_dir" --connect "unix:${socket}" "$@"
-}
-
-vcat() {
-  bloom vfs cat "$1"
-}
-
-vwrite() {
-  bloom vfs write "$1" --data "$2"
-}
 
 open_approval() {
   artifact_path="$1"
@@ -332,43 +315,17 @@ if [ "$live" -eq 0 ] || [ "$execute_hl" -eq 1 ]; then
   fi
 fi
 
-onboard_status='{}'
 if [ "$live" -eq 0 ] || [ "$execute_pm" -eq 1 ]; then
   route_contract="$(vcat "/petals/polymarket/meta/route-contract.json")"
   printf '%s' "$route_contract" | jq -e . >/dev/null ||
     die "Polymarket Petal route contract is unavailable"
-  printf 'Polymarket Petal: loaded\n'
-  onboard_status="$(vcat "/petals/polymarket/onboard/${wallet}/status.json")"
-  printf '\nPolymarket onboarding status:\n'
-  printf '%s\n' "$onboard_status" | jq .
-  if printf '%s' "$onboard_status" |
-    jq -e '.stage == "complete" and .tradeable == true' >/dev/null
-  then
-    printf 'Polymarket account snapshot:\n'
-    vcat "/petals/polymarket/account/${wallet}/status.json" | jq .
-    printf 'Polymarket buying power:\n'
-    pm_buying_power="$(vcat "/petals/polymarket/account/${wallet}/buying_power.json")"
-    printf '%s\n' "$pm_buying_power" | jq .
-    if ! printf '%s' "$pm_buying_power" |
-      jq -e '.can_trade_now == true' >/dev/null
-    then
-      if [ "$execute_pm" -eq 1 ] && [ "$pm_side" = "buy" ]; then
-        printf 'BLOCKER: Polymarket reports no current buying power.\n' >&2
-        preflight_blockers=1
-      else
-        printf 'NOTICE: Polymarket reports no current pUSD buying power; a sell may still be possible.\n' >&2
-      fi
-    fi
-  else
-    printf 'BLOCKER: Polymarket onboarding is not complete and tradeable.\n' >&2
-    preflight_blockers=1
-  fi
+  vls_names "/petals/polymarket/onboard" >/dev/null
+  vls_names "/petals/polymarket/account" >/dev/null
+  vls_names "/petals/polymarket/trade" >/dev/null
+  printf 'Polymarket Petal: mounted and route contract loaded\n'
   if [ -n "$pm_slug" ]; then
     case "$pm_slug" in *[!A-Za-z0-9._-]*|'') die "Polymarket slug contains unsafe characters" ;; esac
-    printf 'Requested Polymarket market:\n'
-    vcat "/petals/polymarket/markets/${pm_slug}/market.json" | jq .
-    printf 'Requested Polymarket prices:\n'
-    vcat "/petals/polymarket/markets/${pm_slug}/prices.json" | jq .
+    printf 'Requested Polymarket slug: %s\n' "$pm_slug"
   fi
 fi
 
@@ -414,9 +371,6 @@ if [ "$execute_hl" -eq 1 ]; then
 fi
 
 if [ "$execute_pm" -eq 1 ]; then
-  printf '%s' "$onboard_status" |
-    jq -e '.stage == "complete" and .tradeable == true' >/dev/null ||
-    die "Polymarket onboarding is not complete/tradeable; no order has been sent"
   if [ "$pm_side" = "buy" ]; then
     pm_price_json="$(jq -nc --arg p "$pm_bound" '{max_price:$p}')"
   else
@@ -428,15 +382,16 @@ if [ "$execute_pm" -eq 1 ]; then
     --argjson bound "$pm_price_json" \
     '{slug:$slug,outcome:$outcome,side:$side,amount:$amount,order_type:$order_type} + $bound')"
   printf '\nCreating the unsigned Polymarket draft for review...\n'
-  drafts_before="$(bloom vfs ls "/petals/polymarket/trade/${wallet}/drafts" 2>/dev/null |
-    awk '{print $1}' || true)"
-  vwrite "/petals/polymarket/trade/${wallet}/new" "$pm_request"
-  drafts_after="$(bloom vfs ls "/petals/polymarket/trade/${wallet}/drafts" |
-    awk '{print $1}')"
+  drafts_before="$(vls_names "/petals/polymarket/trade/${wallet}/drafts" 2>/dev/null || true)"
+  if ! vwrite "/petals/polymarket/trade/${wallet}/new" "$pm_request"; then
+    die "mounted Polymarket draft creation failed; verify onboarding, funding, market, and policy"
+  fi
+  drafts_after="$(vls_names "/petals/polymarket/trade/${wallet}/drafts")"
   draft_id="$(comm -13 \
     <(printf '%s\n' "$drafts_before" | sed '/^$/d' | sort) \
     <(printf '%s\n' "$drafts_after" | sed '/^$/d' | sort) | tail -n 1)"
-  [ -n "$draft_id" ] || die "could not identify the new Polymarket draft"
+  [ -n "$draft_id" ] ||
+    die "mounted Polymarket draft was not created; verify onboarding, funding, market, and policy"
   draft_path="/petals/polymarket/trade/${wallet}/drafts/${draft_id}"
   vwrite "${draft_path}/revalidate" '{"revalidate":true}'
   printf '\nPolymarket draft plan:\n'
@@ -462,9 +417,7 @@ IFS= read -r acknowledgement
 
 if [ "$execute_hl" -eq 1 ]; then
   printf '\nStaging Hyperliquid session approval...\n'
-  if vwrite "/hyperliquid/mainnet/agent_sessions/${wallet}/new.json" "$session_request"; then
-    die "Hyperliquid session unexpectedly started without its passkey ceremony"
-  fi
+  vwrite_staging "/hyperliquid/mainnet/agent_sessions/${wallet}/new.json" "$session_request"
   open_approval "${session_path}/approval_challenge.json"
   vwrite "/hyperliquid/mainnet/agent_sessions/${wallet}/new.json" "$session_request"
   session_active=1
@@ -499,9 +452,7 @@ if [ "$execute_pm" -eq 1 ]; then
   [ "$pm_ack" = "POST POLYMARKET DRAFT ${draft_id}" ] ||
     die "Polymarket draft acknowledgement did not match"
   post_request='{"post":true,"acknowledge_warnings":true}'
-  if vwrite "${draft_path}/post" "$post_request"; then
-    die "Polymarket draft unexpectedly posted without its passkey ceremony"
-  fi
+  vwrite_staging "${draft_path}/post" "$post_request"
   open_approval "${draft_path}/approval.json"
   vwrite "${draft_path}/post" "$post_request"
   pm_receipt="$(vcat "/petals/polymarket/trade/${wallet}/receipts/${draft_id}/receipt.json")"

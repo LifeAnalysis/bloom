@@ -15,17 +15,6 @@ cleanup_test() {
 }
 trap cleanup_test EXIT
 
-wallet_dir="${test_root}/home/keystore/test-passkey"
-mkdir -p "$wallet_dir"
-printf '0x0000000000000000000000000000000000000001\n' > "${wallet_dir}/address"
-printf 'ciphertext fixture\n' > "${wallet_dir}/encrypted.key"
-printf 'passkey\n' > "${wallet_dir}/kind"
-printf '[polymarket]\nenabled = true\n' > "${wallet_dir}/policy.toml"
-printf 'signature fixture\n' > "${wallet_dir}/policy.toml.sig"
-printf 'salt fixture\n' > "${wallet_dir}/prf.salt"
-printf '{"credential":{"counter":7,"credential_id":"fixture"}}\n' \
-  > "${wallet_dir}/passkey.json"
-
 output="$(
   BLOOM_HOME="${test_root}/home" \
   BLOOM_INTEGRATION_BIN="$fixture_bin" \

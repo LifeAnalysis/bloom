@@ -2,7 +2,8 @@
 
 This is the developer path for exercising the real Bloom binary, installed
 Petals, an existing passkey wallet, both venue APIs, policy evaluation,
-interactive browser ceremonies, signing, submission, and receipts without
+the kernel-mounted NFS VFS, interactive browser ceremonies, signing,
+submission, and receipts without
 running Machine, Broker, and Signer as separate services.
 
 It is deliberately not a deployment mode. The `local-integration` Cargo
@@ -31,9 +32,9 @@ mode:
   approval and a separate Polymarket passkey approval;
 - cancels a resting Hyperliquid `Alo` order, and also attempts cancellation
   and session stop if the runner exits abnormally;
-- fingerprints the encrypted key, PRF salt, policy, policy signature, wallet
-  kind, address, public key, and all passkey credential fields other than the
-  authenticator's legitimate monotonic counter.
+- accesses wallet identity, venue state, Petal routes, plans, ceremonies, and
+  receipts exclusively through ordinary reads and writes beneath the temporary
+  kernel mount; it never uses the `bloom vfs` fallback or IPC operations.
 
 The local Hyperliquid policy is in memory and is accepted only if the stored
 wallet has no configured Hyperliquid policy. It never edits `policy.toml`.
@@ -85,15 +86,19 @@ scripts/local-mainnet-integration.sh \
 ```
 
 No ceremony opens and no order is created. Serving may install/update the
-pinned Petal and live status reads may refresh Petal caches, but custody
-material and venue positions are not changed. Preflight verifies:
+pinned Petal, but custody material and venue positions are not changed.
+Preflight verifies:
 
-- the wallet exists and is a complete passkey wallet;
+- the mounted wallet exists, reports passkey kind, and exposes its address;
 - the pinned Polymarket Petal loads;
 - Hyperliquid mainnet metadata and the wallet account snapshot are readable;
-- Polymarket onboarding status is readable;
-- for an onboarded wallet, Polymarket account status and buying power are
-  readable.
+- the Polymarket route contract and onboarding, account, and trade directories
+  are reachable through the kernel-mounted filesystem.
+
+Polymarket's authoritative onboarding, funding, market, and policy checks run
+when the mounted `trade/<wallet>/new` file is written in live mode. Preflight
+does not invoke its refresh-on-read status leaves through a non-filesystem
+fallback.
 
 Supply candidate markets to get their current metadata during preflight:
 
@@ -104,10 +109,10 @@ scripts/local-mainnet-integration.sh \
   --pm-slug YOUR-POLYMARKET-SLUG
 ```
 
-This prints the Hyperliquid asset ID that must be pinned in the live command,
-plus the Polymarket market and prices. Preflight stops with an actionable error
-when credentials, onboarding, funding views, network access, the Petal, or the
-ceremony port are unavailable.
+This prints the Hyperliquid asset ID that must be pinned in the live command
+and echoes the explicitly selected Polymarket slug. Live mounted draft creation
+refuses unavailable markets, incomplete onboarding, insufficient funding, or
+policy failures before any passkey ceremony or order submission.
 
 ## 2. Run bounded mainnet submissions
 
@@ -136,17 +141,19 @@ scripts/local-mainnet-integration.sh \
 The command validates all numeric bounds before touching venue state. It then:
 
 1. starts the special Bloom process on a private Unix socket;
-2. rechecks the wallet, Petal, venue status, onboarding, and account views;
-3. creates and revalidates an unsigned Polymarket draft;
-4. prints both pinned requests and all available review artifacts;
-5. asks for an exact acknowledgement naming the selected venue or venues;
-6. opens the real passkey ceremony for the exact Hyperliquid five-minute
+2. mounts its VFS over NFS at a private temporary directory;
+3. rechecks the wallet, Hyperliquid state, and Polymarket Petal surface
+   exclusively with ordinary filesystem reads through that mount;
+4. creates and revalidates an unsigned Polymarket draft through filesystem
+   writes;
+5. prints both pinned requests and all available review artifacts;
+6. asks for an exact acknowledgement naming the selected venue or venues;
+7. opens the real passkey ceremony for the exact Hyperliquid five-minute
    session, retries session creation, and submits the exact order;
-7. asks for a draft-specific Polymarket acknowledgement;
-8. opens the real passkey ceremony for the exact Polymarket order, retries the
+8. asks for a draft-specific Polymarket acknowledgement;
+9. opens the real passkey ceremony for the exact Polymarket order, retries the
    exact post, and reads the receipt;
-9. cancels applicable resting orders, stops the session, compares wallet
-   fingerprints, and exits.
+10. cancels applicable resting orders, stops the session, unmounts, and exits.
 
 The runner retains its temporary log directory on any failure and prints its
 path. Do not retry blindly after an ambiguous network failure: inspect the
