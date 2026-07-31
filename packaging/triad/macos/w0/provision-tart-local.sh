@@ -39,20 +39,21 @@ if ! vm_exists "$upstream_base"; then
   tart clone "$upstream_image" "$upstream_base"
 fi
 
+development_base_created=false
 if vm_exists "$development_base"; then
-  echo "local Tart W0 development base already exists: $development_base"
-  exit 0
+  echo "updating local Tart W0 development base $development_base"
+else
+  echo "creating local Tart W0 development base $development_base"
+  tart clone "$upstream_base" "$development_base"
+  tart set \
+    "$development_base" \
+    --cpu "$tart_cpu" \
+    --memory "$tart_memory_mb" \
+    --random-mac
+  development_base_created=true
 fi
 
-echo "creating local Tart W0 development base $development_base"
-tart clone "$upstream_base" "$development_base"
-tart set \
-  "$development_base" \
-  --cpu "$tart_cpu" \
-  --memory "$tart_memory_mb" \
-  --random-mac
-
-run_log="$(mktemp "${TMPDIR:-/tmp}/bloom-tart-provision.XXXXXX.log")"
+run_log="$(mktemp "${TMPDIR:-/tmp}/bloom-tart-provision.log.XXXXXX")"
 run_pid=""
 provisioned=false
 
@@ -67,7 +68,7 @@ cleanup() {
   fi
   if [[ "$provisioned" != true ]]; then
     echo "Tart W0 base provisioning failed; VM log: $run_log" >&2
-    if vm_exists "$development_base"; then
+    if [[ "$development_base_created" == true ]] && vm_exists "$development_base"; then
       tart delete "$development_base" >/dev/null 2>&1 || true
     fi
   fi
@@ -109,8 +110,20 @@ sshpass -p "$guest_password" \
 set -Eeuo pipefail
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 /usr/bin/sudo -n /usr/bin/true
-/bin/launchctl print "gui/$(/usr/bin/id -u)" >/dev/null
+gui_domain="gui/$(/usr/bin/id -u)"
+for _ in {1..60}; do
+  if /bin/launchctl print "$gui_domain" >/dev/null 2>&1; then
+    break
+  fi
+  /bin/sleep 2
+done
+/bin/launchctl print "$gui_domain" >/dev/null
 /usr/bin/xcrun --find clang >/dev/null
+missing_formulae=()
+command -v jq >/dev/null 2>&1 || missing_formulae+=(jq)
+if [[ ${#missing_formulae[@]} -gt 0 ]]; then
+  /opt/homebrew/bin/brew install "${missing_formulae[@]}"
+fi
 if ! command -v cargo >/dev/null 2>&1; then
   /usr/bin/curl \
     --proto "=https" \
@@ -119,11 +132,21 @@ if ! command -v cargo >/dev/null 2>&1; then
     https://sh.rustup.rs |
     /bin/sh -s -- -y --profile minimal --default-toolchain stable
 fi
+if ! command -v rg >/dev/null 2>&1; then
+  cargo install ripgrep --version 15.2.0 --locked
+fi
 cargo --version
 rustc --version
+jq --version
+rg --version | /usr/bin/head -1
 GUEST
 
-tart stop "$development_base"
+# A graceful guest shutdown is required for macOS to flush newly installed
+# tools into the Tart disk image. `tart stop` can terminate the guest before
+# Homebrew/Cargo filesystem changes survive the next boot.
+sshpass -p "$guest_password" \
+  ssh "${ssh_options[@]}" "admin@$guest_ip" \
+  /usr/bin/sudo /sbin/shutdown -h now || true
 wait "$run_pid"
 run_pid=""
 provisioned=true
