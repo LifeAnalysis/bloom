@@ -82,6 +82,7 @@ mkdir -p \
 
 "$main_root/packaging/triad/release/check-machine-authority-boundary.sh" \
   --require-clean
+python3 "$main_root/packaging/triad/release/check-legacy-hash-only-routes.py"
 
 cargo build \
   --manifest-path "$main_root/Cargo.toml" \

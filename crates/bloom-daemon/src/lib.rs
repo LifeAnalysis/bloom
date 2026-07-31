@@ -48,7 +48,9 @@ use bloom_revert::{
 };
 use bloom_tx::DynPriceOracle;
 use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxState};
-use bloom_tx::tx_engine::{Eip1559FeeOverrides, TxEngine};
+use bloom_tx::tx_engine::{
+    ConfirmBatchResult, ConfirmBatchTarget, Eip1559FeeOverrides, TxEngine, TxEngineError,
+};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
@@ -1487,6 +1489,102 @@ fn audit_http_target(raw: &str) -> serde_json::Value {
     }
 }
 
+#[derive(Clone)]
+struct CanonicalBatchConfirmation {
+    tx_engine: TxEngine,
+    home_write_permit: Arc<HomeWritePermit>,
+    chains: ChainRegistry,
+    wallet_projections: Arc<dyn WalletProjectionReader>,
+}
+
+fn batch_confirmation_result_json(
+    result: Result<ConfirmBatchResult, TxEngineError>,
+) -> Result<serde_json::Value, String> {
+    match result {
+        Ok(result) => Ok(serde_json::json!({
+            "status": "succeeded",
+            "operation_id": result.operation_id,
+            "signer_receipt_digest": result.signer_receipt_digest,
+            "broker_receipt_digest": result.broker_receipt_digest,
+            "transactions": result.transactions.iter().map(|transaction| serde_json::json!({
+                "chain": transaction.chain,
+                "id": transaction.id,
+                "status": transaction.status,
+                "tx_hash": transaction.tx_hash,
+            })).collect::<Vec<_>>(),
+        })),
+        Err(TxEngineError::ApprovalRequired(requirement)) => Ok(serde_json::json!({
+            "status": "awaiting_ceremony",
+            "action_id": requirement.action_id,
+            "ceremony_url": requirement.ceremony_url,
+            "ceremony_expires_at": requirement.expires_ms,
+            "reason": requirement.reason,
+        })),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
+    fn confirm_batch<'a>(
+        &'a self,
+        request: ipc::BatchConfirmIpcRequest,
+    ) -> ipc::BatchConfirmFuture<'a> {
+        Box::pin(async move {
+            if !(1..=32).contains(&request.txs.len()) {
+                return Err("transaction batch must contain 1 to 32 children".into());
+            }
+            let wallet_id = bloom_triad_protocol::Token::new(request.wallet.clone())
+                .map_err(|error| format!("invalid wallet ID: {error}"))?;
+            let projection = self
+                .wallet_projections
+                .get_wallet(&wallet_id)
+                .await
+                .map_err(|error| format!("load public wallet projection: {error}"))?;
+            let mut targets = Vec::with_capacity(request.txs.len());
+            for reference in &request.txs {
+                let (chain_name, id) = reference
+                    .split_once(':')
+                    .ok_or_else(|| format!("tx ref '{reference}' must be chain:id"))?;
+                let chain_name = chain_name.trim();
+                let id = id.trim();
+                if chain_name.is_empty() || id.is_empty() {
+                    return Err(format!(
+                        "tx ref '{reference}' must include non-empty chain and id"
+                    ));
+                }
+                let chain = self
+                    .chains
+                    .get(chain_name)
+                    .ok_or_else(|| format!("chain '{chain_name}' is not configured"))?;
+                let policy = bloom_vfs::advisory_evm_policy(&projection, chain_name)
+                    .map_err(|error| format!("derive key-free advisory policy: {error}"))?;
+                targets.push(ConfirmBatchTarget {
+                    chain_name: chain_name.to_owned(),
+                    id: id.to_owned(),
+                    chain,
+                    policy,
+                });
+            }
+            let override_warnings = targets.iter().all(|target| {
+                request
+                    .text
+                    .trim()
+                    .eq_ignore_ascii_case(target.policy.override_sentinel())
+            });
+            let result = self
+                .tx_engine
+                .confirm_batch(
+                    &self.home_write_permit,
+                    &request.wallet,
+                    targets,
+                    override_warnings,
+                )
+                .await;
+            batch_confirmation_result_json(result)
+        })
+    }
+}
+
 /// All wired-up state the daemon owns. Cheap to clone (everything is
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
@@ -1521,6 +1619,24 @@ pub struct Daemon {
 }
 
 impl Daemon {
+    /// Build the narrow Machine-local batch execution service used by the CLI
+    /// IPC endpoint. No custody, approval verifier, or private signing object
+    /// is captured; final bytes can only flow through `TxEngine`'s configured
+    /// Broker batch route.
+    pub fn batch_confirmation_service(
+        &self,
+    ) -> Result<Arc<dyn ipc::BatchConfirmationService>, String> {
+        let home_write_permit = self.home_write_permit.clone().ok_or_else(|| {
+            "batch confirmation is unavailable without the Machine home write permit".to_owned()
+        })?;
+        Ok(Arc::new(CanonicalBatchConfirmation {
+            tx_engine: self.tx_engine.clone(),
+            home_write_permit,
+            chains: self.chains.clone(),
+            wallet_projections: self.wallet_projections.clone(),
+        }))
+    }
+
     /// Build a fully-wired daemon from the home directory, materialising
     /// any missing subdirs as needed.
     pub fn from_home(home: HomeDir) -> Result<Self, DaemonError> {
@@ -2621,6 +2737,27 @@ mod tests {
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Handler;
     use bloom_vfs::handler::{Entry, HandlerError};
+
+    #[test]
+    fn batch_approval_requirement_preserves_owner_launch_fields() {
+        let value = batch_confirmation_result_json(Err(TxEngineError::ApprovalRequired(
+            bloom_tx::tx_engine::ApprovalRequirement {
+                action_id: "transaction-batch:operation".into(),
+                ceremony_url: "http://localhost:18734/ceremony/owner-secret".into(),
+                expires_ms: 42_000,
+                reason: "exact batch approval required".into(),
+            },
+        )))
+        .unwrap();
+        assert_eq!(value["status"], "awaiting_ceremony");
+        assert_eq!(
+            value["ceremony_url"],
+            "http://localhost:18734/ceremony/owner-secret"
+        );
+        assert_eq!(value["ceremony_expires_at"], 42_000);
+        assert!(value.get("operation_id").is_none());
+        assert!(value.get("signer_receipt_digest").is_none());
+    }
 
     struct GuestWalletProjectionFixture {
         wrote: std::sync::atomic::AtomicBool,

@@ -3340,8 +3340,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_prepare_projection_hides_and_deletes_cancelled_or_expired_launch_tokens() {
-        for terminal_state in [CeremonyState::Cancelled, CeremonyState::Expired] {
+    async fn approval_prepare_projection_hides_every_failed_terminal_launch_token() {
+        for terminal_state in [
+            CeremonyState::Cancelled,
+            CeremonyState::Expired,
+            CeremonyState::Failed,
+        ] {
             let mut f = make_handler();
             let broker = approval_broker(vec![approval_status(
                 prepare_approval_id(),

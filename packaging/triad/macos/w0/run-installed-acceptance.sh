@@ -259,8 +259,25 @@ run_as_login test \
 run_as_login test \
   --manifest-path "$main_root/Cargo.toml" \
   --locked \
+  -p bloom-petals \
+  ac35_legacy_v0_1
+run_as_login test \
+  --manifest-path "$main_root/Cargo.toml" \
+  --locked \
   -p bloom-vfs \
   --test triad_policy_update
+run_as_login test \
+  --manifest-path "$main_root/Cargo.toml" \
+  --locked \
+  -p bloom-vfs \
+  --lib \
+  approval_prepare_projection
+run_as_login test \
+  --manifest-path "$main_root/Cargo.toml" \
+  --locked \
+  -p bloom \
+  --bin bloom \
+  ac26_every_custody_kind
 run_as_login test \
   --manifest-path "$broker_root/Cargo.toml" \
   --workspace \

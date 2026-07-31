@@ -607,3 +607,62 @@ async fn vfs_policy_terminal_ceremony_states_clear_urls_and_fail_the_projection(
         assert!(projection["ceremony_expires_at_ms"].is_null());
     }
 }
+
+#[tokio::test]
+async fn vfs_policy_non_actionable_ceremony_states_never_expose_launch_data() {
+    for state in [
+        CeremonyState::Prepared,
+        CeremonyState::Verifying,
+        CeremonyState::WalletCommitted,
+        CeremonyState::AwaitingRecoveryAck,
+        CeremonyState::ApprovingRootChange,
+        CeremonyState::CreatingCredential,
+        CeremonyState::Committing,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(temp.path().join("keystore")).unwrap();
+        keystore.create_local("alice", "test-passphrase").unwrap();
+        let fixture = broker_fixture(false);
+        let service: Arc<dyn MachineBrokerService> = fixture.clone();
+        let home = HomeDir::at(temp.path().join("home"));
+        let projection_root = temp.path().join("machine-policy-projections");
+        let handler = WalletsHandler::new(
+            bloom_evm::ChainRegistry::default(),
+            TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+            AddressBook::default(),
+            projection_reader(
+                temp.path().join("cache/non-actionable-wallets.json"),
+                Some(MachineBrokerClient::new(service.clone())),
+            ),
+            &projection_root,
+        )
+        .with_broker(Some(MachineBrokerClient::new(service)))
+        .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+        let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
+
+        assert!(matches!(
+            handler
+                .write(&VfsPath::parse("alice/policy.json").unwrap(), &proposed)
+                .await,
+            Err(HandlerError::PermissionDenied)
+        ));
+        let operation_id = fixture.state.lock().operation_id.clone().unwrap();
+        *fixture.ceremony_state_override.lock() = Some(state);
+
+        let status = handler
+            .read(&VfsPath::parse("alice/policy-updates/latest/status.json").unwrap())
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+        assert!(status["ceremony_url"].is_null(), "{state:?}");
+
+        let projection = projection_root
+            .join("alice/policy-updates/pending")
+            .join(operation_id.as_str())
+            .join("approval_challenge.json");
+        let projection: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(projection).unwrap()).unwrap();
+        assert!(projection["ceremony_url"].is_null(), "{state:?}");
+        assert!(projection["ceremony_expires_at_ms"].is_null(), "{state:?}");
+    }
+}

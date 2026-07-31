@@ -13,6 +13,8 @@ source_date_epoch="$4"
 tar_command="${TAR:-tar}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
+python3 "$script_dir/check-legacy-hash-only-routes.py"
+
 machine_artifact_paths() {
   local root="$1"
   local candidate

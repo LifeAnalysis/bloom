@@ -2,7 +2,7 @@
 //! then on confirm sign and broadcast. Also handles same-nonce
 //! replacement / cancel txs and a legacy (non-1559) build path.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,7 +17,10 @@ use alloy::sol_types::SolCall;
 #[cfg(test)]
 use alloy_signer_local::PrivateKeySigner;
 use bloom_evm::{ChainClient, ChainError, IERC20, NftKind};
-use bloom_machine_client::{ExactPayloadSignOutcome, ExactPayloadSignRequest, MachineBrokerClient};
+use bloom_machine_client::{
+    ExactPayloadBatchSignRequest, ExactPayloadSignOutcome, ExactPayloadSignRequest,
+    MachineBrokerClient,
+};
 
 // Local NFT-write interfaces. `bloom-evm` declares the read shapes for
 // ERC-721/1155; we add the write functions here so calldata encoding stays
@@ -83,6 +86,26 @@ pub struct ApprovalRequirement {
     pub ceremony_url: String,
     pub expires_ms: u64,
     pub reason: String,
+}
+
+/// One owned transaction target in an ordered batch confirmation.
+#[derive(Clone)]
+pub struct ConfirmBatchTarget {
+    pub chain_name: String,
+    pub id: String,
+    pub chain: ChainClient,
+    /// Public policy snapshot for this target's chain. Broker independently
+    /// enforces its signed authority policy at the signing boundary.
+    pub policy: Policy,
+}
+
+/// The durable outcome of one exact Broker/Signer batch operation.
+#[derive(Clone, Debug)]
+pub struct ConfirmBatchResult {
+    pub transactions: Vec<StagedTx>,
+    pub operation_id: OperationId,
+    pub signer_receipt_digest: Digest32,
+    pub broker_receipt_digest: Digest32,
 }
 
 impl std::fmt::Display for ApprovalRequirement {
@@ -387,6 +410,8 @@ type NonceLocks =
     Arc<parking_lot::Mutex<HashMap<(String, String, Address), Arc<tokio::sync::Mutex<()>>>>>;
 
 const TRIAD_SIGNING_STATE_FILE: &str = "ceremony.json";
+const TRIAD_BATCH_STATE_DIR: &str = ".batch-signing";
+const TRIAD_BATCH_STATE_FILE: &str = "ceremony.json";
 const TRIAD_EXACT_APPROVAL_TTL_MS: u64 = 10 * 60 * 1_000;
 
 #[derive(Clone)]
@@ -402,6 +427,38 @@ struct TriadEvmSigningState {
     action_id: String,
     payload_digest: Digest32,
     claimed_hash: Digest32,
+    provenance_digest: Digest32,
+    approval_operation_id: OperationId,
+    signing_operation_id: OperationId,
+    request_nonce: RequestNonce,
+    issued_at_ms: DecimalU64,
+    expires_at_ms: DecimalU64,
+    canonical_plan_facts_digest: Digest32,
+    approval_id: Option<Digest32>,
+    ceremony_url: Option<String>,
+    ceremony_expires_at_ms: Option<DecimalU64>,
+    review_manifest_digest: Option<Digest32>,
+    #[serde(default)]
+    sign_dispatched: bool,
+    #[serde(default)]
+    expected_operation_digest: Option<Digest32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct TriadBatchRef {
+    chain: String,
+    id: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct TriadEvmBatchSigningState {
+    schema: String,
+    wallet: String,
+    ordered_refs: Vec<TriadBatchRef>,
+    ordered_payload_digests: Vec<Digest32>,
+    ordered_hashes: Vec<Digest32>,
     provenance_digest: Digest32,
     approval_operation_id: OperationId,
     signing_operation_id: OperationId,
@@ -1779,6 +1836,278 @@ impl TxEngine {
         .await
     }
 
+    /// Confirm 1–32 staged transactions with one exact ordered Broker approval
+    /// and one Signer batch operation. Signature publication is atomic; chain
+    /// submission is deliberately sequential and each child is durably marked
+    /// before it is sent so a partial broadcast can be reconciled safely.
+    pub async fn confirm_batch(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        targets: Vec<ConfirmBatchTarget>,
+        override_warnings: bool,
+    ) -> Result<ConfirmBatchResult, TxEngineError> {
+        self.assert_write_permit(permit)?;
+        if !(1..=32).contains(&targets.len()) {
+            return Err(TxEngineError::ApprovalConstruction(
+                "transaction batch must contain 1 to 32 children".into(),
+            ));
+        }
+        let mut unique = HashSet::with_capacity(targets.len());
+        let ordered_refs = targets
+            .iter()
+            .map(|target| TriadBatchRef {
+                chain: target.chain_name.clone(),
+                id: target.id.clone(),
+            })
+            .collect::<Vec<_>>();
+        for reference in &ordered_refs {
+            if reference.chain.trim().is_empty() || reference.id.trim().is_empty() {
+                return Err(TxEngineError::ApprovalConstruction(
+                    "transaction batch contains an empty chain or transaction id".into(),
+                ));
+            }
+            if !unique.insert((reference.chain.clone(), reference.id.clone())) {
+                return Err(TxEngineError::ApprovalConstruction(format!(
+                    "transaction batch contains duplicate ref '{}:{}'",
+                    reference.chain, reference.id
+                )));
+            }
+        }
+
+        let mut entries = Vec::with_capacity(targets.len());
+        let mut prepared = Vec::with_capacity(targets.len());
+        let mut already_attempted = Vec::with_capacity(targets.len());
+        let now = now_ms();
+        for target in &targets {
+            let policy = &target.policy;
+            let entry = self.outbox.read(wallet, &target.chain_name, &target.id)?;
+            if entry.staged.wallet != wallet
+                || entry.staged.chain != target.chain_name
+                || entry.staged.id != target.id
+                || entry.staged.chain_id != target.chain.spec().chain_id
+            {
+                return Err(TxEngineError::ApprovalState(format!(
+                    "batch ref '{}:{}' does not match its staged transaction or chain client",
+                    target.chain_name, target.id
+                )));
+            }
+            if entry.state == OutboxState::Failed {
+                return Err(TxEngineError::InvalidTxStatus {
+                    id: target.id.clone(),
+                    status: entry.state.dirname().into(),
+                });
+            }
+            let attempt = if entry.state == OutboxState::Pending {
+                self.outbox
+                    .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
+            } else {
+                None
+            };
+            if entry.state == OutboxState::Pending && attempt.is_none() {
+                let staged = &entry.staged;
+                if staged.expires_ms != 0 && now >= staged.expires_ms {
+                    return Err(TxEngineError::Outbox(OutboxError::StagedExpired {
+                        id: staged.id.clone(),
+                        expired_at: staged.expires_ms,
+                        now,
+                    }));
+                }
+                if let Some(dep_id) = staged.depends_on.as_deref() {
+                    self.ensure_dependency_satisfied(wallet, &target.chain_name, dep_id)?;
+                }
+                if policy_engine::has_hard_violation(&staged.policy_checks) {
+                    return Err(TxEngineError::PolicyDenied);
+                }
+                if policy_engine::has_warning(&staged.policy_checks) && !override_warnings {
+                    return Err(TxEngineError::PolicyDenied);
+                }
+                const ENSO_QUOTE_MAX_AGE_SECS: u64 = 300;
+                if let Some(age) = enso_quote_age_secs(&staged.data_hex, (now / 1000) as u64)
+                    && age > ENSO_QUOTE_MAX_AGE_SECS
+                    && !override_warnings
+                {
+                    return Err(TxEngineError::EnsoQuoteStale { age });
+                }
+                self.ensure_broadcast_allowed(target.chain.spec())?;
+                if policy.private.enabled
+                    && !matches!(
+                        staged.chain_id,
+                        bloom_mempool::MAINNET_CHAIN_ID | bloom_mempool::SEPOLIA_CHAIN_ID
+                    )
+                {
+                    return Err(TxEngineError::PrivateNotSupportedOnChain(
+                        target.chain_name.clone(),
+                    ));
+                }
+                if !override_warnings {
+                    self.simulate_or_reject(staged, &target.chain).await?;
+                }
+            }
+            let unsigned = self.build_unsigned_evm_tx(&entry.staged, &target.chain)?;
+            let signing_hash = Self::unsigned_signing_hash(&unsigned);
+            if entry.state == OutboxState::Pending && attempt.is_none() {
+                self.ensure_action_authorized(
+                    &entry,
+                    &entry.staged,
+                    EvmOutboxActionKind::Confirm,
+                    &signing_hash,
+                    policy,
+                    bloom_proto::AuthorizationSurface::Cli,
+                )
+                .await?;
+            }
+            entries.push(entry);
+            prepared.push(PreparedEvmTx {
+                signing_hash,
+                unsigned,
+            });
+            already_attempted.push(attempt);
+        }
+
+        let parent_state_path =
+            batch_signing_state_path(self.outbox.root(), wallet, &ordered_refs)?;
+        let recovering_parent = read_triad_batch_signing_state(&parent_state_path)?.is_some();
+        if !recovering_parent
+            && entries
+                .iter()
+                .zip(&already_attempted)
+                .any(|(entry, attempt)| entry.state != OutboxState::Pending || attempt.is_some())
+        {
+            return Err(TxEngineError::ApprovalState(
+                "a new transaction batch must contain only unattempted pending children".into(),
+            ));
+        }
+
+        // Model earlier ordered children as filling a nonce slot. This admits
+        // [n, n+1, ...] while still refusing a genuine gap before any approval.
+        let mut next_nonces: HashMap<(String, Address), Option<u64>> = HashMap::new();
+        for (index, target) in targets.iter().enumerate() {
+            let staged = &entries[index].staged;
+            let from: Address =
+                staged
+                    .from
+                    .parse()
+                    .map_err(|error: alloy::hex::FromHexError| {
+                        TxEngineError::Address(error.to_string())
+                    })?;
+            let key = (target.chain_name.clone(), from);
+            if !next_nonces.contains_key(&key) {
+                next_nonces.insert(key.clone(), target.chain.nonce(from).await.ok());
+            }
+            if let Some(chain_next) = next_nonces.get_mut(&key).and_then(Option::as_mut) {
+                if staged.nonce > *chain_next {
+                    let _ =
+                        self.write_nonce_gap_advisory(&entries[index], staged.nonce, *chain_next);
+                    return Err(TxEngineError::NonceGap {
+                        from: bloom_proto::checksum_address(&from),
+                        staged: staged.nonce,
+                        chain_next: *chain_next,
+                    });
+                }
+                if staged.nonce == *chain_next {
+                    *chain_next = chain_next.saturating_add(1);
+                }
+            }
+        }
+
+        let preimages = prepared
+            .iter()
+            .map(|item| Self::unsigned_signing_preimage(&item.unsigned))
+            .collect::<Vec<_>>();
+        let hashes = prepared
+            .iter()
+            .map(|item| item.signing_hash)
+            .collect::<Vec<_>>();
+        let staged_plans = entries
+            .iter()
+            .map(|entry| entry.staged.clone())
+            .collect::<Vec<_>>();
+        let result = self
+            .triad_sign_evm_batch(wallet, &ordered_refs, &staged_plans, &preimages, &hashes)
+            .await?;
+        if result.signatures.len() != prepared.len() {
+            return Err(TxEngineError::Signer(
+                "Broker returned an invalid batch signature count".into(),
+            ));
+        }
+
+        // Verify and assemble every signature before exposing any raw child.
+        let mut signed = Vec::with_capacity(prepared.len());
+        for ((entry, prepared), normalized) in entries
+            .iter()
+            .zip(prepared.into_iter())
+            .zip(result.signatures.iter())
+        {
+            if normalized.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable
+                || normalized.bytes.decode().len() != 65
+            {
+                return Err(TxEngineError::Signer(
+                    "Broker returned an invalid exact EVM batch signature".into(),
+                ));
+            }
+            let signature = Signature::from_raw(&normalized.bytes.decode())
+                .map_err(|error| TxEngineError::Signer(error.to_string()))?;
+            signed.push(self.assemble_signed_raw_tx(
+                &entry.staged,
+                prepared.unsigned,
+                signature,
+            )?);
+        }
+
+        let mut transactions = Vec::with_capacity(entries.len());
+        for (index, target) in targets.iter().enumerate() {
+            let policy = &target.policy;
+            let entry = &entries[index];
+            if entry.state == OutboxState::Sent {
+                transactions.push(entry.staged.clone());
+                continue;
+            }
+            if let Some(attempt) = already_attempted[index].clone() {
+                transactions.push(
+                    self.reconcile_confirm_attempt(entry, attempt, &target.chain, policy)
+                        .await?,
+                );
+                continue;
+            }
+            let child = &signed[index];
+            self.outbox
+                .write_broadcast_raw_tx(entry, BroadcastAttemptKind::Confirm, &child.raw)?;
+            let attempt = BroadcastAttempt {
+                schema: "bloom.broadcast_attempted.v1".into(),
+                tx_hash: format!("{:#x}", child.hash),
+                raw_tx_blake3: blake3::hash(&child.raw).to_hex().to_string(),
+                raw_tx_path: BroadcastAttemptKind::Confirm.raw_name().into(),
+                from: entry.staged.from.clone(),
+                to: entry.staged.to.clone(),
+                nonce: entry.staged.nonce,
+                chain_id: entry.staged.chain_id,
+                created_ms: now_ms(),
+                transport: if policy.private.enabled {
+                    BroadcastTransport::PrivateRpc
+                } else {
+                    BroadcastTransport::PublicRpc
+                },
+                private_provider: policy
+                    .private
+                    .enabled
+                    .then(|| policy.private.provider.clone()),
+            };
+            self.outbox
+                .write_broadcast_attempt(entry, BroadcastAttemptKind::Confirm, &attempt)?;
+            self.submit_signed_raw(&entry.staged, &target.chain, policy, child)
+                .await?;
+            transactions.push(self.finalize_sent(entry, child.hash, &target.chain)?);
+        }
+
+        Ok(ConfirmBatchResult {
+            transactions,
+            operation_id: result.operation_id,
+            signer_receipt_digest: result.signer_receipt_digest,
+            broker_receipt_digest: result.broker_receipt_digest,
+        })
+    }
+
     /// Confirm a staged transaction with an explicit warning-override decision.
     /// This avoids converting trusted boolean decisions into user-configurable
     /// sentinel text at internal call sites.
@@ -2786,6 +3115,281 @@ impl TxEngine {
         }
     }
 
+    async fn triad_sign_evm_batch(
+        &self,
+        wallet: &str,
+        ordered_refs: &[TriadBatchRef],
+        staged_plans: &[StagedTx],
+        preimages: &[Vec<u8>],
+        hashes: &[B256],
+    ) -> Result<SigningResult, TxEngineError> {
+        let service = self.triad_signing.as_ref().ok_or_else(|| {
+            TxEngineError::ApprovalServiceUnavailable(
+                "payload-bearing Machine-to-Broker batch signing is not configured".into(),
+            )
+        })?;
+        let provenance = service
+            .provenance_catalog
+            .records
+            .iter()
+            .find(|record| provenance_action_class(&record.subject) == Some("transaction.confirm"))
+            .ok_or_else(|| {
+                TxEngineError::ApprovalDenied(
+                    "installer provenance does not authorize transaction.confirm".into(),
+                )
+            })?;
+        let provenance_digest = provenance
+            .digest()
+            .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?;
+        let ordered_payload_digests = preimages
+            .iter()
+            .map(|payload| Digest32::from_bytes(sha2::Sha256::digest(payload).into()))
+            .collect::<Vec<_>>();
+        let ordered_hashes = hashes
+            .iter()
+            .map(|hash| Digest32::from_bytes(hash.0))
+            .collect::<Vec<_>>();
+        let state_path = batch_signing_state_path(self.outbox.root(), wallet, ordered_refs)?;
+        let canonical_staged_plans = staged_plans
+            .iter()
+            .cloned()
+            .map(|mut staged| {
+                // State transitions and the resulting chain hash are mutable
+                // recovery facts; every review/signing input remains frozen.
+                staged.status = TxStatus::Pending;
+                staged.tx_hash = None;
+                staged
+            })
+            .collect::<Vec<_>>();
+        let canonical_plan_facts_digest = Digest32::from_bytes(
+            sha2::Sha256::digest(
+                serde_jcs::to_vec(&serde_json::json!({
+                    "wallet": wallet,
+                    "ordered_refs": ordered_refs,
+                    "staged_plans": canonical_staged_plans,
+                    "ordered_payload_digests": ordered_payload_digests,
+                    "ordered_hashes": ordered_hashes,
+                }))
+                .map_err(|error| {
+                    TxEngineError::ApprovalConstruction(format!(
+                        "canonicalize staged transaction batch: {error}"
+                    ))
+                })?,
+            )
+            .into(),
+        );
+        let new_state = || -> Result<TriadEvmBatchSigningState, TxEngineError> {
+            let now = now_ms() as u64;
+            let mut expires = now.saturating_add(TRIAD_EXACT_APPROVAL_TTL_MS);
+            for staged in staged_plans {
+                if staged.expires_ms != 0 {
+                    expires = expires.min(staged.expires_ms.min(u128::from(u64::MAX)) as u64);
+                }
+            }
+            if expires <= now {
+                return Err(TxEngineError::ApprovalDenied(
+                    "staged transaction batch expired before approval prepare".into(),
+                ));
+            }
+            Ok(TriadEvmBatchSigningState {
+                schema: "bloom.machine-evm-batch-signing.1".into(),
+                wallet: wallet.into(),
+                ordered_refs: ordered_refs.to_vec(),
+                ordered_payload_digests: ordered_payload_digests.clone(),
+                ordered_hashes: ordered_hashes.clone(),
+                provenance_digest: provenance_digest.clone(),
+                approval_operation_id: random_operation_id(),
+                signing_operation_id: random_operation_id(),
+                request_nonce: random_request_nonce(),
+                issued_at_ms: DecimalU64::new(now),
+                expires_at_ms: DecimalU64::new(expires),
+                canonical_plan_facts_digest: canonical_plan_facts_digest.clone(),
+                approval_id: None,
+                ceremony_url: None,
+                ceremony_expires_at_ms: None,
+                review_manifest_digest: None,
+                sign_dispatched: false,
+                expected_operation_digest: None,
+            })
+        };
+        let mut state = match read_triad_batch_signing_state(&state_path)? {
+            Some(state) => {
+                if state.schema != "bloom.machine-evm-batch-signing.1"
+                    || state.wallet != wallet
+                    || state.ordered_refs != ordered_refs
+                    || state.ordered_payload_digests != ordered_payload_digests
+                    || state.ordered_hashes != ordered_hashes
+                    || state.provenance_digest != provenance_digest
+                    || state.canonical_plan_facts_digest != canonical_plan_facts_digest
+                {
+                    return Err(TxEngineError::ApprovalState(
+                        "durable Broker batch projection conflicts with exact ordered transaction bytes"
+                            .into(),
+                    ));
+                }
+                state
+            }
+            None => new_state()?,
+        };
+        write_triad_batch_signing_state(&state_path, &state)?;
+
+        if state.sign_dispatched {
+            match service
+                .broker
+                .operation_status(state.signing_operation_id.clone())
+                .await
+            {
+                Ok(status) => {
+                    let expected = state.expected_operation_digest.as_ref().ok_or_else(|| {
+                        TxEngineError::ApprovalState(
+                            "dispatched batch projection omitted its operation digest".into(),
+                        )
+                    })?;
+                    if status.operation_id != state.signing_operation_id
+                        || &status.operation_digest != expected
+                    {
+                        return Err(TxEngineError::ApprovalState(
+                            "Broker operation status conflicts with persisted batch identity"
+                                .into(),
+                        ));
+                    }
+                    match status.state {
+                        OperationState::Succeeded => {
+                            let result = status.result.ok_or_else(|| {
+                                TxEngineError::ApprovalState(
+                                    "succeeded Broker batch omitted its signing result".into(),
+                                )
+                            })?;
+                            validate_evm_batch_signing_result(&state, &result)?;
+                            return Ok(result);
+                        }
+                        OperationState::Received
+                        | OperationState::Validated
+                        | OperationState::Reserved
+                        | OperationState::Dispatched
+                        | OperationState::DownstreamAccepted
+                        | OperationState::Committed => {
+                            return Err(TxEngineError::ApprovalServiceUnavailable(format!(
+                                "Broker batch operation is still {:?}; reconcile the same operation ID",
+                                status.state
+                            )));
+                        }
+                        OperationState::Denied
+                        | OperationState::Cancelled
+                        | OperationState::Failed
+                        | OperationState::Quarantined => {
+                            return Err(TxEngineError::ApprovalDenied(format!(
+                                "Broker batch operation is terminal: {:?}",
+                                status.state
+                            )));
+                        }
+                    }
+                }
+                Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => {
+                    state.sign_dispatched = false;
+                    state.expected_operation_digest = None;
+                    write_triad_batch_signing_state(&state_path, &state)?;
+                }
+                Err(error) => return Err(protocol_signing_error(error)),
+            }
+        }
+
+        if let Some(approval_id) = state.approval_id.clone() {
+            let status = service
+                .broker
+                .approval_status(approval_id.clone())
+                .await
+                .map_err(protocol_signing_error)?;
+            if status.approval_id != approval_id {
+                return Err(TxEngineError::ApprovalState(
+                    "Broker approval status changed batch approval identity".into(),
+                ));
+            }
+            match status.state {
+                ApprovalLifecycleState::Active => {
+                    state.ceremony_url = None;
+                    state.ceremony_expires_at_ms = None;
+                    write_triad_batch_signing_state(&state_path, &state)?;
+                }
+                ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony => {
+                    state.ceremony_url = status.ceremony_url;
+                    state.ceremony_expires_at_ms = status.ceremony_expires_at_ms;
+                    write_triad_batch_signing_state(&state_path, &state)?;
+                    return Err(TxEngineError::ApprovalRequired(batch_approval_requirement(
+                        &state,
+                        "Broker ceremony is not complete",
+                    )?));
+                }
+                terminal => {
+                    return Err(TxEngineError::ApprovalDenied(format!(
+                        "Broker batch approval is terminal: {terminal:?}"
+                    )));
+                }
+            }
+        }
+
+        let request = ExactPayloadBatchSignRequest {
+            wallet_id: Token::new(wallet.to_string())
+                .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
+            preimages: preimages.to_vec(),
+            claimed_hashes: ordered_hashes.clone(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            provenance: provenance.subject.clone(),
+            provenance_digest: state.provenance_digest.clone(),
+            activation_mode: None,
+            approval_operation_id: state.approval_operation_id.clone(),
+            signing_operation_id: state.signing_operation_id.clone(),
+            request_nonce: state.request_nonce.clone(),
+            issued_at_ms: state.issued_at_ms.clone(),
+            expires_at_ms: state.expires_at_ms.clone(),
+            canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
+            approval_id: state.approval_id.clone(),
+        };
+        if state.approval_id.is_some() {
+            state.expected_operation_digest = Some(
+                expected_evm_batch_sign_operation_digest(&service.broker, wallet, &state).await?,
+            );
+            state.sign_dispatched = true;
+            write_triad_batch_signing_state(&state_path, &state)?;
+        }
+        match service
+            .broker
+            .sign_exact_payload_batch(request)
+            .await
+            .map_err(protocol_signing_error)?
+        {
+            ExactPayloadSignOutcome::ApprovalRequired(prepared) => {
+                if state
+                    .approval_id
+                    .as_ref()
+                    .is_some_and(|id| id != &prepared.approval_id)
+                {
+                    return Err(TxEngineError::ApprovalState(
+                        "Broker changed the prepared batch approval identity".into(),
+                    ));
+                }
+                state.approval_id = Some(prepared.approval_id);
+                state.ceremony_url = Some(prepared.ceremony_url);
+                state.ceremony_expires_at_ms = Some(prepared.ceremony_expires_at_ms);
+                state.review_manifest_digest = Some(prepared.review_manifest_digest);
+                state.sign_dispatched = false;
+                state.expected_operation_digest = None;
+                write_triad_batch_signing_state(&state_path, &state)?;
+                Err(TxEngineError::ApprovalRequired(batch_approval_requirement(
+                    &state,
+                    "exact Broker batch approval ceremony required",
+                )?))
+            }
+            ExactPayloadSignOutcome::Signed(result) => {
+                validate_evm_batch_signing_result(&state, &result)?;
+                state.ceremony_url = None;
+                state.ceremony_expires_at_ms = None;
+                write_triad_batch_signing_state(&state_path, &state)?;
+                Ok(result)
+            }
+        }
+    }
+
     async fn host_sign_evm_hash(
         &self,
         entry: &crate::outbox::OutboxEntry,
@@ -3475,6 +4079,30 @@ fn complete_triad_signing_result(
     Ok(signature)
 }
 
+fn validate_evm_batch_signing_result(
+    state: &TriadEvmBatchSigningState,
+    result: &SigningResult,
+) -> Result<(), TxEngineError> {
+    if result.operation_id != state.signing_operation_id
+        || state.expected_operation_digest.as_ref() != Some(&result.operation_digest)
+    {
+        return Err(TxEngineError::ApprovalState(
+            "Broker batch signing result conflicts with persisted operation identity".into(),
+        ));
+    }
+    if result.signatures.len() != state.ordered_hashes.len()
+        || result.signatures.iter().any(|signature| {
+            signature.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable
+                || signature.bytes.decode().len() != 65
+        })
+    {
+        return Err(TxEngineError::Signer(
+            "Broker returned an invalid exact EVM batch signature set".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn approval_requirement(
     state: &TriadEvmSigningState,
     reason: &str,
@@ -3497,6 +4125,155 @@ fn approval_requirement(
         expires_ms,
         reason: reason.into(),
     })
+}
+
+fn batch_approval_requirement(
+    state: &TriadEvmBatchSigningState,
+    reason: &str,
+) -> Result<ApprovalRequirement, TxEngineError> {
+    let ceremony_url = state.ceremony_url.clone().ok_or_else(|| {
+        TxEngineError::ApprovalState(
+            "Broker awaiting batch state omitted the owner-visible ceremony URL".into(),
+        )
+    })?;
+    let expires_ms = state
+        .ceremony_expires_at_ms
+        .as_ref()
+        .map(DecimalU64::get)
+        .ok_or_else(|| {
+            TxEngineError::ApprovalState(
+                "Broker awaiting batch state omitted the ceremony expiry".into(),
+            )
+        })?;
+    Ok(ApprovalRequirement {
+        action_id: format!("transaction-batch:{}", state.signing_operation_id),
+        ceremony_url,
+        expires_ms,
+        reason: reason.into(),
+    })
+}
+
+fn batch_signing_state_path(
+    outbox_root: &std::path::Path,
+    wallet: &str,
+    ordered_refs: &[TriadBatchRef],
+) -> Result<std::path::PathBuf, TxEngineError> {
+    let mut set_key = ordered_refs.to_vec();
+    set_key.sort_by(|left, right| (&left.chain, &left.id).cmp(&(&right.chain, &right.id)));
+    let bytes = serde_jcs::to_vec(&serde_json::json!({
+        "wallet": wallet,
+        "refs": set_key,
+    }))
+    .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?;
+    let digest = sha2::Sha256::digest(bytes);
+    Ok(outbox_root
+        .join(TRIAD_BATCH_STATE_DIR)
+        .join(hex::encode(digest))
+        .join(TRIAD_BATCH_STATE_FILE))
+}
+
+async fn expected_evm_batch_sign_operation_digest(
+    broker: &MachineBrokerClient,
+    wallet_id: &str,
+    state: &TriadEvmBatchSigningState,
+) -> Result<Digest32, TxEngineError> {
+    let approval_id = state.approval_id.clone().ok_or_else(|| {
+        TxEngineError::ApprovalState("active exact batch is missing its approval ID".into())
+    })?;
+    let wallet = broker
+        .wallet(
+            Token::new(wallet_id.to_string())
+                .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
+        )
+        .await
+        .map_err(protocol_signing_error)?;
+    let suite = CryptoSuite::Secp256k1Keccak256Recoverable;
+    let mut matching = wallet
+        .key_refs
+        .into_iter()
+        .filter(|key| key.key_spec == suite.key_spec());
+    let key_ref = matching.next().ok_or_else(|| {
+        TxEngineError::ApprovalDenied("wallet has no key compatible with exact EVM signing".into())
+    })?;
+    if matching.next().is_some() {
+        return Err(TxEngineError::ApprovalDenied(
+            "wallet has multiple compatible keys; exact EVM signing is ambiguous".into(),
+        ));
+    }
+    SignOperationIdentity {
+        operation_id: state.signing_operation_id.clone(),
+        approval_id,
+        key_ref,
+        crypto_suite: suite,
+        ordered_payload_digests: state.ordered_payload_digests.clone(),
+        ordered_hashes: state.ordered_hashes.clone(),
+        petal_use_claim_digest: None,
+        claim_assurance_digest: None,
+        policy_version: wallet.policy_version,
+        policy_digest: wallet.policy_digest,
+    }
+    .digest()
+    .map_err(protocol_signing_error)
+}
+
+fn read_triad_batch_signing_state(
+    path: &std::path::Path,
+) -> Result<Option<TriadEvmBatchSigningState>, TxEngineError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(TxEngineError::Outbox(error.into())),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(TxEngineError::ApprovalState(
+            "durable Broker batch projection is not a regular file".into(),
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(OutboxError::from)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| TxEngineError::ApprovalState(format!("decode batch ceremony: {error}")))
+}
+
+fn write_triad_batch_signing_state(
+    path: &std::path::Path,
+    state: &TriadEvmBatchSigningState,
+) -> Result<(), TxEngineError> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let parent = path.parent().ok_or_else(|| {
+        TxEngineError::ApprovalState("batch ceremony projection has no parent directory".into())
+    })?;
+    std::fs::create_dir_all(parent).map_err(OutboxError::from)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        .map_err(OutboxError::from)?;
+    let bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| TxEngineError::ApprovalState(error.to_string()))?;
+    let mut random = [0_u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
+    let temporary = parent.join(format!(
+        ".{TRIAD_BATCH_STATE_FILE}.{}.tmp",
+        hex::encode(random)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let result = (|| -> Result<(), std::io::Error> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|error| TxEngineError::Outbox(error.into()))
 }
 
 fn read_triad_signing_state(
@@ -3839,9 +4616,21 @@ mod tests {
             .expect("valid deterministic test key")
     }
 
+    fn test_normalized_signature(payload: &[u8], crypto_suite: CryptoSuite) -> NormalizedSignature {
+        use alloy::signers::SignerSync as _;
+
+        let hash = alloy::primitives::keccak256(payload);
+        let signature = test_signer().sign_hash_sync(&hash).unwrap();
+        NormalizedSignature {
+            crypto_suite,
+            bytes: Base64UrlBytes::from_bytes(&signature.as_bytes()),
+        }
+    }
+
     struct TriadBrokerFixture {
         active: AtomicBool,
         lose_sign_response_once: AtomicBool,
+        corrupt_status_result: AtomicBool,
         completed_result: parking_lot::Mutex<Option<SigningResult>>,
         requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
         key_ref: KeyRef,
@@ -3897,12 +4686,15 @@ mod tests {
                         }),
                     ),
                     MachineBrokerRequest::OperationStatus(request) => {
-                        let result = self.completed_result.lock().clone().ok_or_else(|| {
+                        let mut result = self.completed_result.lock().clone().ok_or_else(|| {
                             bloom_triad_protocol::ProtocolError::new(
                                 ProtocolErrorCode::ApprovalNotFound,
                                 "operation not found",
                             )
                         })?;
+                        if self.corrupt_status_result.load(Ordering::SeqCst) {
+                            result.operation_id = OperationId::from_bytes([222; 32]);
+                        }
                         Ok(MachineBrokerResponse::OperationStatus(
                             OperationPublicStatus {
                                 operation_id: request.operation_id,
@@ -3938,6 +4730,32 @@ mod tests {
                             ));
                         }
                         Ok(MachineBrokerResponse::SigningSign(result))
+                    }
+                    MachineBrokerRequest::SigningSignBatch(request) => {
+                        let SigningPayloads::Batch { children } = &request.payloads else {
+                            panic!("fixture expects an exact payload batch");
+                        };
+                        let signatures = children
+                            .iter()
+                            .map(|payload| {
+                                test_normalized_signature(&payload.decode(), request.crypto_suite)
+                            })
+                            .collect();
+                        let result = SigningResult {
+                            operation_id: request.operation_id,
+                            operation_digest: request.operation_digest,
+                            signatures,
+                            signer_receipt_digest: Digest32::from_bytes([9; 32]),
+                            broker_receipt_digest: Digest32::from_bytes([10; 32]),
+                        };
+                        *self.completed_result.lock() = Some(result.clone());
+                        if self.lose_sign_response_once.swap(false, Ordering::SeqCst) {
+                            return Err(bloom_triad_protocol::ProtocolError::new(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                "simulated local batch response loss after Broker commit",
+                            ));
+                        }
+                        Ok(MachineBrokerResponse::SigningSignBatch(result))
                     }
                     other => panic!("unexpected triad fixture request: {other:?}"),
                 }
@@ -4102,6 +4920,99 @@ mod tests {
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         response_body.len(),
                         response_body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_batch_rpc(fail_send_once: Option<usize>) -> String {
+        use std::net::SocketAddr;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let send_count = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let send_count = send_count.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let body = loop {
+                        let read = match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => read,
+                        };
+                        bytes.extend_from_slice(&chunk[..read]);
+                        let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        let start = header_end + 4;
+                        while bytes.len() < start + length {
+                            let read = match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => read,
+                            };
+                            bytes.extend_from_slice(&chunk[..read]);
+                        }
+                        break &bytes[start..start + length];
+                    };
+                    let request: serde_json::Value = serde_json::from_slice(body).unwrap();
+                    let id = request.get("id").cloned().unwrap_or(serde_json::json!(1));
+                    let method = request["method"].as_str().unwrap_or("");
+                    let response = match method {
+                        "eth_chainId" => {
+                            serde_json::json!({"jsonrpc":"2.0","id":id,"result":"0x7a69"})
+                        }
+                        "eth_call" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":"0x"}),
+                        "eth_getTransactionCount" => {
+                            serde_json::json!({"jsonrpc":"2.0","id":id,"result":"0x0"})
+                        }
+                        "eth_getTransactionByHash" | "eth_getTransactionReceipt" => {
+                            serde_json::json!({"jsonrpc":"2.0","id":id,"result":null})
+                        }
+                        "eth_sendRawTransaction" => {
+                            let ordinal = send_count.fetch_add(1, Ordering::SeqCst) + 1;
+                            if Some(ordinal) == fail_send_once {
+                                serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"injected second-child failure"}})
+                            } else {
+                                let raw = request["params"][0].as_str().unwrap();
+                                let raw = hex::decode(raw.trim_start_matches("0x")).unwrap();
+                                let hash = alloy::primitives::keccak256(raw);
+                                serde_json::json!({"jsonrpc":"2.0","id":id,"result":format!("{hash:#x}")})
+                            }
+                        }
+                        _ => {
+                            serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("unmocked method: {method}")}})
+                        }
+                    };
+                    let body = response.to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
                     );
                     let _ = socket.write_all(response.as_bytes()).await;
                     let _ = socket.shutdown().await;
@@ -4614,6 +5525,7 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(false),
             lose_sign_response_once: AtomicBool::new(false),
+            corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
             requests: parking_lot::Mutex::new(Vec::new()),
             key_ref: triad_key_ref(),
@@ -4702,6 +5614,552 @@ mod tests {
                 MachineBrokerRequest::SigningSign(_)
             ]
         ));
+    }
+
+    fn triad_batch_fixture(
+        outbox: Outbox,
+        active: bool,
+        lose_sign_response_once: bool,
+    ) -> (TxEngine, Arc<TriadBrokerFixture>, MachineBrokerClient) {
+        let fixture = Arc::new(TriadBrokerFixture {
+            active: AtomicBool::new(active),
+            lose_sign_response_once: AtomicBool::new(lose_sign_response_once),
+            corrupt_status_result: AtomicBool::new(false),
+            completed_result: parking_lot::Mutex::new(None),
+            requests: parking_lot::Mutex::new(Vec::new()),
+            key_ref: triad_key_ref(),
+        });
+        let service: Arc<dyn MachineBrokerService> = fixture.clone();
+        let broker = MachineBrokerClient::new(service);
+        let engine = TxEngine::new(outbox, 60_000)
+            .with_triad_signing(broker.clone(), triad_catalog())
+            .unwrap();
+        (engine, fixture, broker)
+    }
+
+    fn batch_material(
+        ids: &[&str],
+    ) -> (Vec<TriadBatchRef>, Vec<StagedTx>, Vec<Vec<u8>>, Vec<B256>) {
+        let staged = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut staged = fake_staged_1559(id);
+                staged.created_ms = now_ms();
+                staged.nonce = index as u64;
+                staged
+            })
+            .collect::<Vec<_>>();
+        let refs = staged
+            .iter()
+            .map(|staged| TriadBatchRef {
+                chain: staged.chain.clone(),
+                id: staged.id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let prepared = staged
+            .iter()
+            .map(|staged| {
+                let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+                    chain_id: staged.chain_id,
+                    nonce: staged.nonce,
+                    gas_limit: staged.gas_limit,
+                    max_fee_per_gas: 100,
+                    max_priority_fee_per_gas: 10,
+                    to: TxKind::Call(staged.to.parse().unwrap()),
+                    value: U256::ZERO,
+                    access_list: AccessList::default(),
+                    input: Bytes::new(),
+                });
+                (
+                    TxEngine::unsigned_signing_preimage(&unsigned),
+                    TxEngine::unsigned_signing_hash(&unsigned),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (preimages, hashes): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
+        (refs, staged, preimages, hashes)
+    }
+
+    #[tokio::test]
+    async fn triad_batch_prepares_once_then_signs_once_in_exact_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
+        let (refs, staged, preimages, hashes) = batch_material(&["batch-a", "batch-b"]);
+
+        let error = engine
+            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TxEngineError::ApprovalRequired(_)));
+        fixture.active.store(true, Ordering::SeqCst);
+
+        let result = engine
+            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+            .await
+            .unwrap();
+        assert_eq!(result.signatures.len(), 2);
+        assert_eq!(result.signer_receipt_digest, Digest32::from_bytes([9; 32]));
+        assert_eq!(result.broker_receipt_digest, Digest32::from_bytes([10; 32]));
+        for ((signature, hash), staged) in result.signatures.iter().zip(&hashes).zip(&staged) {
+            let signature = Signature::from_raw(&signature.bytes.decode()).unwrap();
+            assert_eq!(
+                signature.recover_address_from_prehash(hash).unwrap(),
+                staged.from.parse::<Address>().unwrap()
+            );
+        }
+        let requests = fixture.requests.lock();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SealedApprovalPrepare(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSignBatch(_)))
+                .count(),
+            1
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn triad_batch_response_loss_reconciles_without_resigning() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, broker) = triad_batch_fixture(outbox.clone(), false, false);
+        let (refs, staged, preimages, hashes) = batch_material(&["loss-a", "loss-b"]);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        fixture
+            .lose_sign_response_once
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalServiceUnavailable(_))
+        ));
+
+        let restarted = TxEngine::new(outbox, 60_000)
+            .with_triad_signing(broker, triad_catalog())
+            .unwrap();
+        let result = restarted
+            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+            .await
+            .unwrap();
+        assert_eq!(result.signatures.len(), 2);
+        let requests = fixture.requests.lock();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSignBatch(_)))
+                .count(),
+            1,
+            "operation-status reconciliation must not dispatch a second signing request"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, MachineBrokerRequest::OperationStatus(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn triad_batch_recovery_rejects_inconsistent_nested_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
+        let (refs, staged, preimages, hashes) = batch_material(&["bad-a", "bad-b"]);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        fixture
+            .lose_sign_response_once
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalServiceUnavailable(_))
+        ));
+        fixture.corrupt_status_result.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalState(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn triad_batch_reordered_retry_is_rejected_before_second_prepare() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
+        let (refs, staged, preimages, hashes) = batch_material(&["order-a", "order-b"]);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let reversed_refs = refs.iter().cloned().rev().collect::<Vec<_>>();
+        let reversed_staged = staged.iter().cloned().rev().collect::<Vec<_>>();
+        let reversed_preimages = preimages.iter().cloned().rev().collect::<Vec<_>>();
+        let reversed_hashes = hashes.iter().copied().rev().collect::<Vec<_>>();
+        let error = engine
+            .triad_sign_evm_batch(
+                "alice",
+                &reversed_refs,
+                &reversed_staged,
+                &reversed_preimages,
+                &reversed_hashes,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TxEngineError::ApprovalState(_)));
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SealedApprovalPrepare(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_batch_rejects_duplicates_before_outbox_or_broker_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let permit = permit_for(&directory);
+        let chain = stage_chain("http://127.0.0.1:1");
+        let engine = TxEngine::new(outbox, 60_000);
+        let target = ConfirmBatchTarget {
+            chain_name: "anvil".into(),
+            id: "same".into(),
+            chain,
+            policy: Policy::default(),
+        };
+        let error = engine
+            .confirm_batch(&permit, "alice", vec![target.clone(), target], false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TxEngineError::ApprovalConstruction(_)));
+    }
+
+    #[tokio::test]
+    async fn confirm_batch_enforces_protocol_bounds_before_outbox_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let permit = permit_for(&directory);
+        let engine = TxEngine::new(outbox, 60_000);
+        assert!(matches!(
+            engine
+                .confirm_batch(&permit, "alice", Vec::new(), false)
+                .await,
+            Err(TxEngineError::ApprovalConstruction(_))
+        ));
+        let chain = stage_chain("http://127.0.0.1:1");
+        let targets = (0..33)
+            .map(|index| ConfirmBatchTarget {
+                chain_name: "anvil".into(),
+                id: format!("child-{index}"),
+                chain: chain.clone(),
+                policy: Policy::default(),
+            })
+            .collect();
+        assert!(matches!(
+            engine.confirm_batch(&permit, "alice", targets, false).await,
+            Err(TxEngineError::ApprovalConstruction(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_batch_preflights_every_child_before_broker_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut first = fake_staged_1559("preflight-a");
+        first.created_ms = now_ms();
+        let mut second = fake_staged_1559("preflight-b");
+        second.created_ms = now_ms();
+        second.nonce = 1;
+        second.expires_ms = now_ms().saturating_sub(1);
+        outbox.write_pending(&first, "first").unwrap();
+        outbox.write_pending(&second, "second").unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
+        let permit = permit_for(&directory);
+        let chain = stage_chain("http://127.0.0.1:1");
+        let targets = [first, second]
+            .into_iter()
+            .map(|staged| ConfirmBatchTarget {
+                chain_name: staged.chain,
+                id: staged.id,
+                chain: chain.clone(),
+                policy: Policy::default(),
+            })
+            .collect();
+        assert!(matches!(
+            engine.confirm_batch(&permit, "alice", targets, true).await,
+            Err(TxEngineError::Outbox(OutboxError::StagedExpired { .. }))
+        ));
+        assert!(
+            fixture.requests.lock().is_empty(),
+            "a later child preflight failure must prevent approval preparation and signing"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_batch_rejects_unrelated_sent_or_attempted_children() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let permit = permit_for(&directory);
+        let chain = stage_chain("http://127.0.0.1:1");
+        let mut sent = fake_staged_1559("unrelated-sent");
+        sent.created_ms = now_ms();
+        outbox.write_pending(&sent, "sent").unwrap();
+        let sent_entry = outbox
+            .read_in_state("alice", "anvil", &sent.id, OutboxState::Pending)
+            .unwrap();
+        outbox.transition(&sent_entry, OutboxState::Sent).unwrap();
+        let engine = TxEngine::new(outbox.clone(), 60_000);
+        let sent_target = ConfirmBatchTarget {
+            chain_name: "anvil".into(),
+            id: sent.id,
+            chain: chain.clone(),
+            policy: Policy::default(),
+        };
+        assert!(matches!(
+            engine
+                .confirm_batch(&permit, "alice", vec![sent_target], true)
+                .await,
+            Err(TxEngineError::ApprovalState(_))
+        ));
+
+        let mut attempted = fake_staged_1559("unrelated-attempt");
+        attempted.created_ms = now_ms();
+        outbox.write_pending(&attempted, "attempted").unwrap();
+        let attempted_entry = outbox
+            .read_in_state("alice", "anvil", &attempted.id, OutboxState::Pending)
+            .unwrap();
+        outbox
+            .write_broadcast_attempt(
+                &attempted_entry,
+                BroadcastAttemptKind::Confirm,
+                &BroadcastAttempt {
+                    schema: "bloom.broadcast_attempted.v1".into(),
+                    tx_hash: format!("{:#x}", B256::ZERO),
+                    raw_tx_blake3: blake3::hash(&[]).to_hex().to_string(),
+                    raw_tx_path: BroadcastAttemptKind::Confirm.raw_name().into(),
+                    from: attempted.from,
+                    to: attempted.to,
+                    nonce: attempted.nonce,
+                    chain_id: attempted.chain_id,
+                    created_ms: now_ms(),
+                    transport: BroadcastTransport::PublicRpc,
+                    private_provider: None,
+                },
+            )
+            .unwrap();
+        let attempted_target = ConfirmBatchTarget {
+            chain_name: "anvil".into(),
+            id: attempted.id,
+            chain,
+            policy: Policy::default(),
+        };
+        assert!(matches!(
+            engine
+                .confirm_batch(&permit, "alice", vec![attempted_target], true)
+                .await,
+            Err(TxEngineError::ApprovalState(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirm_batch_recovers_partial_broadcast_without_resigning() {
+        let url = spawn_batch_rpc(Some(2)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (mut refs, mut staged, _, _) = batch_material(&["broadcast-a", "broadcast-b"]);
+        for child in &mut staged {
+            child.created_ms = now_ms();
+            outbox.write_pending(child, "batch review").unwrap();
+        }
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&url);
+        let targets = refs
+            .drain(..)
+            .map(|reference| ConfirmBatchTarget {
+                chain_name: reference.chain,
+                id: reference.id,
+                chain: chain.clone(),
+                policy: Policy::default(),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            engine
+                .confirm_batch(&permit, "alice", targets.clone(), false)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        let error = engine
+            .confirm_batch(&permit, "alice", targets.clone(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TxEngineError::Chain(_)));
+        assert_eq!(
+            outbox.read("alice", "anvil", "broadcast-a").unwrap().state,
+            OutboxState::Sent
+        );
+        let second = outbox
+            .read_in_state("alice", "anvil", "broadcast-b", OutboxState::Pending)
+            .unwrap();
+        assert!(
+            outbox
+                .read_broadcast_attempt(&second, BroadcastAttemptKind::Confirm)
+                .unwrap()
+                .is_some(),
+            "failed child must retain its raw transaction and attempt marker"
+        );
+
+        let result = engine
+            .confirm_batch(&permit, "alice", targets, false)
+            .await
+            .unwrap();
+        assert_eq!(result.transactions.len(), 2);
+        assert!(
+            result
+                .transactions
+                .iter()
+                .all(|transaction| transaction.status == TxStatus::Sent)
+        );
+        assert_eq!(result.signer_receipt_digest, Digest32::from_bytes([9; 32]));
+        assert_eq!(result.broker_receipt_digest, Digest32::from_bytes([10; 32]));
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSignBatch(_)))
+                .count(),
+            1,
+            "partial-broadcast recovery must query the completed parent operation, not re-sign"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_batch_recovers_marker_written_before_first_send() {
+        let url = spawn_batch_rpc(None).await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (refs, mut staged, preimages, hashes) = batch_material(&["marker-a", "marker-b"]);
+        for child in &mut staged {
+            child.created_ms = now_ms();
+            outbox.write_pending(child, "batch review").unwrap();
+        }
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        let signing_result = engine
+            .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+            .await
+            .unwrap();
+
+        let chain = stage_chain(&url);
+        let first_entry = outbox
+            .read_in_state("alice", "anvil", "marker-a", OutboxState::Pending)
+            .unwrap();
+        let first_unsigned = engine
+            .build_unsigned_evm_tx(&first_entry.staged, &chain)
+            .unwrap();
+        let first_signature =
+            Signature::from_raw(&signing_result.signatures[0].bytes.decode()).unwrap();
+        let first_signed = engine
+            .assemble_signed_raw_tx(&first_entry.staged, first_unsigned, first_signature)
+            .unwrap();
+        outbox
+            .write_broadcast_raw_tx(
+                &first_entry,
+                BroadcastAttemptKind::Confirm,
+                &first_signed.raw,
+            )
+            .unwrap();
+        outbox
+            .write_broadcast_attempt(
+                &first_entry,
+                BroadcastAttemptKind::Confirm,
+                &BroadcastAttempt {
+                    schema: "bloom.broadcast_attempted.v1".into(),
+                    tx_hash: format!("{:#x}", first_signed.hash),
+                    raw_tx_blake3: blake3::hash(&first_signed.raw).to_hex().to_string(),
+                    raw_tx_path: BroadcastAttemptKind::Confirm.raw_name().into(),
+                    from: first_entry.staged.from.clone(),
+                    to: first_entry.staged.to.clone(),
+                    nonce: first_entry.staged.nonce,
+                    chain_id: first_entry.staged.chain_id,
+                    created_ms: now_ms(),
+                    transport: BroadcastTransport::PublicRpc,
+                    private_provider: None,
+                },
+            )
+            .unwrap();
+
+        let permit = permit_for(&directory);
+        let targets = refs
+            .into_iter()
+            .map(|reference| ConfirmBatchTarget {
+                chain_name: reference.chain,
+                id: reference.id,
+                chain: chain.clone(),
+                policy: Policy::default(),
+            })
+            .collect();
+        let result = engine
+            .confirm_batch(&permit, "alice", targets, false)
+            .await
+            .unwrap();
+        assert!(
+            result
+                .transactions
+                .iter()
+                .all(|transaction| transaction.status == TxStatus::Sent)
+        );
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSignBatch(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]

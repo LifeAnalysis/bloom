@@ -290,6 +290,65 @@ fn spawn_ipc_server(
     (server, server_thread)
 }
 
+struct FixedBatchConfirmation;
+
+impl bloom_daemon::ipc::BatchConfirmationService for FixedBatchConfirmation {
+    fn confirm_batch<'a>(
+        &'a self,
+        request: bloom_daemon::ipc::BatchConfirmIpcRequest,
+    ) -> bloom_daemon::ipc::BatchConfirmFuture<'a> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "operation_id": "batch-operation-id",
+                "signer_receipt_digest": "signer-receipt-digest",
+                "broker_receipt_digest": "broker-receipt-digest",
+                "wallet": request.wallet,
+                "txs": request.txs,
+                "confirmation_text": request.text,
+            }))
+        })
+    }
+}
+
+fn spawn_batch_ipc_server(
+    home: &Path,
+) -> (bloom_daemon::ipc::IpcServer, std::thread::JoinHandle<()>) {
+    use bloom_daemon::ipc::{IpcServer, default_socket_path};
+
+    let socket = default_socket_path(home);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let server = IpcServer::new(
+        bloom_vfs::Vfs::builder().build(),
+        "ipc-test-version",
+        vec![],
+    )
+    .with_batch_confirmation(Arc::new(FixedBatchConfirmation));
+    let server_for_thread = server.clone();
+    let socket_for_thread = socket.clone();
+    let server_thread = std::thread::spawn(move || {
+        rt.block_on(async move {
+            server_for_thread
+                .serve(&socket_for_thread)
+                .await
+                .expect("ipc serve");
+        });
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "batch IPC server never created socket at {}",
+            socket.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (server, server_thread)
+}
+
 fn stop_ipc_server(
     server: bloom_daemon::ipc::IpcServer,
     server_thread: std::thread::JoinHandle<()>,
@@ -1246,6 +1305,29 @@ fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
         "/alice/chains/base/outbox/pending/0001-deadbeef/confirm"
     );
     assert_eq!(writes[0].1, b"y");
+}
+
+#[test]
+fn wallet_confirm_batch_uses_canonical_ipc_and_prints_authority_receipts() {
+    let home = fresh_home();
+    let (server, server_thread) = spawn_batch_ipc_server(home.path());
+
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "confirm-batch",
+            "alice",
+            "base:0001-deadbeef",
+            "ethereum:0002-cafebabe",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("batch-operation-id"))
+        .stdout(predicate::str::contains("signer-receipt-digest"))
+        .stdout(predicate::str::contains("broker-receipt-digest"))
+        .stdout(predicate::str::contains("\"confirmation_text\": \"y\""));
+
+    stop_ipc_server(server, server_thread);
 }
 
 #[test]

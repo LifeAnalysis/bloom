@@ -14,13 +14,16 @@
 //! | `list`     | `{ "path": "/..." }`                  | `[ entry, ... ]`          |
 //! | `version`  | `null`                                | `"x.y.z"`                 |
 //! | `chains`   | `null`                                | `[ "ethereum", ... ]`     |
+//! | `confirm_batch` | `{ "wallet", "txs", "text" }` | batch result              |
 //! | `shutdown` | `null`                                | `null`                    |
 //!
 //! Wire framing is one JSON document per line. Encoding/decoding errors
 //! produce a JSON-RPC `-32700` parse-error response and the connection
 //! continues. Unknown methods produce `-32601`.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
@@ -110,6 +113,24 @@ impl Response {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchConfirmIpcRequest {
+    pub wallet: String,
+    pub txs: Vec<String>,
+    pub text: String,
+}
+
+pub type BatchConfirmFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
+
+/// Narrow Machine-local execution seam for the CLI batch command. This is
+/// deliberately separate from the VFS and from the authenticated triad wire:
+/// the implementation may only orchestrate already-staged outbox entries
+/// through the canonical Broker batch-signing path.
+pub trait BatchConfirmationService: Send + Sync {
+    fn confirm_batch<'a>(&'a self, request: BatchConfirmIpcRequest) -> BatchConfirmFuture<'a>;
+}
+
 /// Server context. Cloning is cheap (Arc-shared).
 #[derive(Clone)]
 pub struct IpcServer {
@@ -117,6 +138,7 @@ pub struct IpcServer {
     pub version: String,
     pub chains: Vec<String>,
     petals: Option<PetalRunner>,
+    batch_confirmation: Option<Arc<dyn BatchConfirmationService>>,
     shutdown: Arc<Notify>,
 }
 
@@ -127,6 +149,7 @@ impl IpcServer {
             version: version.into(),
             chains,
             petals: None,
+            batch_confirmation: None,
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -135,6 +158,11 @@ impl IpcServer {
     /// `-32601 method not found`.
     pub fn with_petals(mut self, runner: PetalRunner) -> Self {
         self.petals = Some(runner);
+        self
+    }
+
+    pub fn with_batch_confirmation(mut self, service: Arc<dyn BatchConfirmationService>) -> Self {
+        self.batch_confirmation = Some(service);
         self
     }
 
@@ -264,6 +292,25 @@ impl IpcServer {
                 Ok(()) => Response::ok(id, Value::Null),
                 Err(e) => map_handler_err(id, e),
             },
+            "confirm_batch" => {
+                let Some(service) = self.batch_confirmation.as_ref() else {
+                    return Response::err(id, -32601, "method not found: confirm_batch");
+                };
+                let request = match serde_json::from_value::<BatchConfirmIpcRequest>(req.params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return Response::err(
+                            id,
+                            -32602,
+                            format!("invalid confirm_batch parameters: {error}"),
+                        );
+                    }
+                };
+                match service.confirm_batch(request).await {
+                    Ok(result) => Response::ok(id, result),
+                    Err(error) => Response::err(id, -32000, error),
+                }
+            }
             "sign_hash" => Response::err(
                 id,
                 -32601,
@@ -608,6 +655,22 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    struct MockBatchConfirmation;
+
+    impl BatchConfirmationService for MockBatchConfirmation {
+        fn confirm_batch<'a>(&'a self, request: BatchConfirmIpcRequest) -> BatchConfirmFuture<'a> {
+            Box::pin(async move {
+                Ok(json!({
+                    "wallet": request.wallet,
+                    "txs": request.txs,
+                    "operation_id": "batch-operation",
+                    "signer_receipt_digest": "signer-receipt",
+                    "broker_receipt_digest": "broker-receipt",
+                }))
+            })
+        }
+    }
+
     struct SingleFileHandler {
         name: String,
         body: Vec<u8>,
@@ -730,6 +793,48 @@ summary = "Demo app used by IPC tests."
             let p = VfsPath::parse(path).unwrap();
             assert!(write_path_uses_wallet_signer(&p), "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn batch_confirmation_is_explicitly_wired_and_returns_authority_receipts() {
+        let server = IpcServer::new(vfs(), "0", vec![])
+            .with_batch_confirmation(Arc::new(MockBatchConfirmation));
+        let response = server
+            .dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(1),
+                method: "confirm_batch".into(),
+                params: serde_json::to_value(BatchConfirmIpcRequest {
+                    wallet: "minnow".into(),
+                    txs: vec!["base:first".into(), "base:second".into()],
+                    text: "override".into(),
+                })
+                .unwrap(),
+            })
+            .await;
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        assert_eq!(result["operation_id"], "batch-operation");
+        assert_eq!(result["signer_receipt_digest"], "signer-receipt");
+        assert_eq!(result["broker_receipt_digest"], "broker-receipt");
+        assert_eq!(result["txs"], json!(["base:first", "base:second"]));
+    }
+
+    #[tokio::test]
+    async fn batch_confirmation_is_unavailable_without_canonical_service() {
+        let response = IpcServer::new(vfs(), "0", vec![])
+            .dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(1),
+                method: "confirm_batch".into(),
+                params: json!({
+                    "wallet": "minnow",
+                    "txs": ["base:first"],
+                    "text": "override",
+                }),
+            })
+            .await;
+        assert_eq!(response.error.unwrap().code, -32601);
     }
 
     #[tokio::test]

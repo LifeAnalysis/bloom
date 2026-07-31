@@ -268,4 +268,30 @@ mod tests {
             Err(HostError::Denied(_))
         ));
     }
+
+    #[tokio::test]
+    async fn ac35_legacy_v0_1_host_methods_are_always_unsupported() {
+        let host = DenyHost;
+        let request = SignRequest {
+            wallet: "alice".into(),
+            hash32: [7; 32],
+            purpose: "orders.place".into(),
+            context: None,
+        };
+        assert!(matches!(
+            host.sign_hash(request.clone()).await,
+            Err(HostError::UnsupportedVersion(message)) if message.contains("@0.1.0")
+        ));
+        assert!(matches!(
+            host.sign_hash_outcome(request.clone()).await,
+            Err(HostError::UnsupportedVersion(message)) if message.contains("@0.1.0")
+        ));
+        assert!(matches!(
+            host.sign_hashes_outcome(SignBatchRequest {
+                requests: vec![request],
+            })
+            .await,
+            Err(HostError::UnsupportedVersion(message)) if message.contains("@0.1.0")
+        ));
+    }
 }

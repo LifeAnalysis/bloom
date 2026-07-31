@@ -3972,11 +3972,8 @@ paths = ["/status"]
     }
 
     #[tokio::test]
-    async fn legacy_component_sign_batch_is_always_unsupported() {
+    async fn ac35_legacy_v0_1_component_routes_are_always_unsupported() {
         let host = Arc::new(MockHost::default());
-        let mut caps = BTreeSet::new();
-        caps.insert(Capability::Sign);
-        let mut store = component_test_store(caps, None, host);
         let request = |wallet: &str, byte: u8| {
             ComponentVal::Record(vec![
                 ("wallet".into(), ComponentVal::String(wallet.into())),
@@ -3984,15 +3981,44 @@ paths = ["/status"]
                 ("intent".into(), ComponentVal::String("orders.place".into())),
             ])
         };
-        let params = [ComponentVal::List(vec![
-            request("alice", 1),
-            request("bob", 2),
-        ])];
-        let mut result = vec![ComponentVal::Bool(false)];
-        component_sign_hashes(store.as_context_mut(), &params, &mut result)
-            .await
-            .unwrap();
-        assert_component_err_contains(&result[0], "UNSUPPORTED_VERSION");
+        for has_sign_capability in [false, true] {
+            let mut caps = BTreeSet::new();
+            if has_sign_capability {
+                caps.insert(Capability::Sign);
+            }
+            let mut store = component_test_store(caps, None, host.clone());
+            for params in [
+                vec![],
+                vec![ComponentVal::String("malformed".into())],
+                vec![
+                    ComponentVal::String("alice".into()),
+                    component_bytes(vec![1; 32]),
+                    ComponentVal::String("orders.place".into()),
+                ],
+            ] {
+                let mut result = vec![ComponentVal::Bool(false)];
+                component_sign_hash(store.as_context_mut(), &params, &mut result)
+                    .await
+                    .unwrap();
+                assert_component_err_contains(&result[0], "UNSUPPORTED_VERSION");
+            }
+
+            for params in [
+                vec![],
+                vec![ComponentVal::String("malformed".into())],
+                vec![ComponentVal::List(vec![
+                    request("alice", 1),
+                    request("bob", 2),
+                ])],
+            ] {
+                let mut result = vec![ComponentVal::Bool(false)];
+                component_sign_hashes(store.as_context_mut(), &params, &mut result)
+                    .await
+                    .unwrap();
+                assert_component_err_contains(&result[0], "UNSUPPORTED_VERSION");
+            }
+        }
+        assert!(host.sign_calls.lock().is_empty());
     }
 
     #[tokio::test]

@@ -1150,7 +1150,7 @@ enum WalletCmd {
         #[arg(long)]
         intent: Option<String>,
     },
-    /// Submit an atomic batch of staged transactions.
+    /// Sign an ordered batch atomically, then broadcast each transaction in order.
     ///
     /// Each TX is `chain:id`, for example `base:0001-abc`.
     ConfirmBatch {
@@ -1158,7 +1158,7 @@ enum WalletCmd {
         /// Staged tx references in the exact order to broadcast.
         txs: Vec<String>,
         /// Confirmation text for each tx.
-        #[arg(long, default_value = "override")]
+        #[arg(long, default_value = "y")]
         text: String,
     },
     /// Validate a proposed policy and prepare its Broker-originated review
@@ -2060,12 +2060,34 @@ async fn run(cli: Cli) -> Result<()> {
             for tx in &txs {
                 let _ = parse_batch_tx_ref(tx)?;
             }
-            bail!(
-                "atomic batch confirmation for wallet '{wallet}' is unavailable until the \
-                 Machine signing.sign_batch projection is connected to Broker; no embedded \
-                 Machine approval or signing fallback is available (confirmation text: \
-                 {text:?})"
+            let request = bloom_daemon::ipc::BatchConfirmIpcRequest { wallet, txs, text };
+            let client = IpcClient::new(&client_endpoint.socket);
+            let result = match try_ipc(
+                &client,
+                &client_endpoint,
+                "confirm_batch",
+                serde_json::to_value(&request)?,
             )
+            .await
+            .with_context(|| format!("ipc wallet confirm-batch via {}", client_endpoint.display))?
+            {
+                Some(result) => {
+                    debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm_batch.via_ipc");
+                    result
+                }
+                None => {
+                    debug!("cli.wallet.confirm_batch.via_inproc: no daemon socket present");
+                    let (_home_permit, daemon) = build_write_daemon(home)?;
+                    daemon
+                        .batch_confirmation_service()
+                        .map_err(anyhow::Error::msg)?
+                        .confirm_batch(request)
+                        .await
+                        .map_err(anyhow::Error::msg)?
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
         }
         Cmd::Ceremony(command) => handle_ceremony(&home, command).await,
         Cmd::Serve { endpoint, mount } => {
@@ -2094,7 +2116,10 @@ async fn run(cli: Cli) -> Result<()> {
             println!("ipc socket: {}", socket.display());
             info!(home = %d.home.root().display(), chains = ?chains, endpoint = %endpoint.display, socket = %socket.display(), mount = ?mount, "cli.serve.starting");
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains)
-                .with_petals(d.petals.clone());
+                .with_petals(d.petals.clone())
+                .with_batch_confirmation(
+                    d.batch_confirmation_service().map_err(anyhow::Error::msg)?,
+                );
             let server2 = server.clone();
             // Trigger graceful shutdown on Ctrl-C or SIGTERM.
             let shutdown = tokio::spawn(async move {
@@ -2663,6 +2688,102 @@ mod tests {
                 std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+        }
+    }
+
+    #[test]
+    fn ac26_every_custody_kind_exposes_launch_data_only_while_awaiting() {
+        use bloom_triad_protocol::{
+            CeremonyKind, CeremonyPublicStatus, CeremonyState, CustodyPrepareResponse, DecimalU64,
+            Digest32, OperationId,
+        };
+
+        let custody_kinds = [
+            CeremonyKind::WalletRegistration,
+            CeremonyKind::WalletImport,
+            CeremonyKind::WalletExport,
+            CeremonyKind::WalletDelete,
+            CeremonyKind::WalletRecovery,
+            CeremonyKind::CredentialAdd,
+            CeremonyKind::CredentialReplace,
+            CeremonyKind::CredentialRemove,
+            CeremonyKind::BackendEnrollment,
+            CeremonyKind::KeyDerive,
+            CeremonyKind::PolicyUpdate,
+        ];
+        let non_actionable_states = [
+            CeremonyState::Prepared,
+            CeremonyState::Verifying,
+            CeremonyState::WalletCommitted,
+            CeremonyState::AwaitingRecoveryAck,
+            CeremonyState::Completed,
+            CeremonyState::ApprovingRootChange,
+            CeremonyState::CreatingCredential,
+            CeremonyState::Committing,
+            CeremonyState::Succeeded,
+            CeremonyState::Cancelled,
+            CeremonyState::Expired,
+            CeremonyState::Failed,
+        ];
+
+        for (ordinal, kind) in custody_kinds.into_iter().enumerate() {
+            let operation_id = OperationId::from_bytes([ordinal as u8 + 1; 32]);
+            let expected_url = format!(
+                "http://localhost:18734/ceremony/ac26-{}",
+                operation_id.as_str()
+            );
+            let prepared = CustodyPrepareResponse {
+                ceremony_kind: kind,
+                custody_operation_id: operation_id.clone(),
+                state: bloom_triad_protocol::CustodyPrepareState::AwaitingUser,
+                ceremony_url: expected_url.clone(),
+                ceremony_expires_at_ms: DecimalU64::new(10_000),
+                signer_contribution_digest: Digest32::from_bytes([ordinal as u8 + 32; 32]),
+            };
+            let awaiting =
+                bloom_machine_client::CeremonyProjection::from_custody_prepare(&prepared, 1_000)
+                    .unwrap();
+            assert_eq!(
+                awaiting.ceremony_url(),
+                Some(expected_url.as_str()),
+                "{kind:?}"
+            );
+            assert_eq!(awaiting.expires_at_ms(), Some(10_000), "{kind:?}");
+            let awaiting_json = serde_json::to_value(&awaiting).unwrap();
+            assert_eq!(awaiting_json["ceremony_url"], expected_url, "{kind:?}");
+            assert_eq!(awaiting_json["ceremony_expires_at_ms"], "10000", "{kind:?}");
+
+            for state in non_actionable_states {
+                let mut projection = awaiting.clone();
+                projection
+                    .reconcile_custody(
+                        &CeremonyPublicStatus {
+                            ceremony_id: Digest32::from_bytes([ordinal as u8 + 64; 32]),
+                            ceremony_kind: kind,
+                            operation_id: operation_id.clone(),
+                            state,
+                            expires_at_ms: DecimalU64::new(10_000),
+                            // A compromised Broker must not make a non-actionable
+                            // state owner-actionable by retaining a launch URL.
+                            ceremony_url: Some(expected_url.clone()),
+                            receipt_digest: matches!(
+                                state,
+                                CeremonyState::Completed | CeremonyState::Succeeded
+                            )
+                            .then(|| Digest32::from_bytes([ordinal as u8 + 96; 32])),
+                        },
+                        2_000,
+                    )
+                    .unwrap();
+                assert_eq!(projection.ceremony_url(), None, "{kind:?} {state:?}");
+                assert_eq!(projection.expires_at_ms(), None, "{kind:?} {state:?}");
+                let persisted = serde_json::to_value(&projection).unwrap();
+                assert!(persisted["ceremony_url"].is_null(), "{kind:?} {state:?}");
+                assert!(
+                    persisted["ceremony_expires_at_ms"].is_null(),
+                    "{kind:?} {state:?}"
+                );
+            }
         }
     }
 

@@ -33,6 +33,7 @@ for root in "$main_root" "$broker_root" "$signer_root"; do
 done
 
 "$main_root/packaging/triad/release/check-machine-authority-boundary.sh" --require-clean
+python3 "$main_root/packaging/triad/release/check-legacy-hash-only-routes.py"
 
 for root in "$main_root" "$broker_root" "$signer_root"; do
   (
