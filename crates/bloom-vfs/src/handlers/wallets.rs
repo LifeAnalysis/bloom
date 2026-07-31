@@ -28,7 +28,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bloom_auth_api::AssuranceLevel;
 use bloom_evm::ChainRegistry;
 #[cfg(test)]
 use bloom_keystore::Keystore;
@@ -1196,11 +1195,11 @@ impl WalletsHandler {
     }
 
     /// Human/agent-facing status view for a policy update. The lifecycle folder
-    /// (`pending`/`confirmed`/`failed`) is authoritative; within `pending` the
-    /// presence of `approval.json` distinguishes `approved` (grant can be minted
-    /// by re-writing the same proposed policy) from `challenged` (ceremony still
-    /// required). Exposes `ceremony_url` and the exact retry path; never exposes
-    /// the signed approval itself.
+    /// (`pending`/`confirmed`/`failed`) and Broker-authenticated projection are
+    /// authoritative. Within `pending`, the Broker ceremony state distinguishes
+    /// a completed ceremony ready for commit from one still awaiting custody.
+    /// Exposes `ceremony_url` and the exact retry path; never exposes the completed
+    /// ceremony receipt or Broker validation receipt.
     fn policy_update_status_json(
         &self,
         wallet: &str,
@@ -1268,7 +1267,6 @@ impl WalletsHandler {
                 ));
             }
         };
-        let assurance: Option<AssuranceLevel> = None;
         let ceremony_url = triad_projection
             .as_ref()
             .and_then(|projection| projection.ceremony_url.clone());
@@ -1288,7 +1286,7 @@ impl WalletsHandler {
             "write_path": policy_update_vfs_write_path(wallet),
             "installation_target": policy_update_vfs_write_path(wallet),
             "challenge_path": format!("/wallets/{wallet}/policy-updates/{state}/{action_id}/{APPROVAL_CHALLENGE_FILE}"),
-            "assurance": assurance,
+            "assurance": null,
             "ceremony_kind": triad_projection.as_ref().map(|_| "policy_update"),
             "ceremony_state": triad_projection.as_ref().map(|p| p.ceremony_state),
             "review_manifest_digest": triad_projection.as_ref().map(|p| p.review_manifest_digest.clone()),

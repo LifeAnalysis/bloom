@@ -1,10 +1,8 @@
-//! `bloom` — bloom daemon and CLI.
+//! `bloom` — key-free Bloom Machine CLI and runtime.
 //!
-//! For v1, the CLI drives the same in-process daemon — there's no
-//! separate long-running server. Each invocation builds the daemon,
-//! performs the requested VFS operation, and exits. A `serve` subcommand
-//! exists as a placeholder for the eventual long-running NFS-mounted
-//! daemon.
+//! Machine owns reads, staging, simulation, broadcast, and public projections.
+//! Every production custody, approval, and signing operation crosses its
+//! authenticated Broker edge; Signer alone owns wallet key material.
 
 #![forbid(unsafe_code)]
 
@@ -1175,18 +1173,18 @@ enum WalletCmd {
     /// Commit a policy update using its completed policy_update ceremony
     /// receipt. This never provides a direct commit path.
     CommitPolicy { operation_id: String },
-    /// Re-bind an existing PRF-based passkey wallet to a new passkey
-    /// credential. Unlocks with the current credential first to prove
-    /// ownership, then runs a fresh WebAuthn registration ceremony and
-    /// re-encrypts the private key under the new PRF output. The wallet
-    /// address does not change.
+    /// Replace a wallet credential through a Broker-originated custody
+    /// ceremony. Signer authenticates the current credential, registers the
+    /// replacement, and updates its credential registry without exposing key
+    /// material to Machine. The wallet address does not change.
     ///
     /// Use this to rotate authenticators (e.g. new YubiKey or new device)
-    /// without moving funds. A recovery key is printed once after rebind.
+    /// without moving funds. Ceremony status and public results are projected
+    /// from Broker.
     RebindPasskey { name: String },
-    /// Permanently delete a wallet. All wallet files are removed from disk.
-    /// This cannot be undone — make sure you have the recovery key or the
-    /// private key stored elsewhere before deleting a passkey wallet.
+    /// Permanently delete a wallet through a Broker-originated custody
+    /// ceremony. Signer deletes custody state after owner authorization;
+    /// Machine removes only its public projection. This cannot be undone.
     Delete { name: String },
 }
 

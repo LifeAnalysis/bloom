@@ -13,7 +13,7 @@
 //! restart can seal the key under a KEK it controls.
 
 use alloy::primitives::Address;
-use alloy::signers::local::PrivateKeySigner;
+use alloy_signer_local::PrivateKeySigner;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::RngCore;

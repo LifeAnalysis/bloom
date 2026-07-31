@@ -18,7 +18,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
-use bloom_auth_api::PETAL_PETAL_ID_PREFIX;
 use bloom_evm::{ChainClient, ChainRegistry};
 
 use bloom_ens::EnsClient;
@@ -38,9 +37,10 @@ use bloom_petals::{
 };
 use bloom_prices::PricesClient;
 use bloom_proto::audit::AuditRecord;
+use bloom_proto::petal_identity::PETAL_ID_PREFIX;
 use bloom_proto::{
     AddressBook, AuditLog, ChainSpec, Config, GasStrategy, HomeDir, HomeWritePermit, RawIntent,
-    RawIntentBody,
+    RawIntentBody, intent_hash_of,
 };
 use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
@@ -104,7 +104,7 @@ impl CentralOutboxProjection for EvmOutboxProjection {
         policy_check_json: &[u8],
         identity: CentralActionIdentity<'_>,
     ) -> Result<(), String> {
-        let intent_hash = bloom_auth_api::intent_hash_of(intent_json);
+        let intent_hash = intent_hash_of(intent_json);
         self.central
             .stage_with_identity(
                 action_id,
@@ -403,7 +403,7 @@ impl DaemonPetalHost {
             ));
         }
         Ok(bloom_proto::plan::ExecutionOrigin {
-            petal_id: format!("{PETAL_PETAL_ID_PREFIX}{}", context.petal_root),
+            petal_id: format!("{PETAL_ID_PREFIX}{}", context.petal_root),
             petal_digest: context.package_hash.clone(),
             petal_version: "v1-package".into(),
         })

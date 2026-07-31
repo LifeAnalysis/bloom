@@ -26,6 +26,7 @@ bloom-machine-client.workspace = true
 bloom-triad-protocol.workspace = true
 bloom-revert.workspace = true
 alloy.workspace = true
+alloy-signer-local = "2.0.5"
 anyhow.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util"] }

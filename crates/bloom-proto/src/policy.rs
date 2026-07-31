@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bloom_auth_api::AssuranceLevel;
+use crate::AssuranceLevel;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -63,10 +63,6 @@ pub struct Policy {
     /// request confirmation requires explicit wallet policy opt-in.
     #[serde(default)]
     pub payments: PaymentsPolicy,
-    /// Hyperliquid action policy (`[hyperliquid]`). Caps default to
-    /// unconfigured (no constraint); unknown action kinds always deny.
-    #[serde(default)]
-    pub hyperliquid: crate::hyperliquid_policy::HyperliquidPolicy,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -1141,7 +1137,6 @@ uv_above_usd = "250"
 
 [approval.step_up.rule_ceilings]
 "limits.max_tx_usd" = { max_usd = "500" }
-"hyperliquid.max_leverage" = { max_u32 = 3 }
 "#;
         let p: Policy = toml::from_str(toml_src).unwrap();
         assert!(p.private.enabled);
@@ -1166,15 +1161,6 @@ uv_above_usd = "250"
                 .max_micro_usd("limits.max_tx_usd")
                 .unwrap(),
             Some(500_000_000)
-        );
-        assert_eq!(
-            p.approval
-                .step_up
-                .rule_ceilings
-                .get("hyperliquid.max_leverage")
-                .unwrap()
-                .max_u32,
-            Some(3)
         );
     }
 

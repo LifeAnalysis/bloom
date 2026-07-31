@@ -1206,7 +1206,7 @@ use std::path::PathBuf;
 
 use alloy::primitives::{Address, B256};
 use alloy::signers::SignerSync as _;
-use alloy::signers::local::PrivateKeySigner;
+use alloy_signer_local::PrivateKeySigner;
 use bloom_proto::{Policy, checksum_address};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};

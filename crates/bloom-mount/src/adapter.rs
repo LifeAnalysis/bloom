@@ -161,69 +161,10 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        [root, _network, branch, _wallet, _session, leaf]
-            if root == "hyperliquid"
-                && branch == "agent_sessions"
-                && matches!(leaf.as_str(), "orphan_cancel_all" | "orphan_close_all") =>
-        {
-            true
-        }
-        [root, _network, branch, _wallet, leaf]
-            if root == "hyperliquid"
-                && branch == "exchange"
-                && matches!(
-                    leaf.as_str(),
-                    "order.json"
-                        | "cancel.json"
-                        | "schedule_cancel.json"
-                        | "update_leverage.json"
-                        | "send_asset.json"
-                ) =>
-        {
-            true
-        }
         // Policy updates and sealed-approval lifecycle writes flow through to
         // the VFS wallets handler. It delegates authority to Broker and never
         // routes them through the disabled raw wallet-signer lane, so the mount
         // must forward them to `vfs.write` rather than deny on flush.
-        _ => false,
-    }
-}
-
-/// Command sinks whose supported payloads are deliberately small and are
-/// expected to be submitted by a single userspace write (shell redirect,
-/// `tee`, or equivalent). macOS' NFS client does not reliably send COMMIT or
-/// propagate CLOSE errors for these synthetic files, so leaving an UNSTABLE
-/// write buffered can make a successful command disappear entirely.
-///
-/// Keep this list narrow. Ordinary files still need whole-file buffering
-/// because a first contiguous WRITE is not proof that more chunks will not
-/// follow. Hyperliquid agent-session commands are JSON/control messages well
-/// below the mount's 64 KiB `wsize`; applying their offset-zero WRITE inline is
-/// what makes the documented mount-only workflow usable on macOS.
-fn mount_write_path_is_atomic_command(path: &VfsPath) -> bool {
-    let segs = path.segments();
-    match segs {
-        [root, _network, branch, _wallet, leaf]
-            if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
-        {
-            true
-        }
-        [root, _network, branch, _wallet, _session, leaf]
-            if root == "hyperliquid"
-                && branch == "agent_sessions"
-                && matches!(
-                    leaf.as_str(),
-                    "order.json"
-                        | "cancel.json"
-                        | "schedule_cancel.json"
-                        | "stop"
-                        | "cancel_all"
-                        | "close_all"
-                ) =>
-        {
-            true
-        }
         _ => false,
     }
 }
@@ -1391,9 +1332,7 @@ impl FileSystem for BloomFs {
                 return Err(FsError::FileTooLarge);
             }
             buf.apply(offset, &data)?;
-            let payload = if buf.should_flush_after_write(requested)
-                || (offset == 0 && mount_write_path_is_atomic_command(&path) && buf.is_complete())
-            {
+            let payload = if buf.should_flush_after_write(requested) {
                 Some(map.remove(&path).expect("just observed").bytes)
             } else {
                 None
@@ -1428,21 +1367,6 @@ impl FileSystem for BloomFs {
             match self.vfs.write(&path, &payload).await {
                 Ok(()) => {
                     // Persisted new bytes — invalidate any stale rendered view.
-                    self.invalidate_after_write(&path);
-                }
-                Err(error) if mount_write_path_is_atomic_command(&path) => {
-                    // macOS can panic in nfs_vinvalbuf2 when a userspace server
-                    // rejects an UNSTABLE WRITE after the kernel has installed
-                    // dirty UBC pages. These command sinks expose their outcome
-                    // through challenge/status/audit/last-response files, so
-                    // acknowledge the transport write after the handler has
-                    // recorded that outcome instead of feeding a deferred NFS
-                    // error back into the kernel's page invalidation path.
-                    warn!(
-                        path = %path.to_string_path(),
-                        error = %error,
-                        "mount.adapter.atomic_command_outcome_deferred"
-                    );
                     self.invalidate_after_write(&path);
                 }
                 Err(error) => return Err(map_err(error)),
@@ -1700,25 +1624,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct AtomicDenyHandler {
-        writes: parking_lot::Mutex<Vec<Vec<u8>>>,
-    }
-
-    #[async_trait]
-    impl Handler for AtomicDenyHandler {
-        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
-            Ok(Entry::writable_file(
-                p.segments().last().map(String::as_str).unwrap_or("command"),
-            ))
-        }
-
-        async fn write(&self, _p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
-            self.writes.lock().push(data.to_vec());
-            Err(HandlerError::PermissionDenied)
-        }
-    }
-
     #[async_trait]
     impl Handler for ChallengeStagingHandler {
         async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
@@ -1822,28 +1727,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mount_write_rejects_signer_consuming_paths() {
-        let fs = BloomFs::new(Vfs::builder().build());
-        let ctx = fake_ctx();
-        let handle = BloomHandle::Path {
-            entry: Entry::file("order.json"),
-            path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow/order.json").unwrap(),
-        };
-
-        let err = fs
-            .write(
-                &ctx,
-                &handle,
-                0,
-                Bytes::from_static(b"{}"),
-                WriteStability::FileSync,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, FsError::PermissionDenied));
-    }
-
-    #[tokio::test]
     async fn write_open_stages_challenge_and_denies_before_write() {
         let handler = ChallengeStagingHandler::new();
         let vfs = Vfs::builder().mount("stage", handler.clone()).build();
@@ -1873,30 +1756,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn mount_create_rejects_signer_consuming_paths() {
-        let fs = BloomFs::new(Vfs::builder().build());
-        let ctx = fake_ctx();
-        let parent = BloomHandle::Path {
-            entry: Entry::dir("minnow"),
-            path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow").unwrap(),
-        };
-
-        let err = fs
-            .create(
-                &ctx,
-                &parent,
-                "order.json",
-                CreateRequest {
-                    kind: CreateKind::File,
-                    attrs: SetAttrs::default(),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, FsError::PermissionDenied));
-    }
-
     #[test]
     fn mount_classifier_forwards_handler_owned_sealed_approval_writes() {
         // Handler-owned Sealed Approval actions must reach the VFS handler, not
@@ -1908,7 +1767,6 @@ mod tests {
             "/wallets/minnow/sealed-approvals/approval-id/revoke",
             "/wallets/minnow/sealed-approvals/revoke_all",
             "/requests/pending/req_1/confirm",
-            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!mount_write_path_uses_wallet_signer(&p), "{path}");
@@ -1920,83 +1778,10 @@ mod tests {
             "/wallets/minnow/sign/typed_data",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/cancel",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/replace",
-            "/hyperliquid/mainnet/exchange/minnow/order.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(mount_write_path_uses_wallet_signer(&p), "{path}");
         }
-    }
-
-    #[test]
-    fn mount_classifier_flushes_hyperliquid_session_commands_inline() {
-        for path in [
-            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/stop",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/close_all",
-        ] {
-            let p = VfsPath::parse(path).unwrap();
-            assert!(mount_write_path_is_atomic_command(&p), "{path}");
-        }
-
-        for path in [
-            "/hyperliquid/mainnet/mids.json",
-            "/hyperliquid/mainnet/exchange/minnow/order.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/status.json",
-            "/wallets/minnow/policy.toml",
-        ] {
-            let p = VfsPath::parse(path).unwrap();
-            assert!(!mount_write_path_is_atomic_command(&p), "{path}");
-        }
-    }
-
-    #[tokio::test]
-    async fn unstable_hyperliquid_session_command_flushes_inline() {
-        let recorder = RecordingHandler::new();
-        let vfs = Vfs::builder()
-            .mount("hyperliquid", recorder.clone())
-            .build();
-        let fs = BloomFs::new(vfs);
-        let ctx = fake_ctx();
-        let handle = BloomHandle::Path {
-            entry: Entry::file("order.json"),
-            path: VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json")
-                .unwrap(),
-        };
-        let body = Bytes::from_static(br#"{"action":{"type":"order"}}"#);
-
-        let result = fs
-            .write(&ctx, &handle, 0, body.clone(), WriteStability::Unstable)
-            .await
-            .unwrap();
-
-        assert_eq!(result.written, body.len() as u32);
-        assert_eq!(recorder.write_count(), 1);
-        assert_eq!(recorder.last_write(), Some(body.to_vec()));
-    }
-
-    #[tokio::test]
-    async fn unstable_hyperliquid_command_defers_handler_error_to_status_files() {
-        let handler = Arc::new(AtomicDenyHandler::default());
-        let vfs = Vfs::builder().mount("hyperliquid", handler.clone()).build();
-        let fs = BloomFs::new(vfs);
-        let ctx = fake_ctx();
-        let handle = BloomHandle::Path {
-            entry: Entry::file("new.json"),
-            path: VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/new.json").unwrap(),
-        };
-        let body = Bytes::from_static(br#"{"id":"session-1"}"#);
-
-        let result = fs
-            .write(&ctx, &handle, 0, body.clone(), WriteStability::Unstable)
-            .await
-            .expect("atomic command transport acknowledges deferred handler outcome");
-
-        assert_eq!(result.written, body.len() as u32);
-        assert_eq!(*handler.writes.lock(), vec![body.to_vec()]);
     }
 
     #[tokio::test]

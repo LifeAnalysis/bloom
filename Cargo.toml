@@ -15,7 +15,6 @@ members = [
   "crates/bloom-keystore",
   "crates/bloom-mempool",
   "crates/bloom-machine-client",
-  "crates/bloom-hyperliquid",
   "crates/bloom-watch",
   "crates/bloom-mount",
   "crates/bloom-proto",
@@ -106,7 +105,7 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 ciborium = "0.2"
 
 # Ethereum stack
-alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract", "transport-throttle", "json-rpc"] }
+alloy = { version = "2", default-features = false, features = ["std", "reqwest", "reqwest-rustls-tls", "rpc-types", "providers", "provider-http", "provider-ws-ring", "consensus", "network", "rlp", "json-abi", "k256", "eips", "contract", "transport-throttle", "json-rpc", "signers"] }
 alloy-dyn-abi = { version = "1.5", features = ["eip712"] }
 # OP Stack typed RPC (Base, Optimism deposit/system transactions & receipts).
 op-alloy = { version = "2", features = ["rpc-types", "consensus", "serde", "network"] }
@@ -123,7 +122,6 @@ bloom-paid-mpp = { path = "crates/bloom-paid-mpp" }
 bloom-paid-x402 = { path = "crates/bloom-paid-x402" }
 bloom-paid-http = { path = "crates/bloom-paid-http" }
 bloom-tools    = { path = "crates/bloom-tools" }
-bloom-hyperliquid = { path = "crates/bloom-hyperliquid" }
 bloom-watch    = { path = "crates/bloom-watch" }
 bloom-mount    = { path = "crates/bloom-mount" }
 bloom-etherscan = { path = "crates/bloom-etherscan" }
@@ -146,3 +144,13 @@ bloom-machine-client = { path = "crates/bloom-machine-client" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# These upstream protocol crates expose generic signing seams that Bloom routes
+# through Broker, but their published packages also compile convenience local
+# private-key adapters unconditionally. The maintained forks below remove only
+# those adapters so concrete signer custody cannot enter a Machine artifact.
+[patch.crates-io]
+alloy = { path = "third-party/alloy-heimdall" }
+mpp = { path = "third-party/mpp" }
+tempo-alloy = { path = "third-party/tempo-alloy" }
+x402-chain-eip155 = { path = "third-party/x402-chain-eip155" }

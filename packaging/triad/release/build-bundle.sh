@@ -13,6 +13,144 @@ source_date_epoch="$4"
 tar_command="${TAR:-tar}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
+machine_artifact_paths() {
+  local root="$1"
+  local candidate
+  for candidate in \
+    "$root/bin/bloom" \
+    "$root/bin/bloom-machine" \
+    "$root/machine" \
+    "$root/config/machine" \
+    "$root/share/bloom/machine" \
+    "$root/lib/bloom/machine" \
+    "$root/libexec/bloom/machine"
+  do
+    [[ ! -e "$candidate" && ! -L "$candidate" ]] || printf '%s\n' "$candidate"
+  done
+}
+
+reject_machine_legacy_authority_files() {
+  local root="$1"
+  local scope="$2"
+  local path relative
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    relative="${path#"$root/"}"
+    echo "forbidden $scope legacy authority file: $relative" >&2
+    return 1
+  done < <(
+    while IFS= read -r machine_path; do
+      [[ -d "$machine_path" ]] || continue
+      find "$machine_path" \
+        \( -type f -o -type d \) \
+        \( -name 'auth.sqlite' -o -name 'keystore' -o -name 'signer-cache' -o \
+           -name 'policy-session' -o -name 'ceremony_server' -o \
+           -name 'registration.rs' -o -name 'sealed_ceremony.rs' -o \
+           -name 'sign_hash.rs' \) -print
+    done < <(machine_artifact_paths "$root")
+  )
+}
+
+reject_legacy_authority_symbols() {
+  local binary="$1"
+  local symbol
+  # Scripts are used by the unit-level bundle fixtures. Real release binaries
+  # are Mach-O or ELF and must pass both their symbol table (when retained) and
+  # printable-string scans. A stripped table is not treated as proof of
+  # cleanliness; the resolved Cargo graph is checked before the release build.
+  if ! file -b "$binary" | grep -Eq '^(Mach-O|ELF) '; then
+    return
+  fi
+  symbol="$({ nm -a "$binary" 2>/dev/null || true; } | LC_ALL=C grep -E -m1 \
+    'KeystorePetalHost|StoreApprovalVerifier|KeystoreApprovalSignatureVerifier|SignerCache|EphemeralAgentKey|PrivateKeySigner|RegistrationCoordinator|AuthServices|InMemoryGrantStore|sign_hash_sync' || true)"
+  if [[ -n "$symbol" ]]; then
+    echo "forbidden production Machine symbol in bin/$(basename "$binary"): $symbol" >&2
+    return 1
+  fi
+}
+
+reject_markers_in_paths() {
+  local scope="$1"
+  shift
+  local marker path
+  while IFS= read -r marker; do
+    [[ -z "$marker" ]] && continue
+    for path in "$@"; do
+      [[ ! -e "$path" && ! -L "$path" ]] && continue
+      if LC_ALL=C grep -aR -F "$marker" "$path" >/dev/null; then
+        echo "forbidden $scope marker: $marker" >&2
+        return 1
+      fi
+    done
+  done
+}
+
+reject_global_debug_markers() {
+  local root="$1"
+  local scope="$2"
+  reject_markers_in_paths "$scope" "$root" <<'EOF'
+bloom-broker-debug-driver
+broker-audit-test-1
+accepting_verifier
+mint_approval
+BLOOM_TRIAD_DEVELOPER_ROOT
+unsafe-debug-signer
+local-integration
+triad-dev-harness
+triad-authority-fixture
+test-only-release-key
+test_credential
+EOF
+}
+
+reject_global_debug_artifact_files() {
+  local root="$1"
+  local scope="$2"
+  local path relative
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    relative="${path#"$root/"}"
+    echo "forbidden $scope debug/test artifact: $relative" >&2
+    return 1
+  done < <(find "$root" \( -type f -o -type d \) \
+    \( -name 'bloom-broker-debug-driver' -o \
+       -name 'broker-audit-test-1' -o \
+       -name 'triad-authority-fixture' -o \
+       -name 'test-only-release-key' -o \
+       -name 'test_credential' \) -print)
+}
+
+reject_machine_authority_markers() {
+  local root="$1"
+  local scope="$2"
+  local -a paths=()
+  while IFS= read -r path; do
+    paths+=("$path")
+  done < <(machine_artifact_paths "$root")
+  ((${#paths[@]} > 0)) || return 0
+  reject_markers_in_paths "$scope" "${paths[@]}" <<'EOF'
+bloom.sign-hash
+bloom-keystore
+bloom-auth
+bloom-auth-api
+bloom-hyperliquid
+alloy-signer-local
+ApprovalVerifier
+AuthStoreWriter
+GrantStore
+InMemoryGrantStore
+KeystorePetalHost
+StoreApprovalVerifier
+KeystoreApprovalSignatureVerifier
+SignerCache
+EphemeralAgentKey
+PrivateKeySigner
+RegistrationCoordinator
+AuthServices
+policy-session
+EOF
+}
+
 [[ "$source_date_epoch" =~ ^[0-9]+$ ]] || {
   echo "SOURCE_DATE_EPOCH must be an unsigned decimal integer" >&2
   exit 64
@@ -23,40 +161,11 @@ for binary in bloom bloom-broker bloom-signer; do
     exit 66
   }
 done
-for forbidden in \
-  bloom-broker-debug-driver \
-  broker-audit-test-1 \
-  accepting_verifier \
-  mint_approval \
-  bloom.sign-hash \
-  bloom-keystore \
-  bloom-auth \
-  bloom-auth-api \
-  ApprovalVerifier \
-  AuthStoreWriter \
-  GrantStore \
-  InMemoryGrantStore \
-  KeystorePetalHost \
-  StoreApprovalVerifier \
-  KeystoreApprovalSignatureVerifier \
-  SignerCache \
-  EphemeralAgentKey \
-  PrivateKeySigner \
-  RegistrationCoordinator \
-  BLOOM_TRIAD_DEVELOPER_ROOT \
-  unsafe-debug-signer \
-  local-integration \
-  triad-dev-harness \
-  triad-authority-fixture \
-  policy-session \
-  test-only-release-key \
-  test_credential
-do
-  if LC_ALL=C grep -aR -F "$forbidden" "$staging" >/dev/null; then
-    echo "forbidden production artifact marker: $forbidden" >&2
-    exit 65
-  fi
-done
+reject_machine_legacy_authority_files "$staging" "production Machine artifact"
+reject_legacy_authority_symbols "$staging/bin/bloom"
+reject_global_debug_artifact_files "$staging" "production"
+reject_global_debug_markers "$staging" "production artifact"
+reject_machine_authority_markers "$staging" "production Machine artifact"
 machine_version="$(sed -n -E 's/^machine = "([^"]+)"$/\1/p' "$script_dir/compatibility-v1.toml")"
 broker_version="$(sed -n -E 's/^broker = "([^"]+)"$/\1/p' "$script_dir/compatibility-v1.toml")"
 signer_version="$(sed -n -E 's/^signer = "([^"]+)"$/\1/p' "$script_dir/compatibility-v1.toml")"
@@ -158,6 +267,9 @@ install -m 0755 \
   "$script_dir/ssh-ed25519-verify.sh" \
   "$payload/installer/release/"
 install -m 0755 "$script_dir/verify-bundle.sh" "$payload/installer/release/"
+reject_machine_legacy_authority_files "$payload" "packaged Machine artifact"
+reject_legacy_authority_symbols "$payload/bin/bloom"
+reject_global_debug_artifact_files "$payload" "packaged"
 
 if [[ "$platform_claim" == "macos-unix-principals" ]]; then
   install -m 0644 \
@@ -190,22 +302,8 @@ then
   fi
 fi
 
-for forbidden in \
-  bloom-broker-debug-driver \
-  broker-audit-test-1 \
-  accepting_verifier \
-  mint_approval \
-  bloom.sign-hash \
-  BLOOM_TRIAD_DEVELOPER_ROOT \
-  triad-authority-fixture \
-  test-only-release-key \
-  test_credential
-do
-  if LC_ALL=C grep -aR -F "$forbidden" "$payload" >/dev/null; then
-    echo "forbidden packaged artifact marker: $forbidden" >&2
-    exit 65
-  fi
-done
+reject_global_debug_markers "$payload" "packaged artifact"
+reject_machine_authority_markers "$payload" "packaged Machine artifact"
 
 for revision_name in BLOOM_MACHINE_SHA BLOOM_BROKER_SHA BLOOM_SIGNER_SHA; do
   revision="${!revision_name:-}"

@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alloy::primitives::Address;
-use alloy::signers::local::PrivateKeySigner;
+use alloy_signer_local::PrivateKeySigner;
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};

@@ -1,408 +1,252 @@
 # Development guide
 
-Operator's manual for working on `bloom`: building, running, testing, and
-debugging the daemon. The user-facing tour lives in [README.md](./README.md)
-and [QUICKSTART.md](./QUICKSTART.md); this file covers the dev loop.
+This document covers building, testing, and debugging the current triad-based
+Bloom implementation. Production authority is always split across Machine,
+Broker, and Signer. Development convenience must not compile wallet custody,
+approval verification, or signing into Machine.
 
-For a service-free developer process that still exercises an existing passkey
-wallet, installed Petals, and tightly bounded manual Hyperliquid + Polymarket
-mainnet submissions, see
-[`docs/local-mainnet-integration.md`](docs/local-mainnet-integration.md).
+For the manual mounted passkey workflow, read
+[`docs/local-mainnet-integration.md`](./docs/local-mainnet-integration.md).
+For the production process and security contract, read
+[`docs/specs/2026-07-23-triad-process-architecture.md`](./docs/specs/2026-07-23-triad-process-architecture.md).
 
-## Contents
+## Prerequisites
 
-1. [Toolchain and prerequisites](#toolchain-and-prerequisites)
-2. [Building](#building)
-3. [Running locally](#running-locally)
-4. [Test suites](#test-suites)
-   - [Rust unit tests](#rust-unit-tests)
-   - [Rust integration tests](#rust-integration-tests)
-   - [Dockerized tests (`tests/docker/`)](#dockerized-tests-testsdocker)
-   - [Acceptance script (`scripts/acceptance.sh`)](#acceptance-script-scriptsacceptancesh)
-   - [Playground (`scripts/play.sh`)](#playground-scriptsplaysh)
-5. [Debugging](#debugging)
-6. [Lint and format](#lint-and-format)
-7. [Coverage map](#coverage-map): which suite tests which crate
+| Tool | Use |
+|---|---|
+| Rust 1.85 or newer | Workspace builds and tests |
+| Foundry (`anvil`, `cast`, `forge`) | Local EVM integration tests |
+| `jq` | Developer harnesses and shell tests |
+| macOS NFS client | Real mounted-VFS tests on macOS |
+| Docker | Optional Linux and Anvil test environments |
+| Tart | Optional local macOS packaging/isolation VM |
 
-## Toolchain and prerequisites
-
-| Tool | Why |
-|------|-----|
-| Rust ≥ 1.85 | Pinned via `rust-toolchain.toml`. `rustup` installs it on first `cargo` run. |
-| Foundry (`anvil`, `cast`, `forge`) | All anvil-backed integration tests, the acceptance script, and the playground. Override the binary paths with `BLOOM_ANVIL_BIN` / `BLOOM_CAST_BIN`. |
-| `jq` | Acceptance script and Docker drivers. |
-| Docker (compose v1 or v2) | Dockerized tests and `scripts/play.sh`. |
-| Linux kernel NFS client | `--mount`/`--fork` Docker tests (requires `SYS_ADMIN`, `apparmor=unconfined`, `/dev/fuse`). |
-| Optional API keys | `BLOOM_ETHERSCAN_KEY`, `BLOOM_MAINNET_RPC` — populate `test.env` (gitignored) and `source` it. |
+Keep optional network endpoints and API keys in a gitignored environment file.
+Never place wallet secrets, recovery material, or passkey PRF output in shell
+variables, command arguments, Machine state, or test logs.
 
 ## Building
 
-The workspace contains 25 crates (`Cargo.toml` `[workspace]`). Default builds
-exclude the optional NFS mount adapter; opt in with the `mount` feature when
-you need it.
-
 ```sh
-# Debug build of every crate
+# Entire workspace
 cargo build --workspace
 
-# Release binary (used by acceptance.sh and play.sh — lands at target/release/bloom)
-cargo build --release -p bloom
+# Production-key-free Machine CLI
+cargo build -p bloom --no-default-features
 
-# Daemon with the embedded NFS server (pulls embednfs as a git dep)
-cargo build --release -p bloom --features bloom-daemon/mount
+# Machine with the NFS mount adapter
+cargo build -p bloom --no-default-features --features mount
 
-# Daemon with the heimdall bytecode-decompile fallback for revert decoding
-# (heavy build; only needed if you're working on revert decoding)
-cargo build --release -p bloom --features bytecode-decompile
+# Optional revert-decoder fallback
+cargo build -p bloom --no-default-features --features bytecode-decompile
 ```
 
-Release tuning (`Cargo.toml`): `lto = "thin"`, `codegen-units = 1`. Expect
-release builds to be slow but cache well.
+Broker and Signer live in the sibling `bloom-broker` and `bloom-signer`
+repositories. Build and test them from those repositories. Machine must never
+connect to Signer directly; Broker is its only authority peer.
+
+Release bundles must be built through the triad packaging scripts so resolved
+dependency, feature, marker, identity, socket, and runtime boundary checks run
+against the packaged artifacts.
 
 ## Running locally
 
-There are three execution modes. They share the same home directory layout
-under `$BLOOM_HOME` (default `~/.bloom`).
+### Read, stage, and simulate
+
+Machine may run without an available Broker for public cached reads, unsigned
+staging, and simulation where the required public inputs exist:
 
 ```sh
-# Mode 1 — one-shot CLI. Each invocation builds the in-process daemon, runs
-# the op, and exits. No socket. Good for scripts and CI.
-BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- init
-BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- vfs cat /chains/anvil/head/number
-
-# Mode 2 — long-running daemon. Binds a UDS JSON-RPC socket; later `bloom vfs`
-# calls auto-detect it and route through (sharing unlock cache, watches, etc.).
-bloom serve                                     # foreground; logs to stderr
-bloom ipc call lookup --params '{"path":"/status/version"}'
-
-# Mode 3 — NFS mount. Build with the `mount` feature, then run the example
-# binary the docker tests use (or `Daemon::mount(path).await` from your own
-# binary). The kernel-mounted tree appears at the path you supply.
-cargo build --release -p bloom-mount --features mount --example mount_demo
-./target/release/examples/mount_demo /tmp/bloom                  # mounts at /tmp/bloom
+BLOOM_HOME=/tmp/bloom-machine cargo run -p bloom -- status
+BLOOM_HOME=/tmp/bloom-machine cargo run -p bloom -- vfs cat /chains/anvil/head/number
 ```
 
-The IPC socket lives at `$BLOOM_HOME/run/bloom.sock` (mode 0600, created on
-first `bloom serve`). The same path is the IPC fallback target for `bloom vfs`
-calls when a daemon is up.
+Signing, approval mutation, policy mutation, and custody must fail promptly
+when Broker or Signer is unavailable. They never restore a local authority
+path.
 
-### Environment variables
+### Out-of-process triad developer harness
 
-Every `BLOOM_*` variable used by the binary, scripts, or test harness:
-
-| Variable | Used by | Notes |
-|----------|---------|-------|
-| `BLOOM_HOME` | binary, all scripts | Override home dir. Default `~/.bloom`. |
-| `BLOOM_PASSPHRASE` | binary, scripts | Argon2id-derived KEK for the keystore. |
-| `BLOOM_ETHERSCAN_KEY` | bloom-etherscan, live tests | Etherscan API key. |
-| `BLOOM_MAINNET_RPC` | bloom-ens live test, acceptance.sh §3/§4 | Optional; scenarios skip cleanly when unset. |
-| `BLOOM_ANVIL_BIN`, `BLOOM_CAST_BIN` | bloom-it, bloom-watch | Override Foundry binary paths. |
-| `BLOOM_TEST_WALLET_NAME/KEY/PASSPHRASE` | docker drivers | Pre-seeds the daemon wallet. |
-| `BLOOM_PLAY_HOME`, `BLOOM_PLAY_PERSIST`, `BLOOM_PLAY_DAEMON_LOG` | scripts/play.sh | Playground knobs. |
-| `RUST_LOG` | binary | `tracing-subscriber` env-filter. Default `info`. |
-
-`test.env` (gitignored) is the canonical place to keep these. `source test.env`
-before invoking the docker drivers.
-
-## Test suites
-
-CI separates the suites by dependency boundary in `.github/workflows/ci.yml`:
-
-- `build_test_archive` compiles all Rust test targets once with
-  `cargo nextest archive` and uploads `target/nextest-archive.tar.zst`.
-- `unit_test` downloads that archive and runs only workspace library tests via
-  nextest, plus doctests with `cargo test --workspace --doc`. It does not
-  install Foundry, Docker, or any external-service credentials.
-- `integration_test` downloads the same archive, installs Foundry, and runs
-  local-only subprocess/anvil tests on the GitHub runner.
-- `e2e_tests` is the live-network lane for ignored external-service tests. It
-  is isolated from fork PRs and reports which optional secrets are present
-  before tests self-skip or run.
-- The Docker mount job is manual-only (`workflow_dispatch`).
-
-### Rust unit tests
-
-Standard `#[cfg(test)] mod tests` blocks, ~572 across the workspace. None
-require external services. Run them all with:
+The supported passkey and signing workflow starts real Machine, Broker, and
+Signer protocol implementations as separate processes:
 
 ```sh
-cargo test --workspace --lib
+mkdir -p ~/.bloom-triad-dev/machine-home \
+  /tmp/bloom-triad-mount /tmp/bloom-triad-logs
+
+scripts/triad-dev-launch.sh \
+  --developer-root ~/.bloom-triad-dev \
+  --machine-home ~/.bloom-triad-dev/machine-home \
+  --mount /tmp/bloom-triad-mount \
+  --machine-socket /tmp/bloom-triad-machine.sock \
+  --log-dir /tmp/bloom-triad-logs \
+  --ready-file /tmp/bloom-triad-ready
 ```
 
-Or scope to a single crate:
+The developer profile runs all processes under the current login UID and makes
+no production principal-isolation claim. It still uses authenticated triad
+transport, Broker-owned ceremony HTTP, genuine WebAuthn, and Signer-held keys.
+The developer feature is rejected by production release packaging.
+
+The launcher writes public authenticated connection settings to
+`/tmp/bloom-triad-logs/triad.env`. Source it only in a second developer shell:
 
 ```sh
-cargo test -p bloom-vfs              # 219 tests — path router, handlers, caches
-cargo test -p bloom-proto            # 71  tests — config, intent, policy, units
-cargo test -p bloom-evm            # 62  tests — RPC client, blocks, balances
-cargo test -p bloom-tx               # 61  tests — staging, simulation, fee logic
-cargo test -p bloom-mount --features mount  # 43  tests — NFSv4 server (feature-gated)
-cargo test -p bloom-revert           # 27  tests — Error/Panic/custom decoders
-cargo test -p bloom-etherscan        # 23  tests — v2 client, ABI parser, cache
-cargo test -p bloom-tools            # 22  tests — keccak/sha/abi/rlp helpers
-cargo test -p bloom-prices           # 21  tests — DefiLlama oracle
-cargo test -p bloom-rpc              # 17  tests — failover, health, sessions
-cargo test -p bloom-watch            # 17  tests — watch executor & log rotation
-cargo test -p bloom-daemon           # 7   tests — IPC dispatch, lifecycle
-cargo test -p bloom-ens              # 6   tests — namehash, encoder
-cargo test -p bloom-keystore         # 5   tests — argon2id + chacha20poly1305
+source /tmp/bloom-triad-logs/triad.env
+target/debug/bloom wallet new test-wallet
 ```
 
-### Rust integration tests
+Wallet registration, import, credential changes, policy updates, delegated-key
+derivation, and signing all use Broker-originated ceremonies and Signer
+receipts. Sensitive import or recovery input belongs only in the Broker-hosted
+browser workflow.
 
-Integration tests live under crate-local `tests/*.rs` files. The CLI smoke
-tests and the primary `bloom-it` anvil flows run by default; heavier anvil,
-fallback, watch, and live-network coverage is gated with `#[ignore]` — pass
-`-- --ignored` to opt in where appropriate.
+### Mounted passkey integration
+
+The bounded manual runner mounts Machine's VFS and drives the requested action
+through ordinary mounted filesystem reads and writes:
 
 ```sh
-# Always-on: CLI smoke tests (no anvil, no network)
+scripts/local-mainnet-integration.sh --wallet test-wallet
+```
+
+Preflight runs the generic Petal-scoped derivation and payload-signing fixture.
+It does not submit a venue order. Live Polymarket mode is separately explicit
+and remains blocked while the pinned external Petal imports the retired
+hash-only guest ABI; the runner fails before draft creation rather than adding
+a compatibility signer.
+
+The former built-in venue routes are retired. Test Hyperliquid only through an
+installed external Petal when a compatible package is available.
+
+## Environment variables
+
+Common current variables are:
+
+| Variable | Purpose |
+|---|---|
+| `BLOOM_HOME` | Machine-owned state root |
+| `BLOOM_TRIAD_DEV_ROOT` | Persistent developer Broker/Signer enrollment and state |
+| `BLOOM_TRIAD_DEVELOPER_ROOT` | Explicit same-UID developer enrollment root used by launched processes |
+| `BLOOM_BROKER_SOCKET` | Authenticated Machine-to-Broker endpoint |
+| `BLOOM_MACHINE_IDENTITY` | Machine transport identity file |
+| `BLOOM_EDGE_MANIFEST` | Installer/developer-signed edge manifest |
+| `BLOOM_PROVENANCE_CATALOG` | Signed Petal provenance catalog |
+| `BLOOM_ANVIL_BIN`, `BLOOM_CAST_BIN` | Foundry binary overrides for tests |
+| `BLOOM_MAINNET_RPC` | Optional read-only live-network test endpoint |
+| `RUST_LOG` | `tracing-subscriber` filter |
+
+Machine environment variables must not contain wallet private keys, wallet
+encryption passwords, passkey outputs, backend credentials, or Signer state.
+
+## Tests
+
+Run platform-independent tests locally:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Useful focused suites:
+
+```sh
+cargo test -p bloom-proto
+cargo test -p bloom-machine-client
+cargo test -p bloom-triad-local-transport
+cargo test -p bloom-vfs
+cargo test -p bloom-mount --features mount
+cargo test -p bloom-daemon
 cargo test -p bloom --test cli
-
-# Anvil-backed end-to-end suite (Foundry must be on $PATH)
 cargo test -p bloom-it -- --ignored
-cargo test -p bloom-watch --test anvil_watch -- --ignored
-
-# Live Ethereum mainnet (skips cleanly if BLOOM_MAINNET_RPC is unset)
-BLOOM_MAINNET_RPC=https://eth.example.com cargo test -p bloom-ens -- --ignored
-
-# Heimdall decompile fallback (feature-gated, heavy build)
-cargo test -p bloom-it --test revert_decoding_fallbacks \
-  --features bytecode-decompile -- --ignored --nocapture
 ```
 
-What each integration test covers:
-
-| Test file | Covers |
-|-----------|--------|
-| `crates/bloom/tests/cli.rs` | Subcommand routing, `init`, `status`, `vfs ls/cat/write`, IPC socket fallback, keystore wallet creation. |
-| `crates/bloom-it/tests/anvil_e2e.rs` | Full stage → confirm → broadcast for native ETH. Funds a wallet, writes `outbox/new.tx`, confirms, asserts the receipt. |
-| `crates/bloom-it/tests/erc20_e2e.rs` | ERC-20 transfer staging incl. fee-bump replacement; surfaces a known failure when token decimals are unreadable. |
-| `crates/bloom-it/tests/revert_decoding.rs` | Deploys a `Reverter` contract and asserts the decoder produces correct output for `Error(string)`, `Panic(uint)`, and custom errors. |
-| `crates/bloom-it/tests/revert_decoding_fallbacks.rs` | Same contract, no Etherscan ABI — exercises the heimdall bytecode decompile path. **Requires `--features bytecode-decompile`.** |
-| `crates/bloom-it/tests/rpc_failover.rs` | Two anvils; kills one mid-loop and asserts subsequent reads succeed within 1s on the survivor. |
-| `crates/bloom-it/tests/rpc_health_probe.rs` | Live anvil + dead endpoint; waits ~17s and asserts the health snapshot reflects success rate and cooldown. |
-| `crates/bloom-it/tests/rpc_state_drift.rs` | Two anvils at different heights; opens a session and asserts cross-provider hash mismatch is degraded-and-retried, not surfaced. |
-| `crates/bloom-it/tests/rpc_ws_subscriptions.rs` | Anvil WS endpoint: `subscribe_blocks`, mines 3 blocks, asserts 3 headers arrive. |
-| `crates/bloom-it/tests/rpc_ws_watch_handover.rs` | Watch executor block-watch survives anvil restart by handing over from WS to polling. |
-| `crates/bloom-watch/tests/anvil_watch.rs` | Balance watch: anvil_setBalance triggers a transition recorded to the live event log. |
-| `crates/bloom-ens/tests/live_mainnet.rs` | `vitalik.eth` round-trip (forward + reverse + text). Skips with a print if `BLOOM_MAINNET_RPC` is unset. |
-
-The `bloom-it` crate (`crates/bloom-it/src/lib.rs`) is the harness shared by
-those nine integration tests: `spawn_anvil()`, `cast_send()`, `pick_free_port()`,
-and an `AnvilGuard` RAII wrapper that kills the child on drop.
-
-### Dockerized tests (`tests/docker/`)
-
-The Docker harness exists because kernel NFS mounts work on Linux but not on
-macOS hosts.
-The host orchestrator is `tests/docker/run.sh`; it builds a Linux `rust:bookworm`
-image once (`Dockerfile`), caches the cargo target dir in the
-`bloom-cargo-cache` named volume, and dispatches into one of four
-in-container drivers.
+Run the current developer-harness shell tests without a browser or mainnet:
 
 ```sh
-# Default — NFS mount surface regression test (no chain, no wallet)
-bash tests/docker/run.sh                       # → tests/docker/test.sh
-
-# `cargo test --workspace --lib` inside the Linux container
-bash tests/docker/run.sh --workspace           # → tests/docker/test_workspace.sh
-
-# Wallet staging + chain reads against an anvil fork of Base
-bash tests/docker/run.sh --fork                # → tests/docker/test_fork_mount.sh
-
-# Force a no-cache rebuild of the test image
-bash tests/docker/run.sh --rebuild --mount
+scripts/test-local-mainnet-integration.sh
 ```
 
-Coverage per mode:
-
-| Mode | Compose stack | Verifies |
-|------|---------------|----------|
-| `--workspace` | single container | The unit-test suite passes on Linux as well as macOS. CI-shape regression for OS-specific code. |
-| `--mount` (default) | single privileged container | NFS server + kernel mount: `ls`, `cat /status/version`, `cat /tools/keccak/abc`, `write /watch/new`. Regression-tests the WRITE-stability bug that returned EREMOTEIO. |
-| `--fork` | compose: anvil-fork sidecar + driver | End-to-end wallet flow over the mount: stage → confirm → broadcast → poll receipt → fee-bump replace; chain reads under `/bloom/chains/base/{head,tx,gas,blocks}`. |
-
-In-container drivers and their helpers all live in `tests/docker/`:
-
-- `Dockerfile` — `rust:bookworm` base; installs `nfs-common` (for `mount.nfs4`),
-  `ca-certificates`, `procps`, `curl`, `jq`. Pins rustfmt + clippy to dodge
-  transient registry hiccups.
-- `docker-compose.yml` — anvil-fork sidecar (Base mainnet at chain_id 8453,
-  port 8545, healthcheck via `cast chain-id`); driver profiles (`fork` and
-  `mempool`) sharing the sidecar.
-- `lib.sh` — bash helpers (`prepare_home_dir`, `build_mount_demo`,
-  `start_mount_demo`, `wait_for_mount`, `wait_tx_success`,
-  `top_up_anvil_balance`, etc.) plus the deterministic Anvil fixtures.
-- `test.sh`, `test_workspace.sh`, `test_fork_mount.sh`, and
-  `test_mempool_mock.sh` — the per-mode drivers invoked by `run.sh`.
-
-Common gotchas (more in each script's header comment):
-
-- The `--mount` and `--fork` containers run with
-  `--cap-add SYS_ADMIN`, `--device /dev/fuse`, and `--security-opt
-  apparmor=unconfined`. The `--workspace` mode does not.
-- `CARGO_TARGET_DIR=/tmp/cargo-target` is set in-container so Linux artifacts
-  don't trample the macOS host's `target/`. The `bloom-cargo-cache` named
-  volume persists this between runs; `docker volume rm bloom-cargo-cache`
-  to nuke.
-Enso-specific integration tests now live with the
-[Enso Petal](https://github.com/bloom-directory/bloom-petal-enso). Validate
-that package with `scripts/check-route-architecture.sh`,
-`cargo test --manifest-path route/Cargo.toml`, `scripts/build.sh`, and
-`petal check --root .` from its source checkout.
-
-### Acceptance script (`scripts/acceptance.sh`)
-
-Host-side end-to-end suite that doesn't need Docker. Drives the local native
-ETH and ERC-20 acceptance paths using `bloom` CLI calls (which exercise the
-same code as VFS writes).
+Run production boundary checks directly:
 
 ```sh
-cargo build --release -p bloom                  # build first
-./scripts/acceptance.sh                        # exit 0 = pass, 1 = fail, 2 = missing tools
+packaging/triad/release/check-machine-authority-boundary.sh
+packaging/triad/release/test-machine-authority-boundary.sh
 ```
 
-Prereqs: `anvil`, `cast`, `forge`, `jq`, and a built `target/release/bloom`
-(override with `BLOOM_BIN`).
-
-| # | Scenario | Skipped when |
-|---|----------|--------------|
-| 1 | Native ETH send staged on local Anvil; initial confirm must deny and write central `approval_challenge.json` with `ceremony_url` | (always runs) |
-| 2 | ERC-20 transfer staged with deployed `MockERC20`; initial confirm must deny and write central `approval_challenge.json` with `ceremony_url` | `forge` missing |
-
-Anvil and the temp home dir are torn down on exit via `trap`.
-
-### Playground (`scripts/play.sh`)
-
-Interactive REPL — not a test, but the fastest way to drive the daemon by
-hand against a real anvil.
-
-```sh
-./scripts/play.sh                              # builds bloom, boots anvil, drops you into a subshell
-BLOOM_PLAY_PERSIST=1 ./scripts/play.sh          # keep the play home between runs
-```
-
-What it sets up: anvil at `127.0.0.1:8545` (chain_id 31337) via
-`docker/playground/docker-compose.yml`; a fresh `~/.bloom-play` with two
-chains (`anvil` broadcasts enabled, `base` mainnet read-only); three wallets
-(`alice`, `bob`, `carol`) imported from anvil's deterministic mnemonic with
-passphrase `play`; a backgrounded `bloom serve` whose logs go to
-`/tmp/bloom-play-daemon.log`. Cleanup on subshell exit kills the daemon and
-the anvil container.
+macOS packaging, service activation, peer-credential isolation, fixed ceremony
+port behavior, and root-installed bundle acceptance belong in the local Tart
+VM. Do not use GitHub Actions as a polling dependency for those checks.
 
 ## Debugging
 
-### Tracing logs
-
-The binary configures `tracing-subscriber` with `EnvFilter` from `RUST_LOG`
-(default `info`, output to stderr). Useful filters:
+### Logs
 
 ```sh
 RUST_LOG=info bloom serve
 RUST_LOG=bloom_daemon=debug,bloom_vfs=debug,info bloom serve
-RUST_LOG=bloom_rpc=trace,info bloom serve              # endpoint health & failover
-RUST_LOG=error bloom status                           # quiet for scripts
+RUST_LOG=bloom_rpc=trace,info bloom status
 ```
 
-For `scripts/play.sh` the daemon log lands at
-`${BLOOM_PLAY_DAEMON_LOG:-/tmp/bloom-play-daemon.log}`.
+The triad developer launcher writes separate `machine.log`, `broker.log`,
+`signer.log`, and `session.log` files beneath its selected log directory. A
+signing failure should be correlated by operation ID across those logs and
+public receipts. Ceremony URLs and secret input must never appear in logs.
 
-### Audit log
+### Status and projections
 
-Every side-effecting operation is appended to `$BLOOM_HOME/audit.jsonl` as a
-hash-chained record (`{ts_ms, kind, wallet?, chain?, data, prev, digest}`,
-all blake3). Tampering is detectable via `AuditLog::verify()`. The live
-fingerprint is exposed under the status surface:
+Machine's VFS status tree is useful for public diagnostics:
 
 ```sh
-bloom vfs cat /status/audit/head      # current blake3 digest
-bloom vfs cat /status/audit/count     # total entries
-bloom vfs cat /status/audit/last      # last 10 records as JSON
+bloom vfs cat /status/daemon.json
+bloom vfs cat /status/chains/base/connected
+bloom vfs cat /status/outbox/pending_count
+bloom vfs cat /status/backends/summary.json
 ```
 
-### Status VFS surface
+Wallet discovery, key references, credential summaries, and policy snapshots
+come from authenticated Broker projections or Machine's explicitly stale
+public cache. A missing Broker projection is not a cue to inspect or seed an
+old wallet store.
 
-The fastest read-only diagnostic. Backed by
-`crates/bloom-vfs/src/handlers/status.rs`; per-path TTLs keep these calls
-cheap (chain probes 5s, version 1d, audit live).
+### Machine state layout
 
-```sh
-bloom vfs cat /status/daemon.json                        # version, uptime, home, chains
-bloom vfs cat /status/chains/base/connected              # true / false (750ms RPC ping)
-bloom vfs cat /status/chains/base/block_number           # head height (or backend error)
-bloom vfs ls  /status/chains/base/endpoints              # health snapshots, 0-indexed
-bloom vfs cat /status/chains/base/endpoints/0/success_rate
-bloom vfs cat /status/outbox/pending_count               # pending tx count
-bloom vfs cat /status/backends/summary.json              # which data source each surface uses
-bloom vfs cat /status/update/installed                   # this binary's compiled-in version
-bloom vfs cat /status/update/summary.json                # latest known GitHub release + verdict
-bloom update check                                       # force-refresh and print as JSON (exit 0/1/2)
-bloom update status                                      # print cached snapshot as JSON
-```
+Machine state is key-free:
 
-### IPC introspection
-
-Once `bloom serve` is up, the JSON-RPC dispatcher
-(`crates/bloom-daemon/src/ipc.rs`) exposes `lookup`, `read`, `write`, `list`,
-`version`, `chains`, `shutdown`. They are addressable directly:
-
-```sh
-bloom ipc call version
-bloom ipc call chains
-bloom ipc call list   --params '{"path":"/wallets"}'
-bloom ipc call read   --params '{"path":"/status/daemon.json"}'
-bloom ipc call write  --params '{"path":"/wallets/alice/chains/anvil/outbox/new.tx","text":"send 0.01 eth to 0x..."}'
-bloom ipc call shutdown
-```
-
-Useful when you suspect the CLI shim is hiding a daemon-side error.
-
-### Home directory layout
-
-```
+```text
 $BLOOM_HOME/
-├── config.toml          # chain config, etherscan key, broadcast policy
-├── addressbook.toml     # local petname directory
-├── audit.jsonl          # hash-chained audit log
-├── run/bloom.sock        # UDS JSON-RPC socket (mode 0600)
-├── keystore/<wallet>/   # encrypted.key, address, pubkey, kind, policy.toml
-├── cache/cache.db       # etherscan / ABI cache (TTL-gated)
-├── blobs/               # large response storage
-├── outbox/<wallet>/<chain>/{pending,sent,failed}/<id>/
-├── watch/<id>/          # subscription state + rotated history.jsonl[.n]
-└── logs/                # daemon log files (when running detached)
+├── config.toml
+├── addressbook.toml
+├── audit.jsonl
+├── run/
+├── cache/                 # public projections and non-authority caches
+├── blobs/
+├── operations/            # idempotent Machine operation index
+├── central_outbox/
+├── outbox/
+├── requests/
+├── watch/
+└── logs/
 ```
 
-## Lint and format
+Production Machine must not create, open, migrate, or trust obsolete wallet,
+approval, challenge, authorization-session, or decrypted-key-cache state.
+Broker and Signer use separate packaging-selected roots inaccessible to the
+Machine principal.
 
-No custom `rustfmt.toml` or `clippy.toml` — defaults apply.
+## Change-to-test map
 
-```sh
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-```
+| Changed area | Minimum local verification |
+|---|---|
+| Machine projections or Broker client | `cargo test -p bloom-machine-client` and affected CLI/VFS tests |
+| VFS handlers | `cargo test -p bloom-vfs`; add `bloom-mount --features mount` for adapter changes |
+| Transaction staging/signature assembly | `cargo test -p bloom-tx` and affected `bloom-it` tests |
+| Petal host interfaces | `cargo test -p bloom-petals` plus the deterministic triad fixture |
+| Triad transport/protocol | relevant protocol/transport suites in all three repositories |
+| Machine authority boundary | both release boundary scripts and production feature checks |
+| macOS packaging/isolation | local Tart VM packaged acceptance |
 
-CI expects both clean.
-
-## Coverage map
-
-Quick "if I changed X, what should I run?" matrix.
-
-| If you touched… | Run, in order |
-|-----------------|---------------|
-| `bloom-proto` (config, intents, units) | `cargo test -p bloom-proto` |
-| `bloom-vfs` handlers | `cargo test -p bloom-vfs` then `bash tests/docker/run.sh --mount` |
-| `bloom-rpc` failover/health/WS | `cargo test -p bloom-rpc` then `cargo test -p bloom-it -- --ignored` |
-| `bloom-evm` | `cargo test -p bloom-evm` then `cargo test -p bloom-it --test anvil_e2e -- --ignored` |
-| `bloom-tx` staging / nonce / replace | `cargo test -p bloom-tx` then `cargo test -p bloom-it --test anvil_e2e -- --ignored` then `bash tests/docker/run.sh --fork` |
-| `bloom-keystore` | `cargo test -p bloom-keystore` |
-| `bloom-revert` | `cargo test -p bloom-revert` then `cargo test -p bloom-it --test revert_decoding -- --ignored` (and `revert_decoding_fallbacks` with `--features bytecode-decompile` if you touched the heimdall path) |
-| `bloom-watch` | `cargo test -p bloom-watch -- --ignored` then `cargo test -p bloom-it --test rpc_ws_watch_handover -- --ignored` |
-| `bloom-mount` | `cargo test -p bloom-mount --features mount` then `bash tests/docker/run.sh --mount` (and `--fork` if you touched plumbing the wallet flow uses) |
-| `bloom-etherscan` | `cargo test -p bloom-etherscan` (and the live test if you have a key) |
-| `bloom-ens` | `cargo test -p bloom-ens` then the live test with `BLOOM_MAINNET_RPC` if applicable |
-| `bloom-prices` | `cargo test -p bloom-prices` |
-| `bloom-daemon` IPC / lifecycle | `cargo test -p bloom-daemon` then `cargo test -p bloom --test cli` |
-| `bloom` CLI | `cargo test -p bloom --test cli` then `./scripts/acceptance.sh` |
-| An installed Petal | Run its repository checks, then `bloom petals install <source> --ref <commit>` in an isolated Bloom home and inspect its route contract. |
+Installed Petals are tested in their own repositories and then installed by
+immutable source revision into an isolated developer Machine home. Do not patch
+an external Petal inside Machine to preserve a retired authority ABI.

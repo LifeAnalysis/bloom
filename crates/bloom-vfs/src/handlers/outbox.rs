@@ -8,13 +8,13 @@
 //! File layout per action (spec §7.1):
 //! ```text
 //! intent.json, intent_hash, plan.md, policy_check.json,
-//! challenge.json, approval.json, status.json, result.json
+//! challenge.json, approval_challenge.json, status.json, result.json
 //! ```
 
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use bloom_auth_api::petal_identity::label_petal_digest;
+use bloom_proto::petal_identity::label_petal_digest;
 
 use crate::handler::{
     Entry, EntryKind, Handler, HandlerError, entry_for_fs_path, entry_from_fs_dir_entry,
@@ -29,7 +29,6 @@ const ACTION_FILES: &[&str] = &[
     "policy_check.json",
     "challenge.json",
     "approval_challenge.json",
-    "approval.json",
     "status.json",
     "result.json",
 ];
@@ -104,7 +103,7 @@ impl CentralOutbox {
     /// action with the Petal that produced it.
     ///
     /// `petal_digest_kind` is derived from `petal_digest` via
-    /// [`bloom_auth_api::petal_identity::label_petal_digest`] and is either
+    /// [`bloom_proto::petal_identity::label_petal_digest`] and is either
     /// `"placeholder"` (current first-party reality) or `"build"` (planned
     /// for reproducible-build/source digests). Spec §11.10 requires that
     /// placeholder digests are surfaced as such so they are not mistaken
@@ -223,7 +222,7 @@ impl CentralOutbox {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         if !matches!(
             file,
-            "approval_challenge.json" | "approval.json" | "result.json" | "status.json"
+            "approval_challenge.json" | "result.json" | "status.json"
         ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -252,7 +251,7 @@ impl CentralOutbox {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         if !matches!(
             file,
-            "approval_challenge.json" | "approval.json" | "result.json" | "status.json"
+            "approval_challenge.json" | "result.json" | "status.json"
         ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -319,13 +318,8 @@ impl OutboxHandler {
         &self,
         path: impl AsRef<std::path::Path>,
         name: &str,
-        writable: bool,
     ) -> Result<Entry, HandlerError> {
-        let mut entry = entry_for_fs_path(path, name, EntryKind::File)?;
-        if writable {
-            entry.mode = 0o644;
-        }
-        Ok(entry)
+        entry_for_fs_path(path, name, EntryKind::File)
     }
 }
 
@@ -370,7 +364,7 @@ impl Handler for OutboxHandler {
                 if !fpath.exists() {
                     return Err(HandlerError::NotFound(format!("/outbox/latest/{file}")));
                 }
-                self.file_entry_for_path(fpath, file, *file == "approval.json")
+                self.file_entry_for_path(fpath, file)
             }
             [state, action_id] if STATES.contains(state) => {
                 validate_action_id(action_id)?;
@@ -395,11 +389,7 @@ impl Handler for OutboxHandler {
                         "/outbox/{state}/{action_id}/{file}"
                     )));
                 }
-                self.file_entry_for_path(
-                    fpath,
-                    file,
-                    *file == "approval.json" && *state == "pending",
-                )
+                self.file_entry_for_path(fpath, file)
             }
             _ => Err(HandlerError::NotFound(path.to_string_path())),
         }
@@ -450,37 +440,8 @@ impl Handler for OutboxHandler {
         }
     }
 
-    async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
-        let segs = match_segs(path);
-        match segs.as_slice() {
-            ["latest", "approval.json"] => {
-                let action_id = self
-                    .latest_pending_action_id()?
-                    .ok_or_else(|| HandlerError::NotFound("outbox/latest".into()))?;
-                let dir = self.outbox.action_dir("pending", &action_id);
-                if !dir.exists() {
-                    return Err(HandlerError::NotFound(format!(
-                        "/outbox/pending/{action_id}"
-                    )));
-                }
-                std::fs::write(dir.join("approval.json"), data)
-                    .map_err(|e| HandlerError::backend(e.to_string()))?;
-                Ok(())
-            }
-            ["pending", action_id, "approval.json"] => {
-                validate_action_id(action_id)?;
-                let dir = self.outbox.action_dir("pending", action_id);
-                if !dir.exists() {
-                    return Err(HandlerError::NotFound(format!(
-                        "/outbox/pending/{action_id}"
-                    )));
-                }
-                std::fs::write(dir.join("approval.json"), data)
-                    .map_err(|e| HandlerError::backend(e.to_string()))?;
-                Ok(())
-            }
-            _ => Err(HandlerError::PermissionDenied),
-        }
+    async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+        Err(HandlerError::PermissionDenied)
     }
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
@@ -520,23 +481,26 @@ impl Handler for OutboxHandler {
                 let mut entries: Vec<Entry> = std::fs::read_dir(&dir)
                     .map_err(|e| HandlerError::backend(e.to_string()))?
                     .filter_map(|e| e.ok())
-                    .map(|e| {
+                    .filter_map(|e| {
                         let name = e.file_name().to_string_lossy().to_string();
+                        if !ACTION_FILES.contains(&name.as_str()) {
+                            return None;
+                        }
                         let metadata = e.metadata().ok();
                         if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                            let entry = if state == &"pending" && name == "approval.json" {
-                                Entry::writable_file(&name)
-                            } else {
-                                Entry::file(&name)
-                            };
-                            metadata
-                                .as_ref()
-                                .map_or(entry.clone(), |m| entry.with_fs_metadata(m))
+                            let entry = Entry::file(&name);
+                            Some(
+                                metadata
+                                    .as_ref()
+                                    .map_or(entry.clone(), |m| entry.with_fs_metadata(m)),
+                            )
                         } else {
                             let entry = Entry::dir(&name);
-                            metadata
-                                .as_ref()
-                                .map_or(entry.clone(), |m| entry.with_fs_metadata(m))
+                            Some(
+                                metadata
+                                    .as_ref()
+                                    .map_or(entry.clone(), |m| entry.with_fs_metadata(m)),
+                            )
                         }
                     })
                     .collect();
@@ -637,19 +601,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_approval_only() {
+    async fn client_writes_are_denied() {
         let h = handler();
         h.outbox
             .stage("act-002", b"{}", "hash", "plan", b"[]")
             .unwrap();
 
-        // approval.json is writable
-        let p = VfsPath::parse("pending/act-002/approval.json").unwrap();
-        h.write(&p, b"approval data").await.unwrap();
-        let data = h.read(&p).await.unwrap();
-        assert_eq!(data, b"approval data");
-
-        // intent.json is NOT writable
         let p = VfsPath::parse("pending/act-002/intent.json").unwrap();
         assert!(h.write(&p, b"x").await.is_err());
     }
@@ -662,7 +619,6 @@ mod tests {
             .unwrap();
         let dir = h.outbox.action_dir("pending", "act-approval");
         std::fs::write(dir.join("approval_challenge.json"), b"{\"challenge\":true}").unwrap();
-        std::fs::write(dir.join("approval.json"), b"{}").unwrap();
 
         let entries = h
             .list(&VfsPath::parse("pending/act-approval").unwrap())
@@ -674,56 +630,63 @@ mod tests {
             .expect("approval_challenge.json is listed");
         assert_eq!(challenge.mode, 0o444);
 
-        let approval = entries
-            .iter()
-            .find(|entry| entry.name == "approval.json")
-            .expect("approval.json is listed");
-        assert_eq!(approval.mode, 0o644);
-
         let p = VfsPath::parse("pending/act-approval/approval_challenge.json").unwrap();
         let entry = h.lookup(&p).await.unwrap();
         assert_eq!(entry.mode, 0o444);
         assert!(h.write(&p, b"{}").await.is_err());
     }
 
-    #[test]
-    fn write_action_file_allows_approval_json_and_rejects_arbitrary() {
+    #[tokio::test]
+    async fn legacy_approval_json_is_absent_and_denied() {
         let h = handler();
         h.outbox
             .stage("act-central-approval", b"{}", "hash", "plan", b"[]")
             .unwrap();
-
-        // The daemon's Mode 3 ceremony mirrors approval.json into the central
-        // projection through this path — it must be allowlisted (regression: it
-        // was silently rejected, so approval.json never reached the central dir).
-        h.outbox
-            .write_action_file("act-central-approval", "pending", "approval.json", b"{}")
-            .expect("approval.json must be a runtime-writable central artifact");
         let dir = h.outbox.action_dir("pending", "act-central-approval");
-        assert!(dir.join("approval.json").exists());
+        let path = VfsPath::parse("pending/act-central-approval/approval.json").unwrap();
 
-        // The allowlist still fails closed for anything else.
-        let err = h
+        assert!(matches!(
+            h.lookup(&path).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        assert!(matches!(
+            h.read(&path).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        assert!(matches!(
+            h.write(&path, b"legacy approval").await,
+            Err(HandlerError::PermissionDenied)
+        ));
+        assert!(!dir.join("approval.json").exists());
+
+        let write_err = h
             .outbox
-            .write_action_file("act-central-approval", "pending", "secrets.json", b"{}")
+            .write_action_file("act-central-approval", "pending", "approval.json", b"{}")
             .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-    }
+        assert_eq!(write_err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!dir.join("approval.json").exists());
 
-    #[tokio::test]
-    async fn approval_json_is_writable_only_while_pending() {
-        let h = handler();
-        h.outbox
-            .stage("act-sent", b"{}", "hash", "plan", b"[]")
+        let read_err = h
+            .outbox
+            .read_action_file("act-central-approval", "pending", "approval.json")
+            .unwrap_err();
+        assert_eq!(read_err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        // A pre-existing legacy artifact is not projected or trusted either.
+        std::fs::write(dir.join("approval.json"), b"stale legacy approval").unwrap();
+        assert!(matches!(
+            h.lookup(&path).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        assert!(matches!(
+            h.read(&path).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        let entries = h
+            .list(&VfsPath::parse("pending/act-central-approval").unwrap())
+            .await
             .unwrap();
-        let pending_dir = h.outbox.action_dir("pending", "act-sent");
-        std::fs::write(pending_dir.join("approval.json"), b"{}").unwrap();
-        h.outbox.transition("act-sent", "pending", "sent").unwrap();
-
-        let p = VfsPath::parse("sent/act-sent/approval.json").unwrap();
-        let entry = h.lookup(&p).await.unwrap();
-        assert_eq!(entry.mode, 0o444);
-        assert!(h.write(&p, b"{}").await.is_err());
+        assert!(entries.iter().all(|entry| entry.name != "approval.json"));
     }
 
     #[tokio::test]
@@ -799,11 +762,12 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(15));
         h.outbox.stage("act-new", b"{}", "h2", "p2", b"[]").unwrap();
 
-        // Simulate writing an approval into the older action — this must
+        // Simulate updating a runtime status in the older action — this must
         // NOT bump its position in the latest ordering, because latest
         // tracks staging time, not modification time.
-        let approval_dir = h.outbox.action_dir("pending", "act-old");
-        std::fs::write(approval_dir.join("approval.json"), b"{}").unwrap();
+        h.outbox
+            .write_action_file("act-old", "pending", "status.json", b"{}")
+            .unwrap();
 
         let entry = h.lookup(&VfsPath::parse("latest").unwrap()).await.unwrap();
         assert_eq!(

@@ -9,7 +9,6 @@ description = "Tx engine, intent parser, policy for bloom"
 default = []
 
 [dependencies]
-bloom-auth-api.workspace = true
 bloom-machine-client.workspace = true
 bloom-proto.workspace = true
 bloom-triad-protocol.workspace = true
@@ -35,4 +34,5 @@ base64.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
+alloy-signer-local = "2.0.5"
 tempfile.workspace = true

@@ -38,31 +38,30 @@ from the release it ships with.
 `agent-guidance.md` ("Working with bloom") currently documents:
 
 - mounting and the `bloom vfs ls`/`bloom vfs cat` facade;
-- the capability security model: reads are always safe; direct value-moving
-  writes cross an owner-approval gate; automated action flows through bounded
-  sessions/capabilities; the owner key is never handed to an agent;
+- the authority security model: reads, staging, and simulation remain
+  Machine-owned; signing uses Broker authorization and Signer-held keys; the
+  owner key is never handed to an agent or Machine;
 - the outbox stage/confirm flow;
 - paid HTTP under `/requests` (staging, `plan.md`, `confirm`, spend caps);
 - the mounted Sealed Approval lifecycle for the EVM slice: permission-denied
-  confirm writes, `approval_challenge.json`, `ceremony_url`, grant / grant +
-  execute, and retrying after a grant-only approval;
-- Hyperliquid session-first trading and discovery of installed Petal docs;
-- passkey policy signing and `under_policy` semantics.
+  confirm writes, `approval_challenge.json`, `ceremony_url`, completed Broker
+  approval, and retrying the bound action;
+- discovery of installed Petal docs and route contracts;
+- passkey policy-update custody and advisory `under_policy` semantics.
 
 As additional Petals adopt the mounted Sealed Approval flow described in
 [`Interaction Modes.md`](./Interaction%20Modes.md), the guidance must stay the
 discovery mechanism for that contract: the permission-denied signal on a confirm
 write, reading `approval_challenge.json` from the same pending directory,
-forwarding or opening `ceremony_url`, the grant / grant + execute choice, and
-retrying the confirm write after a grant-only approval. There is no per-action
+forwarding or opening `ceremony_url`, waiting for Broker to report activation,
+and retrying the bound action. There is no per-action
 hint file and no per-directory README duplication of global contracts.
 
 ## Per-surface documentation
 
 Built-in handlers embed read-only, handler-local documentation, while external
 Petals expose package-defined route documentation under `/petals/<name>/`.
-For example, Hyperliquid exposes `/hyperliquid/README.md`, and the default
-installed Polymarket Petal exposes `/petals/polymarket/README.md`,
+For example, the default installed Polymarket Petal exposes `/petals/polymarket/README.md`,
 `/petals/polymarket/AGENTS.md`, and
 `/petals/polymarket/meta/route-contract.json`. Per-request `plan.md` files under
 `/requests` are per-instance previews rather than static docs.
@@ -95,8 +94,8 @@ Two mechanisms keep the served documentation truthful:
 byte-identical to the vendored source file, and that the content passes
 sanity checks. Petal router tests assert that package `README.md` and
 `AGENTS.md` files are listed, readable, and immutable. Built-in handlers carry
-similar tests for their READMEs (for example, that the Hyperliquid README
-documents safe reads and API-wallet risk).
+similar tests for their retained handler-local documentation. External venue
+guidance is tested as content-addressed Petal package documentation.
 
 **The PR checklist enforces updates.** The repository's pull request
 template includes a mandatory "Agent Documentation updated" item, enforced

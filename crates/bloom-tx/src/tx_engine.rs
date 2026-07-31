@@ -12,11 +12,10 @@ use alloy::eips::eip2930::AccessList;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, B256, Bytes, Signature, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
-#[cfg(test)]
-use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use bloom_auth_api::ValuationPolicy;
+#[cfg(test)]
+use alloy_signer_local::PrivateKeySigner;
 use bloom_evm::{ChainClient, ChainError, IERC20, NftKind};
 use bloom_machine_client::{ExactPayloadSignOutcome, ExactPayloadSignRequest, MachineBrokerClient};
 
@@ -46,7 +45,8 @@ sol! {
 use bloom_proto::plan::ExecutionOrigin;
 use bloom_proto::{
     AddressBook, ChainSpec, HomeWritePermit, NftAction, NftRef, Policy, RawIntent, RawIntentBody,
-    StagedTx, TokenRef, TxActionKind, TxStatus, parse_amount, parse_eth, parse_units,
+    StagedTx, TokenRef, TxActionKind, TxStatus, ValuationPolicy, parse_amount, parse_eth,
+    parse_units,
 };
 use bloom_triad_protocol::{
     ApprovalLifecycleState, CryptoSuite, DecimalU64, Digest32, OperationId, OperationState,
@@ -3833,7 +3833,7 @@ mod tests {
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const TEST_SIGNER_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
-    fn test_signer() -> alloy::signers::local::PrivateKeySigner {
+    fn test_signer() -> alloy_signer_local::PrivateKeySigner {
         TEST_SIGNER_PK
             .parse()
             .expect("valid deterministic test key")
@@ -3987,19 +3987,19 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl bloom_auth_api::PriceOracle for RecordingOracle {
+    impl crate::PriceOracle for RecordingOracle {
         async fn quote_usd(
             &self,
             asset_id: &str,
             amount_base_units: &str,
             _asset_decimals: u8,
             now_ms: u64,
-        ) -> Result<bloom_auth_api::ValuationQuote, bloom_auth_api::AuthApiError> {
+        ) -> Result<bloom_proto::ValuationQuote, bloom_proto::ValuationError> {
             self.calls
                 .lock()
                 .push((asset_id.to_string(), amount_base_units.to_string()));
             let fetched_at_ms = now_ms.saturating_sub(self.age_ms).max(1);
-            Ok(bloom_auth_api::ValuationQuote {
+            Ok(bloom_proto::ValuationQuote {
                 asset_id: asset_id.to_string(),
                 amount_base_units: amount_base_units.to_string(),
                 usd_micro: self.usd_micro,
@@ -4741,7 +4741,7 @@ mod tests {
             amount_base_units: Some("1000000".into()),
         });
         original.usd_value = Some(10.0);
-        original.valuation = Some(bloom_auth_api::ValuationQuote {
+        original.valuation = Some(bloom_proto::ValuationQuote {
             asset_id: "anvil:0x2222222222222222222222222222222222222222".into(),
             amount_base_units: "1000000".into(),
             usd_micro: 10_000_000,
@@ -5497,7 +5497,7 @@ mod tests {
         staged.created_ms = now_ms();
         staged.action_kind = TxActionKind::NativeTransfer;
         staged.value_wei = "1".into();
-        staged.valuation = Some(bloom_auth_api::ValuationQuote {
+        staged.valuation = Some(bloom_proto::ValuationQuote {
             asset_id: "native:anvil".into(),
             amount_base_units: "1".into(),
             usd_micro: 6_000_000,
@@ -5737,7 +5737,7 @@ mod tests {
         let mut native = fake_staged_1559("typed-native");
         native.value_wei = "1".into();
         native.action_kind = TxActionKind::NativeTransfer;
-        native.valuation = Some(bloom_auth_api::ValuationQuote {
+        native.valuation = Some(bloom_proto::ValuationQuote {
             asset_id: "native:anvil".into(),
             amount_base_units: "1".into(),
             usd_micro: 1_000_000,

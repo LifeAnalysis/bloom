@@ -485,6 +485,25 @@ mod tests {
                 || text.contains("does NOT create a local wallet"),
             "guidance must explicitly say a plain /wallets/new write does not create a local wallet"
         );
+        assert!(
+            text.contains("wallets/<wallet>/policy.json")
+                && text.contains("policy.validate_update")
+                && text.contains("policy.commit_update")
+                && text.contains("exact same proposed bytes"),
+            "guidance must document the canonical mounted triad policy-update flow"
+        );
+        for stale in [
+            "> wallets/<wallet>/policy.toml",
+            "policy.toml.sig",
+            "host signer",
+            "the grant",
+            "a grant",
+        ] {
+            assert!(
+                !text.contains(stale),
+                "guidance retains stale Machine-authority vocabulary {stale:?}"
+            );
+        }
     }
 
     #[tokio::test]

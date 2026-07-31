@@ -22,15 +22,17 @@ use alloy::sol_types::SolCall;
 use anyhow::{Context, Result, anyhow};
 use bloom_auth::AuthStore;
 use bloom_auth_api::{
-    AuthApiError, EVM_ERC20_TRANSFER_METHOD, EvmFeePolicy, EvmOwnerSigningSessionCounters,
-    EvmOwnerSigningSessionScope, EvmOwnerSigningSessionUse, PriceOracle, ValuationQuote,
+    EVM_ERC20_TRANSFER_METHOD, EvmFeePolicy, EvmOwnerSigningSessionCounters,
+    EvmOwnerSigningSessionScope, EvmOwnerSigningSessionUse,
     petal_identity::{PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET},
 };
 use bloom_evm::{ChainClient, IERC20};
 use bloom_it::{exact_signing_broker, exact_signing_catalog};
-use bloom_proto::{AgentAutonomyMode, ChainSpec, Policy, RawIntent, RawIntentBody};
-use bloom_tx::Outbox;
+use bloom_proto::{
+    AgentAutonomyMode, ChainSpec, Policy, RawIntent, RawIntentBody, ValuationError, ValuationQuote,
+};
 use bloom_tx::tx_engine::{TxEngine, TxEngineError};
+use bloom_tx::{Outbox, PriceOracle};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -59,7 +61,7 @@ impl PriceOracle for TestPriceOracle {
         amount_base_units: &str,
         _asset_decimals: u8,
         now_ms: u64,
-    ) -> std::result::Result<ValuationQuote, AuthApiError> {
+    ) -> std::result::Result<ValuationQuote, ValuationError> {
         Ok(ValuationQuote {
             asset_id: asset_id.into(),
             amount_base_units: amount_base_units.into(),
@@ -307,7 +309,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
         .map_err(|e| anyhow!("triad signing: {e}"))?;
 
     // Use anvil's prefunded account #0 as the signer.
-    let signer: alloy::signers::local::PrivateKeySigner = ANVIL_PK0.parse()?;
+    let signer: alloy_signer_local::PrivateKeySigner = ANVIL_PK0.parse()?;
     let from = signer.address();
 
     // Keep the staged transaction inside ordinary policy limits. Confirm and

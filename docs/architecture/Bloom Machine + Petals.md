@@ -1,6 +1,14 @@
 # Bloom Machine + Petals
 
-**Status:** architecture decision
+> **SUPERSEDED — HISTORICAL ONLY.** Do not implement or follow the operational
+> instructions below. They describe the retired single-process authority
+> model. The normative architecture is
+> [`2026-07-23-triad-process-architecture.md`](../specs/2026-07-23-triad-process-architecture.md):
+> Machine is key-free, Broker owns ceremonies and authorization, and Signer is
+> the only custody/signing authority. Current Petals use payload-bound
+> Machine-to-Broker requests and Signer-held Petal-scoped keys.
+
+**Status:** superseded historical record — not normative
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 Bloom is comprised of:

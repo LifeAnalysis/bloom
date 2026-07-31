@@ -90,6 +90,7 @@ policy-session	crates/bloom-vfs/src/handlers/wallets.rs	2
 policy-session	crates/bloom-vfs/src/handlers/docs.rs	1
 policy-session	crates/bloom-proto/src/capability.rs	3
 policy-session	crates/bloom-proto/src/ceremony.rs	1
+policy-session	crates/bloom-daemon/tests/m2_no_legacy_authority_store.rs	4
 sign_hash_sync	crates/bloom-daemon/src/lib.rs	2
 sign_hash_sync	crates/bloom-daemon/src/sign_hash.rs	1
 sign_hash_sync	crates/bloom-tx/src/tx_engine.rs	2

@@ -1,6 +1,13 @@
 # Open-Internet Sealed Approval Ceremony
 
-**Status:** architecture proposal — relay not implemented
+> **SUPERSEDED — HISTORICAL ONLY.** Do not implement or follow the operational
+> instructions below. They predate the triad authority boundary and incorrectly
+> assign ceremony and signing material to Machine. The normative architecture
+> is [`2026-07-23-triad-process-architecture.md`](../specs/2026-07-23-triad-process-architecture.md):
+> Broker owns the loopback ceremony listener and authorization; Signer owns
+> custody and signature production; Machine never terminates a custody channel.
+
+**Status:** superseded historical record — not normative
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 This document describes how the Sealed Approval ceremony URL becomes reachable

@@ -45,7 +45,7 @@ pub const FUNDER_PRIV_KEY: &str =
 /// it does not expose or emulate the retired hash-only PetalHost path.
 pub struct ExactSigningBrokerFixture {
     active: AtomicBool,
-    signer: alloy::signers::local::PrivateKeySigner,
+    signer: alloy_signer_local::PrivateKeySigner,
     key_ref: KeyRef,
     requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
 }

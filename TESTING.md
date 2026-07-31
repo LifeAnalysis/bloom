@@ -24,8 +24,8 @@ In-crate `#[cfg(test)] mod tests { ... }` blocks. Co-located with the code they
 cover. No external services, no filesystem, no network.
 
 - Run: `cargo test -p <crate>` (or `cargo test --lib`)
-- Examples: walletFS crates such as `bloom-tx`, `bloom-vfs`, `bloom-petals`,
-  and `bloom-hyperliquid`.
+- Examples: walletFS crates such as `bloom-tx`, `bloom-vfs`, and
+  `bloom-petals`.
 
 ### integration
 

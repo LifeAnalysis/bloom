@@ -787,7 +787,7 @@ impl RequestsHandler {
                 data,
                 &backend,
                 ConfirmBackendOptions {
-                    policy_override: Some(&policy),
+                    policy: &policy,
                     checks_override: Some(checks),
                     sentinel_override: Some(&sentinel),
                     // Execute from the sealed request/challenge/requirement we
@@ -799,7 +799,6 @@ impl RequestsHandler {
                         wallet: &wallet,
                         dry_run: sealed_inputs.dry_run,
                     }),
-                    ..Default::default()
                 },
             )
             .await?;
@@ -1394,9 +1393,11 @@ struct ConfirmResult {
     final_state: String,
 }
 
-#[derive(Default)]
 struct ConfirmBackendOptions<'a> {
-    policy_override: Option<&'a Policy>,
+    /// Explicit key-free policy projection already selected by the caller.
+    /// Confirmation must never recover authority inputs from legacy Machine
+    /// state when this value is unavailable.
+    policy: &'a Policy,
     checks_override: Option<Vec<PolicyCheck>>,
     sentinel_override: Option<&'a str>,
     /// Sealed execution inputs already validated by the caller. When present,
@@ -1501,16 +1502,8 @@ async fn confirm_with_backend(
             "this pending request already minted a payment credential; cancel and stage a fresh request instead of re-confirming",
         ));
     }
-    let fallback_policy;
-    let policy = match options.policy_override {
-        Some(policy) => policy,
-        None => {
-            fallback_policy = backend_policy_for_wallet(root, &wallet).unwrap_or_default();
-            &fallback_policy
-        }
-    };
     let execution = backend
-        .prepare(&challenge, &request, &wallet, policy, id)
+        .prepare(&challenge, &request, &wallet, options.policy, id)
         .await
         .map_err(HandlerError::backend)?;
     write_minted_marker(&pending, id, &execution.credential_metadata)?;
@@ -1637,11 +1630,6 @@ fn validate_pending_projection_matches_subject(
         ));
     }
     Ok(())
-}
-
-fn backend_policy_for_wallet(root: &Path, wallet: &str) -> Result<Policy, HandlerError> {
-    let raw = fs::read_to_string(root.join("keystore").join(wallet).join("policy.toml"))?;
-    toml::from_str(&raw).map_err(|e| HandlerError::backend(e.to_string()))
 }
 
 /// Records a redacted, append-only voucher trail after a session-intent paid

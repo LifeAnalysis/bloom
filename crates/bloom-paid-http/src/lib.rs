@@ -51,8 +51,8 @@ pub struct PaidHttpSigningFacts {
 /// grant, records a `SigningAttestation` built from `facts`, atomically
 /// consumes one signature allowance, and returns the 65-byte secp256k1
 /// signature (`r || s || v`). The concrete implementation lives in the Bloom
-/// runtime (it wraps the host `PetalHost::sign_hash`), keeping key custody and
-/// grant enforcement out of the protocol crates.
+/// runtime and delegates the complete payload to Broker, keeping key custody
+/// and approval enforcement out of the protocol crates.
 #[async_trait::async_trait]
 pub trait PaidHttpHostSigner: Send + Sync {
     /// Sign an exact payload-bearing request. `signing_hash` must equal the

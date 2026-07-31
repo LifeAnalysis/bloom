@@ -1,6 +1,13 @@
 # Wallet Architecture
 
-**Status:** target architecture for passkey wallets and Sealed Approval integration
+> **SUPERSEDED — HISTORICAL ONLY.** Do not implement or follow the operational
+> instructions or storage layouts below. They describe the retired
+> Machine-owned wallet design. The normative architecture is
+> [`2026-07-23-triad-process-architecture.md`](../specs/2026-07-23-triad-process-architecture.md):
+> Signer owns custody and policy CAS, Broker owns ceremonies and Sealed
+> Approvals, and Machine retains only authenticated public projections.
+
+**Status:** superseded historical record — not normative
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 This document describes Bloom's wallet setup, passkey ceremony model, and

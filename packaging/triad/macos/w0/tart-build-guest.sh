@@ -36,6 +36,9 @@ mkdir -p \
   "$distribution_root" \
   "$verified_root"
 
+"$main_root/packaging/triad/release/check-machine-authority-boundary.sh" \
+  --require-clean
+
 cargo build \
   --manifest-path "$main_root/Cargo.toml" \
   --release \

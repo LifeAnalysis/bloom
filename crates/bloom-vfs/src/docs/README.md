@@ -126,10 +126,9 @@ cat /bloom/chains/ethereum/contracts/<contract>/nft/is_approved_for_all/<owner>/
 
 ## Creating a wallet
 
-`wallets/new` creates a wallet. A **plain name** (or a TOML spec that omits
-`kind`, or sets `kind = "passkey"`) starts an **asynchronous passkey
-registration** — it does not create a local wallet, and the write returns
-before the WebAuthn ceremony completes:
+`wallets/new` starts an asynchronous Broker custody registration. The write
+does not create a Machine-local wallet and returns before the owner ceremony
+completes:
 
 ```sh
 printf 'main\n' > /bloom/wallets/new
@@ -139,16 +138,11 @@ cat /bloom/wallets/registrations/main/ceremony_url
 
 Open or forward `ceremony_url` to a human, then poll `status.json` until its
 `state` is `completed`; only then does `wallets/main/address` exist. Write to
-`wallets/registrations/<name>/cancel` to cancel a live registration. This
-requires a running `bloom serve` daemon — an in-process `bloom vfs write`
-fails clearly, before staging anything, if no daemon is reachable.
-
-Explicit `kind = "local"` / `kind = "import"` wallets remain synchronous and
-require `allow_passphrase_wallet = true` plus a passphrase field — passkey is
-the default specifically to avoid silently minting a fund-holding wallet with
-a machine-chosen passphrase. `kind = "passkey-import"` is not yet supported
-through the VFS; use `bloom wallet import <name> <key>` from a trusted
-foreground terminal instead.
+`wallets/registrations/<name>/cancel` to cancel a live registration. Broker
+owns ceremony orchestration and Signer owns custody. If either is unavailable,
+the operation fails closed; Machine has no local fallback. Import, recovery,
+rebind, and deletion likewise use Broker custody ceremonies, never mounted
+secret input.
 
 ## Wallet addresses & roles
 
@@ -181,18 +175,17 @@ is a real hazard — e.g. reporting a Polymarket deposit wallet's balance as
   # Read `deposit_wallet` from the response; it is not the owner EOA.
   ```
 
-  `policy_status` (`signed`/`unsigned`/`stale`/`not_applicable`) reports whether
-  a passkey wallet's policy is signed — `unsigned`/`stale` block
-  **writes/broadcast**, but never block these read-only leaves.
+  `policy_status` reports the Broker-projected policy state. An invalid or
+  stale projection blocks **writes/broadcast**, but never these public leaves.
 
 Read-only leaves (`address`, `addresses.json`, `public_key`, `kind`, balances)
-always work, even when a passkey wallet's `policy.toml` is unsigned or stale.
-The policy signature only gates staging/broadcast/signing.
+always work when their authenticated public projection is available. Machine
+does not validate policy using a local signature file.
 
 ## Reusable authority (sealed approvals)
 
 Reusable signing authority is owned durably by Broker and Signer. Machine does
-not mint grants or keep an in-memory authorization bypass. Prepare an approval
+not mint authority or keep an in-memory authorization bypass. Prepare an approval
 by writing the canonical `ApprovalPrepareRequest` JSON produced by the client
 to the mounted wallet path:
 
@@ -217,6 +210,37 @@ cp approval-revoke-all.json /bloom/wallets/alice/sealed-approvals/revoke_all
 Broker enforces the approval subject, operation classes, limits, expiry, and
 revocation on every signing request. An absent or unavailable Broker fails
 closed; mounted projections are display and orchestration state, not authority.
+
+## Updating wallet policy
+
+The only writable policy surface is the complete canonical JSON document at
+`wallets/<wallet>/policy.json`. The first exact write stages
+`policy.validate_update`; Broker authenticates the baseline, validates the
+proposed bytes, builds the review, and originates a `policy_update` custody
+ceremony:
+
+```sh
+cat /bloom/wallets/alice/policy.json > proposed-policy.json
+cp proposed-policy.json /bloom/wallets/alice/policy.json
+cat /bloom/wallets/alice/policy-updates/latest/status.json
+cat /bloom/wallets/alice/policy-updates/latest/approval_challenge.json
+```
+
+Complete the ceremony at the projected `ceremony_url`, then retry the **exact
+same proposed bytes**. Machine passes Broker's completed custody receipt to
+`policy.commit_update`; Broker invokes Signer's authenticated policy
+compare-and-swap. Changed bytes require fresh validation and review, while a
+changed baseline fails closed.
+
+```sh
+cp proposed-policy.json /bloom/wallets/alice/policy.json
+cat /bloom/wallets/alice/policy-updates/latest/status.json
+```
+
+The mounted status and challenge files are public projections of operation,
+review, receipt, ceremony, and commit state. Receipt authority remains between
+Broker and Signer. The legacy `policy.toml` projection is read-only; Machine
+never writes it or creates a policy signature.
 
 ## Writing (stage-confirm)
 
@@ -304,14 +328,10 @@ tail -f /bloom/watch/<id>/live              # in-process running state
 cat    /bloom/watch/<id>/history.jsonl     # rotated archive (1 MiB each)
 ```
 
-Sign arbitrary message / raw hash / EIP-712 typed data:
-
-```sh
-echo 'hello world' > /bloom/wallets/alice/sign/message
-cat /bloom/wallets/alice/sign/message.sig
-cat eip712.json     > /bloom/wallets/alice/sign/typed_data
-cat /bloom/wallets/alice/sign/typed_data.sig
-```
+Legacy arbitrary message, raw-hash, and typed-data signing leaves fail closed.
+Installed Petals must use their declared payload-bearing Broker signing route;
+transactions use the staged outbox path. Machine never writes signatures into
+a local keystore.
 
 Address book petnames:
 

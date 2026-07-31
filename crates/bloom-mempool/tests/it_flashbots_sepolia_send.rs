@@ -164,7 +164,7 @@ async fn send_flashbots_private_tx(
     url: &str,
     raw: &Bytes,
     max_block: u64,
-    signer: &alloy::signers::local::PrivateKeySigner,
+    signer: &alloy_signer_local::PrivateKeySigner,
 ) -> anyhow::Result<B256> {
     let raw_hex = format!("0x{}", hex::encode(raw.as_ref()));
     let body = serde_json::json!({

@@ -73,6 +73,10 @@ for binary in bloom bloom-broker bloom-signer; do
     exit 1
   }
 done
+[[ ! -e "$release_root/bloom-machine" ]] || {
+  echo "installed payload unexpectedly has an alternate Machine executable" >&2
+  exit 1
+}
 
 if find "$payload" \
   \( -name embedded.provisionprofile \
@@ -153,6 +157,30 @@ broker_uid="$(plutil -extract broker_uid raw -o - "$enrollment")"
 signer_uid="$(plutil -extract signer_uid raw -o - "$enrollment")"
 assert_installed_process bloom-broker "$broker_uid" "$release_root/bloom-broker"
 assert_installed_process bloom-signer "$signer_uid" "$release_root/bloom-signer"
+sudo -u "$login_user" \
+  "$release_root/bloom" --triad-health-check "$release_digest"
+
+machine_identity="/Library/Application Support/BloomTriad/config/$login_uid/machine/identity.json"
+edge_manifest="/Library/Application Support/BloomTriad/config/$login_uid/edge-manifest.json"
+"$main_root/packaging/triad/macos/w0/run-packaged-machine-negative.sh" \
+  "$release_root/bloom" \
+  "$login_uid" \
+  "$login_user" \
+  "$broker_uid" \
+  "$signer_uid" \
+  "$machine_identity" \
+  "$edge_manifest"
+
+# The runtime negative restores the installed Broker before returning.
+deadline=$((SECONDS + 20))
+while [[ $SECONDS -lt $deadline ]]; do
+  if sudo -u "$login_user" \
+    "$release_root/bloom" --triad-health-check "$release_digest"
+  then
+    break
+  fi
+  sleep 1
+done
 sudo -u "$login_user" \
   "$release_root/bloom" --triad-health-check "$release_digest"
 

@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use alloy::primitives::B256;
 use alloy::signers::SignerSync;
-use alloy::signers::local::PrivateKeySigner;
+use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use base64::Engine as _;
 

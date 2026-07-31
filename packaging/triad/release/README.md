@@ -71,6 +71,27 @@ workspace suites with the verified bundle bound as acceptance input.
 `--test-signing-key` is CI-only; production invocation must set
 `TRIAD_RELEASE_SIGNING_KEY`.
 
+Before compiling, `check-machine-authority-boundary.sh --require-clean`
+resolves every entry in `machine-production-feature-sets.tsv` with locked
+Cargo metadata and walks the normal/build edge closure from the exact Machine
+root. It rejects legacy authority crates, concrete local/custody signer
+implementations, and authority-restoring resolved features; dev-dependencies
+are not treated as production edges. The same gate checks the reachable
+production source roots for forbidden authority markers and files. Any
+non-authority migration diagnostic exception must be an exact marker/file
+entry in `machine-authority-source-allowlist.tsv`; wildcard and artifact-wide
+exceptions are unsupported. Bundle assembly independently rejects forbidden
+paths, printable markers, and retained Machine symbols, so stripping symbols
+or changing one source spelling cannot substitute for the Cargo graph proof.
+Debug and accepting-test artifacts remain forbidden across the entire bundle.
+Legacy authority markers, files, and symbols are scoped to the Machine
+executable and explicit Machine-owned payload roots; conforming custody and
+private-signer implementations in `bloom-signer` are not false positives.
+The installed macOS acceptance additionally runs the packaged `bloom serve`
+Machine against a same-principal hostile Broker socket and an accessible
+hostile Signer sentinel, proving prompt fail-closed/degraded behavior, no
+direct Signer connection, and no legacy Machine authority state.
+
 Fault-injection acceptance tests remain separately linked test executables:
 putting fault hooks into the production services would violate AC-20. Their
 post-extraction rerun is bound to the exact clean source revisions recorded in

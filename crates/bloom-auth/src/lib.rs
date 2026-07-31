@@ -1307,7 +1307,9 @@ impl AuthStore {
         policy: &ValuationPolicy,
         now_ms: u64,
     ) -> Result<ReservationRecord, AuthStoreError> {
-        valuation.validate_for_authorization(policy, now_ms)?;
+        valuation
+            .validate_for_authorization(policy, now_ms)
+            .map_err(|error| AuthStoreError::Denied(error.to_string()))?;
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO reservations(

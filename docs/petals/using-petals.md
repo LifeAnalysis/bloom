@@ -108,10 +108,12 @@ An agent should:
 5. ask for the required user ceremony or confirmation instead of treating a
    staged action as completed.
 
-Signing and transaction calls remain daemon-mediated. A signing route must use
-an intent declared by its package, and a transaction staged by one route is
-available to the other routes in the same package. A daemon restart deliberately
-forgets in-memory approval grants and may require the user to approve again.
+Machine routes signing and transaction authorization over its authenticated
+Broker edge; Signer alone holds keys and signs exact payloads. A signing route
+must use an intent declared by its package, and a transaction staged by one
+route is available to the other routes in the same package. Reusable Sealed
+Approval state is durable and Broker-owned, so a Machine restart neither owns
+nor discards that authority.
 
 Petals with `bloom:vfs.read` or `bloom:vfs.write` currently receive broad VFS
 authority rather than manifest-declared path prefixes. The `/petals` subtree is

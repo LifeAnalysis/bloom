@@ -1,6 +1,5 @@
-//! Capability model: the unified read-only shape for bounded trading
-//! authority across built-in venues (Hyperliquid agent sessions and EVM
-//! policy-sessions).
+//! Capability model: a read-only projection for non-authoritative service
+//! capabilities.
 //!
 //! [`CapabilityViewEntry`] is the serialisable snapshot each venue handler
 //! projects into, rendered at `/wallets/<w>/capabilities/active.json`.
@@ -15,10 +14,6 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Venue {
-    /// EVM outbox confirm batches via policy-session.
-    EvmOutbox,
-    /// Hyperliquid perp/spot trading via agent sessions.
-    Hyperliquid,
     /// DeFi intent routes via Enso shortcuts.
     Defi,
 }
@@ -31,14 +26,6 @@ pub enum Venue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SigningModel {
-    /// The capability holds an ephemeral key the venue accepts as a delegated
-    /// signer. The owner key is needed only at capability-creation time
-    /// (e.g. Hyperliquid `approveAgent`).
-    HoldsDelegatedKey,
-    /// The capability authorises actions but every action is still signed by
-    /// the owner key (which must be resident in daemon RAM for the window).
-    /// This is the EVM `policy-session` model.
-    AuthorizesOwnerSigning,
     /// The capability is a service credential only (HMAC / API key). It never
     /// moves funds — the owner must still sign value-moving operations
     /// separately (e.g. Enso API keys).
@@ -57,12 +44,8 @@ pub enum CapabilityStatus {
     Halted,
     /// Explicitly revoked by owner or agent.
     Revoked,
-    /// Daemon restart lost the in-memory signing key (HL sessions only).
-    /// Owner must perform orphan recovery.
-    Orphaned,
-    /// Still live in memory, but the most recent risk snapshot read failed, so
-    /// the reported risk figures are last-known. Distinct from `Orphaned`, which
-    /// means the signing key itself was lost (HL sessions only).
+    /// The most recent external status read failed, so reported values are
+    /// last-known.
     Stale,
 }
 

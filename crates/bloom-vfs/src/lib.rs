@@ -17,7 +17,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod auth;
 pub mod cache;
 pub mod exact_signing;
 pub mod handler;
@@ -28,7 +27,6 @@ pub mod path;
 pub mod planning;
 pub mod router;
 
-pub use auth::AuthServices;
 pub use cache::PathCache;
 pub use exact_signing::{BrokerExactPayloadSigner, ExactPayloadOutcome};
 pub use handler::{

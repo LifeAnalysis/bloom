@@ -20,7 +20,6 @@ mount = ["bloom-mount/mount"]
 bytecode-decompile = ["bloom-revert/bytecode-decompile"]
 
 [dependencies]
-bloom-auth-api.workspace = true
 bloom-proto.workspace = true
 bloom-paid-http.workspace = true
 bloom-evm.workspace = true

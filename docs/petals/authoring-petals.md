@@ -61,7 +61,7 @@ Supported component imports map to manifest capabilities as follows:
 |---|---|
 | `bloom:http/fetch@0.1.0` | `bloom:http` plus `[[net.allow]]` |
 | `bloom:store/kv@0.1.0` | `bloom:store` plus `[store]` namespaces |
-| `bloom:sign/signing@0.1.0` | `bloom:sign` plus `[sign].allowed_intents` |
+| `bloom:sign/signing@0.3.0` | `bloom:sign` plus `[sign].allowed_intents`; exact payload and optional Signer-owned Petal KeyRef selector |
 | `bloom:tx/outbox@0.1.0` | `bloom:tx.outbox` |
 | `bloom:chain/read@0.1.0` | `bloom:chain` |
 | `bloom:vfs/readwrite@0.1.0` | `bloom:vfs.read` and/or `bloom:vfs.write`, according to used exports |
@@ -70,7 +70,8 @@ Supported component imports map to manifest capabilities as follows:
 Imports, route metadata, and the top-level manifest must agree. Metadata may
 narrow installed authority at runtime but may not widen it. A package declaring
 `bloom:sign` must list allowed intents, and each signing route's metadata must
-select one of them.
+select one of them. The retired `bloom:sign/signing@0.1.0` hash-only import is
+incompatible with production signing and fails closed.
 
 ## Routes and ABI
 

@@ -17,7 +17,7 @@ case "$mode" in
   *) usage ;;
 esac
 
-for command_name in cargo rg awk sed sort uniq; do
+for command_name in cargo jq rg awk sed sort uniq; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "machine authority boundary check requires $command_name" >&2
     exit 69
@@ -95,6 +95,121 @@ cargo_tree_for_set() {
   cargo "${args[@]}"
 }
 
+cargo_metadata_for_set() {
+  local package="$1"
+  local defaults="$2"
+  local features="$3"
+  local args=(
+    metadata
+    --format-version 1
+    --locked
+    --manifest-path "$workspace/Cargo.toml"
+    --filter-platform "$(rustc -vV | sed -n 's/^host: //p')"
+  )
+  [[ "$defaults" == "no" ]] && args+=(--no-default-features)
+  [[ "$features" != "-" ]] && args+=(--features "$package/$features")
+  cargo "${args[@]}"
+}
+
+# Print the exact normal/build closure selected for one Machine root. Cargo
+# metadata includes all workspace members, so selecting packages from the
+# top-level package list is insufficient. Traverse from the named root through
+# only non-dev resolved edges instead.
+metadata_reachable_packages() {
+  local package="$1"
+  jq -r --arg root_name "$package" '
+    . as $metadata
+    | ($metadata.packages | map({ key: .id, value: . }) | from_entries) as $packages
+    | ($metadata.resolve.nodes | map({ key: .id, value: . }) | from_entries) as $nodes
+    | ($metadata.packages[] | select(.name == $root_name) | .id) as $root
+    | def children($id):
+        $nodes[$id].deps[]
+        | select(any(.dep_kinds[]; .kind == null or .kind == "build"))
+        | .pkg;
+      def closure($frontier; $seen):
+        if ($frontier | length) == 0 then $seen
+        else ([ $frontier[] as $id | children($id) ] | unique - $seen) as $next
+        | closure($next; (($seen + $next) | unique))
+        end;
+      closure([$root]; [$root])[]
+      | $packages[.] as $package
+      | [ $package.name, $package.id, $package.manifest_path ]
+      | @tsv
+  '
+}
+
+metadata_reachable_features() {
+  local package="$1"
+  jq -r --arg root_name "$package" '
+    . as $metadata
+    | ($metadata.packages | map({ key: .id, value: . }) | from_entries) as $packages
+    | ($metadata.resolve.nodes | map({ key: .id, value: . }) | from_entries) as $nodes
+    | ($metadata.packages[] | select(.name == $root_name) | .id) as $root
+    | def children($id):
+        $nodes[$id].deps[]
+        | select(any(.dep_kinds[]; .kind == null or .kind == "build"))
+        | .pkg;
+      def closure($frontier; $seen):
+        if ($frontier | length) == 0 then $seen
+        else ([ $frontier[] as $id | children($id) ] | unique - $seen) as $next
+        | closure($next; (($seen + $next) | unique))
+        end;
+      closure([$root]; [$root])[]
+      | . as $id
+      | $nodes[$id].features[]?
+      | "\($packages[$id].name):\(.)"
+  '
+}
+
+forbidden_dependencies() {
+  if [[ -n "${BLOOM_MACHINE_FORBIDDEN_DEPENDENCIES:-}" ]]; then
+    tr ',' '\n' <<<"$BLOOM_MACHINE_FORBIDDEN_DEPENDENCIES"
+    return
+  fi
+  cat <<'EOF'
+bloom-keystore
+bloom-auth
+bloom-auth-api
+bloom-hyperliquid
+alloy-signer-local
+alloy-signer-aws
+alloy-signer-gcp
+alloy-signer-ledger
+alloy-signer-trezor
+alloy-signer-turnkey
+alloy-signer-yubihsm
+coins-bip32
+coins-bip39
+eth-keystore
+webauthn-rs
+webauthn-rs-core
+aws-sdk-kms
+EOF
+}
+
+forbidden_resolved_features() {
+  cat <<'EOF'
+*:local-integration
+*:unsafe-debug-signer
+*:triad-dev-harness
+alloy:signer-local
+webauthn-rs:danger-allow-state-serialisation
+EOF
+}
+
+feature_is_forbidden() {
+  local observed="$1"
+  local forbidden
+  while IFS= read -r forbidden; do
+    [[ -z "$forbidden" ]] && continue
+    case "$forbidden" in
+      \*:*) [[ "${observed#*:}" == "${forbidden#*:}" ]] && return 0 ;;
+      *) [[ "$observed" == "$forbidden" ]] && return 0 ;;
+    esac
+  done < <(forbidden_resolved_features)
+  return 1
+}
+
 production_source_roots() {
   local label package defaults features
   while IFS=$'\t' read -r label package defaults features; do
@@ -104,6 +219,7 @@ production_source_roots() {
     sed -n -E 's#^.* \((/[^)]*)\)( \(\*\))?$#\1#p' |
     sort -u |
     awk -v workspace="$workspace" '
+      index($0, workspace "/crates/") == 1 &&
       $0 != workspace "/crates/bloom-keystore" &&
       $0 != workspace "/crates/bloom-auth" &&
       $0 != workspace "/crates/bloom-auth-api"
@@ -119,42 +235,50 @@ if [[ -n "${BLOOM_MACHINE_AUTHORITY_EXTRA_SOURCE_ROOTS:-}" ]]; then
   source_roots+=("${extra_source_roots[@]}")
 fi
 
-normalized_tree_packages() {
-  sed -E 's/ v[0-9][^ ]*( \([^)]*\))?( \(\*\))?$//' | sed -E 's/ \(\*\)$//'
-}
-
 inventory_dependencies() {
-  local label package defaults features dependency tree
+  local label package defaults features dependency metadata reachable
   while IFS=$'\t' read -r label package defaults features; do
     [[ -z "$label" || "$label" == \#* ]] && continue
     echo "feature-set: $label package=$package default-features=$defaults features=$features"
-    tree="$(cargo_tree_for_set "$package" "$defaults" "$features")"
-    for dependency in bloom-keystore bloom-auth bloom-auth-api; do
-      if printf '%s\n' "$tree" | normalized_tree_packages | grep -Fx "$dependency" >/dev/null; then
+    metadata="$(cargo_metadata_for_set "$package" "$defaults" "$features")"
+    reachable="$(printf '%s\n' "$metadata" | metadata_reachable_packages "$package" | cut -f1)"
+    while IFS= read -r dependency; do
+      if printf '%s\n' "$reachable" | grep -Fx "$dependency" >/dev/null; then
         echo "  reachable-forbidden-dependency: $dependency"
       fi
-    done
+    done < <(forbidden_dependencies)
   done < "$feature_sets"
 }
 
 require_clean_dependencies() {
   local failed=0
-  local label package defaults features dependency tree
+  local label package defaults features dependency metadata reachable observed_feature
   while IFS=$'\t' read -r label package defaults features; do
     [[ -z "$label" || "$label" == \#* ]] && continue
     case ",${features}," in
-      *,unsafe-debug-signer,*|*,local-integration,*)
+      *,unsafe-debug-signer,*|*,local-integration,*|*,triad-dev-harness,*)
         echo "forbidden production Machine feature in $label: $features" >&2
         failed=1
         ;;
     esac
-    tree="$(cargo_tree_for_set "$package" "$defaults" "$features")"
-    for dependency in bloom-keystore bloom-auth bloom-auth-api; do
-      if printf '%s\n' "$tree" | normalized_tree_packages | grep -Fx "$dependency" >/dev/null; then
+    if ! metadata="$(cargo_metadata_for_set "$package" "$defaults" "$features")"; then
+      echo "failed to resolve production Machine feature set $label" >&2
+      failed=1
+      continue
+    fi
+    reachable="$(printf '%s\n' "$metadata" | metadata_reachable_packages "$package" | cut -f1)"
+    while IFS= read -r dependency; do
+      if printf '%s\n' "$reachable" | grep -Fx "$dependency" >/dev/null; then
         echo "forbidden production Machine dependency in $label: $dependency" >&2
         failed=1
       fi
-    done
+    done < <(forbidden_dependencies)
+    while IFS= read -r observed_feature; do
+      if feature_is_forbidden "$observed_feature"; then
+        echo "forbidden resolved Machine feature in $label: $observed_feature" >&2
+        failed=1
+      fi
+    done < <(printf '%s\n' "$metadata" | metadata_reachable_features "$package" | sort -u)
   done < "$feature_sets"
 
   for manifest in \
@@ -163,10 +287,131 @@ require_clean_dependencies() {
     crates/bloom-vfs/Cargo.toml \
     crates/bloom-tx/Cargo.toml
   do
+    [[ -f "$workspace/$manifest" ]] || continue
     if rg -n '^(unsafe-debug-signer|local-integration)[[:space:]]*=' \
       "$workspace/$manifest" >&2
     then
       echo "forbidden authority-restoring production feature remains in $manifest" >&2
+      failed=1
+    fi
+  done
+  (( failed == 0 ))
+}
+
+source_marker_allowlisted() {
+  local marker="$1"
+  local relative="$2"
+  local allowlist="$script_dir/machine-authority-source-allowlist.tsv"
+  [[ -f "$allowlist" ]] || return 1
+  awk -F '\t' -v marker="$marker" -v relative="$relative" '
+    $0 !~ /^#/ && $1 == marker && $2 == relative { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$allowlist"
+}
+
+forbidden_source_markers() {
+  cat <<'EOF'
+bloom-keystore
+bloom-auth
+bloom-auth-api
+bloom_hyperliquid
+bloom_keystore
+bloom_auth
+KeystorePetalHost
+StoreApprovalVerifier
+KeystoreApprovalSignatureVerifier
+SignerCache
+EphemeralAgentKey
+PrivateKeySigner
+RegistrationCoordinator
+AuthServices
+InMemoryGrantStore
+SessionStore
+ActiveSession
+SessionActionFacts
+authorize_and_debit
+PetalHost::sign_hash
+sign_hash_sync
+backend_policy_for_wallet
+policy_override
+unsafe-debug-signer
+local-integration
+policy-session
+bloom.sign-hash
+EOF
+}
+
+require_clean_sources() {
+  local failed=0
+  local marker absolute relative source_root
+  while IFS= read -r marker; do
+    [[ -z "$marker" ]] && continue
+    for source_root in "${source_roots[@]}"; do
+      [[ -d "$source_root/src" ]] || continue
+      while IFS= read -r absolute; do
+        [[ -z "$absolute" ]] && continue
+        relative="${absolute#"$workspace/"}"
+        if ! source_marker_allowlisted "$marker" "$relative"; then
+          echo "forbidden production Machine source marker: $marker in $relative" >&2
+          failed=1
+        fi
+      done < <(rg -l -F --glob '*.rs' --glob '*.html' -- "$marker" "$source_root/src" || true)
+    done
+  done < <(forbidden_source_markers)
+
+  for source_root in "${source_roots[@]}"; do
+    [[ -d "$source_root/src" ]] || continue
+    while IFS= read -r absolute; do
+      relative="${absolute#"$workspace/"}"
+      echo "forbidden legacy authority source file: $relative" >&2
+      failed=1
+    done < <(find "$source_root/src" -type f \
+      \( -name 'registration.rs' -o -name 'sealed_ceremony.rs' -o \
+         -name 'sign_hash.rs' -o -name 'auth.sqlite' \) -print)
+    if [[ -d "$source_root/src/ceremony_server" ]]; then
+      relative="${source_root#"$workspace/"}/src/ceremony_server"
+      echo "forbidden legacy authority source directory: $relative" >&2
+      failed=1
+    fi
+    if [[ "$source_root" == "$workspace/crates/bloom-tx" && \
+      -e "$source_root/src/session.rs" ]]
+    then
+      echo "forbidden legacy authority source file: crates/bloom-tx/src/session.rs" >&2
+      failed=1
+    fi
+  done
+  (( failed == 0 ))
+}
+
+require_clean_current_entry_docs() {
+  local failed=0
+  local configured relative path
+  local -a entry_docs
+  if [[ -n "${BLOOM_MACHINE_CURRENT_ENTRY_DOCS:-}" ]]; then
+    IFS=':' read -r -a entry_docs <<<"$BLOOM_MACHINE_CURRENT_ENTRY_DOCS"
+  else
+    entry_docs=("QUICKSTART.md" "EXAMPLES.md")
+  fi
+
+  for configured in "${entry_docs[@]}"; do
+    [[ "$configured" = /* ]] && path="$configured" || path="$workspace/$configured"
+    relative="${path#"$workspace/"}"
+    if [[ ! -f "$path" ]]; then
+      echo "missing current Machine entry documentation: $relative" >&2
+      failed=1
+      continue
+    fi
+    if rg -n -i \
+      -e '\bgrant(s|ed|ing)?\b' \
+      -e 'policy\.toml(\.sig)?' \
+      -e 'keystore' \
+      -e 'passphrase' \
+      -e 'wallet[[:space:]]+unlock' \
+      -e 'in-process' \
+      -e '/sign/(message|hash|typed_data)' \
+      -- "$path" >&2
+    then
+      echo "forbidden legacy authority instruction in current entry documentation: $relative" >&2
       failed=1
     fi
   done
@@ -190,8 +435,12 @@ case "$mode" in
     done < "$baseline"
     ;;
   --require-clean)
-    check_source_ratchet
-    require_clean_dependencies
+    failed=0
+    check_source_ratchet || failed=1
+    require_clean_dependencies || failed=1
+    require_clean_sources || failed=1
+    require_clean_current_entry_docs || failed=1
+    (( failed == 0 )) || exit 1
     echo "Machine production authority boundary is clean"
     ;;
 esac

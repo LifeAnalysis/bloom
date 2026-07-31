@@ -69,8 +69,8 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     let home = HomeDir::at(&home_root);
     let permit = Arc::new(HomeWritePermit::acquire(&home)?);
     let passphrase = "integration-test-pass";
-    let keystore =
-        bloom_keystore::Keystore::new(home.keystore_dir()).map_err(|e| anyhow!("keystore: {e}"))?;
+    let keystore = bloom_keystore::Keystore::new(home.root().join("keystore"))
+        .map_err(|e| anyhow!("keystore: {e}"))?;
     let info = keystore
         .import_hex("alice", TEST_WALLET_PRIVATE_KEY, passphrase)
         .map_err(|e| anyhow!("create_local: {e}"))?;
@@ -321,8 +321,8 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
     let home = HomeDir::at(&home_root);
     let permit = Arc::new(HomeWritePermit::acquire(&home)?);
     let passphrase = "integration-test-pass";
-    let keystore =
-        bloom_keystore::Keystore::new(home.keystore_dir()).map_err(|e| anyhow!("keystore: {e}"))?;
+    let keystore = bloom_keystore::Keystore::new(home.root().join("keystore"))
+        .map_err(|e| anyhow!("keystore: {e}"))?;
     let info = keystore
         .import_hex("alice", TEST_WALLET_PRIVATE_KEY, passphrase)
         .map_err(|e| anyhow!("create_local: {e}"))?;

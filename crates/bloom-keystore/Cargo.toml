@@ -22,6 +22,7 @@ chacha20poly1305.workspace = true
 zeroize.workspace = true
 rand.workspace = true
 alloy.workspace = true
+alloy-signer-local = "2.0.5"
 parking_lot.workspace = true
 tracing.workspace = true
 toml.workspace = true

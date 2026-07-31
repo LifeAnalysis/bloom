@@ -208,6 +208,25 @@ mod tests {
         assert!(!help.contains("policy-session"), "{help}");
         assert!(help.contains("sealed-approvals"), "{help}");
         assert!(help.contains("Broker enforces"), "{help}");
+        assert!(help.contains("policy.json"), "{help}");
+        assert!(help.contains("policy.validate_update"), "{help}");
+        assert!(help.contains("policy.commit_update"), "{help}");
+        assert!(
+            help.contains("same proposed bytes") && help.contains("**exact"),
+            "{help}"
+        );
+        for stale in [
+            "> /bloom/wallets/alice/policy.toml",
+            "policy.toml.sig",
+            "host signer",
+            "the grant",
+            "a grant",
+        ] {
+            assert!(
+                !help.contains(stale),
+                "mounted help retains stale Machine-authority vocabulary {stale:?}"
+            );
+        }
     }
 
     #[tokio::test]
