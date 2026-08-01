@@ -196,6 +196,7 @@ fn generate_for_owner(plan: &EnrollmentPlan, expected_owner: u32) -> Result<()> 
     let broker_audit = GeneratedKey::new();
     let broker_review = GeneratedKey::new();
     let signer_revocation = GeneratedKey::new();
+    let signer_audit = GeneratedKey::new();
     let signer_ceremony = GeneratedKey::new();
     let installer = GeneratedKey::new();
 
@@ -266,6 +267,7 @@ fn generate_for_owner(plan: &EnrollmentPlan, expected_owner: u32) -> Result<()> 
             "@SIGNER_REVOCATION_PUBLIC_KEY_HEX@",
             signer_revocation.public_hex(),
         ),
+        ("@SIGNER_AUDIT_SEED_HEX@", signer_audit.private_hex()),
         ("@SIGNER_CEREMONY_SEED_HEX@", signer_ceremony.private_hex()),
         (
             "@SIGNER_CEREMONY_PUBLIC_KEY_HEX@",
@@ -729,6 +731,24 @@ mod tests {
             )
         );
         assert_eq!(edge["session_socket_gid"], 260_503);
+
+        let signer_config: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("signer.json")).unwrap()).unwrap();
+        let signer_revocation_seed = signer_config["revocation_signing_seed_hex"]
+            .as_str()
+            .unwrap();
+        let signer_audit_seed = signer_config["audit_signing_seed_hex"].as_str().unwrap();
+        let signer_ceremony_seed = signer_config["ceremony_signing_seed_hex"].as_str().unwrap();
+        assert_ne!(signer_audit_seed, signer_revocation_seed);
+        assert_ne!(signer_audit_seed, signer_ceremony_seed);
+        assert_ne!(
+            signer_config["audit_key_id"],
+            signer_config["revocation_key_id"]
+        );
+        assert_ne!(
+            signer_config["audit_key_id"],
+            signer_config["ceremony_key_id"]
+        );
 
         let installer: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("installer-identity.json")).unwrap())

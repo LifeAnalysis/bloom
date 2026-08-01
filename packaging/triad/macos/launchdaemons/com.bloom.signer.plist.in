@@ -28,7 +28,9 @@
     <string>@BLOOM_SIGNER_CONFIG@</string>
     <key>BLOOM_EDGE_MANIFEST</key>
     <string>@BLOOM_EDGE_MANIFEST@</string>
-    <key>BLOOM_AUDIT_CHECKPOINT_DIR</key>
+    <key>BLOOM_AUTHORITY_EDGE_HISTORY</key>
+    <string>@BLOOM_AUTHORITY_EDGE_HISTORY@</string>
+    <key>BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR</key>
     <string>@BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR@</string>
     <key>BLOOM_SIGNER_SOCKET</key>
     <string>@BLOOM_SIGNER_SOCKET@</string>

@@ -2,12 +2,10 @@
 //!
 //! The router optionally wires two cross-cutting concerns:
 //!
-//! 1. A hash-chained audit log ([`AuditLog`]) — every successful write
-//!    appends an `vfs.write` record (with sha256 of the body); every
-//!    successful read of a *side-effecting* path (handler-declared via
-//!    [`Handler::is_read_side_effecting`]) appends an `vfs.read` record.
-//!    Failures are not logged; we err on the side of *fewer* entries to
-//!    keep the chain useful.
+//! 1. A service-signed audit log ([`AuditLog`]). Security-effecting reads and
+//!    every write persist an exact intent before handler dispatch and a result
+//!    afterward. Audit failure is fail-closed and latched; pure reads remain
+//!    available.
 //! 2. A per-path TTL cache ([`PathCache`]) — handlers opt in via
 //!    [`Handler::cache_ttl`]. Reads consult the cache first; writes
 //!    invalidate the exact path and the whole top-level prefix.
@@ -40,6 +38,7 @@ const AUDIT_ACTOR_LOCAL: &str = "local";
 pub struct Vfs {
     handlers: Arc<BTreeMap<String, Arc<dyn Handler>>>,
     audit: Option<Arc<AuditLog>>,
+    audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
     cache: Option<Arc<PathCache>>,
     root_dynamic: Arc<BTreeMap<String, Arc<RootContentRenderer>>>,
 }
@@ -57,6 +56,7 @@ impl Vfs {
         Self {
             handlers: Arc::new(BTreeMap::new()),
             audit: None,
+            audit_effect_lock: Arc::new(tokio::sync::Mutex::new(())),
             cache: None,
             root_dynamic: Arc::new(BTreeMap::new()),
         }
@@ -104,12 +104,15 @@ impl Vfs {
         h.is_read_side_effecting(&rest)
     }
 
-    /// Best-effort audit append. Errors are logged at WARN and dropped —
-    /// audit failures must not break user-visible operations.
-    fn audit_record(&self, kind: &str, path: &VfsPath, data: serde_json::Value) {
-        let Some(log) = &self.audit else {
-            return;
-        };
+    fn audit_record(
+        &self,
+        kind: &str,
+        path: &VfsPath,
+        data: serde_json::Value,
+    ) -> Result<(), HandlerError> {
+        let log = self.audit.as_ref().ok_or_else(|| {
+            HandlerError::backend("Machine security effect has no configured audit journal")
+        })?;
         let record = AuditRecord {
             ts_ms: 0, // overwritten by AuditLog::append
             kind: kind.to_string(),
@@ -123,25 +126,72 @@ impl Vfs {
             prev: String::new(),
             digest: String::new(),
         };
-        if let Err(e) = log.append(record) {
-            tracing::warn!(target: "bloom_vfs::audit", error = %e, "audit append failed");
-        }
+        log.append(record)
+            .map(|_| ())
+            .map_err(|error| HandlerError::backend(format!("Machine audit unavailable: {error}")))
     }
 
-    fn audit_write(&self, path: &VfsPath, body: &[u8]) {
-        let sha = bloom_tools::sha256_hex(body);
+    fn begin_effect(
+        &self,
+        operation: &str,
+        path: &VfsPath,
+        payload: &[u8],
+    ) -> Result<Option<String>, HandlerError> {
+        if self.audit.is_none() {
+            // Explicit builder-level unit/developer seam. Production Daemon
+            // always installs its signed journal.
+            return Ok(None);
+        }
+        let payload_digest = bloom_tools::sha256_hex(payload);
+        let operation_id = bloom_tools::sha256_hex(
+            format!(
+                "bloom-machine-effect/v1\0{operation}\0{}\0{payload_digest}\0{}",
+                path.to_string_path(),
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        let sequence = self
+            .audit
+            .as_ref()
+            .map(|audit| audit.sequence() + 1)
+            .unwrap_or(0);
+        let correlation_id = format!("{operation_id}:{sequence}");
         self.audit_record(
-            AUDIT_KIND_WRITE,
+            "machine.effect.intent",
             path,
             serde_json::json!({
-                "sha256": sha,
-                "size": body.len(),
+                "operation": operation,
+                "operation_id": operation_id,
+                "correlation_id": correlation_id,
+                "payload_sha256": payload_digest,
+                "payload_size": payload.len(),
             }),
-        );
+        )?;
+        Ok(Some(correlation_id))
     }
 
-    fn audit_side_effecting_read(&self, path: &VfsPath) {
-        self.audit_record(AUDIT_KIND_READ, path, serde_json::json!({}));
+    fn finish_effect(
+        &self,
+        operation: &str,
+        path: &VfsPath,
+        correlation_id: Option<&str>,
+        outcome: &str,
+        result: serde_json::Value,
+    ) -> Result<(), HandlerError> {
+        let Some(correlation_id) = correlation_id else {
+            return Ok(());
+        };
+        self.audit_record(
+            "machine.effect.result",
+            path,
+            serde_json::json!({
+                "operation": operation,
+                "correlation_id": correlation_id,
+                "outcome": outcome,
+                "result": result,
+            }),
+        )
     }
 
     /// Read `path` pinned to a historical block. This bypasses the router-level
@@ -241,19 +291,46 @@ impl Handler for Vfs {
             return Ok(bytes);
         }
 
-        let bytes = h.read(&rest).await?;
+        let side_effecting = h.is_read_side_effecting(&rest);
+        let _audit_guard = if side_effecting {
+            Some(self.audit_effect_lock.lock().await)
+        } else {
+            None
+        };
+        let correlation = if side_effecting {
+            self.begin_effect(AUDIT_KIND_READ, path, &[])?
+        } else {
+            None
+        };
+        let read_result = h.read(&rest).await;
+        if correlation.is_some() {
+            match &read_result {
+                Ok(bytes) => self.finish_effect(
+                    AUDIT_KIND_READ,
+                    path,
+                    correlation.as_deref(),
+                    "ok",
+                    serde_json::json!({
+                        "sha256": bloom_tools::sha256_hex(bytes),
+                        "size": bytes.len(),
+                    }),
+                )?,
+                Err(error) => self.finish_effect(
+                    AUDIT_KIND_READ,
+                    path,
+                    correlation.as_deref(),
+                    "error",
+                    serde_json::json!({"error": error.to_string()}),
+                )?,
+            }
+        }
+        let bytes = read_result?;
 
         // Populate cache if the handler declares a TTL for this path.
         if let (Some(cache), Some(ttl)) = (&self.cache, h.cache_ttl(&rest))
             && !ttl.is_zero()
         {
             cache.put(&key, bytes.clone(), ttl);
-        }
-
-        // Side-effecting reads (signing, broadcast triggers, etc) get
-        // an audit entry — only on success.
-        if h.is_read_side_effecting(&rest) {
-            self.audit_side_effecting_read(path);
         }
 
         Ok(bytes)
@@ -266,7 +343,26 @@ impl Handler for Vfs {
             .get(head)
             .ok_or_else(|| HandlerError::NotFound(path.to_string_path()))?;
         let rest = path.shift();
-        h.write(&rest, data).await?;
+        let _audit_guard = self.audit_effect_lock.lock().await;
+        let correlation = self.begin_effect(AUDIT_KIND_WRITE, path, data)?;
+        let write_result = h.write(&rest, data).await;
+        match &write_result {
+            Ok(()) => self.finish_effect(
+                AUDIT_KIND_WRITE,
+                path,
+                correlation.as_deref(),
+                "ok",
+                serde_json::json!({}),
+            )?,
+            Err(error) => self.finish_effect(
+                AUDIT_KIND_WRITE,
+                path,
+                correlation.as_deref(),
+                "error",
+                serde_json::json!({"error": error.to_string()}),
+            )?,
+        }
+        write_result?;
 
         // Successful write — invalidate cache, then audit. Cache
         // invalidation goes first so a concurrent reader can't observe
@@ -274,7 +370,6 @@ impl Handler for Vfs {
         if let Some(cache) = &self.cache {
             cache.invalidate(&path_to_cache_key(path));
         }
-        self.audit_write(path, data);
         Ok(())
     }
 
@@ -319,6 +414,7 @@ impl Handler for Vfs {
 pub struct VfsBuilder {
     handlers: BTreeMap<String, Arc<dyn Handler>>,
     audit: Option<Arc<AuditLog>>,
+    audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
     cache: Option<Arc<PathCache>>,
     root_dynamic: BTreeMap<String, Arc<RootContentRenderer>>,
 }
@@ -353,6 +449,7 @@ impl VfsBuilder {
         Vfs {
             handlers: Arc::new(self.handlers),
             audit: self.audit,
+            audit_effect_lock: self.audit_effect_lock,
             cache: self.cache,
             root_dynamic: Arc::new(self.root_dynamic),
         }
@@ -628,13 +725,19 @@ mod tests {
         let p = VfsPath::parse("/k/x").unwrap();
         vfs.write(&p, b"hello").await.unwrap();
         let tail = log.tail(10).unwrap();
-        assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].kind, AUDIT_KIND_WRITE);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].kind, "machine.effect.intent");
+        assert_eq!(tail[1].kind, "machine.effect.result");
         let details = tail[0].data.get("details").unwrap();
-        let sha = details.get("sha256").unwrap().as_str().unwrap();
+        assert_eq!(details["operation"], AUDIT_KIND_WRITE);
+        let sha = details.get("payload_sha256").unwrap().as_str().unwrap();
         assert!(sha.starts_with("0x") && sha.len() == 66, "sha = {sha}");
-        assert_eq!(details.get("size").unwrap().as_u64().unwrap(), 5);
+        assert_eq!(details.get("payload_size").unwrap().as_u64().unwrap(), 5);
         assert_eq!(tail[0].data.get("path").unwrap().as_str().unwrap(), "/k/x");
+        assert_eq!(
+            tail[0].data["details"]["correlation_id"],
+            tail[1].data["details"]["correlation_id"]
+        );
     }
 
     #[tokio::test]
@@ -651,9 +754,10 @@ mod tests {
         vfs.read(&VfsPath::parse("/pure/x").unwrap()).await.unwrap();
         assert_eq!(log.count().unwrap(), 0, "pure read must not audit");
         vfs.read(&VfsPath::parse("/sign/x").unwrap()).await.unwrap();
-        assert_eq!(log.count().unwrap(), 1, "side-effecting read must audit");
-        let tail = log.tail(1).unwrap();
-        assert_eq!(tail[0].kind, AUDIT_KIND_READ);
+        assert_eq!(log.count().unwrap(), 2, "side-effecting read must audit");
+        let tail = log.tail(2).unwrap();
+        assert_eq!(tail[0].kind, "machine.effect.intent");
+        assert_eq!(tail[0].data["details"]["operation"], AUDIT_KIND_READ);
         assert_eq!(
             tail[0].data.get("path").unwrap().as_str().unwrap(),
             "/sign/x"
@@ -686,7 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_write_does_not_audit() {
+    async fn failed_write_records_intent_and_error_result() {
         struct Failing;
         #[async_trait]
         impl Handler for Failing {
@@ -707,6 +811,100 @@ mod tests {
             .write(&VfsPath::parse("/k/x").unwrap(), b"oops")
             .await
             .unwrap_err();
+        assert_eq!(log.count().unwrap(), 2);
+        let tail = log.tail(2).unwrap();
+        assert_eq!(tail[1].data["details"]["outcome"], "error");
+    }
+
+    #[tokio::test]
+    async fn audit_intent_failure_prevents_handler_dispatch_and_latches() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let handler = Arc::new(CountingHandler::new(None));
+        let vfs = Vfs::builder()
+            .mount("k", handler.clone())
+            .with_audit(log.clone())
+            .build();
+        log.fail_next_write_for_test();
+        let error = vfs
+            .write(&VfsPath::parse("/k/x").unwrap(), b"must-not-dispatch")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("audit"));
+        assert_eq!(handler.writes.load(Ordering::SeqCst), 0);
         assert_eq!(log.count().unwrap(), 0);
+        assert!(log.mutation_degradation().is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_vfs_and_petal_network_effects_do_not_self_latch() {
+        struct PausingHandler {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl Handler for PausingHandler {
+            async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+                Ok(Entry::writable_file(path.to_string_path().as_str()))
+            }
+            async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let vfs = Vfs::builder()
+            .mount(
+                "k",
+                Arc::new(PausingHandler {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                }),
+            )
+            .with_audit(log.clone())
+            .build();
+        let write = tokio::spawn(async move {
+            vfs.write(&VfsPath::parse("/k/x").unwrap(), b"vfs-effect")
+                .await
+        });
+        entered.notified().await;
+
+        log.append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.intent".into(),
+            wallet: None,
+            chain: None,
+            data: serde_json::json!({
+                "operation":"petal.http_fetch",
+                "correlation_id":"petal-network:1"
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })
+        .unwrap();
+        log.append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.result".into(),
+            wallet: None,
+            chain: None,
+            data: serde_json::json!({
+                "operation":"petal.http_fetch",
+                "correlation_id":"petal-network:1",
+                "outcome":"ok"
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })
+        .unwrap();
+        release.notify_one();
+        write.await.unwrap().unwrap();
+        assert!(log.mutation_degradation().is_none());
+        assert!(log.pending_effect_correlations().unwrap().is_empty());
+        assert_eq!(log.count().unwrap(), 4);
     }
 }

@@ -20,6 +20,7 @@ bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
 # Out-of-process same-UID integration bootstrap. It adds no custody or signing
 # implementation to Machine and is excluded from release bundles.
 triad-dev-harness = [
+  "bloom-daemon/triad-dev-harness",
   "bloom-machine-client/triad-dev-harness",
   "bloom-triad-local-transport/triad-dev-harness",
 ]

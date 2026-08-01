@@ -22,6 +22,7 @@ use bloom_evm::{ChainClient, ChainRegistry};
 
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
+use bloom_machine_client::MachineJournalHeadProvider;
 use bloom_machine_client::{
     CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient,
     TrustedPetalSignRequest, WalletProjectionReader,
@@ -39,8 +40,8 @@ use bloom_prices::PricesClient;
 use bloom_proto::audit::AuditRecord;
 use bloom_proto::petal_identity::PETAL_ID_PREFIX;
 use bloom_proto::{
-    AddressBook, AuditLog, ChainSpec, Config, GasStrategy, HomeDir, HomeWritePermit, RawIntent,
-    RawIntentBody, intent_hash_of,
+    AddressBook, AuditIdentity, AuditLog, ChainSpec, Config, GasStrategy, HomeDir, HomeWritePermit,
+    RawIntent, RawIntentBody, intent_hash_of,
 };
 use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
@@ -67,6 +68,46 @@ use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+/// §20 production background-effect inventory. Security-relevant network
+/// decisions and durable projections are journaled; purely observational
+/// availability caches are intentionally non-authorizing.
+pub const BACKGROUND_EFFECT_AUDIT_MATRIX: &[(&str, &str)] = &[
+    (
+        "Broker wallet projection boot refresh",
+        "signed intent/result before Broker read and durable cache replacement",
+    ),
+    ("tx receipt/trace reconciliation", "signed intent/result"),
+    (
+        "receipt.json mined-result projection",
+        "signed intent/result",
+    ),
+    ("basefee bump advisory input/output", "signed intent/result"),
+    (
+        "expired outbox durable state moves",
+        "signed intent/result before moving staged entries to expired",
+    ),
+    (
+        "mempool subscription cache",
+        "ephemeral non-authorizing observation; no durable authority result",
+    ),
+    (
+        "watch polling and durable live/history rotation",
+        "signed intent/result around externally derived watch network calls and projections",
+    ),
+    (
+        "bloom-rpc endpoint health probe loop",
+        "volatile transport scoring only; cannot authorize effects or create durable projections",
+    ),
+    (
+        "private RPC health probe",
+        "in-memory availability status only; cannot select or authorize submission",
+    ),
+    (
+        "update checker",
+        "advisory release metadata only; never installs or executes updates",
+    ),
+];
 
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
 
@@ -175,6 +216,7 @@ struct DaemonPetalHost {
     vfs: Arc<LateVfsHost>,
     http: reqwest::Client,
     audit: Arc<AuditLog>,
+    http_audit_lock: tokio::sync::Mutex<()>,
     tx_outbox: Option<PetalTxOutbox>,
     tx_stage_lock: tokio::sync::Mutex<()>,
     broker: Option<MachineBrokerClient>,
@@ -286,6 +328,7 @@ impl DaemonPetalHost {
             vfs,
             http,
             audit,
+            http_audit_lock: tokio::sync::Mutex::new(()),
             tx_outbox: None,
             tx_stage_lock: tokio::sync::Mutex::new(()),
             broker: None,
@@ -411,15 +454,49 @@ impl DaemonPetalHost {
         })
     }
 
+    fn audit_http_intent(&self, method: &str, url: &str, body: &[u8]) -> Result<String, HostError> {
+        let payload_hash = bloom_tools::sha256_hex(body);
+        let operation_id = bloom_tools::sha256_hex(
+            format!(
+                "bloom-machine-petal-http/v1\0{method}\0{}\0{payload_hash}\0{}",
+                audit_http_target(url),
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let correlation_id = format!("{operation_id}:{}", self.audit.sequence() + 1);
+        self.audit
+            .append(AuditRecord {
+                ts_ms: 0,
+                kind: "machine.effect.intent".into(),
+                wallet: None,
+                chain: None,
+                data: serde_json::json!({
+                    "operation": "petal.http_fetch",
+                    "operation_id": operation_id,
+                    "correlation_id": correlation_id,
+                    "method": method,
+                    "target": audit_http_target(url),
+                    "payload_sha256": payload_hash,
+                    "payload_size": body.len(),
+                }),
+                prev: String::new(),
+                digest: String::new(),
+            })
+            .map_err(|error| HostError::Backend(format!("Machine audit unavailable: {error}")))?;
+        Ok(correlation_id)
+    }
+
     fn audit_http_fetch(
         &self,
+        correlation_id: &str,
         method: &str,
         url: &str,
         outcome: &str,
         status: Option<u16>,
         body_len: Option<usize>,
         error: Option<&str>,
-    ) {
+    ) -> Result<(), HostError> {
         let mut data = serde_json::json!({
             "method": method,
             "target": audit_http_target(url),
@@ -434,17 +511,46 @@ impl DaemonPetalHost {
         if let Some(error) = error {
             data["error"] = serde_json::json!(error);
         }
-        if let Err(e) = self.audit.append(AuditRecord {
-            ts_ms: 0,
-            kind: "petal.http_fetch".into(),
-            wallet: None,
-            chain: None,
-            data,
-            prev: String::new(),
-            digest: String::new(),
-        }) {
-            warn!(error = %e, "petal.http_fetch.audit_append_failed");
-        }
+        self.audit
+            .append(AuditRecord {
+                ts_ms: 0,
+                kind: "machine.effect.result".into(),
+                wallet: None,
+                chain: None,
+                data: serde_json::json!({
+                    "operation": "petal.http_fetch",
+                    "correlation_id": correlation_id,
+                    "outcome": outcome,
+                    "result": data,
+                }),
+                prev: String::new(),
+                digest: String::new(),
+            })
+            .map(|_| ())
+            .map_err(|error| HostError::Backend(format!("Machine audit unavailable: {error}")))
+    }
+
+    fn audited_http_error(
+        &self,
+        correlation_id: &str,
+        method: &str,
+        url: &str,
+        outcome: &str,
+        status: Option<u16>,
+        body_len: Option<usize>,
+        error: HostError,
+    ) -> HostError {
+        self.audit_http_fetch(
+            correlation_id,
+            method,
+            url,
+            outcome,
+            status,
+            body_len,
+            Some(&error.to_string()),
+        )
+        .err()
+        .unwrap_or(error)
     }
 }
 
@@ -619,10 +725,10 @@ impl PetalHost for DaemonPetalHost {
                             HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
                         })?;
                     if public.key_ref != *derived_key_ref
-                        || !public
-                            .supported_crypto_suites
+                        || !scope
+                            .allowed_crypto_suites
                             .iter()
-                            .all(|suite| scope.allowed_crypto_suites.contains(suite))
+                            .all(|suite| public.supported_crypto_suites.contains(suite))
                     {
                         return Err(HostError::Denied(
                             "Broker returned public key metadata outside the Petal scope".into(),
@@ -715,19 +821,30 @@ impl PetalHost for DaemonPetalHost {
         policy: NetPolicy,
         max_response_bytes: usize,
     ) -> Result<HttpResponse, HostError> {
+        // Keep each network intent/result pair adjacent. The audit journal
+        // itself supports multiple outstanding correlations, but serializing
+        // Petal HTTP makes crash reconciliation and operator diagnosis exact.
+        let _audit_guard = self.http_audit_lock.lock().await;
         let mut method = req.method;
         let mut url = req.url;
         let mut body = req.body;
         let mut headers = req.headers;
         for redirect_count in 0..=PETAL_HTTP_MAX_REDIRECTS {
+            let correlation_id = self.audit_http_intent(&method, &url, &body)?;
             if let Err(e) = policy.check(&method, &url) {
-                self.audit_http_fetch(&method, &url, "denied", None, None, Some(&e.to_string()));
-                return Err(e);
+                return Err(self.audited_http_error(
+                    &correlation_id,
+                    &method,
+                    &url,
+                    "denied",
+                    None,
+                    None,
+                    e,
+                ));
             }
             let reqwest_method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| {
                 let err = HostError::Invalid(format!("http method: {e}"));
-                self.audit_http_fetch(&method, &url, "error", None, None, Some(&err.to_string()));
-                err
+                self.audited_http_error(&correlation_id, &method, &url, "error", None, None, err)
             })?;
             let mut builder = self.http.request(reqwest_method, &url);
             for (name, value) in &headers {
@@ -735,8 +852,7 @@ impl PetalHost for DaemonPetalHost {
             }
             let resp = builder.body(body.clone()).send().await.map_err(|e| {
                 let err = HostError::Backend(format!("http_fetch send: {e}"));
-                self.audit_http_fetch(&method, &url, "error", None, None, Some(&err.to_string()));
-                err
+                self.audited_http_error(&correlation_id, &method, &url, "error", None, None, err)
             })?;
             let status = resp.status().as_u16();
             if resp.status().is_redirection() {
@@ -747,68 +863,76 @@ impl PetalHost for DaemonPetalHost {
                     .map(str::to_string);
                 let Some(location) = location else {
                     let err = HostError::Backend("http redirect missing Location".into());
-                    self.audit_http_fetch(
+                    return Err(self.audited_http_error(
+                        &correlation_id,
                         &method,
                         &url,
                         "error",
                         Some(status),
                         None,
-                        Some(&err.to_string()),
-                    );
-                    return Err(err);
+                        err,
+                    ));
                 };
                 if redirect_count == PETAL_HTTP_MAX_REDIRECTS {
                     let err = HostError::Backend("http redirect limit exceeded".into());
-                    self.audit_http_fetch(
+                    return Err(self.audited_http_error(
+                        &correlation_id,
                         &method,
                         &url,
                         "error",
                         Some(status),
                         None,
-                        Some(&err.to_string()),
-                    );
-                    return Err(err);
+                        err,
+                    ));
                 }
                 let next_url = match resolve_redirect_target(&url, &location) {
                     Ok(url) => url,
                     Err(e) => {
-                        self.audit_http_fetch(
+                        return Err(self.audited_http_error(
+                            &correlation_id,
                             &method,
                             &url,
                             "error",
                             Some(status),
                             None,
-                            Some(&e.to_string()),
-                        );
-                        return Err(e);
+                            e,
+                        ));
                     }
                 };
                 let next_method = redirect_method(&method, status);
                 if let Err(e) = policy.check(&next_method, &next_url) {
-                    self.audit_http_fetch(
+                    return Err(self.audited_http_error(
+                        &correlation_id,
                         &method,
                         &url,
                         "denied_redirect",
                         Some(status),
                         None,
-                        Some(&e.to_string()),
-                    );
-                    return Err(e);
+                        e,
+                    ));
                 }
                 if let Err(e) =
                     prepare_redirect_request(&url, &next_url, &next_method, &mut headers, &mut body)
                 {
-                    self.audit_http_fetch(
+                    return Err(self.audited_http_error(
+                        &correlation_id,
                         &method,
                         &url,
                         "denied_redirect",
                         Some(status),
                         None,
-                        Some(&e.to_string()),
-                    );
-                    return Err(e);
+                        e,
+                    ));
                 }
-                self.audit_http_fetch(&method, &url, "redirect", Some(status), None, None);
+                self.audit_http_fetch(
+                    &correlation_id,
+                    &method,
+                    &url,
+                    "redirect",
+                    Some(status),
+                    None,
+                    None,
+                )?;
                 method = next_method;
                 url = next_url;
                 continue;
@@ -829,46 +953,54 @@ impl PetalHost for DaemonPetalHost {
                     .unwrap_or(true)
             }) {
                 let err = HostError::Backend("http response too large".into());
-                self.audit_http_fetch(
+                return Err(self.audited_http_error(
+                    &correlation_id,
                     &method,
                     &url,
                     "error",
                     Some(status),
                     None,
-                    Some(&err.to_string()),
-                );
-                return Err(err);
+                    err,
+                ));
             }
             let mut body = Vec::new();
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| {
                     let err = HostError::Backend(format!("http_fetch body: {e}"));
-                    self.audit_http_fetch(
+                    self.audited_http_error(
+                        &correlation_id,
                         &method,
                         &url,
                         "error",
                         Some(status),
                         Some(body.len()),
-                        Some(&err.to_string()),
-                    );
-                    err
+                        err,
+                    )
                 })?;
                 if body.len().saturating_add(chunk.len()) > max_response_bytes {
                     let err = HostError::Backend("http response too large".into());
-                    self.audit_http_fetch(
+                    return Err(self.audited_http_error(
+                        &correlation_id,
                         &method,
                         &url,
                         "error",
                         Some(status),
                         Some(body.len().saturating_add(chunk.len())),
-                        Some(&err.to_string()),
-                    );
-                    return Err(err);
+                        err,
+                    ));
                 }
                 body.extend_from_slice(&chunk);
             }
-            self.audit_http_fetch(&method, &url, "ok", Some(status), Some(body.len()), None);
+            self.audit_http_fetch(
+                &correlation_id,
+                &method,
+                &url,
+                "ok",
+                Some(status),
+                Some(body.len()),
+                None,
+            )?;
             return Ok(HttpResponse {
                 status,
                 headers,
@@ -1489,12 +1621,82 @@ fn audit_http_target(raw: &str) -> serde_json::Value {
     }
 }
 
+fn default_machine_audit_history_path() -> PathBuf {
+    let uid = rustix::process::geteuid().as_raw();
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from(format!(
+            "/Library/Application Support/BloomTriad/config/{uid}/machine-audit-history.json"
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        PathBuf::from(format!("/etc/bloom/{uid}/machine-audit-history.json"))
+    }
+}
+
+fn default_machine_checkpoint_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR") {
+        return PathBuf::from(path);
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    #[cfg(target_os = "macos")]
+    return PathBuf::from(format!(
+        "/private/var/db/bloom/{uid}/machine/audit-checkpoints"
+    ));
+    #[cfg(not(target_os = "macos"))]
+    PathBuf::from(format!("/var/lib/bloom/{uid}/machine/audit-checkpoints"))
+}
+
+fn default_authority_edge_history_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("BLOOM_AUTHORITY_EDGE_HISTORY") {
+        return PathBuf::from(path);
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    #[cfg(target_os = "macos")]
+    return PathBuf::from(format!(
+        "/Library/Application Support/BloomTriad/config/{uid}/authority-edge-history.json"
+    ));
+    #[cfg(not(target_os = "macos"))]
+    PathBuf::from(format!("/etc/bloom/{uid}/authority-edge-history.json"))
+}
+
+struct MachineAuditHeadProvider(Arc<AuditLog>);
+
+impl MachineJournalHeadProvider for MachineAuditHeadProvider {
+    fn verified_head(
+        &self,
+    ) -> Result<(u64, bloom_triad_protocol::Digest32), bloom_triad_protocol::ProtocolError> {
+        if let Some(reason) = self.0.mutation_degradation() {
+            return Err(bloom_triad_protocol::ProtocolError::new(
+                bloom_triad_protocol::ProtocolErrorCode::ServiceUnavailable,
+                format!("Machine audit journal is degraded: {reason}"),
+            ));
+        }
+        let hash = self.0.head_hash();
+        let hash = if hash.is_empty() {
+            "00".repeat(32)
+        } else {
+            hash
+        };
+        Ok((
+            self.0.sequence(),
+            bloom_triad_protocol::Digest32::new(hash)?,
+        ))
+    }
+
+    fn latch_mutations(&self, reason: String) {
+        self.0.latch_mutations(reason);
+    }
+}
+
 #[derive(Clone)]
 struct CanonicalBatchConfirmation {
     tx_engine: TxEngine,
     home_write_permit: Arc<HomeWritePermit>,
     chains: ChainRegistry,
     wallet_projections: Arc<dyn WalletProjectionReader>,
+    audit: Arc<AuditLog>,
 }
 
 fn batch_confirmation_result_json(
@@ -1571,6 +1773,37 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
                     .trim()
                     .eq_ignore_ascii_case(target.policy.override_sentinel())
             });
+            let request_bytes = serde_jcs::to_vec(&request)
+                .map_err(|error| format!("canonicalize batch execution intent: {error}"))?;
+            let payload_digest = bloom_tools::sha256_hex(&request_bytes);
+            let operation_id = bloom_tools::sha256_hex(
+                format!(
+                    "bloom-machine-batch-confirm/v1\0{payload_digest}\0{}",
+                    request_bytes.len()
+                )
+                .as_bytes(),
+            );
+            let correlation_id = format!("{operation_id}:{}", self.audit.sequence() + 1);
+            self.audit
+                .append(AuditRecord {
+                    ts_ms: 0,
+                    kind: "machine.effect.intent".into(),
+                    wallet: Some(request.wallet.clone()),
+                    chain: None,
+                    data: serde_json::json!({
+                        "operation": "tx.confirm_batch",
+                        "operation_id": operation_id,
+                        "correlation_id": correlation_id.clone(),
+                        "payload_sha256": payload_digest,
+                        "payload_size": request_bytes.len(),
+                        "ordered_tx_refs": request.txs.clone(),
+                    }),
+                    prev: String::new(),
+                    digest: String::new(),
+                })
+                .map_err(|error| {
+                    format!("Machine audit unavailable before batch dispatch: {error}")
+                })?;
             let result = self
                 .tx_engine
                 .confirm_batch(
@@ -1580,7 +1813,30 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
                     override_warnings,
                 )
                 .await;
-            batch_confirmation_result_json(result)
+            let projected = batch_confirmation_result_json(result);
+            let (outcome, result_data) = match &projected {
+                Ok(value) => ("ok", value.clone()),
+                Err(error) => ("error", serde_json::json!({"error": error})),
+            };
+            self.audit
+                .append(AuditRecord {
+                    ts_ms: 0,
+                    kind: "machine.effect.result".into(),
+                    wallet: Some(request.wallet),
+                    chain: None,
+                    data: serde_json::json!({
+                        "operation": "tx.confirm_batch",
+                        "correlation_id": correlation_id,
+                        "outcome": outcome,
+                        "result": result_data,
+                    }),
+                    prev: String::new(),
+                    digest: String::new(),
+                })
+                .map_err(|error| {
+                    format!("Machine audit unavailable after batch dispatch: {error}")
+                })?;
+            projected
         })
     }
 }
@@ -1634,11 +1890,13 @@ impl Daemon {
             home_write_permit,
             chains: self.chains.clone(),
             wallet_projections: self.wallet_projections.clone(),
+            audit: self.audit.clone(),
         }))
     }
 
     /// Build a fully-wired daemon from the home directory, materialising
     /// any missing subdirs as needed.
+    #[cfg(any(test, debug_assertions, feature = "unsigned-audit-test-seam"))]
     pub fn from_home(home: HomeDir) -> Result<Self, DaemonError> {
         Self::from_home_inner(home, None, None, None)
     }
@@ -1646,7 +1904,27 @@ impl Daemon {
     /// Build a daemon with a held home write permit. VFS write surfaces use
     /// this permit for TxEngine mutations; callers that omit it get a daemon
     /// suitable for reads/tests but not outbox writes.
+    #[cfg(any(test, debug_assertions, feature = "unsigned-audit-test-seam"))]
     pub fn from_home_with_permit(
+        home: HomeDir,
+        permit: Arc<HomeWritePermit>,
+    ) -> Result<Self, DaemonError> {
+        Self::from_home_inner(home, Some(permit), None, None)
+    }
+
+    /// Explicit key-free developer composition used by the debug CLI when an
+    /// installed triad is absent. Release builds do not compile this entry
+    /// point. It has no Broker client, signing path, custody path, legacy
+    /// keystore, or legacy approval store.
+    #[cfg(debug_assertions)]
+    pub fn from_home_without_broker_for_debug(home: HomeDir) -> Result<Self, DaemonError> {
+        Self::from_home_inner(home, None, None, None)
+    }
+
+    /// Write-permitted counterpart to [`Self::from_home_without_broker_for_debug`]
+    /// for Machine-owned state such as Petal installation and unsigned staging.
+    #[cfg(debug_assertions)]
+    pub fn from_home_with_permit_without_broker_for_debug(
         home: HomeDir,
         permit: Arc<HomeWritePermit>,
     ) -> Result<Self, DaemonError> {
@@ -1710,15 +1988,6 @@ impl Daemon {
                 DaemonError::Audit(format!("Machine wallet projection cache: {error}"))
             })?,
         );
-        if broker.is_some() && tokio::runtime::Handle::try_current().is_ok() {
-            let projection_refresh = wallet_projections.clone();
-            tokio::spawn(async move {
-                if let Err(error) = projection_refresh.list_wallets().await {
-                    warn!(%error, "Machine wallet projection refresh failed");
-                }
-            });
-        }
-
         // Build per-chain mempool indexes + handlers from [mempool.<chain>]
         // config. Each entry creates an LRU index, a VFS handler, and
         // spawns a long-lived subscription task. Handles are kept in
@@ -1876,19 +2145,97 @@ impl Daemon {
         };
         let address_book_arc = Arc::new(address_book.clone());
 
-        let audit =
-            AuditLog::open(home.audit_path()).map_err(|e| DaemonError::Audit(e.to_string()))?;
+        let audit_history_path = std::env::var_os("BLOOM_MACHINE_AUDIT_HISTORY")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_machine_audit_history_path);
+        let (audit_history, audit_history_error) =
+            match AuditLog::load_root_trusted_history(&audit_history_path) {
+                Ok(history) => (history, None),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!(
+                        "packaging-pinned Machine audit history is invalid: {error}"
+                    )),
+                ),
+            };
+        let audit = match broker
+            .as_ref()
+            .and_then(MachineBrokerClient::local_application_identity)
+        {
+            Some(identity) => AuditLog::open_signed_with_history(
+                home.audit_path(),
+                AuditIdentity::new(
+                    identity.service_id.as_str(),
+                    identity.application_key_id.as_str(),
+                    identity.signing_key,
+                ),
+                &audit_history,
+            ),
+            None => {
+                #[cfg(any(test, debug_assertions, feature = "unsigned-audit-test-seam"))]
+                {
+                    // Explicit nonproduction seam. Release builds do not
+                    // compile an unsigned Machine journal constructor.
+                    AuditLog::open(home.audit_path())
+                }
+                #[cfg(not(any(test, debug_assertions, feature = "unsigned-audit-test-seam")))]
+                {
+                    return Err(DaemonError::Audit(
+                        "production Machine construction requires an authenticated application identity"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        .map_err(|e| DaemonError::Audit(e.to_string()))?;
+        if let Some(reason) = audit_history_error {
+            audit.latch_mutations(reason);
+        }
         let audit_arc = Arc::new(audit.clone());
+        if let Some(client) = broker.as_ref()
+            && client.local_application_identity().is_some()
+        {
+            #[cfg(feature = "triad-dev-harness")]
+            let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
+                rustix::process::geteuid().as_raw()
+            } else {
+                0
+            };
+            #[cfg(not(feature = "triad-dev-harness"))]
+            let history_owner = 0;
+            let attachment = bloom_machine_client::AuthorityEdgeHistory::load_trusted(
+                default_authority_edge_history_path(),
+                history_owner,
+            )
+            .map_err(|error| error.to_string())
+            .and_then(|history| {
+                client
+                    .attach_authority_journal_with_history(
+                        Arc::new(MachineAuditHeadProvider(audit_arc.clone())),
+                        default_machine_checkpoint_path(),
+                        rustix::process::geteuid().as_raw(),
+                        history,
+                    )
+                    .map_err(|error| error.to_string())
+            });
+            if let Err(error) = attachment {
+                audit_arc.latch_mutations(format!(
+                    "Machine authority-edge checkpoint/history degradation: {error}"
+                ));
+            }
+        }
+        if broker.is_some() && tokio::runtime::Handle::try_current().is_ok() {
+            spawn_wallet_projection_refresh(wallet_projections.clone(), audit_arc.clone());
+        }
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
             WatchRegistry::new(home.watch_dir()).map_err(|e| DaemonError::Watch(e.to_string()))?,
         );
-        let watch_executor = Arc::new(WatchExecutor::new(
-            chains.clone(),
-            watch_registry.clone(),
-            home.clone(),
-        ));
+        let watch_executor = Arc::new(
+            WatchExecutor::new(chains.clone(), watch_registry.clone(), home.clone())
+                .with_audit(audit_arc.clone()),
+        );
 
         let etherscan = config
             .etherscan
@@ -2125,6 +2472,7 @@ impl Daemon {
                 "petals",
                 Arc::new(
                     PetalRouter::new(petals.clone(), petal_app_host)
+                        .with_audit(audit_arc.clone())
                         .with_runtime_petals(config.petals.runtime.clone())
                         .map_err(|e| {
                             DaemonError::Audit(format!("petals runtime configuration: {e}"))
@@ -2333,7 +2681,8 @@ impl Daemon {
                     basefee,
                     cfg,
                 )
-                .with_wallet_policy(wallet_policy),
+                .with_wallet_policy(wallet_policy)
+                .with_audit(audit_arc.clone()),
             );
             let shutdown = scanner.spawn();
             bump_shutdown.push(shutdown);
@@ -2348,6 +2697,7 @@ impl Daemon {
             let reconciler = Arc::new(bloom_tx::reconcile::Reconciler::new(
                 tx_engine.outbox.clone(),
                 chains.clone(),
+                audit_arc.clone(),
             ));
             bump_shutdown.push(reconciler.spawn());
             debug!("daemon.reconciler_spawned");
@@ -2490,6 +2840,7 @@ impl Daemon {
     }
 
     /// Convenience for the default home dir (`~/.bloom`).
+    #[cfg(any(test, debug_assertions, feature = "unsigned-audit-test-seam"))]
     pub fn from_default_home() -> Result<Self, DaemonError> {
         let home = HomeDir::resolve("~/.bloom")?;
         Self::from_home(home)
@@ -2523,6 +2874,7 @@ impl Daemon {
         drop(update_shutdown);
 
         let outbox = self.tx_engine.outbox.clone();
+        let audit = self.audit.clone();
         let (tx, mut rx) = watch::channel(false);
         let interval = Duration::from_secs(60);
         let handle = tokio::spawn(async move {
@@ -2538,7 +2890,7 @@ impl Daemon {
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis())
                             .unwrap_or(0);
-                        match outbox.sweep_expired(now_ms) {
+                        match run_expiry_sweep_once(&outbox, &audit, now_ms) {
                             Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
                             Err(e) => warn!(error = %e, "outbox.sweep_expired_failed"),
@@ -2576,6 +2928,122 @@ impl Daemon {
     ) -> Result<bloom_mount::NfsMountHandle, bloom_mount::MountError> {
         bloom_mount::serve_nfs(self.vfs.clone(), path).await
     }
+}
+
+fn run_expiry_sweep_once(
+    outbox: &bloom_tx::outbox::Outbox,
+    audit: &AuditLog,
+    now_ms: u128,
+) -> Result<usize, String> {
+    let intent = serde_json::json!({
+        "operation": "tx.outbox.sweep_expired",
+        "cutoff_ms": now_ms.to_string(),
+        "scope": "all_pending_machine_outbox_entries",
+    });
+    let operation_id =
+        bloom_tools::sha256_hex(&serde_jcs::to_vec(&intent).map_err(|error| error.to_string())?);
+    let correlation_id = format!("{operation_id}:{}", audit.sequence() + 1);
+    audit
+        .append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.intent".into(),
+            wallet: None,
+            chain: None,
+            data: serde_json::json!({
+                "operation_id": operation_id,
+                "correlation_id": correlation_id,
+                "details": intent,
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })
+        .map_err(|error| format!("Machine audit unavailable before expiry sweep: {error}"))?;
+    let swept = outbox.sweep_expired(now_ms);
+    let result = match &swept {
+        Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
+        Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
+    };
+    audit
+        .append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.result".into(),
+            wallet: None,
+            chain: None,
+            data: serde_json::json!({
+                "operation": "tx.outbox.sweep_expired",
+                "correlation_id": correlation_id,
+                "result": result,
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })
+        .map_err(|error| format!("Machine audit unavailable after expiry sweep: {error}"))?;
+    swept.map_err(|error| error.to_string())
+}
+
+fn spawn_wallet_projection_refresh(
+    projections: Arc<dyn WalletProjectionReader>,
+    audit: Arc<AuditLog>,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = refresh_wallet_projections_once(projections.as_ref(), &audit).await {
+            warn!(%error, "Machine wallet projection refresh failed");
+        }
+    });
+}
+
+async fn refresh_wallet_projections_once(
+    projections: &dyn WalletProjectionReader,
+    audit: &AuditLog,
+) -> Result<(), String> {
+    let operation_id = bloom_tools::sha256_hex(b"machine.wallet_projection.boot_refresh/v1");
+    let correlation_id = format!("{operation_id}:{}", audit.sequence() + 1);
+    audit
+        .append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.intent".into(),
+            wallet: None,
+            chain: None,
+            data: serde_json::json!({
+                "operation_id": operation_id,
+                "correlation_id": correlation_id,
+                "details": {
+                    "operation": "machine.wallet_projection.boot_refresh",
+                    "broker_method": "wallet.list_public",
+                    "projection": "wallet-projections.json",
+                },
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })
+        .map_err(|error| format!("Machine audit unavailable before wallet refresh: {error}"))?;
+    let refreshed = projections.list_wallets().await;
+    let result = match &refreshed {
+        Ok(wallets) => serde_json::json!({
+            "outcome": "refreshed",
+            "wallet_count": wallets.len(),
+        }),
+        Err(error) => serde_json::json!({
+            "outcome": "error",
+            "error": error.to_string(),
+        }),
+    };
+    audit
+        .append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.result".into(),
+            wallet: None,
+            chain: None,
+            data: serde_json::json!({
+                "operation": "machine.wallet_projection.boot_refresh",
+                "correlation_id": correlation_id,
+                "result": result,
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })
+        .map_err(|error| format!("Machine audit unavailable after wallet refresh: {error}"))?;
+    refreshed.map(|_| ()).map_err(|error| error.to_string())
 }
 
 /// Handle to background tasks owned by a running [`Daemon`]. Drop to
@@ -2763,6 +3231,39 @@ mod tests {
         wrote: std::sync::atomic::AtomicBool,
     }
 
+    struct ProjectionRefreshFixture {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl WalletProjectionReader for ProjectionRefreshFixture {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<bloom_machine_client::WalletProjection>, bloom_triad_protocol::ProtocolError>
+        {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &bloom_triad_protocol::Token,
+        ) -> Result<bloom_machine_client::WalletProjection, bloom_triad_protocol::ProtocolError>
+        {
+            Err(bloom_triad_protocol::ProtocolError::new(
+                bloom_triad_protocol::ProtocolErrorCode::ServiceUnavailable,
+                "fixture has no wallet",
+            ))
+        }
+
+        fn cached_wallets(
+            &self,
+        ) -> Result<Vec<bloom_machine_client::WalletProjection>, bloom_triad_protocol::ProtocolError>
+        {
+            Ok(Vec::new())
+        }
+    }
+
     #[async_trait::async_trait]
     impl Handler for GuestWalletProjectionFixture {
         async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
@@ -2901,6 +3402,10 @@ mod tests {
                                 ],
                                 supported_crypto_suites: vec![
                                     bloom_triad_protocol::CryptoSuite::Secp256k1Keccak256Recoverable,
+                                    // Public key capability may be broader than this
+                                    // Petal's immutable scope. Signer enforces the
+                                    // narrower scope independently on every use.
+                                    bloom_triad_protocol::CryptoSuite::Secp256k1Sha256Recoverable,
                                 ],
                             },
                         ))
@@ -2933,6 +3438,63 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn petal_http_audit_intent_failure_prevents_network_dispatch_and_latches() {
+        let directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit.clone());
+        audit.fail_next_write_for_test();
+        let error = host
+            .http_fetch(
+                bloom_petals::HttpRequest {
+                    method: "GET".into(),
+                    url: "http://127.0.0.1:9/must-not-dispatch".into(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+                bloom_petals::NetPolicy::deny_all(),
+                1024,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Machine audit unavailable"));
+        assert_eq!(audit.count().unwrap(), 0);
+        assert!(audit.mutation_degradation().is_some());
+    }
+
+    #[tokio::test]
+    async fn denied_petal_network_attempt_has_exact_intent_and_error_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit.clone());
+        let error = host
+            .http_fetch(
+                bloom_petals::HttpRequest {
+                    method: "POST".into(),
+                    url: "https://example.invalid/orders?secret=redacted".into(),
+                    headers: Vec::new(),
+                    body: b"exact-payload".to_vec(),
+                },
+                bloom_petals::NetPolicy::deny_all(),
+                1024,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HostError::Denied(_)));
+        let records = audit.tail(2).unwrap();
+        assert_eq!(records[0].kind, "machine.effect.intent");
+        assert_eq!(records[0].data["operation"], "petal.http_fetch");
+        assert_eq!(records[0].data["method"], "POST");
+        assert_eq!(records[0].data["payload_size"], 13);
+        assert_eq!(records[1].kind, "machine.effect.result");
+        assert_eq!(records[1].data["outcome"], "denied");
+        assert_eq!(
+            records[0].data["correlation_id"],
+            records[1].data["correlation_id"]
+        );
+        assert!(audit.pending_effect_correlations().unwrap().is_empty());
+    }
+
     #[test]
     fn installed_petal_markdown_exposes_mount_summary_and_capabilities() {
         let markdown = render_petal_discovery_markdown(&[bloom_petals::package::PetalDiscovery {
@@ -2946,6 +3508,91 @@ mod tests {
         assert!(markdown.contains("Request routes, simulate, and stage swap transactions."));
         assert!(markdown.contains("`bloom:chain`, `bloom:tx.outbox`"));
         assert!(markdown.contains("`petals/enso/README.md`"));
+    }
+
+    #[test]
+    fn production_background_effect_inventory_has_explicit_audit_or_non_authority_rationale() {
+        assert_eq!(BACKGROUND_EFFECT_AUDIT_MATRIX.len(), 10);
+        for (effect, treatment) in BACKGROUND_EFFECT_AUDIT_MATRIX {
+            assert!(!effect.is_empty());
+            assert!(
+                treatment.contains("signed intent/result")
+                    || treatment.contains("non-authorizing")
+                    || treatment.contains("cannot authorize")
+                    || treatment.contains("cannot select or authorize")
+                    || treatment.contains("never installs"),
+                "background effect {effect} lacks an explicit §20 treatment: {treatment}"
+            );
+        }
+
+        // Keep this tied to the actual production launch sites. Adding a new
+        // background route without extending this list makes the release test
+        // fail rather than silently relying on a hand-maintained prose table.
+        let daemon = include_str!("lib.rs");
+        let rpc = include_str!("../../bloom-rpc/src/transport.rs");
+        let watch = include_str!("../../bloom-watch/src/executor.rs");
+        let update = include_str!("../../bloom-update/src/checker.rs");
+        let routes = [
+            (
+                daemon,
+                "spawn_wallet_projection_refresh(",
+                "Broker wallet projection boot refresh",
+            ),
+            (
+                daemon,
+                "bloom_mempool::stream::spawn",
+                "mempool subscription cache",
+            ),
+            (
+                daemon,
+                "scanner.spawn()",
+                "basefee bump advisory input/output",
+            ),
+            (
+                daemon,
+                "reconciler.spawn()",
+                "tx receipt/trace reconciliation",
+            ),
+            (
+                daemon,
+                "run_expiry_sweep_once(",
+                "expired outbox durable state moves",
+            ),
+            (
+                daemon,
+                "provider.health().await",
+                "private RPC health probe",
+            ),
+            (
+                daemon,
+                "watch_executor.start()",
+                "watch polling and durable live/history rotation",
+            ),
+            (daemon, ".spawn_background()", "update checker"),
+            (
+                rpc,
+                "spawn_probe_loop(",
+                "bloom-rpc endpoint health probe loop",
+            ),
+            (
+                watch,
+                "watch.poll_and_project",
+                "watch polling and durable live/history rotation",
+            ),
+            (update, "tokio::spawn(async move", "update checker"),
+        ];
+        for (source, launch, effect) in routes {
+            assert!(
+                source.contains(launch),
+                "expected production background launch route disappeared: {launch}"
+            );
+            assert!(
+                BACKGROUND_EFFECT_AUDIT_MATRIX
+                    .iter()
+                    .any(|(listed, _)| *listed == effect),
+                "production background launch {launch} is missing inventory row {effect}"
+            );
+        }
     }
 
     #[test]
@@ -3691,12 +4338,108 @@ ws_url = "wss://example.invalid"
             execution_origin: None,
         };
         d.tx_engine.outbox.write_pending(&staged, "p").unwrap();
-        let n = d.tx_engine.outbox.sweep_expired(2).unwrap();
+        let n = run_expiry_sweep_once(&d.tx_engine.outbox, &d.audit, 2).unwrap();
         assert_eq!(n, 1);
+        let records = d.audit.tail(2).unwrap();
+        assert_eq!(records[0].kind, "machine.effect.intent");
+        assert_eq!(
+            records[0].data["details"]["operation"],
+            "tx.outbox.sweep_expired"
+        );
+        assert_eq!(records[1].kind, "machine.effect.result");
+        assert_eq!(records[1].data["result"]["swept"], 1);
 
         // Shutdown completes promptly.
         tokio::time::timeout(std::time::Duration::from_secs(2), tasks.shutdown())
             .await
             .expect("background task did not honour shutdown signal");
+    }
+
+    #[test]
+    fn expiry_sweep_audit_prewrite_failure_prevents_durable_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+        let staged = bloom_proto::StagedTx {
+            id: "0001-audit-failure".into(),
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            chain_id: 31337,
+            from: "0x0000000000000000000000000000000000000001".into(),
+            to: "0x0000000000000000000000000000000000000002".into(),
+            value_wei: "0".into(),
+            data_hex: "0x".into(),
+            gas_limit: 21_000,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            gas_price: None,
+            nonce: 0,
+            policy_checks: vec![],
+            created_ms: 0,
+            expires_ms: 1,
+            status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::Unknown,
+            tx_hash: None,
+            token: None,
+            nft: None,
+            usd_value: None,
+            valuation: None,
+            depends_on: None,
+            action_id: None,
+            execution_origin: None,
+        };
+        d.tx_engine.outbox.write_pending(&staged, "p").unwrap();
+        d.audit.fail_next_write_for_test();
+        assert!(run_expiry_sweep_once(&d.tx_engine.outbox, &d.audit, 2).is_err());
+        let entry = d
+            .tx_engine
+            .outbox
+            .read("alice", "anvil", "0001-audit-failure")
+            .unwrap();
+        assert_eq!(entry.state, bloom_tx::outbox::OutboxState::Pending);
+        assert!(d.audit.mutation_degradation().is_some());
+    }
+
+    #[tokio::test]
+    async fn wallet_projection_boot_refresh_prewrite_failure_prevents_broker_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let audit = AuditLog::open(directory.path().join("audit.jsonl")).unwrap();
+        let projections = ProjectionRefreshFixture {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        audit.fail_next_write_for_test();
+        assert!(
+            refresh_wallet_projections_once(&projections, &audit)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            projections.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(audit.mutation_degradation().is_some());
+    }
+
+    #[tokio::test]
+    async fn wallet_projection_boot_refresh_result_loss_latches_on_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let audit = AuditLog::open(&path).unwrap();
+        let projections = ProjectionRefreshFixture {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        audit.fail_after_writes_for_test(1);
+        assert!(
+            refresh_wallet_projections_once(&projections, &audit)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            projections.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        drop(audit);
+        let restarted = AuditLog::open(&path).unwrap();
+        assert!(restarted.mutation_degradation().is_some());
+        assert_eq!(restarted.pending_effect_correlations().unwrap().len(), 1);
     }
 }

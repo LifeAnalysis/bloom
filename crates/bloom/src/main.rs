@@ -27,8 +27,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
-use bloom_machine_client::WalletProjectionReader as _;
-use bloom_proto::{HomeDir, HomeWritePermit};
+use bloom_machine_client::{MachineJournalHeadProvider, WalletProjectionReader as _};
+use bloom_proto::{AuditIdentity, AuditLog, HomeDir, HomeWritePermit};
 use bloom_vfs::{
     VfsPath,
     handler::{Entry, EntryKind, Handler},
@@ -125,14 +125,14 @@ fn resolve_server_endpoint(home: &HomeDir, endpoint: Option<&str>) -> Result<Res
     Ok(ResolvedEndpoint::default_for_home(home))
 }
 
-fn configured_broker_client() -> Result<bloom_machine_client::MachineBrokerClient> {
-    configured_broker_client_with_activation(false)
+fn configured_broker_client(home: &HomeDir) -> Result<bloom_machine_client::MachineBrokerClient> {
+    configured_broker_client_with_activation(home, false)
 }
 
 fn configured_wallet_projection_reader(
     home: &HomeDir,
 ) -> Result<bloom_machine_client::CachedWalletProjectionReader> {
-    let broker = match configured_broker_client() {
+    let broker = match configured_broker_client(home) {
         Ok(client) => Some(client),
         Err(error) => {
             debug!(error = %error, "wallet projection using stale cache until Broker is available");
@@ -161,6 +161,42 @@ fn validate_wallet_name(name: &str) -> Result<()> {
 }
 
 fn configured_broker_client_with_activation(
+    home: &HomeDir,
+    allow_activating: bool,
+) -> Result<bloom_machine_client::MachineBrokerClient> {
+    let client = configured_raw_broker_client_with_activation(allow_activating)?;
+    let identity = client
+        .local_application_identity()
+        .context("authenticated Machine client did not retain its application identity")?;
+    let audit = Arc::new(open_configured_machine_audit(home, identity)?);
+    let checkpoint_root = configured_machine_checkpoint_path()?;
+    #[cfg(feature = "triad-dev-harness")]
+    let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
+        rustix::process::geteuid().as_raw()
+    } else {
+        0
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let history_owner = 0;
+    let authority_history = bloom_machine_client::AuthorityEdgeHistory::load_trusted(
+        configured_authority_edge_history_path()?,
+        history_owner,
+    )
+    .map_err(anyhow::Error::new)
+    .context("load packaging-owned authority-edge application-key history")?;
+    client
+        .attach_authority_journal_with_history(
+            Arc::new(ConfiguredMachineAuditHead(audit)),
+            checkpoint_root,
+            rustix::process::geteuid().as_raw(),
+            authority_history,
+        )
+        .map_err(anyhow::Error::new)
+        .context("attach signed Machine authority-edge journal")?;
+    Ok(client)
+}
+
+fn configured_raw_broker_client_with_activation(
     allow_activating: bool,
 ) -> Result<bloom_machine_client::MachineBrokerClient> {
     let installed = installed_macos_triad_paths_with_activation(allow_activating)?;
@@ -213,7 +249,8 @@ async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
     let installed = installed_macos_triad_paths_with_activation(true)
         .ok()
         .flatten();
-    let client = configured_broker_client_with_activation(true)
+    let home = HomeDir::resolve("~/.bloom").context("resolve Machine home for health check")?;
+    let client = configured_broker_client_with_activation(&home, true)
         .map_err(|error| enrich_broker_startup_failure(error, installed.as_ref()))?;
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -245,11 +282,15 @@ async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
     Ok(())
 }
 
-fn configured_broker_connection() -> Result<(
+fn configured_broker_connection(
+    _home: &HomeDir,
+) -> Result<(
     bloom_machine_client::MachineBrokerClient,
     bloom_triad_protocol::ProvenanceCatalog,
 )> {
-    let broker = configured_broker_client()?;
+    // Daemon construction attaches this raw authenticated client to the exact
+    // AuditLog instance it owns before any RPC can be dispatched.
+    let broker = configured_raw_broker_client_with_activation(false)?;
     let installed = installed_macos_triad_paths()?;
     let provenance_catalog = std::env::var_os("BLOOM_PROVENANCE_CATALOG")
         .map(std::path::PathBuf::from)
@@ -279,6 +320,8 @@ struct InstalledMacosTriadPaths {
     machine_identity: PathBuf,
     edge_manifest: PathBuf,
     provenance_catalog: PathBuf,
+    machine_audit_history: PathBuf,
+    authority_edge_history: PathBuf,
     startup_status: PathBuf,
     broker_uid: u32,
     machine_broker_gid: u32,
@@ -360,6 +403,8 @@ fn installed_macos_triad_paths_with_activation(
             machine_identity: config.join("machine/identity.json"),
             edge_manifest: config.join("edge-manifest.json"),
             provenance_catalog: config.join("provenance-catalog.json"),
+            machine_audit_history: config.join("machine-audit-history.json"),
+            authority_edge_history: config.join("authority-edge-history.json"),
             startup_status: PathBuf::from(format!(
                 "/private/var/run/bloom/{uid}/status/broker-startup.json"
             )),
@@ -439,6 +484,8 @@ mod broker_startup_failure_tests {
             machine_identity: PathBuf::new(),
             edge_manifest: PathBuf::new(),
             provenance_catalog: PathBuf::new(),
+            machine_audit_history: PathBuf::new(),
+            authority_edge_history: PathBuf::new(),
             startup_status,
             broker_uid: metadata.uid(),
             machine_broker_gid: metadata.gid(),
@@ -473,20 +520,214 @@ mod broker_startup_failure_tests {
 
 fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {
     let permit = Arc::new(HomeWritePermit::acquire(&home)?);
-    let daemon = match configured_broker_connection() {
+    // Loading the authenticated edge is local and does not connect to Broker.
+    // Production Machine must retain that application identity even while the
+    // Broker process is down so its own audit journal never falls back to an
+    // unsigned/best-effort mode.
+    let daemon = match configured_broker_connection(&home) {
         Ok((broker, catalog)) => {
             Daemon::from_home_with_permit_and_broker(home, permit.clone(), broker, catalog)
+                .context("build daemon")?
         }
         Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Broker unavailable; Machine remains available for reads, staging, and simulation"
-            );
-            Daemon::from_home_with_permit(home, permit.clone())
+            #[cfg(debug_assertions)]
+            {
+                debug!(error = %error, "authenticated Broker edge absent; using key-free debug Machine composition");
+                Daemon::from_home_with_permit_without_broker_for_debug(home, permit.clone())
+                    .context("build key-free debug daemon")?
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                return Err(error).context("load authenticated Machine identity and Broker edge");
+            }
+        }
+    };
+    Ok((permit, daemon))
+}
+
+fn build_authenticated_read_daemon(home: HomeDir) -> Result<Daemon> {
+    // Reads may still execute effectful VFS routes (for example provider
+    // refreshes), so production never constructs the unsigned developer
+    // composition merely because the long-running Machine socket is absent.
+    match configured_broker_connection(&home) {
+        Ok((broker, catalog)) => Daemon::from_home_with_broker(home, broker, catalog)
+            .context("build authenticated read daemon"),
+        Err(error) => {
+            #[cfg(debug_assertions)]
+            {
+                debug!(error = %error, "authenticated Broker edge absent; using key-free debug read composition");
+                Daemon::from_home_without_broker_for_debug(home)
+                    .context("build key-free debug read daemon")
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                Err(error).context("load authenticated Machine identity and Broker edge")
+            }
         }
     }
-    .context("build daemon")?;
-    Ok((permit, daemon))
+}
+
+fn configured_machine_audit(home: &HomeDir) -> Result<AuditLog> {
+    let client = configured_raw_broker_client_with_activation(false)
+        .context("load authenticated Machine identity for local audit operation")?;
+    let identity = client
+        .local_application_identity()
+        .context("authenticated Machine client did not retain its application identity")?;
+    open_configured_machine_audit(home, identity)
+}
+
+fn machine_audit_status(audit: &AuditLog) -> serde_json::Value {
+    let (pending, pending_read_error) = match audit.pending_effect_correlations() {
+        Ok(pending) => (pending, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    let degradation = audit
+        .mutation_degradation()
+        .or_else(|| pending_read_error.clone());
+    let first_pending = pending.first().cloned();
+    serde_json::json!({
+        "service_id": "bloom-machine",
+        "sequence": audit.sequence(),
+        "head": audit.head_hash(),
+        "mutation_degradation": degradation,
+        "pending_effect_correlation": first_pending,
+        "pending_effect_correlations": pending,
+        "pending_effect_read_error": pending_read_error,
+        "required_confirmation": first_pending.as_ref().map(|correlation| {
+            serde_json::json!({
+                "committed": format!("RECONCILE MACHINE AUDIT {correlation} AS COMMITTED"),
+                "aborted": format!("RECONCILE MACHINE AUDIT {correlation} AS ABORTED"),
+            })
+        }),
+    })
+}
+
+fn machine_audit_status_output(audit: &AuditLog) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&machine_audit_status(audit))?)
+}
+
+fn execute_audit_command(command: &AuditCmd, audit: &AuditLog) -> Result<String> {
+    match command {
+        AuditCmd::Status => machine_audit_status_output(audit),
+        AuditCmd::Reconcile {
+            correlation_id,
+            outcome,
+            confirm,
+        } => Ok(serde_json::to_string_pretty(
+            &audit.reconcile_pending_effect(correlation_id, outcome, confirm)?,
+        )?),
+    }
+}
+
+fn open_configured_machine_audit(
+    home: &HomeDir,
+    identity: bloom_triad_local_transport::LocalIdentity,
+) -> Result<AuditLog> {
+    let history_path = configured_machine_audit_history_path()?;
+    open_machine_audit_with_history(home, identity, &history_path)
+}
+
+fn open_machine_audit_with_history(
+    home: &HomeDir,
+    identity: bloom_triad_local_transport::LocalIdentity,
+    history_path: &Path,
+) -> Result<AuditLog> {
+    let (history, history_error) = match AuditLog::load_root_trusted_history(history_path) {
+        Ok(history) => (history, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!(
+                "packaging-pinned Machine audit history is invalid: {error}"
+            )),
+        ),
+    };
+    let audit = AuditLog::open_signed_with_history(
+        home.audit_path(),
+        AuditIdentity::new(
+            identity.service_id.as_str(),
+            identity.application_key_id.as_str(),
+            identity.signing_key,
+        ),
+        &history,
+    )
+    .context("open signed Machine audit journal")?;
+    if let Some(reason) = history_error {
+        audit.latch_mutations(reason);
+    }
+    Ok(audit)
+}
+
+struct ConfiguredMachineAuditHead(Arc<AuditLog>);
+
+impl MachineJournalHeadProvider for ConfiguredMachineAuditHead {
+    fn verified_head(
+        &self,
+    ) -> Result<(u64, bloom_triad_protocol::Digest32), bloom_triad_protocol::ProtocolError> {
+        if let Some(reason) = self.0.mutation_degradation() {
+            return Err(bloom_triad_protocol::ProtocolError::new(
+                bloom_triad_protocol::ProtocolErrorCode::ServiceUnavailable,
+                format!("Machine audit journal is degraded: {reason}"),
+            ));
+        }
+        let hash = self.0.head_hash();
+        let hash = if hash.is_empty() {
+            "00".repeat(32)
+        } else {
+            hash
+        };
+        Ok((
+            self.0.sequence(),
+            bloom_triad_protocol::Digest32::new(hash)?,
+        ))
+    }
+
+    fn latch_mutations(&self, reason: String) {
+        self.0.latch_mutations(reason);
+    }
+}
+
+fn configured_machine_checkpoint_path() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    if installed_macos_triad_paths()?.is_some() {
+        return Ok(PathBuf::from(format!(
+            "/private/var/db/bloom/{uid}/machine/audit-checkpoints"
+        )));
+    }
+    Ok(PathBuf::from(format!(
+        "/var/lib/bloom/{uid}/machine/audit-checkpoints"
+    )))
+}
+
+fn configured_authority_edge_history_path() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("BLOOM_AUTHORITY_EDGE_HISTORY") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(installed) = installed_macos_triad_paths()? {
+        return Ok(installed.authority_edge_history);
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    Ok(PathBuf::from(format!(
+        "/etc/bloom/{uid}/authority-edge-history.json"
+    )))
+}
+
+fn configured_machine_audit_history_path() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("BLOOM_MACHINE_AUDIT_HISTORY") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(installed) = installed_macos_triad_paths()? {
+        return Ok(installed.machine_audit_history);
+    }
+    #[cfg(unix)]
+    let uid = rustix::process::geteuid().as_raw();
+    #[cfg(not(unix))]
+    let uid = 0_u32;
+    Ok(PathBuf::from(format!(
+        "/etc/bloom/{uid}/machine-audit-history.json"
+    )))
 }
 
 async fn launch_custody_ceremony(
@@ -504,7 +745,7 @@ async fn launch_custody_ceremony(
         .context("requested wallet name must be a safe single path segment")?;
     bloom_triad_protocol::Token::new(requested_name.to_owned())
         .context("requested wallet name must be a protocol token")?;
-    let client = configured_broker_client()
+    let client = configured_broker_client(home)
         .context("custody requires the authenticated Machine-to-Broker edge")?;
     let mut operation_bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut operation_bytes);
@@ -592,7 +833,7 @@ async fn prepare_policy_update(
     let proposed_bytes =
         serde_jcs::to_vec(&proposed).context("canonicalize proposed policy document")?;
 
-    let client = configured_broker_client()
+    let client = configured_broker_client(home)
         .context("policy update requires the authenticated Machine-to-Broker edge")?;
     let baseline = client
         .policy(wallet_id.clone())
@@ -667,7 +908,7 @@ async fn prepare_policy_update(
 async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<()> {
     let operation_id = bloom_triad_protocol::OperationId::new(operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
-    let client = configured_broker_client()
+    let client = configured_broker_client(home)
         .context("policy commit requires the authenticated Machine-to-Broker edge")?;
     let ceremony_receipt = client
         .custody_result(bloom_triad_protocol::OperationRequest {
@@ -811,7 +1052,7 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<()> {
     };
     let operation_id = bloom_triad_protocol::OperationId::new(operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
-    let client = configured_broker_client()
+    let client = configured_broker_client(home)
         .context("ceremony operations require the authenticated Machine-to-Broker edge")?;
     if action == "result" {
         let result = client
@@ -919,6 +1160,9 @@ struct Cli {
 enum Cmd {
     /// Show daemon status (chains configured, version, uptime).
     Status,
+    /// Inspect or explicitly reconcile the Machine-owned audit journal.
+    #[command(subcommand)]
+    Audit(AuditCmd),
     /// VFS path operations (no NFS mount required).
     #[command(subcommand)]
     Vfs(VfsCmd),
@@ -967,6 +1211,21 @@ enum Cmd {
 
     /// Print a shell completion script.
     Completions { shell: Shell },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditCmd {
+    /// Print signed-journal health without performing a mutation.
+    Status,
+    /// Close an unmatched durable intent without redispatching its effect.
+    Reconcile {
+        correlation_id: String,
+        #[arg(long, value_parser = ["committed", "aborted"])]
+        outcome: String,
+        /// Exact confirmation printed by `bloom audit status`.
+        #[arg(long)]
+        confirm: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1609,6 +1868,11 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Audit(command) => {
+            let audit = configured_machine_audit(&home)?;
+            println!("{}", execute_audit_command(&command, &audit)?);
+            Ok(())
+        }
         Cmd::Vfs(VfsCmd::Cat { path }) => {
             let p = VfsPath::parse(&path).context("parse path")?;
             let client = IpcClient::new(&client_endpoint.socket);
@@ -1629,7 +1893,7 @@ async fn run(cli: Cli) -> Result<()> {
                 B64.decode(b64).context("ipc read: bad base64")?
             } else {
                 debug!("cli.vfs.cat.via_inproc: no daemon socket present");
-                let d = Daemon::from_home(home).context("build daemon")?;
+                let d = build_authenticated_read_daemon(home)?;
                 d.vfs.read(&p).await.context("vfs read")?
             };
             std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
@@ -1660,7 +1924,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             } else {
                 debug!("cli.vfs.ls.via_inproc: no daemon socket present");
-                let d = Daemon::from_home(home).context("build daemon")?;
+                let d = build_authenticated_read_daemon(home)?;
                 let entries = d.vfs.list(&p).await.context("vfs list")?;
                 for e in entries {
                     println!("{}\t{:?}", e.name, e.kind);
@@ -1684,7 +1948,7 @@ async fn run(cli: Cli) -> Result<()> {
                 print_vfs_stat_json(&path, &res)?;
             } else {
                 debug!("cli.vfs.stat.via_inproc: no daemon socket present");
-                let d = Daemon::from_home(home).context("build daemon")?;
+                let d = build_authenticated_read_daemon(home)?;
                 let entry = d.vfs.lookup(&p).await.context("vfs lookup")?;
                 print_vfs_stat_entry(&path, &entry);
             }
@@ -1764,7 +2028,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Request(RequestCmd::Plan { id }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
+            let d = build_authenticated_read_daemon(home)?;
             let path = VfsPath::parse(&format!("/requests/{id}/plan.md"))?;
             let bytes = d.vfs.read(&path).await.context("request plan")?;
             std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
@@ -1802,14 +2066,14 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Request(RequestCmd::Body { id }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
+            let d = build_authenticated_read_daemon(home)?;
             let path = VfsPath::parse(&format!("/requests/{id}/response/body"))?;
             let bytes = d.vfs.read(&path).await.context("request body")?;
             std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
             Ok(())
         }
         Cmd::Request(RequestCmd::Receipt { id }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
+            let d = build_authenticated_read_daemon(home)?;
             let path = VfsPath::parse(&format!("/requests/{id}/receipt.json"))?;
             let bytes = d.vfs.read(&path).await.context("request receipt")?;
             std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
@@ -2233,7 +2497,7 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
         other => other,
     };
 
-    let d = Daemon::from_home(home.clone()).context("build daemon")?;
+    let d = build_authenticated_read_daemon(home.clone())?;
     match cmd {
         PetalsCmd::Install { path, ref_ } => {
             if let Some(repo) = github_source::parse_github_install_url(&path)? {
@@ -2630,10 +2894,59 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        Cli, Cmd, WalletCmd, ceremony_projection_path, format_petal_consent_net_rule,
-        is_completed_policy_update_receipt, load_ceremony_projection, persist_ceremony_projection,
+        Cli, Cmd, WalletCmd, ceremony_projection_path, execute_audit_command,
+        format_petal_consent_net_rule, is_completed_policy_update_receipt,
+        load_ceremony_projection, open_machine_audit_with_history, persist_ceremony_projection,
         request_body_with_wallet,
     };
+
+    #[test]
+    fn audit_status_reports_malformed_evidence_as_degradation() {
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = bloom_proto::HomeDir::at(temp.path());
+        let path = home.audit_path();
+        let identity = bloom_triad_local_transport::LocalIdentity {
+            service_id: bloom_triad_protocol::Token::new("bloom-machine").unwrap(),
+            boot_epoch: bloom_triad_protocol::BootEpoch::from_bytes([7; 16]),
+            application_key_id: bloom_triad_protocol::Token::new("machine-app").unwrap(),
+            signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7; 32])),
+        };
+        let audit = open_machine_audit_with_history(
+            &home,
+            identity,
+            &temp.path().join("missing-packaging-history.json"),
+        )
+        .unwrap();
+        audit
+            .append(bloom_proto::AuditRecord {
+                ts_ms: 0,
+                kind: "test.valid".into(),
+                wallet: None,
+                chain: None,
+                data: serde_json::json!({}),
+                prev: String::new(),
+                digest: String::new(),
+            })
+            .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "not-json-evidence").unwrap();
+        file.sync_all().unwrap();
+
+        let cli = Cli::try_parse_from(["bloom", "audit", "status"]).unwrap();
+        let Cmd::Audit(command) = cli.cmd else {
+            panic!("audit status must parse to the audit command handler");
+        };
+        let output = execute_audit_command(&command, &audit).unwrap();
+        let status: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(status["mutation_degradation"].is_string());
+        assert!(status["pending_effect_read_error"].is_string());
+        assert_eq!(status["pending_effect_correlations"], serde_json::json!([]));
+    }
 
     #[test]
     fn petal_consent_network_line_includes_named_binding() {
@@ -2864,5 +3177,17 @@ mod tests {
         receipt.public_status = bloom_triad_protocol::CeremonyState::Succeeded;
         receipt.ceremony_kind = bloom_triad_protocol::CeremonyKind::WalletDelete;
         assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
+    }
+
+    #[test]
+    fn production_cli_has_no_unsigned_daemon_fallback_call_site() {
+        let source = include_str!("main.rs");
+        let forbidden = concat!("Daemon::", "from_home(");
+        assert!(
+            !source.contains(forbidden),
+            "production CLI fallbacks must retain the authenticated Machine identity"
+        );
+        assert!(source.contains("build_authenticated_read_daemon(home)"));
+        assert!(source.contains("Daemon::from_home_with_broker(home, broker, catalog)"));
     }
 }

@@ -47,6 +47,7 @@ signer_bin="${BLOOM_INTEGRATION_SIGNER_BIN:-${signer_repo}/target/debug/bloom-si
 if [ -z "${BLOOM_INTEGRATION_MACHINE_BIN:-}" ]; then
   (cd "$repo_root" && cargo build -p bloom --no-default-features --features mount,triad-dev-harness)
 fi
+
 if [ -z "${BLOOM_INTEGRATION_BROKER_BIN:-}" ]; then
   (cd "$broker_repo" && cargo build -p bloom-broker --features triad-dev-harness)
 fi
@@ -95,6 +96,18 @@ if [ ! -f "${config_dir}/edge-manifest.json" ]; then
   rm -rf -- "$template_dir"
 fi
 
+authority_edge_history="${config_dir}/authority-edge-history.json"
+if [ ! -e "$authority_edge_history" ]; then
+  printf '%s\n' \
+    '{' \
+    '  "schema": "bloom.authority-edge-application-history.1",' \
+    '  "historical_keys": [],' \
+    '  "handovers": []' \
+    '}' > "$authority_edge_history"
+  chmod 0600 "$authority_edge_history"
+fi
+export BLOOM_AUTHORITY_EDGE_HISTORY="$authority_edge_history"
+
 for name in edge-manifest.json machine-identity.json broker-identity.json \
   signer-identity.json session-identity.json broker.json signer.json \
   provenance-catalog.json
@@ -125,6 +138,12 @@ signer_socket="${runtime_dir}/signer/signer.sock"
 signer_control_socket="${runtime_dir}/signer/control.sock"
 broker_socket="${runtime_dir}/broker/broker.sock"
 broker_control_socket="${runtime_dir}/broker/control.sock"
+broker_checkpoint_dir="${developer_root}/audit-checkpoints/broker"
+signer_checkpoint_dir="${developer_root}/audit-checkpoints/signer"
+machine_checkpoint_dir="${developer_root}/audit-checkpoints/machine"
+mkdir -p "$broker_checkpoint_dir" "$signer_checkpoint_dir" "$machine_checkpoint_dir"
+chmod 0700 "$broker_checkpoint_dir" "$signer_checkpoint_dir" "$machine_checkpoint_dir"
+export BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR="$machine_checkpoint_dir"
 
 rewrite_broker_config() {
   source="${config_dir}/broker.json"
@@ -152,6 +171,10 @@ env_file="${log_dir}/triad.env"
   printf 'export BLOOM_TRIAD_DEVELOPER_RUNTIME=%q\n' "$runtime_dir"
   printf 'export BLOOM_HOME=%q\n' "$machine_home"
   printf 'export BLOOM_BROKER_SOCKET=%q\n' "$broker_socket"
+  printf 'export BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=%q\n' "$broker_checkpoint_dir"
+  printf 'export BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR=%q\n' "$signer_checkpoint_dir"
+  printf 'export BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR=%q\n' "$machine_checkpoint_dir"
+  printf 'export BLOOM_AUTHORITY_EDGE_HISTORY=%q\n' "$authority_edge_history"
   printf 'export BLOOM_MACHINE_IDENTITY=%q\n' "${config_dir}/machine-identity.json"
   printf 'export BLOOM_EDGE_MANIFEST=%q\n' "${config_dir}/edge-manifest.json"
   printf 'export BLOOM_PROVENANCE_CATALOG=%q\n' "${config_dir}/provenance-catalog.json"
@@ -201,6 +224,7 @@ BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
 BLOOM_SIGNER_CONFIG="${config_dir}/signer.json" \
 BLOOM_SIGNER_SOCKET="$signer_socket" \
 BLOOM_SIGNER_CONTROL_SOCKET="$signer_control_socket" \
+BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR="$signer_checkpoint_dir" \
 BLOOM_SESSION_SOCKET="$session_socket" \
   "$signer_bin" >"${log_dir}/signer.log" 2>&1 &
 signer_pid=$!
@@ -212,6 +236,7 @@ BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
 BLOOM_BROKER_CONFIG="${config_dir}/broker.json" \
 BLOOM_BROKER_SOCKET="$broker_socket" \
 BLOOM_BROKER_CONTROL_SOCKET="$broker_control_socket" \
+BLOOM_BROKER_AUDIT_CHECKPOINT_DIR="$broker_checkpoint_dir" \
 BLOOM_SESSION_SOCKET="$session_socket" \
   "$broker_bin" >"${log_dir}/broker.log" 2>&1 &
 broker_pid=$!
@@ -256,6 +281,8 @@ BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
     --endpoint "unix:${machine_socket}" --mount "$mount_dir" \
     >"${log_dir}/machine.log" 2>&1 &
 machine_pid=$!
+printf '%s\n' "$machine_pid" > "${log_dir}/machine.pid"
+chmod 0600 "${log_dir}/machine.pid"
 wait_for_socket "$machine_socket" "$machine_pid" machine
 mount_attempts=0
 while ! mount | grep -F " on ${mount_dir} " >/dev/null 2>&1 || ! command ls "$mount_dir" >/dev/null 2>&1; do

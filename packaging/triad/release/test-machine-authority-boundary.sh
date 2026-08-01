@@ -58,6 +58,76 @@ fi
 grep -F 'forbidden production Machine feature in forbidden-dev-harness: triad-dev-harness' \
   "$work/forbidden-feature.out" >/dev/null
 
+for audit_feature in audit-test-seam; do
+  printf '%s\t%s\t%s\t%s\n' \
+    "forbidden-$audit_feature" bloom-proto no "$audit_feature" \
+    >"$work/forbidden-audit-feature-sets.tsv"
+  if BLOOM_MACHINE_PRODUCTION_FEATURE_SETS="$work/forbidden-audit-feature-sets.tsv" \
+    "$checker" --require-clean >"$work/forbidden-$audit_feature.out" 2>&1
+  then
+    echo "synthetic direct $audit_feature production feature unexpectedly passed" >&2
+    exit 1
+  fi
+  grep -F "forbidden production Machine feature in forbidden-$audit_feature: $audit_feature" \
+    "$work/forbidden-$audit_feature.out" >/dev/null
+done
+printf '%s\t%s\t%s\t%s\n' forbidden-unsigned-audit-seam bloom-daemon no unsigned-audit-test-seam \
+  >"$work/forbidden-unsigned-audit-feature-sets.tsv"
+if BLOOM_MACHINE_PRODUCTION_FEATURE_SETS="$work/forbidden-unsigned-audit-feature-sets.tsv" \
+  "$checker" --require-clean >"$work/forbidden-unsigned-audit-feature.out" 2>&1
+then
+  echo "synthetic direct unsigned-audit-test-seam unexpectedly passed" >&2
+  exit 1
+fi
+grep -F 'forbidden production Machine feature in forbidden-unsigned-audit-seam: unsigned-audit-test-seam' \
+  "$work/forbidden-unsigned-audit-feature.out" >/dev/null
+
+cat >"$work/resolved-audit-feature-metadata.json" <<'EOF'
+{
+  "packages": [
+    {"id":"bloom-id","name":"bloom","manifest_path":"/synthetic/bloom/Cargo.toml"},
+    {"id":"proto-id","name":"bloom-proto","manifest_path":"/synthetic/bloom-proto/Cargo.toml"},
+    {"id":"daemon-id","name":"bloom-daemon","manifest_path":"/synthetic/bloom-daemon/Cargo.toml"}
+  ],
+  "resolve": {"nodes": [
+    {"id":"bloom-id","deps":[{"pkg":"proto-id","dep_kinds":[{"kind":null}]},{"pkg":"daemon-id","dep_kinds":[{"kind":null}]}],"features":[]},
+    {"id":"proto-id","deps":[],"features":["audit-test-seam"]},
+    {"id":"daemon-id","deps":[],"features":[]}
+  ]}
+}
+EOF
+printf '%s\n' \
+  bloom \
+  'bloom-proto feature "audit-test-seam"' \
+  >"$work/resolved-audit-feature-tree.txt"
+printf '%s\t%s\t%s\t%s\n' resolved-audit-seam bloom yes - \
+  >"$work/resolved-audit-feature-sets.tsv"
+if BLOOM_MACHINE_PRODUCTION_FEATURE_SETS="$work/resolved-audit-feature-sets.tsv" \
+  BLOOM_MACHINE_METADATA_FIXTURE="$work/resolved-audit-feature-metadata.json" \
+  BLOOM_MACHINE_FEATURE_TREE_FIXTURE="$work/resolved-audit-feature-tree.txt" \
+  "$checker" --require-clean >"$work/resolved-audit-feature.out" 2>&1
+then
+  echo "synthetic resolved audit-test-seam unexpectedly passed" >&2
+  exit 1
+fi
+grep -F 'forbidden resolved Machine feature in resolved-audit-seam: bloom-proto:audit-test-seam' \
+  "$work/resolved-audit-feature.out" >/dev/null
+
+printf '%s\n' \
+  bloom \
+  'bloom-daemon feature "unsigned-audit-test-seam"' \
+  >"$work/resolved-unsigned-audit-feature-tree.txt"
+if BLOOM_MACHINE_PRODUCTION_FEATURE_SETS="$work/resolved-audit-feature-sets.tsv" \
+  BLOOM_MACHINE_METADATA_FIXTURE="$work/resolved-audit-feature-metadata.json" \
+  BLOOM_MACHINE_FEATURE_TREE_FIXTURE="$work/resolved-unsigned-audit-feature-tree.txt" \
+  "$checker" --require-clean >"$work/resolved-unsigned-audit-feature.out" 2>&1
+then
+  echo "synthetic resolved unsigned-audit-test-seam unexpectedly passed" >&2
+  exit 1
+fi
+grep -F 'forbidden resolved Machine feature in resolved-audit-seam: bloom-daemon:unsigned-audit-test-seam' \
+  "$work/resolved-unsigned-audit-feature.out" >/dev/null
+
 mkdir "$work/forbidden-clean-source"
 mkdir "$work/forbidden-clean-source/src"
 printf 'struct EphemeralAgentKey;\nstruct SessionStore;\nfn backend_policy_for_wallet() {}\n' \

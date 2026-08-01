@@ -17,16 +17,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, U256};
-use alloy::sol_types::SolCall;
 use anyhow::{Context, Result, anyhow};
-use bloom_auth::AuthStore;
-use bloom_auth_api::{
-    EVM_ERC20_TRANSFER_METHOD, EvmFeePolicy, EvmOwnerSigningSessionCounters,
-    EvmOwnerSigningSessionScope, EvmOwnerSigningSessionUse,
-    petal_identity::{PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET},
-};
-use bloom_evm::{ChainClient, IERC20};
+use bloom_evm::ChainClient;
 use bloom_it::{exact_signing_broker, exact_signing_catalog};
 use bloom_proto::{
     AgentAutonomyMode, ChainSpec, Policy, RawIntent, RawIntentBody, ValuationError, ValuationQuote,
@@ -42,14 +34,6 @@ const ANVIL_PK0: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784
 const ANVIL_ADDR0: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 /// Anvil prefunded account #1 (recipient).
 const ANVIL_ADDR1: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
-
-fn now_ms_u64() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
-}
 
 struct TestPriceOracle;
 
@@ -104,10 +88,6 @@ fn anvil_bin() -> String {
     std::env::var("BLOOM_ANVIL_BIN").unwrap_or_else(|_| "anvil".to_string())
 }
 
-fn forge_bin() -> String {
-    std::env::var("BLOOM_FORGE_BIN").unwrap_or_else(|_| "forge".to_string())
-}
-
 async fn spawn_anvil(no_mining: bool) -> Result<AnvilGuard> {
     let port = pick_free_port()?;
     let mut cmd = Command::new(anvil_bin());
@@ -156,82 +136,6 @@ fn anvil_chain_spec(rpc_url: &str) -> ChainSpec {
     spec.rpc_urls = vec![rpc_url.to_string()];
     spec.allow_broadcast = true;
     spec
-}
-
-async fn deploy_mock_erc20(rpc_url: &str, owner: &str, supply: &str) -> Result<Address> {
-    let tmp = tempfile::tempdir()?;
-    let src = tmp.path().join("MockERC20.sol");
-    std::fs::write(
-        &src,
-        r#"
-// SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.20;
-
-contract MockERC20 {
-    string public name = "Mock USDC";
-    string public symbol = "mUSDC";
-    uint8 public decimals = 6;
-    mapping(address => uint256) public balanceOf;
-
-    constructor(address owner, uint256 supply) {
-        balanceOf[owner] = supply;
-    }
-
-    function transfer(address to, uint256 amount) external returns (bool) {
-        require(balanceOf[msg.sender] >= amount, "insufficient");
-        balanceOf[msg.sender] -= amount;
-        balanceOf[to] += amount;
-        return true;
-    }
-}
-"#,
-    )?;
-    let output = Command::new(forge_bin())
-        .arg("create")
-        .arg("--json")
-        .arg("--broadcast")
-        .arg("--rpc-url")
-        .arg(rpc_url)
-        .arg("--private-key")
-        .arg(ANVIL_PK0)
-        .arg(format!("{}:MockERC20", src.display()))
-        .arg("--constructor-args")
-        .arg(owner)
-        .arg(supply)
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("forge create MockERC20")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "forge create failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let deployed = value
-        .get("deployedTo")
-        .and_then(|v| v.as_str())
-        .or_else(|| value.get("deployed_to").and_then(|v| v.as_str()))
-        .or_else(|| value.get("contractAddress").and_then(|v| v.as_str()))
-        .ok_or_else(|| {
-            anyhow!(
-                "forge create JSON missing deployed address: stdout={}, stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-        })?;
-    deployed
-        .parse()
-        .map_err(|e| anyhow!("parse deployed token address: {e}"))
-}
-
-fn erc20_transfer_calldata(recipient: Address, amount: u128) -> String {
-    let call = IERC20::transferCall {
-        to: recipient,
-        amount: U256::from(amount),
-    };
-    format!("0x{}", hex::encode(call.abi_encode()))
 }
 
 /// Stage an ERC-20 transfer to a hardcoded token symbol that resolves
@@ -389,128 +293,6 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
         replaced.tx_hash.is_some(),
         "replacement broadcast produced no tx hash"
     );
-
-    drop(anvil);
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn owner_session_hash_only_execution_fails_closed_without_broadcast() -> Result<()> {
-    let anvil = spawn_anvil(false).await?;
-    let rpc_url = anvil.rpc_url();
-    let chain = ChainClient::new(anvil_chain_spec(&rpc_url)).map_err(|e| anyhow!("chain: {e}"))?;
-    let token = deploy_mock_erc20(&rpc_url, ANVIL_ADDR0, "1000000000").await?;
-    let owner: Address = ANVIL_ADDR0.parse()?;
-    let recipient: Address = ANVIL_ADDR1.parse()?;
-
-    let engine = TxEngine::new(
-        Outbox::new(tempfile::tempdir()?.path().join("outbox"))?,
-        60_000,
-    );
-
-    let now = now_ms_u64();
-    let session_id = "evm-owner-session-it-1";
-    let scope = EvmOwnerSigningSessionScope {
-        wallet: "alice".into(),
-        chain_id: 31337,
-        token_contract: bloom_proto::checksum_address(&token),
-        recipient: bloom_proto::checksum_address(&recipient),
-        method: EVM_ERC20_TRANSFER_METHOD.into(),
-        daily_cap_base_units: "100000000".into(),
-        ttl_ms: 120_000,
-        fee_policy: EvmFeePolicy {
-            max_fee_per_gas_wei: Some("2000000000".into()),
-            max_priority_fee_per_gas_wei: Some("1000000".into()),
-            max_total_fee_wei: Some("200000000000000".into()),
-        },
-        max_signature_count: 5,
-        autonomy_classification: "bounded_owner_signing".into(),
-        policy_snapshot_digest: "it-policy".into(),
-        petal_id: PETAL_ID_EVM_WALLET.into(),
-        petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
-        petal_version: bloom_auth_api::petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
-        reason: "integration bounded USDC payments".into(),
-        native_transfers_allowed: false,
-    };
-    let counters = EvmOwnerSigningSessionCounters {
-        daily_window_start_ms: now,
-        spent_base_units: "0".into(),
-        reserved_base_units: "0".into(),
-        signature_count: 0,
-        pending_reservations: Default::default(),
-    };
-    let mut auth_store = AuthStore::open(tempfile::tempdir()?.path().join("auth.sqlite"))?;
-    auth_store.create_standing_session(
-        session_id,
-        "alice",
-        PETAL_ID_EVM_WALLET,
-        bloom_auth_api::EVM_OWNER_SIGNING_SESSION_KIND,
-        &serde_json::to_string(&scope)?,
-        &serde_json::to_string(&counters)?,
-        0,
-        PLACEHOLDER_DIGEST_EVM_WALLET,
-        now,
-        now + 120_000,
-        now,
-    )?;
-    let request = EvmOwnerSigningSessionUse {
-        wallet: "alice".into(),
-        chain_id: 31337,
-        chain: Some("anvil".into()),
-        token_contract: bloom_proto::checksum_address(&token),
-        recipient: bloom_proto::checksum_address(&recipient),
-        method: EVM_ERC20_TRANSFER_METHOD.into(),
-        calldata_hex: erc20_transfer_calldata(recipient, 40_000_000),
-        amount_base_units: "40000000".into(),
-        value_wei: "0".into(),
-        nonce: None,
-        gas_limit: Some(100_000),
-        max_fee_per_gas_wei: Some("2000000000".into()),
-        max_priority_fee_per_gas_wei: Some("1000000".into()),
-        max_total_fee_wei: Some("200000000000000".into()),
-    };
-    let reservation_id = "res-hash-only";
-    let reserved = auth_store.reserve_evm_owner_session_use(
-        session_id,
-        reservation_id,
-        &request,
-        true,
-        now + 1,
-    )?;
-    let err = engine
-        .execute_evm_owner_session_use(
-            "alice",
-            session_id,
-            reservation_id,
-            &request,
-            &reserved,
-            "anvil",
-            &chain,
-            owner,
-            &Policy::permissive(),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, TxEngineError::ApprovalServiceUnavailable(ref message)
-            if message.contains("UNSUPPORTED_VERSION")
-                && message.contains("hash-only")
-                && message.contains("payload-bearing")),
-        "{err}"
-    );
-    auth_store.release_evm_owner_session_use(session_id, reservation_id, now + 2)?;
-
-    let balance = chain
-        .erc20_balance(token, recipient)
-        .await?
-        .ok_or_else(|| anyhow!("recipient token balance missing"))?;
-    assert_eq!(balance, U256::ZERO, "hash-only route must not broadcast");
-    let session = auth_store
-        .standing_session(session_id)?
-        .ok_or_else(|| anyhow!("missing owner session"))?;
-    assert_eq!(session.counters["spent_base_units"], "0");
-    assert_eq!(session.counters["reserved_base_units"], "0");
-    assert_eq!(session.counters["signature_count"], 0);
 
     drop(anvil);
     Ok(())

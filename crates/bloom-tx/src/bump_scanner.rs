@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bloom_mempool::PendingTxIndex;
+use bloom_proto::{AuditLog, AuditRecord};
 use parking_lot::RwLock;
 
 use crate::outbox::{Outbox, SentEntry};
@@ -86,6 +87,7 @@ pub struct BumpScanner {
     /// `cfg.stuck_after` / `cfg.basefee_overrun_pct` are used for every
     /// wallet (back-compat: tests + existing call sites).
     wallet_policy: Option<WalletPolicyLookup>,
+    audit: Option<Arc<AuditLog>>,
 }
 
 impl BumpScanner {
@@ -101,7 +103,13 @@ impl BumpScanner {
             basefee_provider,
             cfg,
             wallet_policy: None,
+            audit: None,
         }
+    }
+
+    pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Plumb a per-wallet policy lookup. The closure receives the wallet
@@ -158,7 +166,21 @@ impl BumpScanner {
             return Ok(());
         };
 
+        let basefee_correlation = self.audit_intent(
+            &entry,
+            serde_json::json!({
+                "operation": "tx.bump_scanner.basefee_lookup",
+                "wallet": entry.wallet,
+                "chain": entry.chain,
+                "tx_id": entry.id,
+            }),
+        )?;
         let basefee = self.basefee_provider.basefee_wei(&entry.chain).await;
+        self.audit_result(
+            &entry,
+            basefee_correlation.as_deref(),
+            serde_json::json!({"basefee_wei": basefee.map(|value| value.to_string())}),
+        )?;
         let max_fee = entry.fees.max_fee_per_gas();
         let basefee_trigger = matches!(
             basefee,
@@ -212,19 +234,95 @@ impl BumpScanner {
             "bumped_pct": 12.5,
         });
 
-        self.outbox
-            .write_sent_sibling(&entry, "bump.tx", &serde_json::to_vec_pretty(&bump_tx)?)?;
-        self.outbox.write_sent_sibling(
+        let bump_bytes = serde_json::to_vec_pretty(&bump_tx)?;
+        let cancel_bytes = serde_json::to_vec_pretty(&cancel_tx)?;
+        let advice_bytes = serde_json::to_vec_pretty(&advice)?;
+        let projection_correlation = self.audit_intent(
             &entry,
-            "cancel.tx",
-            &serde_json::to_vec_pretty(&cancel_tx)?,
+            serde_json::json!({
+                "operation": "tx.bump_scanner.advice_projection",
+                "wallet": entry.wallet,
+                "chain": entry.chain,
+                "tx_id": entry.id,
+                "files": [
+                    {"name": "bump.tx", "sha256": bloom_tools::sha256_hex(&bump_bytes), "size": bump_bytes.len()},
+                    {"name": "cancel.tx", "sha256": bloom_tools::sha256_hex(&cancel_bytes), "size": cancel_bytes.len()},
+                    {"name": "bump_advice.json", "sha256": bloom_tools::sha256_hex(&advice_bytes), "size": advice_bytes.len()},
+                ],
+            }),
         )?;
-        self.outbox.write_sent_sibling(
+        let write_result = (|| -> Result<(), crate::outbox::OutboxError> {
+            self.outbox
+                .write_sent_sibling(&entry, "bump.tx", &bump_bytes)?;
+            self.outbox
+                .write_sent_sibling(&entry, "cancel.tx", &cancel_bytes)?;
+            self.outbox
+                .write_sent_sibling(&entry, "bump_advice.json", &advice_bytes)?;
+            Ok(())
+        })();
+        self.audit_result(
             &entry,
-            "bump_advice.json",
-            &serde_json::to_vec_pretty(&advice)?,
+            projection_correlation.as_deref(),
+            match &write_result {
+                Ok(()) => serde_json::json!({"outcome": "written"}),
+                Err(error) => {
+                    serde_json::json!({"outcome": "error", "error": error.to_string()})
+                }
+            },
         )?;
+        write_result?;
 
+        Ok(())
+    }
+
+    fn audit_intent(
+        &self,
+        entry: &SentEntry,
+        details: serde_json::Value,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(audit) = &self.audit else {
+            return Ok(None);
+        };
+        let operation_id = bloom_tools::sha256_hex(&serde_jcs::to_vec(&details)?);
+        let correlation_id = format!("{operation_id}:{}", audit.sequence() + 1);
+        audit.append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.intent".into(),
+            wallet: Some(entry.wallet.clone()),
+            chain: Some(entry.chain.clone()),
+            data: serde_json::json!({
+                "operation_id": operation_id,
+                "correlation_id": correlation_id,
+                "details": details,
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })?;
+        Ok(Some(correlation_id))
+    }
+
+    fn audit_result(
+        &self,
+        entry: &SentEntry,
+        correlation_id: Option<&str>,
+        result: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let (Some(audit), Some(correlation_id)) = (&self.audit, correlation_id) else {
+            return Ok(());
+        };
+        audit.append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.result".into(),
+            wallet: Some(entry.wallet.clone()),
+            chain: Some(entry.chain.clone()),
+            data: serde_json::json!({
+                "operation": "tx.bump_scanner",
+                "correlation_id": correlation_id,
+                "result": result,
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })?;
         Ok(())
     }
 
@@ -255,6 +353,7 @@ impl BumpScanner {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     use bloom_proto::{StagedTx, TxStatus};
@@ -265,6 +364,16 @@ mod tests {
     impl BasefeeProvider for StaticBasefee {
         async fn basefee_wei(&self, _chain: &str) -> Option<u128> {
             self.0
+        }
+    }
+
+    struct CountingBasefee(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl BasefeeProvider for CountingBasefee {
+        async fn basefee_wei(&self, _chain: &str) -> Option<u128> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Some(150)
         }
     }
 
@@ -373,6 +482,29 @@ mod tests {
             "113", // ceil(100 * 9/8) = 113
             "bumped max_fee_per_gas should be 113"
         );
+    }
+
+    #[tokio::test]
+    async fn audit_prewrite_failure_prevents_basefee_network_and_advice_projection() {
+        let tmp = TempDir::new().unwrap();
+        let outbox = Outbox::new(tmp.path().join("outbox")).unwrap();
+        seed_sent_entry(&outbox, "alice", "ethereum", 100);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let audit = Arc::new(AuditLog::open(tmp.path().join("audit.jsonl")).unwrap());
+        audit.fail_next_write_for_test();
+        let scanner = BumpScanner::new(
+            outbox.clone(),
+            Arc::new(RwLock::new(BTreeMap::new())),
+            Arc::new(CountingBasefee(calls.clone())),
+            BumpScannerConfig::default(),
+        )
+        .with_audit(audit.clone());
+        assert!(scanner.tick().await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let entry = &outbox.walk_all_sent().unwrap()[0];
+        let directory = outbox.sent_dir("alice", "ethereum", &entry.id).unwrap();
+        assert!(!directory.join("bump.tx").exists());
+        assert!(audit.mutation_degradation().is_some());
     }
 
     #[tokio::test]

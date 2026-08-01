@@ -74,6 +74,27 @@ case "$action" in
         exit 66
       }
     done
+    installed_config_root="$root/etc/bloom/$login_uid"
+    if [[ -e "$installed_config_root/edge-manifest.json" ]]; then
+      for identity_pair in \
+        "edge-manifest.json:edge-manifest.json" \
+        "broker/identity.json:broker-identity.json" \
+        "signer/identity.json:signer-identity.json"
+      do
+        installed_relative="${identity_pair%%:*}"
+        payload_relative="${identity_pair#*:}"
+        installed_identity="$installed_config_root/$installed_relative"
+        payload_identity="$payload/config/$payload_relative"
+        [[ -f "$installed_identity" && ! -L "$installed_identity" ]] || {
+          echo "installed Linux transport identity set is incomplete; refusing replacement" >&2
+          exit 65
+        }
+        cmp -s "$installed_identity" "$payload_identity" || {
+          echo "Linux install may not replace transport identities; use the explicit coordinated identity-rotation path" >&2
+          exit 65
+        }
+      done
+    fi
     active_units=()
     if [[ "$root" == "/" ]] && [[ -x "$root/usr/libexec/bloom/bloom-broker" ]]; then
       while IFS= read -r unit; do
@@ -154,6 +175,33 @@ case "$action" in
     chmod 0711 "$config_root"
     chmod 0700 "$config_root/broker" "$config_root/signer"
     atomic_install "$payload/config/edge-manifest.json" "$config_root/edge-manifest.json" 0644
+    machine_audit_history_source="$config_root/.machine-audit-history.source.$$"
+    printf '%s\n' \
+      '{' \
+      '  "schema": "bloom.machine-audit-trust.v1",' \
+      '  "predecessors": []' \
+      '}' > "$machine_audit_history_source"
+    if [[ ! -e "$config_root/machine-audit-history.json" ]]; then
+      atomic_install \
+        "$machine_audit_history_source" \
+        "$config_root/machine-audit-history.json" \
+        0644
+    fi
+    rm -f -- "$machine_audit_history_source"
+    authority_edge_history_source="$config_root/.authority-edge-history.source.$$"
+    printf '%s\n' \
+      '{' \
+      '  "schema": "bloom.authority-edge-application-history.1",' \
+      '  "historical_keys": [],' \
+      '  "handovers": []' \
+      '}' > "$authority_edge_history_source"
+    if [[ ! -e "$config_root/authority-edge-history.json" ]]; then
+      atomic_install \
+        "$authority_edge_history_source" \
+        "$config_root/authority-edge-history.json" \
+        0644
+    fi
+    rm -f -- "$authority_edge_history_source"
     atomic_install "$payload/config/broker.json" "$config_root/broker/config.json" 0600
     atomic_install "$payload/config/signer.json" "$config_root/signer/config.json" 0600
     atomic_install \
@@ -250,6 +298,45 @@ case "$action" in
       echo "principal is not installed" >&2
       exit 66
     }
+    command -v python3 >/dev/null || {
+      echo "Linux config rotation requires python3 for closed-field validation" >&2
+      exit 69
+    }
+    python3 - "$destination" "$config" "$principal" <<'PY'
+import json
+import pathlib
+import sys
+
+old_path, new_path, principal = sys.argv[1:]
+try:
+    old = json.loads(pathlib.Path(old_path).read_text())
+    new = json.loads(pathlib.Path(new_path).read_text())
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"invalid Linux {principal} config rotation JSON: {error}")
+if not isinstance(old, dict) or not isinstance(new, dict):
+    raise SystemExit("Linux config rotation requires JSON objects")
+
+operational = {
+    "maximum_connections",
+    "maximum_in_flight_mutations",
+    "maximum_requests_per_window",
+    "request_window_ms",
+    "maximum_journal_admissions_per_window",
+    "journal_window_ms",
+    "control_maximum_connections",
+    "control_maximum_in_flight_mutations",
+    "control_maximum_requests_per_window",
+    "control_request_window_ms",
+    "control_maximum_journal_admissions_per_window",
+    "control_journal_window_ms",
+}
+missing = object()
+for field in sorted(set(old) | set(new)):
+    if field not in operational and old.get(field, missing) != new.get(field, missing):
+        raise SystemExit(
+            f"Linux config rotation may not change authority or identity field: {field}"
+        )
+PY
     atomic_install "$config" "$destination" 0600
     if [[ "$root" == "/" ]]; then
       chown "bloom-$principal-$login_uid:bloom-$principal-$login_uid" "$destination"

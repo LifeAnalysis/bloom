@@ -653,6 +653,16 @@ verify_installed_security_files() {
     "$BLOOM_MACOS_SIGNER_UID" \
     "$BLOOM_MACOS_SIGNER_GID" \
     700
+  require_live_directory_metadata \
+    "$enrolled_state_root/machine" \
+    "$enrolled_uid" \
+    "$BLOOM_MACOS_MACHINE_BROKER_GID" \
+    700
+  require_live_directory_metadata \
+    "$enrolled_state_root/machine/audit-checkpoints" \
+    "$enrolled_uid" \
+    "$BLOOM_MACOS_MACHINE_BROKER_GID" \
+    700
   require_live_directory_metadata "$enrolled_runtime_root" 0 0 711
   require_live_directory_metadata "$enrolled_runtime_root/containment" 0 0 755
   require_live_directory_metadata \
@@ -690,6 +700,16 @@ verify_installed_security_files() {
   require_live_file_metadata "$enrolled_config_root/edge-manifest.json" 0 0 644
   require_live_file_metadata \
     "$enrolled_config_root/provenance-catalog.json" \
+    0 \
+    0 \
+    644
+  require_live_file_metadata \
+    "$enrolled_config_root/machine-audit-history.json" \
+    0 \
+    0 \
+    644
+  require_live_file_metadata \
+    "$enrolled_config_root/authority-edge-history.json" \
     0 \
     0 \
     644
@@ -856,6 +876,7 @@ render_template() {
     -e "s|@BLOOM_SIGNER_IDENTITY@|$signer_config_root/identity.json|g" \
     -e "s|@BLOOM_SIGNER_CONFIG@|$signer_config_root/config.json|g" \
     -e "s|@BLOOM_EDGE_MANIFEST@|$edge_manifest|g" \
+    -e "s|@BLOOM_AUTHORITY_EDGE_HISTORY@|$config_root/authority-edge-history.json|g" \
     -e "s|@BLOOM_BROKER_AUDIT_CHECKPOINT_DIR@|$broker_state/audit-checkpoints|g" \
     -e "s|@BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR@|$signer_state/audit-checkpoints|g" \
     -e "s|@BLOOM_BROKER_STATE_DIR@|$broker_state|g" \
@@ -896,7 +917,9 @@ set_live_ownership() {
   chown "$login_user:$machine_broker_group" \
     "$machine_config_root" \
     "$machine_config_root/identity.json" \
-    "$machine_config_root/revoke-identity.json"
+    "$machine_config_root/revoke-identity.json" \
+    "$machine_state" \
+    "$machine_state/audit-checkpoints"
   chown "$login_user:$revoke_group" \
     "$session_config_root" \
     "$session_config_root/identity.json" \
@@ -904,7 +927,9 @@ set_live_ownership() {
   chown root:wheel \
     "$installer_config_root" \
     "$installer_config_root/identity.json" \
-    "$config_root/provenance-catalog.json"
+    "$config_root/provenance-catalog.json" \
+    "$config_root/machine-audit-history.json" \
+    "$config_root/authority-edge-history.json"
   chown root:wheel "$runtime_root" "$runtime_root/containment"
   chown "$broker_user:$machine_broker_group" "$runtime_root/machine-broker"
   chown "$signer_user:$broker_signer_group" "$runtime_root/broker-signer"
@@ -1696,6 +1721,7 @@ write_rotation_phase() {
 
 transport_rotation_files=(
   edge-manifest.json
+  authority-edge-history.json
   machine/identity.json
   machine/revoke-identity.json
   broker/identity.json
@@ -1733,6 +1759,9 @@ copy_generated_transport_tree() {
     "$destination_tree/signer" \
     "$destination_tree/session"
   cp "$generated/edge-manifest.json" "$destination_tree/edge-manifest.json"
+  cp \
+    "$product_root/config/$login_uid/authority-edge-history.json" \
+    "$destination_tree/authority-edge-history.json"
   cp "$generated/machine-identity.json" "$destination_tree/machine/identity.json"
   cp \
     "$generated/revoke-identity.json" \
@@ -1740,7 +1769,9 @@ copy_generated_transport_tree() {
   cp "$generated/broker-identity.json" "$destination_tree/broker/identity.json"
   cp "$generated/signer-identity.json" "$destination_tree/signer/identity.json"
   cp "$generated/session-identity.json" "$destination_tree/session/identity.json"
-  chown root:wheel "$destination_tree/edge-manifest.json"
+  chown root:wheel \
+    "$destination_tree/edge-manifest.json" \
+    "$destination_tree/authority-edge-history.json"
   chown "$login_uid:$BLOOM_MACOS_MACHINE_BROKER_GID" \
     "$destination_tree/machine/identity.json" \
     "$destination_tree/machine/revoke-identity.json"
@@ -1750,7 +1781,9 @@ copy_generated_transport_tree() {
     "$destination_tree/signer/identity.json"
   chown "$login_uid:$BLOOM_MACOS_REVOKE_GID" \
     "$destination_tree/session/identity.json"
-  chmod 0644 "$destination_tree/edge-manifest.json"
+  chmod 0644 \
+    "$destination_tree/edge-manifest.json" \
+    "$destination_tree/authority-edge-history.json"
   chmod 0600 \
     "$destination_tree/machine/identity.json" \
     "$destination_tree/machine/revoke-identity.json" \
@@ -1828,12 +1861,36 @@ restore_rotation_jobs() {
   done < "$rotation_transaction/jobs"
 }
 
+roll_forward_transport_rotation() {
+  launchctl bootout "gui/$login_uid/com.bloom.session" 2>/dev/null || true
+  launchctl bootout "system/com.bloom.broker.$login_uid" 2>/dev/null || true
+  launchctl bootout "system/com.bloom.signer.$login_uid" 2>/dev/null || true
+  # Once the staged identities may have been activated, retained checkpoints
+  # can contain new-key heads. Reapplying the staged tree is idempotent and
+  # preserves the old->new handovers required to verify both generations;
+  # restoring the backup would make those durable heads unverifiable.
+  swap_transport_rotation_tree "$rotation_transaction/staged" || return
+  write_rotation_phase switched
+  restore_rotation_jobs || return
+  write_rotation_phase activating
+  health_check_enrollment || return
+  write_rotation_phase committed
+  rm -rf -- "$rotation_transaction"
+  rotation_in_progress=false
+}
+
 rollback_rotation() {
   load_rotation_identity || return
   phase="$(<"$rotation_transaction/phase")"
   if [[ "$phase" == "committed" ]]; then
     rm -rf -- "$rotation_transaction"
     rotation_in_progress=false
+    return
+  fi
+  if [[ "$principal" == "transport" ]] &&
+    [[ "$phase" == "switched" || "$phase" == "activating" ]]
+  then
+    roll_forward_transport_rotation
     return
   fi
   if [[ "$principal" == "transport" ]]; then
@@ -1879,8 +1936,11 @@ require_same_config_field() {
   old_config="$1"
   new_config="$2"
   field="$3"
-  old_value="$(plutil -extract "$field" raw -o - "$old_config")"
-  new_value="$(plutil -extract "$field" raw -o - "$new_config")"
+  # Compare the complete typed plist value. `raw` is only defined for scalar
+  # leaves and would silently make audit key-history arrays/objects impossible
+  # to pin across a config-only rotation.
+  old_value="$(plutil -extract "$field" json -o - "$old_config")"
+  new_value="$(plutil -extract "$field" json -o - "$new_config")"
   [[ "$old_value" == "$new_value" ]] || {
     echo "config rotation may not change $field" >&2
     return 65
@@ -1926,6 +1986,10 @@ verify_config_rotation() {
       ceremony_verifying_public_key_hex
       revocation_key_id
       revocation_signing_seed_hex
+      audit_key_id
+      audit_signing_seed_hex
+      audit_historical_public_keys
+      audit_rotation_previous_key
       ceremony_key_id
       ceremony_signing_seed_hex
     )
@@ -1992,6 +2056,111 @@ prepare_rotation() {
   rotation_transaction_staging=""
   sync
   rotation_in_progress=true
+}
+
+latest_checkpoint_tuple() {
+  service_id="$1"
+  expected_key_id="$2"
+  checkpoint_dir="$3"
+  best_sequence=""
+  best_hash=""
+  best_key=""
+  for checkpoint_entry in "$checkpoint_dir"/*.jcs; do
+    [[ -f "$checkpoint_entry" && ! -L "$checkpoint_entry" ]] || continue
+    entry_service="$(plutil -extract peer_head.service_id raw -o - "$checkpoint_entry")"
+    [[ "$entry_service" == "$service_id" ]] || continue
+    entry_sequence="$(plutil -extract peer_head.sequence raw -o - "$checkpoint_entry")"
+    entry_hash="$(plutil -extract peer_head.head_hash raw -o - "$checkpoint_entry")"
+    entry_key="$(plutil -extract peer_head.key_id raw -o - "$checkpoint_entry")"
+    [[ "$entry_key" == "$expected_key_id" ]] || continue
+    [[ "$entry_sequence" =~ ^(0|[1-9][0-9]*)$ &&
+      "$entry_hash" =~ ^[0-9a-f]{64}$ ]] || return 65
+    if [[ -z "$best_sequence" ||
+      ${#entry_sequence} -gt ${#best_sequence} ||
+      (${#entry_sequence} -eq ${#best_sequence} && "$entry_sequence" > "$best_sequence") ]]
+    then
+      best_sequence="$entry_sequence"
+      best_hash="$entry_hash"
+      best_key="$entry_key"
+    fi
+  done
+  [[ -n "$best_sequence" ]] || return 65
+  printf '%s|%s|%s\n' "$best_sequence" "$best_hash" "$best_key"
+}
+
+consistent_checkpoint_tuple() {
+  service_id="$1"
+  expected_key_id="$2"
+  shift 2
+  expected=""
+  for checkpoint_dir in "$@"; do
+    observed="$(latest_checkpoint_tuple \
+      "$service_id" "$expected_key_id" "$checkpoint_dir")" || {
+      echo "missing verified $service_id/$expected_key_id head in $checkpoint_dir" >&2
+      return 65
+    }
+    if [[ -z "$expected" ]]; then
+      expected="$observed"
+    elif [[ "$observed" != "$expected" ]]; then
+      echo "authority-edge checkpoint roots disagree for $service_id" >&2
+      return 65
+    fi
+  done
+  printf '%s\n' "$expected"
+}
+
+append_transport_handover() {
+  service_field="$1"
+  checkpoint_tuple="$2"
+  backup_manifest="$3"
+  staged_manifest="$4"
+  staged_history="$5"
+  service_id="$(plutil -extract "$service_field.service_id" raw -o - "$backup_manifest")"
+  old_key_id="$(plutil -extract "$service_field.application_key_id" raw -o - "$backup_manifest")"
+  old_public_key="$(plutil -extract "$service_field.application_public_key_hex" raw -o - "$backup_manifest")"
+  new_key_id="$(plutil -extract "$service_field.application_key_id" raw -o - "$staged_manifest")"
+  IFS='|' read -r sequence head_hash observed_key <<EOF
+$checkpoint_tuple
+EOF
+  [[ "$observed_key" == "$old_key_id" && "$new_key_id" != "$old_key_id" ]] || {
+    echo "checkpoint/application identity mismatch for $service_id" >&2
+    return 65
+  }
+  historical_json="$(printf \
+    '{\"service_id\":\"%s\",\"key_id\":\"%s\",\"public_key_hex\":\"%s\"}' \
+    "$service_id" "$old_key_id" "$old_public_key")"
+  handover_json="$(printf \
+    '{\"service_id\":\"%s\",\"old_key_id\":\"%s\",\"new_key_id\":\"%s\",\"sequence\":\"%s\",\"head_hash\":\"%s\"}' \
+    "$service_id" "$old_key_id" "$new_key_id" "$sequence" "$head_hash")"
+  plutil -insert historical_keys.0 -json "$historical_json" "$staged_history"
+  plutil -insert handovers.0 -json "$handover_json" "$staged_history"
+}
+
+finalize_transport_handover_history() {
+  broker_checkpoints="/private/var/db/bloom/$login_uid/broker/audit-checkpoints"
+  signer_checkpoints="/private/var/db/bloom/$login_uid/signer/audit-checkpoints"
+  machine_checkpoints="/private/var/db/bloom/$login_uid/machine/audit-checkpoints"
+  staged_history="$rotation_transaction/staged/authority-edge-history.json"
+  backup_manifest="$rotation_transaction/backup/edge-manifest.json"
+  staged_manifest="$rotation_transaction/staged/edge-manifest.json"
+  machine_key="$(plutil -extract machine.application_key_id raw -o - "$backup_manifest")"
+  broker_key="$(plutil -extract broker.application_key_id raw -o - "$backup_manifest")"
+  signer_key="$(plutil -extract signer.application_key_id raw -o - "$backup_manifest")"
+  machine_tuple="$(consistent_checkpoint_tuple \
+    bloom-machine "$machine_key" "$broker_checkpoints" "$machine_checkpoints")"
+  broker_tuple="$(consistent_checkpoint_tuple \
+    bloom-broker "$broker_key" "$broker_checkpoints" "$signer_checkpoints" "$machine_checkpoints")"
+  signer_tuple="$(consistent_checkpoint_tuple \
+    bloom-signer "$signer_key" "$signer_checkpoints" "$broker_checkpoints")"
+  append_transport_handover machine "$machine_tuple" \
+    "$backup_manifest" "$staged_manifest" "$staged_history"
+  append_transport_handover broker "$broker_tuple" \
+    "$backup_manifest" "$staged_manifest" "$staged_history"
+  append_transport_handover signer "$signer_tuple" \
+    "$backup_manifest" "$staged_manifest" "$staged_history"
+  chown root:wheel "$staged_history"
+  chmod 0644 "$staged_history"
+  sync
 }
 
 prepare_transport_rotation() {
@@ -2061,6 +2230,10 @@ activate_rotation() {
   fi
   launchctl bootout "system/com.bloom.broker.$login_uid" 2>/dev/null || true
   launchctl bootout "system/com.bloom.signer.$login_uid" 2>/dev/null || true
+  if [[ "$principal" == "transport" ]]; then
+    write_rotation_phase quiesced
+    finalize_transport_handover_history
+  fi
   write_rotation_phase switching
   if [[ "$principal" == "transport" ]]; then
     swap_transport_rotation_tree "$rotation_transaction/staged"
@@ -2701,6 +2874,7 @@ case "$action" in
     fi
     broker_state="$variable_root/db/bloom/$login_uid/broker"
     signer_state="$variable_root/db/bloom/$login_uid/signer"
+    machine_state="$variable_root/db/bloom/$login_uid/machine"
     runtime_root="$variable_root/run/bloom/$login_uid"
     if $live_install && $restoring_retained; then
       enrollment_temporary="$enrollment.restoring.$$"
@@ -2713,6 +2887,20 @@ case "$action" in
       retained_restore_in_progress=true
     fi
     if $live_install && $existing_enrollment; then
+      authority_edge_history="$config_root/authority-edge-history.json"
+      if [[ ! -e "$authority_edge_history" ]]; then
+        authority_edge_history_new="$authority_edge_history.new.$$"
+        printf '%s\n' \
+          '{' \
+          '  "schema": "bloom.authority-edge-application-history.1",' \
+          '  "historical_keys": [],' \
+          '  "handovers": []' \
+          '}' > "$authority_edge_history_new"
+        chown root:wheel "$authority_edge_history_new"
+        chmod 0644 "$authority_edge_history_new"
+        mv "$authority_edge_history_new" "$authority_edge_history"
+        sync
+      fi
       verify_installed_security_files "$config_root" "$enrollment"
     fi
     mkdir -p \
@@ -2724,6 +2912,7 @@ case "$action" in
       "$installer_config_root" \
       "$broker_state/audit-checkpoints" \
       "$signer_state/audit-checkpoints" \
+      "$machine_state/audit-checkpoints" \
       "$runtime_root/machine-broker" \
       "$runtime_root/broker-signer" \
       "$runtime_root/revoke" \
@@ -2745,6 +2934,8 @@ case "$action" in
       "$signer_state" \
       "$broker_state/audit-checkpoints" \
       "$signer_state/audit-checkpoints" \
+      "$machine_state" \
+      "$machine_state/audit-checkpoints" \
       "$runtime_root" \
       "$runtime_root/machine-broker" \
       "$runtime_root/broker-signer" \
@@ -2771,7 +2962,9 @@ case "$action" in
       "$broker_state" \
       "$signer_state" \
       "$broker_state/audit-checkpoints" \
-      "$signer_state/audit-checkpoints"
+      "$signer_state/audit-checkpoints" \
+      "$machine_state" \
+      "$machine_state/audit-checkpoints"
     chmod 0710 \
       "$runtime_root/machine-broker" \
       "$runtime_root/broker-signer" \
@@ -2856,6 +3049,39 @@ case "$action" in
         "$config_source/provenance-catalog.json" \
         "$config_root/provenance-catalog.json" \
         0644
+    fi
+
+    machine_audit_history="$config_root/machine-audit-history.json"
+    if [[ ! -e "$machine_audit_history" ]]; then
+      machine_audit_history_new="$machine_audit_history.new.$$"
+      printf '%s\n' \
+        '{' \
+        '  "schema": "bloom.machine-audit-trust.v1",' \
+        '  "predecessors": []' \
+        '}' > "$machine_audit_history_new"
+      chmod 0644 "$machine_audit_history_new"
+      if $live_install; then
+        chown root:wheel "$machine_audit_history_new"
+      fi
+      mv "$machine_audit_history_new" "$machine_audit_history"
+      sync
+    fi
+
+    authority_edge_history="$config_root/authority-edge-history.json"
+    if [[ ! -e "$authority_edge_history" ]]; then
+      authority_edge_history_new="$authority_edge_history.new.$$"
+      printf '%s\n' \
+        '{' \
+        '  "schema": "bloom.authority-edge-application-history.1",' \
+        '  "historical_keys": [],' \
+        '  "handovers": []' \
+        '}' > "$authority_edge_history_new"
+      chmod 0644 "$authority_edge_history_new"
+      if $live_install; then
+        chown root:wheel "$authority_edge_history_new"
+      fi
+      mv "$authority_edge_history_new" "$authority_edge_history"
+      sync
     fi
 
     if ! $restoring_retained; then
@@ -3042,6 +3268,10 @@ case "$action" in
     require_current_release "$BLOOM_RELEASE_DIGEST"
     machine_binary="$release_base/current/bloom"
     verify_installed_security_files "$product_root/config/$login_uid" "$enrollment"
+    # Synchronize the final old-key heads before freezing the exact handover
+    # tuples. No service is stopped and no identity is staged until all three
+    # principals have completed this authenticated readiness exchange.
+    health_check_enrollment
     generated_material="$(mktemp -d "$product_root/.enrollment-material.XXXXXX")"
     chmod 0700 "$generated_material"
     chown root:wheel "$generated_material"

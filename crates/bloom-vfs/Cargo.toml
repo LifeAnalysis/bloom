@@ -49,6 +49,7 @@ mpp.workspace = true
 qrcode.workspace = true
 
 [dev-dependencies]
+bloom-proto = { workspace = true, features = ["audit-test-seam"] }
 bloom-auth.workspace = true
 bloom-keystore.workspace = true
 tempfile.workspace = true

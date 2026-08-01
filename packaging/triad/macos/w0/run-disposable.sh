@@ -314,6 +314,7 @@ sudo -u "bloom-broker-$login_uid" test ! -r "$signer_probe"
 sudo -u "bloom-broker-$login_uid" test ! -r "$signer_checkpoint_probe"
 sudo -u "bloom-signer-$login_uid" test ! -r "$broker_probe"
 sudo -u "bloom-signer-$login_uid" test ! -r "$broker_checkpoint_probe"
+rm -f -- "$broker_checkpoint_probe" "$signer_checkpoint_probe"
 sudo -u "$login_user" test ! -r \
   "/Library/Application Support/BloomTriad/config/$login_uid/installer/identity.json"
 sudo -u "$login_user" test ! -r \
@@ -332,6 +333,34 @@ sudo -u "bloom-signer-$login_uid" test ! -r \
 launchctl print "system/com.bloom.broker.$login_uid" >/dev/null
 launchctl print "system/com.bloom.signer.$login_uid" >/dev/null
 launchctl print "gui/$login_uid/com.bloom.session" >/dev/null
+
+broker_checkpoint_dir="/private/var/db/bloom/$login_uid/broker/audit-checkpoints"
+signer_checkpoint_dir="/private/var/db/bloom/$login_uid/signer/audit-checkpoints"
+first_checkpoint() {
+  for candidate in "$1"/*.jcs; do
+    if [[ -f "$candidate" && ! -L "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+for attempt in {1..100}; do
+  broker_checkpoint="$(first_checkpoint "$broker_checkpoint_dir" || true)"
+  signer_checkpoint="$(first_checkpoint "$signer_checkpoint_dir" || true)"
+  [[ -n "$broker_checkpoint" && -n "$signer_checkpoint" ]] && break
+  sleep 0.1
+done
+[[ -n "${broker_checkpoint:-}" && -n "${signer_checkpoint:-}" ]] || {
+  echo "Broker/Signer did not persist their initial authenticated peer audit heads" >&2
+  exit 1
+}
+assert_metadata "$broker_checkpoint" "$broker_uid:$broker_gid:600"
+assert_metadata "$signer_checkpoint" "$signer_uid:$signer_gid:600"
+sudo -u "$login_user" test ! -r "$broker_checkpoint"
+sudo -u "$login_user" test ! -r "$signer_checkpoint"
+sudo -u "bloom-broker-$login_uid" test ! -r "$signer_checkpoint"
+sudo -u "bloom-signer-$login_uid" test ! -r "$broker_checkpoint"
 
 pf_rules="$(pfctl -a "com.bloom.triad/$login_uid" -sr)"
 assert_pf_principal() {
@@ -934,11 +963,63 @@ for relative in "${transport_identity_paths[@]}"; do
       awk '{print $1}'
   )")
 done
-"$installer" rotate-identities / "$login_uid"
+"$installer" rotate-identities / "$login_uid" &
+interrupted_identity_rotation_pid=$!
+identity_rotation_phase="/Library/Application Support/BloomTriad/rotation-transaction/phase"
+deadline=$((SECONDS + 30))
+while [[ $SECONDS -lt $deadline ]]; do
+  if [[ -f "$identity_rotation_phase" ]] &&
+    [[ "$(<"$identity_rotation_phase")" == "activating" ]]
+  then
+    break
+  fi
+  if ! kill -0 "$interrupted_identity_rotation_pid" 2>/dev/null; then
+    echo "W0 identity rotation exited before its post-activation interruption point" >&2
+    wait "$interrupted_identity_rotation_pid" || true
+    exit 1
+  fi
+  sleep 0.005
+done
+[[ -f "$identity_rotation_phase" && "$(<"$identity_rotation_phase")" == "activating" ]] || {
+  echo "W0 did not observe the identity rotation activation phase" >&2
+  kill "$interrupted_identity_rotation_pid" 2>/dev/null || true
+  wait "$interrupted_identity_rotation_pid" || true
+  exit 1
+}
+kill -STOP "$interrupted_identity_rotation_pid"
+# The newly bootstrapped services continue while the installer is stopped.
+# A successful external health exchange proves the new application keys have
+# emitted and their heads have reached the independently retained roots.
+sudo -u "$login_user" \
+  "$machine_binary" \
+  --triad-health-check \
+  "$release_digest"
+staged_edge_digest="$(
+  shasum -a 256 \
+    "/Library/Application Support/BloomTriad/rotation-transaction/staged/edge-manifest.json" |
+    awk '{print $1}'
+)"
+kill -9 "$interrupted_identity_rotation_pid"
+wait "$interrupted_identity_rotation_pid" 2>/dev/null || true
+[[ -d "/Library/Application Support/BloomTriad/rotation-transaction" ]] || {
+  echo "interrupted W0 identity rotation did not leave a recovery journal" >&2
+  exit 1
+}
+# Any subsequent installer operation must roll the transport rotation forward,
+# because the new keys may already have emitted retained journal heads.
+"$installer" rotate-config / "$login_uid" broker "$rotated_config"
+[[ ! -e "/Library/Application Support/BloomTriad/rotation-transaction" ]] || {
+  echo "W0 identity rotation recovery did not consume its journal" >&2
+  exit 1
+}
 new_edge_digest="$(
   shasum -a 256 "$config_root/edge-manifest.json" |
     awk '{print $1}'
 )"
+[[ "$new_edge_digest" == "$staged_edge_digest" ]] || {
+  echo "post-activation identity recovery rolled back instead of forward" >&2
+  exit 1
+}
 new_broker_config_digest="$(
   shasum -a 256 "$config_root/broker/config.json" |
     awk '{print $1}'

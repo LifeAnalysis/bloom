@@ -12,7 +12,8 @@ ExecStart=@BLOOM_BROKER_BINARY@
 Environment=BLOOM_BROKER_IDENTITY=/etc/bloom/%i/broker/identity.json
 Environment=BLOOM_BROKER_CONFIG=/etc/bloom/%i/broker/config.json
 Environment=BLOOM_EDGE_MANIFEST=/etc/bloom/%i/edge-manifest.json
-Environment=BLOOM_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/broker/audit-checkpoints
+Environment=BLOOM_AUTHORITY_EDGE_HISTORY=/etc/bloom/%i/authority-edge-history.json
+Environment=BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/broker/audit-checkpoints
 Environment=BLOOM_BROKER_ACTIVATION_NAME=broker
 Environment=BLOOM_BROKER_CONTROL_ACTIVATION_NAME=broker-control
 Environment=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony

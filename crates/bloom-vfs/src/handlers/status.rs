@@ -17,6 +17,8 @@
 //!     `success_rate`, `last_block`
 //! - `status/audit/head`                         — hex of head record digest
 //! - `status/audit/count`                        — total entries (decimal)
+//! - `status/audit/state`                        — ready or mutation-degraded
+//! - `status/audit/pending_effects.json`         — unresolved exact correlations
 //! - `status/cache/etherscan_entries`            — count of cached etherscan files
 //! - `status/cache/prices_entries`               — count of cached price responses
 //! - `status/wallets/count`                      — number of wallets
@@ -671,7 +673,13 @@ impl StatusHandler {
                     Err(HandlerError::not_found(path.to_string_path()))
                 }
             }
-            [a, leaf] if a == "audit" && matches!(leaf.as_str(), "head" | "count") => {
+            [a, leaf]
+                if a == "audit"
+                    && matches!(
+                        leaf.as_str(),
+                        "head" | "count" | "state" | "pending_effects.json"
+                    ) =>
+            {
                 Ok(Entry::file(leaf))
             }
             [a, leaf]
@@ -818,6 +826,38 @@ impl StatusHandler {
                     .count()
                     .map_err(|e| HandlerError::backend(e.to_string()))?;
                 Ok(format!("{}\n", n).into_bytes())
+            }
+            [a, leaf] if a == "audit" && leaf == "state" => {
+                let evidence_invalid = self.audit.pending_effect_correlations().is_err();
+                Ok(format!(
+                    "{}\n",
+                    if self.audit.mutation_degradation().is_some() || evidence_invalid {
+                        "mutation-degraded"
+                    } else {
+                        "ready"
+                    }
+                )
+                .into_bytes())
+            }
+            [a, leaf] if a == "audit" && leaf == "pending_effects.json" => {
+                let (pending, read_error) = match self.audit.pending_effect_correlations() {
+                    Ok(pending) => (pending, None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
+                let degradation = self
+                    .audit
+                    .mutation_degradation()
+                    .or_else(|| read_error.clone());
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "pending_effect_correlations": pending,
+                    "mutation_degradation": degradation,
+                    "pending_effect_read_error": read_error,
+                }))
+                .map(|mut bytes| {
+                    bytes.push(b'\n');
+                    bytes
+                })
+                .map_err(|error| HandlerError::backend(error.to_string()))
             }
             [a, leaf] if a == "cache" && leaf == "etherscan_entries" => {
                 Ok(format!("{}\n", self.etherscan_entries()).into_bytes())
@@ -1004,7 +1044,12 @@ impl StatusHandler {
                     Entry::file("last_block"),
                 ])
             }
-            [a] if a == "audit" => Ok(vec![Entry::file("head"), Entry::file("count")]),
+            [a] if a == "audit" => Ok(vec![
+                Entry::file("head"),
+                Entry::file("count"),
+                Entry::file("state"),
+                Entry::file("pending_effects.json"),
+            ]),
             [a] if a == "cache" => Ok(vec![
                 Entry::file("etherscan_entries"),
                 Entry::file("prices_entries"),
@@ -1232,6 +1277,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, b"1\n");
+    }
+
+    #[tokio::test]
+    async fn audit_degradation_status_remains_readable_after_mutations_latch() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+        h.audit.fail_next_write_for_test();
+        assert!(
+            h.audit
+                .append(AuditRecord {
+                    ts_ms: 0,
+                    kind: "blocked".into(),
+                    wallet: None,
+                    chain: None,
+                    data: serde_json::json!({}),
+                    prev: String::new(),
+                    digest: String::new(),
+                })
+                .is_err()
+        );
+        assert_eq!(
+            h.read(&VfsPath::parse("audit/state").unwrap())
+                .await
+                .unwrap(),
+            b"mutation-degraded\n"
+        );
+        let pending = h
+            .read(&VfsPath::parse("audit/pending_effects.json").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(pending)
+                .unwrap()
+                .contains("mutation_degradation")
+        );
+    }
+
+    #[tokio::test]
+    async fn mounted_audit_status_reports_post_start_evidence_corruption() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+        h.audit
+            .append(AuditRecord {
+                ts_ms: 0,
+                kind: "status.fixture".into(),
+                wallet: None,
+                chain: None,
+                data: serde_json::json!({}),
+                prev: String::new(),
+                digest: String::new(),
+            })
+            .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("audit.jsonl"))
+            .unwrap();
+        writeln!(file, "corrupt-after-start").unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(
+            h.read(&VfsPath::parse("audit/state").unwrap())
+                .await
+                .unwrap(),
+            b"mutation-degraded\n"
+        );
+        let body = h
+            .read(&VfsPath::parse("audit/pending_effects.json").unwrap())
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(status["mutation_degradation"].is_string());
+        assert!(status["pending_effect_read_error"].is_string());
     }
 
     #[tokio::test]

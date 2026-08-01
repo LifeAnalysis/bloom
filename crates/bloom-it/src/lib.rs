@@ -26,12 +26,14 @@ use bloom_auth_api::{
 };
 use bloom_machine_client::MachineBrokerClient;
 use bloom_triad_protocol::{
-    ApprovalLifecycleState, ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes, DecimalU64,
-    Digest32, KeyRef, KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
-    NormalizedSignature, ProvenanceCatalog, ProvenanceFeeAsset, ProvenanceOperationClass,
-    ProvenanceRecord, ProvenanceSubject, ServiceFuture, SigningPayloads, SigningResult, Token,
-    WalletPublic,
+    ApprovalLifecycleState, ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes,
+    CanonicalWalletPolicy, CredentialPublic, CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef,
+    KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
+    NormalizedSignature, PolicyDestination, ProvenanceCatalog, ProvenanceFeeAsset,
+    ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, ServiceFuture,
+    SignedPolicySnapshot, SigningPayloads, SigningResult, Token, WalletPublic, WalletRequest,
 };
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -51,6 +53,51 @@ pub struct ExactSigningBrokerFixture {
 }
 
 impl ExactSigningBrokerFixture {
+    fn policy_snapshot(&self, wallet_id: Token) -> SignedPolicySnapshot {
+        let canonical_policy = serde_json::to_vec(&CanonicalWalletPolicy {
+            wallet_id: wallet_id.clone(),
+            maximum_approval_lifetime_ms: 3_600_000,
+            allowed_petal_packages: Vec::new(),
+            allowed_destinations: vec![PolicyDestination {
+                chain: Token::new("anvil").unwrap(),
+                destination: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8".into(),
+            }],
+            required_verifiers: Vec::new(),
+        })
+        .unwrap();
+        let policy_digest = Digest32::from_bytes(Sha256::digest(&canonical_policy).into());
+        SignedPolicySnapshot {
+            wallet_id,
+            version: DecimalU64::new(1),
+            canonical_policy: Base64UrlBytes::from_bytes(&canonical_policy),
+            policy_digest,
+            policy_signing_key_id: Token::new("integration-test-policy-key").unwrap(),
+            policy_verifying_key: Base64UrlBytes::from_bytes(&[12; 32]),
+            signer_signature: Base64UrlBytes::from_bytes(&[13; 64]),
+        }
+    }
+
+    fn wallet_public(&self, wallet_id: Token) -> WalletPublic {
+        let policy = self.policy_snapshot(wallet_id.clone());
+        WalletPublic {
+            wallet_id,
+            wallet_kind: Token::new("local").unwrap(),
+            key_refs: vec![self.key_ref.clone()],
+            policy_version: DecimalU64::new(1),
+            policy_digest: policy.policy_digest,
+            wallet_revocation_epoch: DecimalU64::new(0),
+        }
+    }
+
+    fn key_public(&self) -> KeyPublic {
+        KeyPublic {
+            key_ref: self.key_ref.clone(),
+            canonical_public_key: Base64UrlBytes::from_bytes(self.signer.public_key().as_slice()),
+            addresses: vec![format!("{:#x}", self.signer.address())],
+            supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        }
+    }
+
     pub fn activate(&self) {
         self.active.store(true, Ordering::SeqCst);
     }
@@ -68,15 +115,35 @@ impl MachineBrokerService for ExactSigningBrokerFixture {
         Box::pin(async move {
             self.requests.lock().push(request.clone());
             match request {
-                MachineBrokerRequest::WalletGetPublic(request) => {
-                    Ok(MachineBrokerResponse::WalletGetPublic(WalletPublic {
-                        wallet_id: request.wallet_id,
-                        wallet_kind: Token::new("local").unwrap(),
-                        key_refs: vec![self.key_ref.clone()],
-                        policy_version: DecimalU64::new(1),
-                        policy_digest: Digest32::from_bytes([7; 32]),
-                        wallet_revocation_epoch: DecimalU64::new(0),
-                    }))
+                MachineBrokerRequest::WalletListPublic(_) => {
+                    Ok(MachineBrokerResponse::WalletListPublic(vec![
+                        self.wallet_public(Token::new("alice").unwrap()),
+                    ]))
+                }
+                MachineBrokerRequest::WalletGetPublic(request) => Ok(
+                    MachineBrokerResponse::WalletGetPublic(self.wallet_public(request.wallet_id)),
+                ),
+                MachineBrokerRequest::KeyListPublic(WalletRequest { wallet_id })
+                    if wallet_id.as_str() == "alice" =>
+                {
+                    Ok(MachineBrokerResponse::KeyListPublic(vec![
+                        self.key_public(),
+                    ]))
+                }
+                MachineBrokerRequest::CredentialListPublic(WalletRequest { wallet_id })
+                    if wallet_id.as_str() == "alice" =>
+                {
+                    Ok(MachineBrokerResponse::CredentialListPublic(Vec::<
+                        CredentialPublic,
+                    >::new(
+                    )))
+                }
+                MachineBrokerRequest::PolicyRead(WalletRequest { wallet_id })
+                    if wallet_id.as_str() == "alice" =>
+                {
+                    Ok(MachineBrokerResponse::PolicyRead(
+                        self.policy_snapshot(wallet_id),
+                    ))
                 }
                 MachineBrokerRequest::SealedApprovalPrepare(request) => {
                     Ok(MachineBrokerResponse::SealedApprovalPrepare(

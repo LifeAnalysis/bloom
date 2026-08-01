@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bloom_proto::config::PetalRuntimeConfig;
+use bloom_proto::{AuditLog, AuditRecord};
 use bloom_vfs::handler::{Entry, EntryKind, Handler, HandlerError};
 use bloom_vfs::path::VfsPath;
 
@@ -25,6 +26,8 @@ pub struct PetalRouter {
     runner: PetalRunner,
     host: Arc<dyn PetalHost>,
     runtime_petals: BTreeMap<String, PetalRuntimeConfig>,
+    audit: Option<Arc<AuditLog>>,
+    audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl PetalRouter {
@@ -33,7 +36,14 @@ impl PetalRouter {
             runner,
             host,
             runtime_petals: BTreeMap::new(),
+            audit: None,
+            audit_effect_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Retained temporarily for daemon API compatibility. Petal writes are
@@ -108,7 +118,48 @@ impl PetalRouter {
         path: String,
         body: Vec<u8>,
     ) -> Result<DispatchResponse, HandlerError> {
-        let out = self
+        let _audit_guard = self.audit_effect_lock.lock().await;
+        let operation = format!("petal.execute.{op:?}").to_ascii_lowercase();
+        let payload_digest = blake3::hash(&body).to_hex().to_string();
+        let operation_id = blake3::hash(
+            format!(
+                "bloom-machine-petal-execution/v1\0{mount}\0{operation}\0{path}\0{payload_digest}\0{}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        let correlation_id = self
+            .audit
+            .as_ref()
+            .map(|audit| format!("{operation_id}:{}", audit.sequence() + 1));
+        if let (Some(audit), Some(correlation_id)) = (&self.audit, &correlation_id) {
+            audit
+                .append(AuditRecord {
+                    ts_ms: 0,
+                    kind: "machine.effect.intent".into(),
+                    wallet: None,
+                    chain: None,
+                    data: serde_json::json!({
+                        "operation": operation,
+                        "operation_id": operation_id,
+                        "correlation_id": correlation_id,
+                        "petal_mount": mount,
+                        "route_path": path,
+                        "payload_blake3": payload_digest,
+                        "payload_size": body.len(),
+                    }),
+                    prev: String::new(),
+                    digest: String::new(),
+                })
+                .map_err(|error| {
+                    HandlerError::backend(format!(
+                        "Machine audit unavailable before Petal execution: {error}"
+                    ))
+                })?;
+        }
+        let executed = self
             .runner
             .dispatch_petal_route(
                 mount,
@@ -122,9 +173,44 @@ impl PetalRouter {
                 None,
                 self.run_options(mount),
             )
-            .await
-            .map_err(map_petal_err)?;
-        Ok(out.response)
+            .await;
+        let (outcome, result_digest) = match &executed {
+            Ok(out) => (
+                "ok",
+                blake3::hash(format!("{:?}", out.response).as_bytes())
+                    .to_hex()
+                    .to_string(),
+            ),
+            Err(error) => (
+                "error",
+                blake3::hash(error.to_string().as_bytes())
+                    .to_hex()
+                    .to_string(),
+            ),
+        };
+        if let (Some(audit), Some(correlation_id)) = (&self.audit, &correlation_id) {
+            audit
+                .append(AuditRecord {
+                    ts_ms: 0,
+                    kind: "machine.effect.result".into(),
+                    wallet: None,
+                    chain: None,
+                    data: serde_json::json!({
+                        "operation": operation,
+                        "correlation_id": correlation_id,
+                        "outcome": outcome,
+                        "result_digest_blake3": result_digest,
+                    }),
+                    prev: String::new(),
+                    digest: String::new(),
+                })
+                .map_err(|error| {
+                    HandlerError::backend(format!(
+                        "Machine audit unavailable after Petal execution: {error}"
+                    ))
+                })?;
+        }
+        Ok(executed.map_err(map_petal_err)?.response)
     }
 }
 

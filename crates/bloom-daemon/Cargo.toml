@@ -18,6 +18,10 @@ mount = ["bloom-mount/mount"]
 # decompile fallback to the revert-decoder chain. Heavy build (heimdall
 # pulls a lot of git deps) so opt-in only.
 bytecode-decompile = ["bloom-revert/bytecode-decompile"]
+# Explicitly nonproduction constructor seam for external developer harnesses.
+# Release packaging must not enable this feature.
+unsigned-audit-test-seam = []
+triad-dev-harness = ["bloom-machine-client/triad-dev-harness"]
 
 [dependencies]
 bloom-proto.workspace = true
@@ -27,6 +31,7 @@ bloom-mempool.workspace = true
 bloom-machine-client.workspace = true
 bloom-triad-protocol.workspace = true
 bloom-tx.workspace = true
+bloom-tools.workspace = true
 bloom-vfs.workspace = true
 bloom-watch.workspace = true
 bloom-mount.workspace = true
@@ -54,6 +59,8 @@ blake3.workspace = true
 futures.workspace = true
 hex.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
+rustix.workspace = true
 
 [dev-dependencies]
+bloom-proto = { workspace = true, features = ["audit-test-seam"] }
 tempfile.workspace = true

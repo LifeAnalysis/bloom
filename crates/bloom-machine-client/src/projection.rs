@@ -200,11 +200,10 @@ impl FileProjectionStore {
             .create_new(true)
             .open(&temporary)
             .map_err(|error| unavailable(format!("create Machine projection update: {error}")))?;
-        let result = (|| {
-            file.write_all(&bytes)
-                .and_then(|()| file.sync_all())
-                .and_then(|()| fs::rename(&temporary, &self.path))
-        })();
+        let result = file
+            .write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::rename(&temporary, &self.path));
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }

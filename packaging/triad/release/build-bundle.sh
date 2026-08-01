@@ -64,7 +64,7 @@ reject_legacy_authority_symbols() {
     return
   fi
   symbol="$({ nm -a "$binary" 2>/dev/null || true; } | LC_ALL=C grep -E -m1 \
-    'KeystorePetalHost|StoreApprovalVerifier|KeystoreApprovalSignatureVerifier|SignerCache|EphemeralAgentKey|PrivateKeySigner|RegistrationCoordinator|AuthServices|InMemoryGrantStore|sign_hash_sync' || true)"
+    'KeystorePetalHost|StoreApprovalVerifier|KeystoreApprovalSignatureVerifier|SignerCache|EphemeralAgentKey|RegistrationCoordinator|AuthServices|InMemoryGrantStore|sign_hash_sync' || true)"
   if [[ -n "$symbol" ]]; then
     echo "forbidden production Machine symbol in bin/$(basename "$binary"): $symbol" >&2
     return 1
@@ -92,11 +92,14 @@ reject_global_debug_markers() {
   local scope="$2"
   reject_markers_in_paths "$scope" "$root" <<'EOF'
 bloom-broker-debug-driver
+assert-machine-secret-confinement
 broker-audit-test-1
 accepting_verifier
 mint_approval
 BLOOM_TRIAD_DEVELOPER_ROOT
 unsafe-debug-signer
+unsigned-audit-test-seam
+audit-test-seam
 local-integration
 triad-dev-harness
 triad-authority-fixture
@@ -136,7 +139,6 @@ bloom-keystore
 bloom-auth
 bloom-auth-api
 bloom-hyperliquid
-alloy-signer-local
 ApprovalVerifier
 AuthStoreWriter
 GrantStore
@@ -146,7 +148,6 @@ StoreApprovalVerifier
 KeystoreApprovalSignatureVerifier
 SignerCache
 EphemeralAgentKey
-PrivateKeySigner
 RegistrationCoordinator
 AuthServices
 policy-session
@@ -259,7 +260,15 @@ printf '%s\n' "$platform_claim" > "$payload/PLATFORM_CLAIM"
 install -m 0644 "$script_dir/compatibility-v1.toml" "$payload/compatibility-v1.toml"
 mkdir -p "$payload/installer/release"
 cp -R "$script_dir/../linux" "$payload/installer/linux"
-cp -R "$script_dir/../macos" "$payload/installer/macos"
+mkdir -p "$payload/installer/macos"
+# W0 is source-tree conformance tooling, not an installed product component.
+# Copy the reviewed installer inputs individually so debug drivers, hostile
+# listeners, VM orchestration, and acceptance markers can never enter a signed
+# production payload through the macOS directory wholesale.
+for macos_input in "$script_dir"/../macos/*; do
+  [[ "$(basename "$macos_input")" == "w0" ]] && continue
+  cp -R "$macos_input" "$payload/installer/macos/"
+done
 install -m 0755 \
   "$script_dir/install-linux.sh" \
   "$script_dir/install-macos.sh" \

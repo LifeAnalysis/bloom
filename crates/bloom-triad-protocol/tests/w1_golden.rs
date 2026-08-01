@@ -280,6 +280,24 @@ fn broker_signer_journal_head_envelope_matches_reviewed_artifact() {
 }
 
 #[test]
+fn machine_broker_journal_head_envelope_matches_reviewed_artifact() {
+    let vector: JournalHeadEnvelopeVector = serde_json::from_str(include_str!(
+        "../vectors/machine-broker-journal-head-v1.json"
+    ))
+    .unwrap();
+    assert_eq!(vector.name, "machine-broker-journal-head-minor-1");
+    assert_eq!(
+        String::from_utf8(vector.unsigned_envelope.canonical_bytes().unwrap()).unwrap(),
+        vector.canonical_jcs
+    );
+    let head = vector.unsigned_envelope.sender_journal_head.unwrap();
+    assert_eq!(
+        Base64UrlBytes::from_bytes(&head.signature_message()),
+        vector.head_signature_message_base64url
+    );
+}
+
+#[test]
 fn operation_identity_excludes_attempt_only_fields() {
     let vector: SignOperationVector =
         serde_json::from_str(include_str!("../vectors/sign-operation-local-v1.json")).unwrap();
@@ -336,4 +354,84 @@ fn sign_request_rejects_issue_time_after_expiry() {
         request.validate_shape().unwrap_err().code,
         ProtocolErrorCode::MalformedFrame
     );
+}
+
+#[test]
+fn broker_validation_receipt_signature_and_digest_golden() {
+    let receipt = BrokerValidationReceipt {
+        approval_id: Digest32::new("11".repeat(32)).unwrap(),
+        approval_digest: Digest32::new("12".repeat(32)).unwrap(),
+        operation_digest: Digest32::new("13".repeat(32)).unwrap(),
+        policy_version: DecimalU64::new(7),
+        policy_digest: Digest32::new("14".repeat(32)).unwrap(),
+        claim_digest: Some(Digest32::new("15".repeat(32)).unwrap()),
+        assurance_digest: Some(Digest32::new("16".repeat(32)).unwrap()),
+        reservation_ids: vec![Digest32::new("17".repeat(32)).unwrap()],
+        effective_claim_assurance: Some(ClaimAssurance::MachineAsserted),
+        broker_key_id: Token::new("broker-app-v1").unwrap(),
+        broker_signature: Base64UrlBytes::from_bytes(&[0x18; 64]),
+    };
+    let unsigned = String::from_utf8(receipt.unsigned_canonical_bytes().unwrap()).unwrap();
+    assert!(!unsigned.contains("broker_signature"));
+    assert_eq!(
+        unsigned,
+        "{\"approval_digest\":\"1212121212121212121212121212121212121212121212121212121212121212\",\"approval_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"assurance_digest\":\"1616161616161616161616161616161616161616161616161616161616161616\",\"broker_key_id\":\"broker-app-v1\",\"claim_digest\":\"1515151515151515151515151515151515151515151515151515151515151515\",\"effective_claim_assurance\":{\"kind\":\"machine_asserted\"},\"operation_digest\":\"1313131313131313131313131313131313131313131313131313131313131313\",\"policy_digest\":\"1414141414141414141414141414141414141414141414141414141414141414\",\"policy_version\":\"7\",\"reservation_ids\":[\"1717171717171717171717171717171717171717171717171717171717171717\"]}"
+    );
+    assert_eq!(
+        receipt.digest().unwrap().as_str(),
+        "18291199bc67c8e91afd52e6d872fffc3108e618608c18b44019094433bbf776"
+    );
+    assert!(
+        receipt
+            .signature_message()
+            .unwrap()
+            .starts_with(BROKER_VALIDATION_RECEIPT_SIGNATURE_DOMAIN)
+    );
+
+    let baseline_message = receipt.signature_message().unwrap();
+    let baseline_digest = receipt.digest().unwrap();
+    let mut changes = Vec::new();
+    let mut changed = receipt.clone();
+    changed.approval_id = Digest32::new("21".repeat(32)).unwrap();
+    changes.push(changed);
+    let mut changed = receipt.clone();
+    changed.approval_digest = Digest32::new("22".repeat(32)).unwrap();
+    changes.push(changed);
+    let mut changed = receipt.clone();
+    changed.operation_digest = Digest32::new("23".repeat(32)).unwrap();
+    changes.push(changed);
+    let mut changed = receipt.clone();
+    changed.policy_version = DecimalU64::new(8);
+    changes.push(changed);
+    let mut changed = receipt.clone();
+    changed.policy_digest = Digest32::new("24".repeat(32)).unwrap();
+    changes.push(changed);
+    let mut changed = receipt.clone();
+    changed.claim_digest = None;
+    changes.push(changed);
+    let mut changed = receipt.clone();
+    changed.assurance_digest = None;
+    changes.push(changed);
+    let mut changed = receipt.clone();
+    changed
+        .reservation_ids
+        .push(Digest32::new("25".repeat(32)).unwrap());
+    changes.push(changed);
+    let mut changed = receipt.clone();
+    changed.effective_claim_assurance = None;
+    changes.push(changed);
+    let mut changed = receipt.clone();
+    changed.broker_key_id = Token::new("broker-app-v2").unwrap();
+    changes.push(changed);
+    for changed in changes {
+        assert_ne!(changed.signature_message().unwrap(), baseline_message);
+        assert_ne!(changed.digest().unwrap(), baseline_digest);
+    }
+    let mut signature_changed = receipt;
+    signature_changed.broker_signature = Base64UrlBytes::from_bytes(&[0x19; 64]);
+    assert_eq!(
+        signature_changed.signature_message().unwrap(),
+        baseline_message
+    );
+    assert_ne!(signature_changed.digest().unwrap(), baseline_digest);
 }

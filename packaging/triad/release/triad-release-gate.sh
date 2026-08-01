@@ -35,6 +35,14 @@ done
 "$main_root/packaging/triad/release/check-machine-authority-boundary.sh" --require-clean
 python3 "$main_root/packaging/triad/release/check-legacy-hash-only-routes.py"
 
+resolved_machine_features="$(cargo tree --manifest-path "$main_root/Cargo.toml" -p bloom -e normal,build,features --prefix none)"
+for forbidden_feature in unsigned-audit-test-seam audit-test-seam; do
+  if grep -F "feature \"$forbidden_feature\"" <<<"$resolved_machine_features" >/dev/null; then
+    echo "forbidden production Machine feature resolved: $forbidden_feature" >&2
+    exit 65
+  fi
+done
+
 for root in "$main_root" "$broker_root" "$signer_root"; do
   (
     cd "$root"

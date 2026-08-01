@@ -28,7 +28,7 @@ pub mod valuation;
 
 pub use address::{AddressBook, AddressBookError, checksum_address, parse_address};
 pub use assurance::AssuranceLevel;
-pub use audit::{AuditLog, AuditRecord};
+pub use audit::{AuditIdentity, AuditLog, AuditRecord, AuditTrustedPredecessor};
 pub use audit_ext::{append_auth_event, auth_event};
 pub use capability::{CapabilityStatus, CapabilityViewEntry, SigningModel, Venue};
 pub use ceremony::{CeremonyIntent, CeremonyIntentKind};

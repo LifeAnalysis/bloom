@@ -8,5 +8,7 @@ d /var/lib/bloom/@LOGIN_UID@/broker 0700 bloom-broker-@LOGIN_UID@ bloom-broker-@
 d /var/lib/bloom/@LOGIN_UID@/signer 0700 bloom-signer-@LOGIN_UID@ bloom-signer-@LOGIN_UID@ -
 d /var/lib/bloom/@LOGIN_UID@/broker/audit-checkpoints 0700 bloom-broker-@LOGIN_UID@ bloom-broker-@LOGIN_UID@ -
 d /var/lib/bloom/@LOGIN_UID@/signer/audit-checkpoints 0700 bloom-signer-@LOGIN_UID@ bloom-signer-@LOGIN_UID@ -
+d /var/lib/bloom/@LOGIN_UID@/machine 0700 @LOGIN_USER@ @LOGIN_USER@ -
+d /var/lib/bloom/@LOGIN_UID@/machine/audit-checkpoints 0700 @LOGIN_USER@ @LOGIN_USER@ -
 d /etc/bloom/@LOGIN_UID@/broker 0700 bloom-broker-@LOGIN_UID@ bloom-broker-@LOGIN_UID@ -
 d /etc/bloom/@LOGIN_UID@/signer 0700 bloom-signer-@LOGIN_UID@ bloom-signer-@LOGIN_UID@ -

@@ -170,24 +170,44 @@ fn ac18_sender_journal_head_is_signed_required_and_edge_confined() {
     machine.unsigned.caller_service_id = Token::new("bloom-machine").unwrap();
     machine.unsigned.audience = Token::new("bloom-broker").unwrap();
     machine.unsigned.application_key_id = Token::new("machine-app").unwrap();
+    machine
+        .unsigned
+        .sender_journal_head
+        .as_mut()
+        .unwrap()
+        .service_id = Token::new("bloom-machine").unwrap();
+    machine
+        .unsigned
+        .sender_journal_head
+        .as_mut()
+        .unwrap()
+        .key_id = Token::new("machine-app").unwrap();
+    let machine_head = machine.unsigned.sender_journal_head.as_mut().unwrap();
+    machine_head.signature = Base64UrlBytes::from_bytes(
+        &signing_key
+            .sign(&machine_head.signature_message())
+            .to_bytes(),
+    );
     let mut machine_peer = peer.clone();
     machine_peer.service_id = machine.unsigned.caller_service_id.clone();
     machine_peer.audience = machine.unsigned.audience.clone();
     machine_peer.application_key_id = machine.unsigned.application_key_id.clone();
     resign(&mut machine, &signing_key);
-    assert_eq!(
-        machine.verify(501, &machine_peer).unwrap_err().code,
-        ProtocolErrorCode::UnauthenticatedPeer,
-        "Machine must not inject a peer checkpoint head"
-    );
+    machine.verify(501, &machine_peer).unwrap();
 
     machine.unsigned.sender_journal_head = None;
     resign(&mut machine, &signing_key);
-    machine.verify(501, &machine_peer).unwrap();
+    assert_eq!(
+        machine.verify(501, &machine_peer).unwrap_err().code,
+        ProtocolErrorCode::UnauthenticatedPeer,
+    );
 
     machine.unsigned.protocol.minor = 0;
     resign(&mut machine, &signing_key);
-    machine.verify(501, &machine_peer).unwrap();
+    assert_eq!(
+        machine.verify(501, &machine_peer).unwrap_err().code,
+        ProtocolErrorCode::UnsupportedVersion,
+    );
 
     let mut downgraded_broker = envelope;
     downgraded_broker.unsigned.protocol.minor = 0;
@@ -197,6 +217,24 @@ fn ac18_sender_journal_head_is_signed_required_and_edge_confined() {
         downgraded_broker.verify(501, &peer).unwrap_err().code,
         ProtocolErrorCode::UnsupportedVersion
     );
+
+    let (mut control, mut control_peer) = signed();
+    control.unsigned.caller_service_id = Token::new("bloom-session").unwrap();
+    control.unsigned.audience = Token::new("bloom-broker").unwrap();
+    control.unsigned.application_key_id = Token::new("session-app").unwrap();
+    control_peer.service_id = control.unsigned.caller_service_id.clone();
+    control_peer.audience = control.unsigned.audience.clone();
+    control_peer.application_key_id = control.unsigned.application_key_id.clone();
+    resign(&mut control, &signing_key);
+    assert_eq!(
+        control.verify(501, &control_peer).unwrap_err().code,
+        ProtocolErrorCode::UnauthenticatedPeer,
+        "control edges must reject sender journal heads"
+    );
+    control.unsigned.sender_journal_head = None;
+    control.unsigned.protocol.minor = 0;
+    resign(&mut control, &signing_key);
+    control.verify(501, &control_peer).unwrap();
 }
 
 fn enrolled() -> EnrolledKeyBinding {

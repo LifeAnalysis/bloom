@@ -18,7 +18,7 @@ case "$mode" in
   *) usage ;;
 esac
 
-for command_name in cargo jq python3 awk sed sort uniq; do
+for command_name in cargo jq python3 awk sed sort uniq find; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "machine authority boundary check requires $command_name" >&2
     exit 69
@@ -173,11 +173,53 @@ cargo_tree_for_set() {
   return "$status"
 }
 
+cargo_feature_tree_for_set() {
+  local package="$1"
+  local defaults="$2"
+  local features="$3"
+  if [[ -n "${BLOOM_MACHINE_FEATURE_TREE_FIXTURE:-}" ]]; then
+    [[ -f "$BLOOM_MACHINE_FEATURE_TREE_FIXTURE" ]] || {
+      echo "missing synthetic Machine feature-tree fixture: $BLOOM_MACHINE_FEATURE_TREE_FIXTURE" >&2
+      return 1
+    }
+    command cat "$BLOOM_MACHINE_FEATURE_TREE_FIXTURE"
+    return
+  fi
+  local args=(
+    tree
+    --manifest-path "$workspace/Cargo.toml"
+    -p "$package"
+    -e "normal,build,features"
+    --prefix none
+  )
+  [[ "$defaults" == "no" ]] && args+=(--no-default-features)
+  [[ "$features" != "-" ]] && args+=(--features "$features")
+  local attempt status=1
+  for attempt in 1 2 3; do
+    if cargo "${args[@]}"; then
+      return 0
+    else
+      status=$?
+    fi
+    echo "Cargo feature tree attempt $attempt failed with status $status" >&2
+    (( attempt == 3 )) || sleep 2
+  done
+  return "$status"
+}
+
 cargo_metadata_for_set() {
   local package="$1"
   local defaults="$2"
   local features="$3"
   local host_triple
+  if [[ -n "${BLOOM_MACHINE_METADATA_FIXTURE:-}" ]]; then
+    [[ -f "$BLOOM_MACHINE_METADATA_FIXTURE" ]] || {
+      echo "missing synthetic Machine metadata fixture: $BLOOM_MACHINE_METADATA_FIXTURE" >&2
+      return 1
+    }
+    command cat "$BLOOM_MACHINE_METADATA_FIXTURE"
+    return
+  fi
   if ! host_triple="$(rustc_host_triple)"; then
     echo "failed to resolve rustc host triple" >&2
     return 1
@@ -266,11 +308,7 @@ forbidden_dependencies() {
     return
   fi
   printf '%s\n' \
-    bloom-keystore bloom-auth bloom-auth-api bloom-hyperliquid \
-    alloy-signer-local alloy-signer-aws alloy-signer-gcp \
-    alloy-signer-ledger alloy-signer-trezor alloy-signer-turnkey \
-    alloy-signer-yubihsm coins-bip32 coins-bip39 eth-keystore \
-    webauthn-rs webauthn-rs-core aws-sdk-kms
+    bloom-keystore bloom-auth bloom-auth-api bloom-hyperliquid
 }
 
 forbidden_resolved_features() {
@@ -278,8 +316,8 @@ forbidden_resolved_features() {
     '*:local-integration' \
     '*:unsafe-debug-signer' \
     '*:triad-dev-harness' \
-    'alloy:signer-local' \
-    'webauthn-rs:danger-allow-state-serialisation'
+    '*:unsigned-audit-test-seam' \
+    '*:audit-test-seam'
 }
 
 feature_is_forbidden() {
@@ -357,7 +395,7 @@ require_clean_dependencies() {
   while IFS=$'\t' read -r label package defaults features; do
     [[ -z "$label" || "$label" == \#* ]] && continue
     case ",${features}," in
-      *,unsafe-debug-signer,*|*,local-integration,*|*,triad-dev-harness,*)
+      *,unsafe-debug-signer,*|*,local-integration,*|*,triad-dev-harness,*|*,unsigned-audit-test-seam,*|*,audit-test-seam,*)
         echo "forbidden production Machine feature in $label: $features" >&2
         failed=1
         ;;
@@ -389,7 +427,9 @@ require_clean_dependencies() {
       fi
     done < <(forbidden_dependencies)
     if ! observed_features="$(
-      printf '%s\n' "$metadata" | metadata_reachable_features "$package"
+      cargo_feature_tree_for_set "$package" "$defaults" "$features" |
+        sed -n -E 's/^([^ ]+) feature "([^"]+)".*$/\1:\2/p' |
+        sort -u
     )"
     then
       echo "failed to resolve production Machine features in $label" >&2

@@ -2,6 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck disable=SC1091
+source "${repo_root}/scripts/lib/bounded-process.sh"
 broker_repo="$(cd "${repo_root}/../bloom-broker" && pwd -P)"
 launcher="${BLOOM_TRIAD_DEV_LAUNCHER:-${repo_root}/scripts/triad-dev-launch.sh}"
 startup_timeout_secs="${BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS:-300}"
@@ -76,8 +78,8 @@ start_stack() {
   done
   # shellcheck disable=SC1090
   source "${log_dir}/triad.env"
-  bloom_bin="${repo_root}/target/debug/bloom"
-  driver_bin="${broker_repo}/target/debug/bloom-broker-debug-driver"
+  bloom_bin="${BLOOM_INTEGRATION_MACHINE_BIN:-${repo_root}/target/debug/bloom}"
+  driver_bin="${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:-${broker_repo}/target/debug/bloom-broker-debug-driver}"
   [ -x "$bloom_bin" ] && [ -x "$driver_bin" ] || die "integration binaries are missing"
 }
 
@@ -90,6 +92,39 @@ mounted() {
     /*) printf '%s%s\n' "$mount_dir" "$1" ;;
     *) die "internal VFS path is not absolute: $1" ;;
   esac
+}
+
+bounded_mounted_read() {
+  path="$1"
+  label="$2"
+  deadline_secs="${BLOOM_MA08_MOUNT_READ_TIMEOUT_SECS:-15}"
+  case "$deadline_secs" in *[!0-9]*|'') die "mounted-read timeout must be an integer" ;; esac
+  [ "$deadline_secs" -ge 1 ] || die "mounted-read timeout must be positive"
+  output="${run_root}/bounded-read.$$.${RANDOM}"
+  cat "$path" > "$output" 2>/dev/null &
+  read_pid=$!
+  deadline=$(( $(date +%s) + deadline_secs ))
+  while kill -0 "$read_pid" 2>/dev/null; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      # A macOS NFS client can remain in an uninterruptible read after the
+      # userspace deadline. Stop the serving Machine first so the syscall is
+      # released, then fail with the exact mounted surface instead of hanging
+      # acceptance indefinitely.
+      if [ -f "${log_dir}/machine.pid" ]; then
+        kill "$(tr -d '[:space:]' < "${log_dir}/machine.pid")" 2>/dev/null || true
+      fi
+      kill "$read_pid" 2>/dev/null || true
+      rm -f -- "$output"
+      die "${label} exceeded ${deadline_secs}s at mounted path ${path}"
+    fi
+    sleep 0.05
+  done
+  if ! wait "$read_pid"; then
+    rm -f -- "$output"
+    return 1
+  fi
+  command cat "$output"
+  rm -f -- "$output"
 }
 
 complete_launch() {
@@ -164,8 +199,145 @@ wait_for_fixture_record() {
   die "Petal key derivation ceremony did not appear through the mounted VFS"
 }
 
+wait_for_fixture_stage() {
+  expected="$1"
+  attempts=0
+  while [ "$attempts" -lt 200 ]; do
+    fixture_body="$(cat "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true)"
+    fixture_stage="$(printf '%s' "$fixture_body" | jq -r '
+      if .stage == "key" then "key:" + (.outcome.state // "")
+      else .stage // "" end
+    ' 2>/dev/null || true)"
+    if [ "$fixture_stage" = "$expected" ]; then
+      printf '%s\n' "$fixture_body"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.05
+  done
+  die "fixture Petal did not reach mounted stage ${expected}"
+}
+
+wait_for_approval_prepare() {
+  wallet_id="$1"
+  attempts=0
+  while [ "$attempts" -lt 200 ]; do
+    approval_body="$(bounded_mounted_read \
+      "$(mounted "/wallets/${wallet_id}/sealed-approvals/new.json")" \
+      "Sealed Approval ceremony projection read")"
+    if printf '%s' "$approval_body" | jq -e '
+      (.approval_id | test("^[0-9a-f]{64}$")) and
+      (.ceremony_url | type == "string")
+    ' >/dev/null 2>&1; then
+      printf '%s\n' "$approval_body"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.05
+  done
+  die "fixture Sealed Approval prepare did not appear through the mounted VFS"
+}
+
+wait_for_approval_active() {
+  wallet_id="$1"
+  approval_id="$2"
+  attempts=0
+  while [ "$attempts" -lt 20 ]; do
+    approvals="$(bounded_mounted_read \
+      "$(mounted "/wallets/${wallet_id}/sealed-approvals/active.json")" \
+      "Sealed Approval active-list projection read")"
+    if printf '%s' "$approvals" | jq -e --arg approval_id "$approval_id" '
+      any(.approvals[]?; .approval_id == $approval_id and .state == "ACTIVE")
+    ' >/dev/null 2>&1; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.25
+  done
+  die "fixture Sealed Approval did not become active through the mounted VFS"
+}
+
+assert_machine_secret_artifacts() {
+  machine_pid_file="${log_dir}/machine.pid"
+  [ -f "$machine_pid_file" ] || die "triad launcher omitted the Machine PID diagnostic"
+  machine_pid="$(tr -d '[:space:]' < "$machine_pid_file")"
+  case "$machine_pid" in *[!0-9]*|'') die "triad launcher published a malformed Machine PID" ;; esac
+  kill -0 "$machine_pid" 2>/dev/null || die "Machine exited before MA-08 artifact capture"
+
+  artifact_dir="${run_root}/machine-artifacts"
+  mkdir -p "$artifact_dir"
+  machine_diagnostic="${artifact_dir}/machine-sample.txt"
+  # A stack diagnostic is useful and portable on macOS; it complements the
+  # full memory/core capture required by the Tart acceptance profile.
+  if [ "$(uname -s)" = "Darwin" ] && [ -x /usr/bin/sample ]; then
+    sample_timeout_secs="${BLOOM_MA08_SAMPLE_TIMEOUT_SECS:-10}"
+    bloom_bounded_process "$sample_timeout_secs" "${artifact_dir}/sample.log" \
+      /usr/bin/sample "$machine_pid" 1 1 -file "$machine_diagnostic" ||
+      printf 'sample unavailable for this developer login\n' > "$machine_diagnostic"
+  else
+    ps -o pid=,ppid=,state=,command= -p "$machine_pid" > "$machine_diagnostic"
+  fi
+
+  require_capture="${BLOOM_MA08_REQUIRE_MEMORY_CAPTURE:-0}"
+  request_capture="${BLOOM_MA08_CAPTURE_MEMORY:-$require_capture}"
+  case "$require_capture:$request_capture" in
+    0:0|0:1|1:1) ;;
+    *) die "BLOOM_MA08_REQUIRE_MEMORY_CAPTURE and BLOOM_MA08_CAPTURE_MEMORY must be 0 or 1" ;;
+  esac
+  machine_core=""
+  if [ "$request_capture" -eq 1 ]; then
+    capture_timeout_secs="${BLOOM_MA08_MEMORY_CAPTURE_TIMEOUT_SECS:-180}"
+    case "$(uname -s)" in
+      Darwin)
+        machine_core="${artifact_dir}/machine.core"
+        if ! command -v lldb >/dev/null 2>&1 ||
+          ! bloom_bounded_process "$capture_timeout_secs" "${artifact_dir}/lldb.log" \
+              lldb --batch -p "$machine_pid" \
+              -o "process save-core ${machine_core}" \
+              -o "process detach" ||
+          [ ! -s "$machine_core" ]
+        then
+          machine_core=""
+        fi
+        ;;
+      Linux)
+        if command -v gcore >/dev/null 2>&1 &&
+          bloom_bounded_process "$capture_timeout_secs" "${artifact_dir}/gcore.log" \
+            gcore -o "${artifact_dir}/machine.core" "$machine_pid"
+        then
+          machine_core="${artifact_dir}/machine.core.${machine_pid}"
+          [ -s "$machine_core" ] || machine_core=""
+        fi
+        ;;
+      *) ;;
+    esac
+    if [ -z "$machine_core" ] && [ "$require_capture" -eq 1 ]; then
+      die "MA-08 acceptance requires a readable full Machine memory/core capture; enable debugger task access in the disposable Tart VM"
+    fi
+  fi
+
+  signer_database="${developer_root}/state/signer/signer.db"
+  [ -f "$signer_database" ] || die "Signer database is unavailable for MA-08 decryptability control"
+  scanner_args=(
+    assert-machine-secret-confinement
+    --signer-db "$signer_database"
+    --authenticator-seed replacement-auth
+    --artifact "$machine_home"
+    --artifact "${log_dir}/machine.log"
+    --artifact "$artifact_dir"
+  )
+  "$driver_bin" "${scanner_args[@]}"
+  if [ -z "$machine_core" ]; then
+    printf 'MA-08 portable lane: filesystem and Machine diagnostics scanned; full memory/core capture is enforced by BLOOM_MA08_REQUIRE_MEMORY_CAPTURE=1 in Tart acceptance\n'
+  else
+    printf 'MA-08 acceptance lane: live Machine full memory/core artifact scanned (%s)\n' "$machine_core"
+  fi
+}
+
 printf 'Building deterministic ceremony driver...\n'
-(cd "$broker_repo" && cargo build -p bloom-broker-debug-driver)
+if [ -z "${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:-}" ]; then
+  (cd "$broker_repo" && cargo build -p bloom-broker-debug-driver)
+fi
 start_stack
 
 # The frozen protocol contains credential add/remove prepare variants for
@@ -269,6 +441,93 @@ printf '%s' "$derived_projection" | jq -e --arg replacement "$replacement_creden
   (.credentials | length) == 1 and
   .credentials[0].credential_id == $replacement
 ' >/dev/null || die "later Broker projection refresh lost the replacement credential"
+
+printf 'MA-08: signing with the scoped child through the mounted fixture Petal...\n'
+# Re-run the exact mounted request after custody completion.  The Petal must
+# now reach the canonical missing-approval boundary rather than receiving any
+# child secret or a Machine-minted capability.
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true
+fixture_missing_approval="$(wait_for_fixture_stage signing_failed)"
+printf '%s' "$fixture_missing_approval" | jq -e '
+  .stage == "signing_failed" and (.error | contains("APPROVAL_NOT_FOUND"))
+' >/dev/null || die "fixture Petal did not fail closed before Sealed Approval preparation"
+
+fixture_key_record_path=""
+while IFS= read -r record_name; do
+  [ -n "$record_name" ] || continue
+  candidate="/petal-key-requests/${record_name}"
+  candidate_body="$(cat "$(mounted "$candidate")" 2>/dev/null || true)"
+  if printf '%s' "$candidate_body" | jq -e --arg request_id "$request_id" \
+    '.request_id == $request_id and .status == "succeeded" and .public_key != null' \
+    >/dev/null 2>&1
+  then
+    fixture_key_record_path="$candidate"
+    fixture_key_record_body="$candidate_body"
+    break
+  fi
+done < <(LC_ALL=C command ls -1 "$(mounted /petal-key-requests)" 2>/dev/null || true)
+[ -n "$fixture_key_record_path" ] || die "completed fixture key record was not found through the mount"
+
+fixture_key_ref="$(printf '%s' "$fixture_key_record_body" | jq -ec '.public_key.key_ref')"
+fixture_provenance_digest="$(printf '%s' "$fixture_key_record_body" | jq -er '.provenance_digest')"
+fixture_agent_id="$(printf '%s' "$fixture_key_record_body" | jq -c '.scope.agent_id')"
+wallet_authority="$(cat "$(mounted "/wallets/${registered_wallet}/addresses.json")")"
+policy_version="$(printf '%s' "$wallet_authority" | jq -er '.policy_version')"
+policy_digest="$(printf '%s' "$wallet_authority" | jq -er '.policy_digest')"
+wallet_revocation_epoch="$(printf '%s' "$wallet_authority" | jq -er '.wallet_revocation_epoch')"
+approval_now_ms="$(( $(date +%s) * 1000 ))"
+# The approval must outlive Broker's custody ceremony so the completed
+# activation cannot already exceed immutable terms. It remains strictly
+# inside the fixture child's 15-minute scope.
+approval_expires_ms="$((approval_now_ms + 600000))"
+approval_operation_id="$(printf '%s' "${request_id}:approval" | shasum -a 256 | awk '{print $1}')"
+approval_nonce="$(printf '%s' "${request_id}:nonce" | shasum -a 256 | awk '{print substr($1, 1, 32)}')"
+approval_plan="$(jq -ncS \
+  --arg wallet_id "$registered_wallet" --arg package_hash "$fixture_hash" \
+  --arg route "r000001" --arg operation_class "fixture.payload" \
+  --arg payload_sha256 "$(printf 'ma03' | shasum -a 256 | awk '{print $1}')" \
+  '{wallet_id:$wallet_id,package_hash:$package_hash,route:$route,
+    operation_class:$operation_class,payload_sha256:$payload_sha256}')"
+approval_plan_digest="$(printf '%s' "$approval_plan" | shasum -a 256 | awk '{print $1}')"
+approval_request="$(jq -ncS \
+  --arg operation_id "$approval_operation_id" --arg wallet_id "$registered_wallet" \
+  --arg package_hash "$fixture_hash" --arg route "r000001" \
+  --argjson agent_id "$fixture_agent_id" --argjson key_ref "$fixture_key_ref" \
+  --arg policy_version "$policy_version" --arg policy_digest "$policy_digest" \
+  --arg revocation_epoch "$wallet_revocation_epoch" \
+  --arg provenance_digest "$fixture_provenance_digest" --arg nonce "$approval_nonce" \
+  --arg issued_at_ms "$approval_now_ms" --arg expires_at_ms "$approval_expires_ms" \
+  --arg plan_digest "$approval_plan_digest" \
+  '{operation_id:$operation_id,canonical_plan_facts_digest:$plan_digest,terms:{
+    subject:{kind:"petal",package_hash:$package_hash,route:$route,agent_id:$agent_id},
+    wallet_id:$wallet_id,key_ref:$key_ref,
+    allowed_crypto_suites:["secp256k1-sha256-recoverable"],
+    selector:{kind:"petal",package_hash:$package_hash,route:$route,
+      allowed_operation_classes:["fixture.payload"],required_claim_assurance:"machine_asserted"},
+    limits:{max_operations:"1",max_signatures:"1",operation_rate_limits:[],
+      signature_rate_limits:[],value_limits:[]},
+    activation_mode:{kind:"boot_bound"},wallet_revocation_epoch:$revocation_epoch,
+    policy_version:$policy_version,policy_digest:$policy_digest,
+    provenance_digest:$provenance_digest,request_nonce:$nonce,
+    issued_at_ms:$issued_at_ms,not_before_ms:$issued_at_ms,
+    expires_at_ms:$expires_at_ms,renewal_of:null}}')"
+printf '%s\n' "$approval_request" > \
+  "$(mounted "/wallets/${registered_wallet}/sealed-approvals/new.json")"
+approval_projection="$(wait_for_approval_prepare "$registered_wallet")"
+fixture_approval_id="$(printf '%s' "$approval_projection" | jq -er '.approval_id')"
+approval_ceremony_url="$(printf '%s' "$approval_projection" | jq -er '.ceremony_url')"
+"$driver_bin" complete "$approval_ceremony_url" replacement-auth --sign-count 4 >/dev/null
+wait_for_approval_active "$registered_wallet" "$fixture_approval_id"
+fixture_request="$(printf '%s' "$fixture_request" | jq -cS --arg approval_id "$fixture_approval_id" \
+  '.approval_hint = $approval_id')"
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)"
+fixture_signed="$(wait_for_fixture_stage complete)"
+printf '%s' "$fixture_signed" | jq -e '
+  .stage == "complete" and
+  (.public_key.key_ref_jcs | type == "array") and
+  (.signature_hex | test("^[0-9a-f]+$"))
+' >/dev/null || die "fixture Petal did not complete scoped payload signing"
+assert_machine_secret_artifacts
 
 printf 'MA-03: deleting the imported wallet through Broker/Signer...\n'
 delete_launch="$(cli wallet delete "$imported_wallet")"

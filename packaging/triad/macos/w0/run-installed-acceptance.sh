@@ -169,7 +169,8 @@ edge_manifest="/Library/Application Support/BloomTriad/config/$login_uid/edge-ma
   "$broker_uid" \
   "$signer_uid" \
   "$machine_identity" \
-  "$edge_manifest"
+  "$edge_manifest" \
+  "$broker_root"
 
 # The runtime negative restores the installed Broker before returning.
 deadline=$((SECONDS + 20))

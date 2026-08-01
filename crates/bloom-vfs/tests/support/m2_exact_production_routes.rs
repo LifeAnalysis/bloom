@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use super::Keystore;
 use async_trait::async_trait;
 use bloom_machine_client::{
     MachineBrokerClient, ProjectionFreshness, ProjectionVerification, WalletProjection,

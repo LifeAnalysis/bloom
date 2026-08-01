@@ -34,5 +34,7 @@ base64.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
+bloom-proto = { workspace = true, features = ["audit-test-seam"] }
+
 alloy-signer-local = "2.0.5"
 tempfile.workspace = true

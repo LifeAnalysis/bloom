@@ -200,6 +200,64 @@ pub struct BrokerValidationReceipt {
     pub broker_signature: Base64UrlBytes,
 }
 
+pub const BROKER_VALIDATION_RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"bloom-broker-validation-receipt/v1";
+
+impl BrokerValidationReceipt {
+    pub fn unsigned_canonical_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            approval_id: &'a Digest32,
+            approval_digest: &'a Digest32,
+            operation_digest: &'a Digest32,
+            policy_version: &'a DecimalU64,
+            policy_digest: &'a Digest32,
+            claim_digest: &'a Option<Digest32>,
+            assurance_digest: &'a Option<Digest32>,
+            reservation_ids: &'a [Digest32],
+            effective_claim_assurance: &'a Option<ClaimAssurance>,
+            broker_key_id: &'a Token,
+        }
+        serde_jcs::to_vec(&Unsigned {
+            approval_id: &self.approval_id,
+            approval_digest: &self.approval_digest,
+            operation_digest: &self.operation_digest,
+            policy_version: &self.policy_version,
+            policy_digest: &self.policy_digest,
+            claim_digest: &self.claim_digest,
+            assurance_digest: &self.assurance_digest,
+            reservation_ids: &self.reservation_ids,
+            effective_claim_assurance: &self.effective_claim_assurance,
+            broker_key_id: &self.broker_key_id,
+        })
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                format!("Broker validation receipt JCS encoding failed: {error}"),
+            )
+        })
+    }
+
+    pub fn signature_message(&self) -> Result<Vec<u8>, ProtocolError> {
+        Ok([
+            BROKER_VALIDATION_RECEIPT_SIGNATURE_DOMAIN,
+            self.unsigned_canonical_bytes()?.as_slice(),
+        ]
+        .concat())
+    }
+
+    pub fn digest(&self) -> Result<Digest32, ProtocolError> {
+        Ok(Digest32::from_bytes(
+            Sha256::digest(serde_jcs::to_vec(self).map_err(|error| {
+                ProtocolError::new(
+                    ProtocolErrorCode::MalformedFrame,
+                    format!("Broker validation receipt JCS encoding failed: {error}"),
+                )
+            })?)
+            .into(),
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedSignature {

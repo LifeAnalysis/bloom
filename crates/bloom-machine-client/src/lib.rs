@@ -14,10 +14,31 @@ pub use projection::{
 };
 
 use std::{
+    future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
+    time::Duration,
 };
 
+const AUTHORITY_HEAD_EXCHANGE_CADENCE: Duration = Duration::from_secs(45);
+const AUTHORITY_HEAD_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn run_periodic_authority_head_exchange<F, Fut, T>(mut exchange: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let mut interval = tokio::time::interval(AUTHORITY_HEAD_EXCHANGE_CADENCE);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let _ = tokio::time::timeout(AUTHORITY_HEAD_EXCHANGE_TIMEOUT, exchange()).await;
+    }
+}
+
+pub use bloom_audit_checkpoint::AuthorityEdgeHistory;
+use bloom_audit_checkpoint::{CheckpointSink, CheckpointStore, PinnedAuditKey};
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use bloom_triad_protocol::{
     ActivationMode, ApprovalLifecycleState, ApprovalLimitState, ApprovalLimits,
@@ -30,8 +51,8 @@ use bloom_triad_protocol::{
     PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
     ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, RevocationState,
     RevokeRequest, SealedApprovalPrepareResponse, SealedApprovalTerms, SignOperationIdentity,
-    SignedPolicySnapshot, SigningPayloads, SigningResult, Token, WalletOperationRequest,
-    WalletPublic, WalletRequest,
+    SignedPolicySnapshot, SigningPayloads, SigningResult, Token, TypedRequestMethod,
+    WalletOperationRequest, WalletPublic, WalletRequest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -44,6 +65,19 @@ pub struct UnixMachineBrokerService {
     socket_path: PathBuf,
     identity: LocalIdentity,
     broker: PeerAcl,
+    journals: Arc<RwLock<Option<AuthorityJournalState>>>,
+}
+
+/// Narrow provider seam implemented by the signed Machine journal owner. It
+/// deliberately exposes no append or caller-supplied-head capability.
+pub trait MachineJournalHeadProvider: Send + Sync {
+    fn verified_head(&self) -> Result<(u64, Digest32), ProtocolError>;
+    fn latch_mutations(&self, reason: String);
+}
+
+struct AuthorityJournalState {
+    provider: Arc<dyn MachineJournalHeadProvider>,
+    checkpoints: Arc<CheckpointStore>,
 }
 
 impl UnixMachineBrokerService {
@@ -52,7 +86,132 @@ impl UnixMachineBrokerService {
             socket_path: socket_path.into(),
             identity,
             broker,
+            journals: Arc::new(RwLock::new(None)),
         }
+    }
+
+    fn attach_journal(
+        &self,
+        provider: Arc<dyn MachineJournalHeadProvider>,
+        checkpoint_root: impl AsRef<Path>,
+        expected_uid: u32,
+        history: AuthorityEdgeHistory,
+    ) -> Result<(), ProtocolError> {
+        let allowed_services = [&self.identity.service_id, &self.broker.service_id];
+        let historical = history
+            .historical_pins_for(&allowed_services)
+            .map_err(|error| {
+                service_unavailable(format!("load checkpoint key history: {error}"))
+            })?;
+        let handovers = history.handovers_for(&allowed_services);
+        let checkpoints = CheckpointStore::open_with_history(
+            checkpoint_root,
+            expected_uid,
+            self.identity.service_id.clone(),
+            [
+                PinnedAuditKey {
+                    service_id: self.identity.service_id.clone(),
+                    key_id: self.identity.application_key_id.clone(),
+                    verifying_key: self.identity.signing_key.verifying_key(),
+                },
+                PinnedAuditKey {
+                    service_id: self.broker.service_id.clone(),
+                    key_id: self.broker.application_key_id.clone(),
+                    verifying_key: ed25519_dalek::VerifyingKey::from_bytes(
+                        &self.broker.application_public_key,
+                    )
+                    .map_err(|_| service_unavailable("invalid Broker checkpoint pin"))?,
+                },
+            ],
+            historical,
+            handovers,
+        )
+        .map_err(|error| service_unavailable(format!("open Machine checkpoint store: {error}")))?;
+        let mut state = self
+            .journals
+            .write()
+            .map_err(|_| service_unavailable("Machine journal provider lock poisoned"))?;
+        if state.is_some() {
+            return Err(service_unavailable(
+                "Machine journal provider is already attached",
+            ));
+        }
+        *state = Some(AuthorityJournalState {
+            provider,
+            checkpoints: Arc::new(checkpoints),
+        });
+        Ok(())
+    }
+
+    async fn dispatch_head_aware(
+        &self,
+        request: MachineBrokerRequest,
+    ) -> Result<MachineBrokerResponse, ProtocolError> {
+        let method = request.method()?;
+        let (provider, checkpoints) = {
+            let state = self
+                .journals
+                .read()
+                .map_err(|_| service_unavailable("Machine journal provider lock poisoned"))?;
+            let state = state.as_ref().ok_or_else(|| {
+                service_unavailable("Machine authority-edge journal is not initialized")
+            })?;
+            (state.provider.clone(), state.checkpoints.clone())
+        };
+        let sender_head = match provider.verified_head() {
+            Ok((sequence, head_hash)) => {
+                let head = bloom_triad_local_transport::sign_journal_head(
+                    &self.identity,
+                    sequence,
+                    head_hash,
+                );
+                if let Err(error) = checkpoints.append_peer_head(&head) {
+                    provider.latch_mutations(format!(
+                        "persist Machine authority-edge audit head: {error}"
+                    ));
+                    if !bloom_triad_local_transport::is_read_only_method(&method) {
+                        return Err(service_unavailable(format!(
+                            "persist Machine audit head before Broker dispatch: {error}"
+                        )));
+                    }
+                }
+                head
+            }
+            Err(_error) if bloom_triad_local_transport::is_read_only_method(&method) => checkpoints
+                .latest(&self.identity.service_id)
+                .map_err(|failure| {
+                    service_unavailable(format!("load retained Machine audit head: {failure}"))
+                })?
+                .ok_or_else(|| {
+                    service_unavailable("no independently retained Machine audit head is available")
+                })?,
+            Err(error) => return Err(error),
+        };
+        let mut stream = tokio::net::UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|error| service_unavailable(format!("connect Broker: {error}")))?;
+        bloom_triad_local_transport::call_with_journal_head(
+            &mut stream,
+            &self.identity,
+            &self.broker,
+            request,
+            30_000,
+            sender_head,
+            move |peer_head| {
+                if let Err(error) = checkpoints.append_peer_head(peer_head) {
+                    provider.latch_mutations(format!(
+                        "persist Broker authority-edge audit head: {error}"
+                    ));
+                    if !bloom_triad_local_transport::is_read_only_method(&method) {
+                        return Err(service_unavailable(format!(
+                            "persist Broker audit checkpoint before publishing mutation result: {error}"
+                        )));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await
     }
 }
 
@@ -61,30 +220,24 @@ impl MachineBrokerService for UnixMachineBrokerService {
         &'a self,
         request: MachineBrokerRequest,
     ) -> bloom_triad_protocol::ServiceFuture<'a, MachineBrokerResponse> {
-        Box::pin(async move {
-            let mut stream = tokio::net::UnixStream::connect(&self.socket_path)
-                .await
-                .map_err(|error| service_unavailable(format!("connect Broker: {error}")))?;
-            bloom_triad_local_transport::call(
-                &mut stream,
-                &self.identity,
-                &self.broker,
-                request,
-                30_000,
-            )
-            .await
-        })
+        Box::pin(async move { self.dispatch_head_aware(request).await })
     }
 }
 
 #[derive(Clone)]
 pub struct MachineBrokerClient {
     service: Arc<dyn MachineBrokerService>,
+    local_identity: Option<LocalIdentity>,
+    unix_service: Option<Arc<UnixMachineBrokerService>>,
 }
 
 impl MachineBrokerClient {
     pub fn new(service: Arc<dyn MachineBrokerService>) -> Self {
-        Self { service }
+        Self {
+            service,
+            local_identity: None,
+            unix_service: None,
+        }
     }
 
     pub fn connect_unix(
@@ -92,11 +245,72 @@ impl MachineBrokerClient {
         identity: LocalIdentity,
         broker: PeerAcl,
     ) -> Self {
-        Self::new(Arc::new(UnixMachineBrokerService::new(
+        let unix_service = Arc::new(UnixMachineBrokerService::new(
             socket_path,
-            identity,
+            identity.clone(),
             broker,
-        )))
+        ));
+        Self {
+            service: unix_service.clone(),
+            local_identity: Some(identity),
+            unix_service: Some(unix_service),
+        }
+    }
+
+    /// Completes production authority-edge construction. Until this succeeds,
+    /// the Unix client rejects every request rather than emitting a headless
+    /// envelope. It also starts the required idle readiness exchange.
+    pub fn attach_authority_journal(
+        &self,
+        provider: Arc<dyn MachineJournalHeadProvider>,
+        checkpoint_root: impl AsRef<Path>,
+        expected_uid: u32,
+    ) -> Result<(), ProtocolError> {
+        self.attach_authority_journal_with_history(
+            provider,
+            checkpoint_root,
+            expected_uid,
+            AuthorityEdgeHistory::empty(),
+        )
+    }
+
+    pub fn attach_authority_journal_with_history(
+        &self,
+        provider: Arc<dyn MachineJournalHeadProvider>,
+        checkpoint_root: impl AsRef<Path>,
+        expected_uid: u32,
+        history: AuthorityEdgeHistory,
+    ) -> Result<(), ProtocolError> {
+        let unix = self.unix_service.as_ref().ok_or_else(|| {
+            service_unavailable("in-process Machine Broker service has no authority-edge transport")
+        })?;
+        unix.attach_journal(provider, checkpoint_root, expected_uid, history)?;
+        let periodic = unix.clone();
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| {
+                service_unavailable("start Machine-Broker readiness timer outside runtime")
+            })?
+            .spawn(async move {
+                run_periodic_authority_head_exchange(|| {
+                    let periodic = periodic.clone();
+                    async move {
+                        periodic
+                            .dispatch_head_aware(MachineBrokerRequest::BrokerReadiness(
+                                bloom_triad_protocol::Empty {},
+                            ))
+                            .await
+                    }
+                })
+                .await;
+            });
+        Ok(())
+    }
+
+    /// Return the already-authenticated Machine application identity for
+    /// signing Machine-owned service records. This is transport/audit
+    /// identity only; it has no wallet authority.
+    pub fn local_application_identity(&self) -> Option<LocalIdentity> {
+        self.local_identity.clone()
     }
 
     /// Loads the Machine application identity and the root-owned edge manifest
@@ -1610,20 +1824,59 @@ fn response_mismatch(method: &str) -> ProtocolError {
     )
 }
 
-fn service_unavailable(message: String) -> ProtocolError {
-    ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message)
+fn service_unavailable(message: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::unix::fs::MetadataExt, sync::Mutex};
+    use std::{
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use bloom_triad_protocol::{
         ApprovalPrepareState, CeremonyKind, CustodyPrepareState, DeclaredFee, KeySpec,
         NormalizedSignature, RequestNonce, ServiceFuture, SignatureEncoding,
     };
     use ed25519_dalek::SigningKey;
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_machine_broker_exchange_completes_with_margin_inside_sixty_seconds() {
+        let completions = Arc::new(AtomicUsize::new(0));
+        let observed = completions.clone();
+        let task = tokio::spawn(run_periodic_authority_head_exchange(move || {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(44)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(45)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(completions.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    struct TestJournalProvider;
+
+    impl MachineJournalHeadProvider for TestJournalProvider {
+        fn verified_head(&self) -> Result<(u64, Digest32), ProtocolError> {
+            Ok((3, Digest32::from_bytes([3; 32])))
+        }
+
+        fn latch_mutations(&self, _reason: String) {}
+    }
 
     struct MockBroker {
         wallet: WalletPublic,
@@ -1938,29 +2191,30 @@ mod tests {
             .await
             .unwrap();
 
-        let requests = broker.requests.lock().unwrap();
-        assert!(matches!(
-            &requests[0],
-            MachineBrokerRequest::WalletGetPublic(_)
-        ));
-        let MachineBrokerRequest::KeyGetPublic(key_request) = &requests[1] else {
-            panic!("explicit delegated signing must fetch its public key projection");
+        let reusable_operation_id = {
+            let requests = broker.requests.lock().unwrap();
+            assert!(matches!(
+                &requests[0],
+                MachineBrokerRequest::WalletGetPublic(_)
+            ));
+            let MachineBrokerRequest::KeyGetPublic(key_request) = &requests[1] else {
+                panic!("explicit delegated signing must fetch its public key projection");
+            };
+            assert_eq!(key_request.key_ref, delegated_key_ref);
+            let MachineBrokerRequest::SigningSign(sign_request) = &requests[2] else {
+                panic!("explicit delegated signing must use signing.sign");
+            };
+            assert_eq!(sign_request.key_ref, delegated_key_ref);
+            assert_eq!(sign_request.petal_use_claim.as_ref(), Some(&request.claim));
+            assert_eq!(
+                sign_request
+                    .claim_assurance_evidence
+                    .as_ref()
+                    .map(Base64UrlBytes::decode),
+                Some(b"machine evidence".to_vec())
+            );
+            sign_request.operation_id.clone()
         };
-        assert_eq!(key_request.key_ref, delegated_key_ref);
-        let MachineBrokerRequest::SigningSign(sign_request) = &requests[2] else {
-            panic!("explicit delegated signing must use signing.sign");
-        };
-        assert_eq!(sign_request.key_ref, delegated_key_ref);
-        assert_eq!(sign_request.petal_use_claim.as_ref(), Some(&request.claim));
-        assert_eq!(
-            sign_request
-                .claim_assurance_evidence
-                .as_ref()
-                .map(Base64UrlBytes::decode),
-            Some(b"machine evidence".to_vec())
-        );
-        let reusable_operation_id = sign_request.operation_id.clone();
-        drop(requests);
 
         broker.requests.lock().unwrap().clear();
         let mut exact_request = request.clone();
@@ -1969,34 +2223,35 @@ mod tests {
             .sign_petal_payload_with_key(exact_request, delegated_key_ref.clone())
             .await
             .unwrap();
-        let requests = broker.requests.lock().unwrap();
-        let MachineBrokerRequest::SigningSign(exact_sign_request) = &requests[2] else {
-            panic!("exact explicit delegated signing must use signing.sign");
-        };
-        assert_eq!(exact_sign_request.key_ref, delegated_key_ref);
-        assert!(exact_sign_request.petal_use_claim.is_none());
-        assert!(exact_sign_request.claim_assurance_evidence.is_none());
-        assert_ne!(exact_sign_request.operation_id, reusable_operation_id);
-        let expected_exact_digest = SignOperationIdentity {
-            operation_id: exact_sign_request.operation_id.clone(),
-            approval_id: digest(50),
-            key_ref: delegated_key_ref.clone(),
-            crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
-            ordered_payload_digests: vec![Digest32::from_bytes(
-                Sha256::digest(b"delegated petal action").into(),
-            )],
-            ordered_hashes: vec![Digest32::from_bytes(
-                Sha256::digest(b"delegated petal action").into(),
-            )],
-            petal_use_claim_digest: None,
-            claim_assurance_digest: None,
-            policy_version: DecimalU64::new(7),
-            policy_digest: digest(7),
+        {
+            let requests = broker.requests.lock().unwrap();
+            let MachineBrokerRequest::SigningSign(exact_sign_request) = &requests[2] else {
+                panic!("exact explicit delegated signing must use signing.sign");
+            };
+            assert_eq!(exact_sign_request.key_ref, delegated_key_ref);
+            assert!(exact_sign_request.petal_use_claim.is_none());
+            assert!(exact_sign_request.claim_assurance_evidence.is_none());
+            assert_ne!(exact_sign_request.operation_id, reusable_operation_id);
+            let expected_exact_digest = SignOperationIdentity {
+                operation_id: exact_sign_request.operation_id.clone(),
+                approval_id: digest(50),
+                key_ref: delegated_key_ref.clone(),
+                crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+                ordered_payload_digests: vec![Digest32::from_bytes(
+                    Sha256::digest(b"delegated petal action").into(),
+                )],
+                ordered_hashes: vec![Digest32::from_bytes(
+                    Sha256::digest(b"delegated petal action").into(),
+                )],
+                petal_use_claim_digest: None,
+                claim_assurance_digest: None,
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+            }
+            .digest()
+            .unwrap();
+            assert_eq!(exact_sign_request.operation_digest, expected_exact_digest);
         }
-        .digest()
-        .unwrap();
-        assert_eq!(exact_sign_request.operation_digest, expected_exact_digest);
-        drop(requests);
         broker.requests.lock().unwrap().clear();
 
         let mut unsupported_key_ref = key_ref();
@@ -2722,22 +2977,53 @@ mod tests {
             );
             let response: Result<MachineBrokerResponse, ProtocolError> =
                 Ok(MachineBrokerResponse::ActionValidate(server_expected));
-            bloom_triad_local_transport::send_response(
+            bloom_triad_local_transport::send_response_with_journal_head(
                 &mut stream,
                 &server_identity,
                 &request,
                 response,
+                bloom_triad_local_transport::sign_journal_head(
+                    &server_identity,
+                    4,
+                    Digest32::from_bytes([4; 32]),
+                ),
             )
             .await
             .unwrap();
         });
 
-        let response = MachineBrokerClient::connect_unix(socket, machine, broker_acl)
+        let checkpoint_root = directory.path().join("checkpoints");
+        std::fs::create_dir(&checkpoint_root).unwrap();
+        std::fs::set_permissions(&checkpoint_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let client = MachineBrokerClient::connect_unix(socket, machine, broker_acl);
+        client
+            .attach_authority_journal(Arc::new(TestJournalProvider), &checkpoint_root, uid)
+            .unwrap();
+        let response = client
             .request(MachineBrokerRequest::ActionValidate(expected.clone()))
             .await
             .unwrap();
         assert_eq!(response, MachineBrokerResponse::ActionValidate(expected));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unix_service_never_emits_a_headless_authority_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let machine = local_identity("bloom-machine", "machine-key", 7);
+        let broker = local_identity("bloom-broker", "broker-key", 8);
+        let uid = std::fs::metadata(directory.path()).unwrap().uid();
+        let client = MachineBrokerClient::connect_unix(
+            directory.path().join("missing.sock"),
+            machine,
+            peer_acl(uid, &broker),
+        );
+        let error = client
+            .request(MachineBrokerRequest::ActionValidate(digest(1)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+        assert!(error.message.contains("journal is not initialized"));
     }
 
     #[test]
