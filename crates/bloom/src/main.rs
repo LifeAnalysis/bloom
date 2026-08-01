@@ -168,8 +168,12 @@ fn configured_broker_client_with_activation(
     let identity = client
         .local_application_identity()
         .context("authenticated Machine client did not retain its application identity")?;
-    let audit = Arc::new(open_configured_machine_audit(home, identity)?);
-    let checkpoint_root = configured_machine_checkpoint_path()?;
+    let audit = Arc::new(open_configured_machine_audit_with_activation(
+        home,
+        identity,
+        allow_activating,
+    )?);
+    let checkpoint_root = configured_machine_checkpoint_path_with_activation(allow_activating)?;
     #[cfg(feature = "triad-dev-harness")]
     let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
         rustix::process::geteuid().as_raw()
@@ -179,7 +183,7 @@ fn configured_broker_client_with_activation(
     #[cfg(not(feature = "triad-dev-harness"))]
     let history_owner = 0;
     let authority_history = bloom_machine_client::AuthorityEdgeHistory::load_trusted(
-        configured_authority_edge_history_path()?,
+        configured_authority_edge_history_path_with_activation(allow_activating)?,
         history_owner,
     )
     .map_err(anyhow::Error::new)
@@ -331,6 +335,10 @@ fn installed_macos_triad_paths() -> Result<Option<InstalledMacosTriadPaths>> {
     installed_macos_triad_paths_with_activation(false)
 }
 
+fn enrollment_state_is_usable(state: &str, allow_activating: bool) -> bool {
+    state == "active" || (allow_activating && state == "activating")
+}
+
 fn installed_macos_triad_paths_with_activation(
     allow_activating: bool,
 ) -> Result<Option<InstalledMacosTriadPaths>> {
@@ -376,7 +384,7 @@ fn installed_macos_triad_paths_with_activation(
             .get("state")
             .and_then(serde_json::Value::as_str)
             .context("installed Bloom enrollment has no state")?;
-        if state != "active" && !(allow_activating && state == "activating") {
+        if !enrollment_state_is_usable(state, allow_activating) {
             bail!("installed Bloom enrollment is not active");
         }
         let broker_uid = u32::try_from(
@@ -623,7 +631,15 @@ fn open_configured_machine_audit(
     home: &HomeDir,
     identity: bloom_triad_local_transport::LocalIdentity,
 ) -> Result<AuditLog> {
-    let history_path = configured_machine_audit_history_path()?;
+    open_configured_machine_audit_with_activation(home, identity, false)
+}
+
+fn open_configured_machine_audit_with_activation(
+    home: &HomeDir,
+    identity: bloom_triad_local_transport::LocalIdentity,
+    allow_activating: bool,
+) -> Result<AuditLog> {
+    let history_path = configured_machine_audit_history_path_with_activation(allow_activating)?;
     open_machine_audit_with_history(home, identity, &history_path)
 }
 
@@ -686,12 +702,12 @@ impl MachineJournalHeadProvider for ConfiguredMachineAuditHead {
     }
 }
 
-fn configured_machine_checkpoint_path() -> Result<PathBuf> {
+fn configured_machine_checkpoint_path_with_activation(allow_activating: bool) -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR") {
         return Ok(PathBuf::from(path));
     }
     let uid = rustix::process::geteuid().as_raw();
-    if installed_macos_triad_paths()?.is_some() {
+    if installed_macos_triad_paths_with_activation(allow_activating)?.is_some() {
         return Ok(PathBuf::from(format!(
             "/private/var/db/bloom/{uid}/machine/audit-checkpoints"
         )));
@@ -701,11 +717,13 @@ fn configured_machine_checkpoint_path() -> Result<PathBuf> {
     )))
 }
 
-fn configured_authority_edge_history_path() -> Result<PathBuf> {
+fn configured_authority_edge_history_path_with_activation(
+    allow_activating: bool,
+) -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("BLOOM_AUTHORITY_EDGE_HISTORY") {
         return Ok(PathBuf::from(path));
     }
-    if let Some(installed) = installed_macos_triad_paths()? {
+    if let Some(installed) = installed_macos_triad_paths_with_activation(allow_activating)? {
         return Ok(installed.authority_edge_history);
     }
     let uid = rustix::process::geteuid().as_raw();
@@ -714,11 +732,13 @@ fn configured_authority_edge_history_path() -> Result<PathBuf> {
     )))
 }
 
-fn configured_machine_audit_history_path() -> Result<PathBuf> {
+fn configured_machine_audit_history_path_with_activation(
+    allow_activating: bool,
+) -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("BLOOM_MACHINE_AUDIT_HISTORY") {
         return Ok(PathBuf::from(path));
     }
-    if let Some(installed) = installed_macos_triad_paths()? {
+    if let Some(installed) = installed_macos_triad_paths_with_activation(allow_activating)? {
         return Ok(installed.machine_audit_history);
     }
     #[cfg(unix)]
@@ -2894,11 +2914,20 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        Cli, Cmd, WalletCmd, ceremony_projection_path, execute_audit_command,
-        format_petal_consent_net_rule, is_completed_policy_update_receipt,
+        Cli, Cmd, WalletCmd, ceremony_projection_path, enrollment_state_is_usable,
+        execute_audit_command, format_petal_consent_net_rule, is_completed_policy_update_receipt,
         load_ceremony_projection, open_machine_audit_with_history, persist_ceremony_projection,
         request_body_with_wallet,
     };
+
+    #[test]
+    fn activating_enrollment_is_usable_only_for_installer_health() {
+        assert!(enrollment_state_is_usable("active", false));
+        assert!(enrollment_state_is_usable("active", true));
+        assert!(enrollment_state_is_usable("activating", true));
+        assert!(!enrollment_state_is_usable("activating", false));
+        assert!(!enrollment_state_is_usable("pending", true));
+    }
 
     #[test]
     fn audit_status_reports_malformed_evidence_as_degradation() {
