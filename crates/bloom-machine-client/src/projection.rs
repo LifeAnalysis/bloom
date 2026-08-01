@@ -311,7 +311,13 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
     async fn list_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
         match self.refresh().await {
             Ok(projections) => Ok(projections),
-            Err(error) if error.code == ProtocolErrorCode::ServiceUnavailable => self.cached(),
+            Err(error) if error.code == ProtocolErrorCode::ServiceUnavailable => {
+                tracing::warn!(
+                    error = %error,
+                    "Machine authority edge unavailable; serving cached wallet projections"
+                );
+                self.cached()
+            }
             Err(error) => Err(error),
         }
     }
@@ -329,6 +335,11 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
             Err(error) if error.code == ProtocolErrorCode::ServiceUnavailable => error,
             Err(error) => return Err(error),
         };
+        tracing::warn!(
+            error = %broker_error,
+            wallet_id = %wallet_id.as_str(),
+            "Machine authority edge unavailable; serving cached wallet projection"
+        );
         let cache = self
             .cache
             .lock()
