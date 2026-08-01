@@ -277,9 +277,19 @@ registration_url="$(sed -n 's/^ceremony_url: //p' "$work/registration.log")"
   cat "$work/registration.log" >&2
   exit 1
 }
-sudo -H -u "$login_user" \
+if ! sudo -H -u "$login_user" \
   "$debug_driver" complete "$registration_url" "$authenticator_seed" \
   >"$work/registration-complete.log" 2>&1
+then
+  cat "$work/registration-complete.log" >&2
+  exit 1
+fi
+wallet_id="$(jq -r '.wallet_id // empty' "$work/registration-complete.log")"
+[[ "$wallet_id" =~ ^wallet-[0-9a-f]{24}$ ]] || {
+  cat "$work/registration-complete.log" >&2
+  echo "wallet registration did not return a usable Signer-originated wallet ID" >&2
+  exit 1
+}
 
 deadline=$((SECONDS + 15))
 while [[ $SECONDS -lt $deadline ]]; do
@@ -287,21 +297,24 @@ while [[ $SECONDS -lt $deadline ]]; do
     BLOOM_HOME="$clean_home" \
     BLOOM_MACHINE_IDENTITY="$machine_identity" \
     BLOOM_EDGE_MANIFEST="$edge_manifest" \
-    "$machine_binary" --home "$clean_home" wallet projection ma05-cached \
+    "$machine_binary" --home "$clean_home" wallet projection "$wallet_id" \
     >"$work/live-projection.log" 2>"$work/live-projection.stderr"
   then
     break
   fi
   sleep 0.1
 done
-[[ -s "$work/live-projection.log" ]] || exit 1
+if [[ ! -s "$work/live-projection.log" ]]; then
+  cat "$work/live-projection.stderr" >&2
+  exit 1
+fi
 wallet_address="$(jq -r '.keys[0].addresses[0] // empty' "$work/live-projection.log")"
 [[ "$wallet_address" =~ ^0x[0-9a-fA-F]{40}$ ]] || exit 1
 
 # Install one explicit destination so the later confirm reaches the Broker
 # signing boundary rather than stopping at Machine's advisory deny-all view.
 jq -nc \
-  --arg wallet ma05-cached \
+  --arg wallet "$wallet_id" \
   --arg destination "$wallet_address" \
   '{wallet_id:$wallet,maximum_approval_lifetime_ms:2592000000,allowed_petal_packages:[],allowed_destinations:[{chain:"anvil",destination:$destination}],required_verifiers:[]}' \
   >"$work/live-policy.json"
@@ -311,7 +324,7 @@ sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" wallet update-policy ma05-cached \
+  "$machine_binary" --home "$clean_home" wallet update-policy "$wallet_id" \
     --file "$work/live-policy.json" >"$work/policy-prepare-live.log" 2>&1
 policy_operation_id="$(sed -n 's/^operation_id: //p' "$work/policy-prepare-live.log")"
 policy_ceremony_url="$(sed -n 's/^ceremony_url: //p' "$work/policy-prepare-live.log")"
@@ -330,11 +343,12 @@ sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" wallet projection ma05-cached \
+  "$machine_binary" --home "$clean_home" wallet projection "$wallet_id" \
   >"$work/live-projection.log" 2>"$work/live-projection.stderr"
 jq -e \
   --arg address "$wallet_address" \
-  '.verification == "authenticated_broker" and .freshness == "fresh" and .wallet.wallet_id == "ma05-cached" and .keys[0].addresses[0] == $address' \
+  --arg wallet "$wallet_id" \
+  '.verification == "authenticated_broker" and .freshness == "fresh" and .wallet.wallet_id == $wallet and .keys[0].addresses[0] == $address' \
   "$work/live-projection.log" >/dev/null
 /usr/bin/python3 - "$work/live-projection.log" "$wallet_address" <<'PY'
 import base64
@@ -617,7 +631,7 @@ sudo -H -u "$login_user" env \
     --endpoint "unix:$machine_socket" --mount "$mount_dir" \
     >"$work/machine-service.log" 2>&1 &
 machine_service_pid=$!
-deadline=$((SECONDS + 8))
+deadline=$((SECONDS + 30))
 while { [[ ! -S "$machine_socket" ]] ||
   ! mount | grep -F " on $mount_dir " >/dev/null 2>&1 ||
   ! sudo -u "$login_user" /bin/ls "$mount_dir" >/dev/null 2>&1; } &&
@@ -631,7 +645,8 @@ do
   sleep 0.05
 done
 if [[ ! -S "$machine_socket" ]] ||
-  ! mount | grep -F " on $mount_dir " >/dev/null 2>&1
+  ! mount | grep -F " on $mount_dir " >/dev/null 2>&1 ||
+  ! sudo -u "$login_user" /bin/ls "$mount_dir" >/dev/null 2>&1
 then
   cat "$work/machine-service.log" >&2
   echo "packaged production Machine service did not publish its IPC socket and kernel mount" >&2
@@ -651,7 +666,7 @@ run_machine_with_deadline \
 
 run_login_with_deadline \
   "$work/cached-wallet-address.log" \
-  /bin/cat "$mount_dir/wallets/ma05-cached/address" || {
+  /bin/cat "$mount_dir/wallets/$wallet_id/address" || {
   cat "$work/cached-wallet-address.log" >&2
   echo "packaged Machine did not preserve cached reads through its kernel mount" >&2
   exit 1
@@ -661,7 +676,7 @@ grep -Fx "$wallet_address" "$work/cached-wallet-address.log" >/dev/null
 degraded_intent="send 0.000000000000000001 eth to $wallet_address on anvil"
 mounted_write_with_deadline \
   "$work/stage.log" \
-  "$mount_dir/wallets/ma05-cached/chains/anvil/outbox/new.tx" \
+  "$mount_dir/wallets/$wallet_id/chains/anvil/outbox/new.tx" \
   "$degraded_intent" || {
   cat "$work/stage.log" >&2
   echo "packaged Machine did not preserve unsigned staging through its kernel mount with Broker stopped" >&2
@@ -705,7 +720,7 @@ jq -e \
 
 run_login_with_deadline \
   "$work/pending.log" \
-  /bin/ls -1 "$mount_dir/wallets/ma05-cached/chains/anvil/outbox/pending"
+  /bin/ls -1 "$mount_dir/wallets/$wallet_id/chains/anvil/outbox/pending"
 staged_id="$(sed -n '1p' "$work/pending.log")"
 [[ -n "$staged_id" ]] || {
   cat "$work/pending.log" >&2
@@ -715,7 +730,7 @@ staged_id="$(sed -n '1p' "$work/pending.log")"
 signing_audit_start="$(audit_sequence)"
 if mounted_write_with_deadline \
   "$work/signing.log" \
-  "$mount_dir/wallets/ma05-cached/chains/anvil/outbox/pending/$staged_id/confirm" \
+  "$mount_dir/wallets/$wallet_id/chains/anvil/outbox/pending/$staged_id/confirm" \
   y
 then
   signing_status=0
@@ -729,7 +744,7 @@ fi
 }
 assert_mounted_effect_denied \
   signing \
-  "/wallets/ma05-cached/chains/anvil/outbox/pending/$staged_id/confirm" \
+  "/wallets/$wallet_id/chains/anvil/outbox/pending/$staged_id/confirm" \
   y \
   "$signing_audit_start"
 # macOS NFS may acknowledge a close before surfacing a handler denial. The
@@ -738,7 +753,7 @@ assert_mounted_effect_denied \
 run_login_with_deadline \
   "$work/signing-pending.log" \
   /bin/test -d \
-  "$mount_dir/wallets/ma05-cached/chains/anvil/outbox/pending/$staged_id" || {
+  "$mount_dir/wallets/$wallet_id/chains/anvil/outbox/pending/$staged_id" || {
   cat "$work/signing.log" >&2
   echo "packaged Machine changed pending signing state without Broker authority" >&2
   exit 1
@@ -746,7 +761,7 @@ run_login_with_deadline \
 if run_login_with_deadline \
   "$work/signing-sent.log" \
   /bin/test -e \
-  "$mount_dir/wallets/ma05-cached/chains/anvil/outbox/sent/$staged_id"
+  "$mount_dir/wallets/$wallet_id/chains/anvil/outbox/sent/$staged_id"
 then
   echo "packaged Machine produced a sent transaction without Broker authority" >&2
   exit 1
@@ -754,17 +769,18 @@ fi
 
 run_login_with_deadline \
   "$work/policy-before.log" \
-  /bin/cat "$mount_dir/wallets/ma05-cached/policy.json"
-cat >"$work/proposed-policy.json" <<'JSON'
-{"allowed_destinations":[{"chain":"anvil","destination":"0x0000000000000000000000000000000000000003"}],"allowed_petal_packages":[],"maximum_approval_lifetime_ms":600000,"required_verifiers":[],"wallet_id":"ma05-cached"}
-JSON
+  /bin/cat "$mount_dir/wallets/$wallet_id/policy.json"
+jq -nc \
+  --arg wallet "$wallet_id" \
+  '{allowed_destinations:[{chain:"anvil",destination:"0x0000000000000000000000000000000000000003"}],allowed_petal_packages:[],maximum_approval_lifetime_ms:600000,required_verifiers:[],wallet_id:$wallet}' \
+  >"$work/proposed-policy.json"
 chown "$login_uid" "$work/proposed-policy.json"
 chmod 0600 "$work/proposed-policy.json"
 proposed_policy="$(<"$work/proposed-policy.json")"
 policy_audit_start="$(audit_sequence)"
 if mounted_write_with_deadline \
   "$work/policy.log" \
-  "$mount_dir/wallets/ma05-cached/policy.json" \
+  "$mount_dir/wallets/$wallet_id/policy.json" \
   "$proposed_policy"
 then
   policy_status=0
@@ -778,19 +794,19 @@ fi
 }
 assert_mounted_effect_denied \
   policy \
-  /wallets/ma05-cached/policy.json \
+  "/wallets/$wallet_id/policy.json" \
   "$proposed_policy" \
   "$policy_audit_start"
 run_login_with_deadline \
   "$work/policy-after.log" \
-  /bin/cat "$mount_dir/wallets/ma05-cached/policy.json"
+  /bin/cat "$mount_dir/wallets/$wallet_id/policy.json"
 /usr/bin/cmp -s "$work/policy-before.log" "$work/policy-after.log" || {
   echo "packaged Machine changed its authenticated policy projection without Broker authority" >&2
   exit 1
 }
 run_login_with_deadline \
   "$work/policy-pending.log" \
-  /bin/ls -A "$mount_dir/wallets/ma05-cached/policy-updates/pending"
+  /bin/ls -A "$mount_dir/wallets/$wallet_id/policy-updates/pending"
 [[ ! -s "$work/policy-pending.log" ]] || {
   cat "$work/policy-pending.log" >&2
   echo "packaged Machine staged policy authority state without Broker authority" >&2
@@ -801,7 +817,7 @@ approval_request="$(<"$work/approval-request.json")"
 approval_audit_start="$(audit_sequence)"
 if mounted_write_with_deadline \
   "$work/approval.log" \
-  "$mount_dir/wallets/ma05-cached/sealed-approvals/new.json" \
+  "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json" \
   "$approval_request"
 then
   approval_status=0
@@ -815,12 +831,12 @@ fi
 }
 assert_mounted_effect_denied \
   approval \
-  /wallets/ma05-cached/sealed-approvals/new.json \
+  "/wallets/$wallet_id/sealed-approvals/new.json" \
   "$approval_request" \
   "$approval_audit_start"
 run_login_with_deadline \
   "$work/approval-after.log" \
-  /bin/cat "$mount_dir/wallets/ma05-cached/sealed-approvals/new.json"
+  /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json"
 /usr/bin/python3 - "$work/approval-after.log" <<'PY'
 import json
 import pathlib
@@ -860,7 +876,7 @@ fi
   echo "packaged Machine mount lost its cached projection after authority denial" >&2
   exit 1
 }
-grep -Fx 'ma05-cached' "$work/projection.log" >/dev/null
+grep -Fx "$wallet_id" "$work/projection.log" >/dev/null
 grep -E 'Broker.*unavailable|authority.*unavailable|authenticated Machine-to-Broker edge' \
   "$work/machine-service.log" >/dev/null || {
   cat "$work/machine-service.log" >&2

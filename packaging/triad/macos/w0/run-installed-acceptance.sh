@@ -107,9 +107,9 @@ mkdir -p "$static_work/staging/bin"
 for binary in bloom bloom-broker bloom-signer; do
   cp "$payload/bin/$binary" "$static_work/staging/bin/$binary"
 done
-openssl genpkey \
-  -algorithm ED25519 \
-  -out "$static_work/release-key.pem" >/dev/null 2>&1
+printf '%s\n' 'intentionally invalid: conformance rejection must precede signing' \
+  > "$static_work/release-key.pem"
+chmod 0600 "$static_work/release-key.pem"
 set +e
 env \
   BLOOM_PLATFORM_CLAIM=macos-unix-principals \
