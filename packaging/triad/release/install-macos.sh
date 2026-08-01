@@ -414,23 +414,19 @@ require_directory_value() {
   attribute="$3"
   expected="$4"
   record="$(dscl -plist . -read "/$kind/$name" "$attribute")"
-  observed="$(
+  if observed="$(
     plutil -extract "dsAttrTypeStandard:$attribute".0 raw -o - - \
-      <<<"$record" 2>/dev/null || true
-  )"
-  if [[ -n "$observed" ]]; then
+      <<<"$record" 2>/dev/null
+  )"; then
     attribute_key="dsAttrTypeStandard:$attribute"
-  else
-    observed="$(
+  elif observed="$(
       plutil -extract "dsAttrTypeNative:$attribute".0 raw -o - - \
-        <<<"$record" 2>/dev/null || true
-    )"
-    if [[ -n "$observed" ]]; then
-      attribute_key="dsAttrTypeNative:$attribute"
-    else
-      echo "$kind/$name is missing required attribute $attribute" >&2
-      exit 65
-    fi
+        <<<"$record" 2>/dev/null
+  )"; then
+    attribute_key="dsAttrTypeNative:$attribute"
+  else
+    echo "$kind/$name is missing required attribute $attribute" >&2
+    exit 65
   fi
   if plutil -type "$attribute_key".1 -o - - <<<"$record" >/dev/null 2>&1; then
     echo "$kind/$name has multiple values for $attribute" >&2
