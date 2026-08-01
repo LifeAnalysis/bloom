@@ -512,19 +512,71 @@ require_live_directory_metadata() {
   }
 }
 
+extract_json_config_field() {
+  local config_file="$1"
+  local field="$2"
+  local output_format="$3"
+  /usr/bin/osascript -l JavaScript -e '
+    function run(argv) {
+      ObjC.import("Foundation");
+      const data = $.NSData.dataWithContentsOfFile(argv[0]);
+      if (!data) throw new Error("cannot read JSON config");
+      const text = $.NSString.alloc
+        .initWithDataEncoding(data, $.NSUTF8StringEncoding).js;
+      let value = JSON.parse(text);
+      argv[1].split(".").forEach(function (component) {
+        if (value === null || typeof value !== "object" ||
+            !Object.prototype.hasOwnProperty.call(value, component)) {
+          throw new Error("missing JSON config field");
+        }
+        value = value[component];
+      });
+      if (argv[2] === "json") return JSON.stringify(value);
+      if (Array.isArray(value)) return String(value.length);
+      if (value === null) return "null";
+      if (typeof value === "object") {
+        throw new Error("raw JSON config field is not scalar");
+      }
+      return String(value);
+    }
+  ' "$config_file" "$field" "$output_format"
+}
+
+validate_json_config() {
+  extract_json_config_field "$1" build_digest raw >/dev/null
+}
+
+set_json_config_field() {
+  local config_file="$1"
+  local field="$2"
+  local encoded_value="$3"
+  /usr/bin/osascript -l JavaScript -e '
+    function run(argv) {
+      ObjC.import("Foundation");
+      const data = $.NSData.dataWithContentsOfFile(argv[0]);
+      if (!data) throw new Error("cannot read JSON config");
+      const text = $.NSString.alloc
+        .initWithDataEncoding(data, $.NSUTF8StringEncoding).js;
+      const config = JSON.parse(text);
+      config[argv[1]] = JSON.parse(argv[2]);
+      const output = $(JSON.stringify(config, null, 2) + "\n")
+        .dataUsingEncoding($.NSUTF8StringEncoding);
+      if (!output.writeToFileAtomically(argv[0], true)) {
+        throw new Error("cannot write JSON config");
+      }
+    }
+  ' "$config_file" "$field" "$encoded_value" >/dev/null
+}
+
 require_network_containment_config() {
   config_file="$1"
   enrolled_uid="$2"
   expected_status="/private/var/run/bloom/$enrolled_uid/containment/status.json"
-  observed="$(
-    plutil -extract network_containment.status_path raw -o - "$config_file"
-  )"
+  observed="$(extract_json_config_field "$config_file" network_containment.status_path raw)"
   [[ "$observed" == "$expected_status" ]]
-  observed="$(plutil -extract network_containment.login_uid raw -o - "$config_file")"
+  observed="$(extract_json_config_field "$config_file" network_containment.login_uid raw)"
   [[ "$observed" == "$enrolled_uid" ]]
-  observed="$(
-    plutil -extract network_containment.maximum_age_ms raw -o - "$config_file"
-  )"
+  observed="$(extract_json_config_field "$config_file" network_containment.maximum_age_ms raw)"
   [[ "$observed" == "5000" ]]
 }
 
@@ -830,19 +882,16 @@ atomic_install() {
 }
 
 install_network_containment_config() {
-  config_file="$1"
-  enrolled_uid="$2"
+  local config_file="$1"
+  local enrolled_uid="$2"
+  local containment_json
   containment_json="$(
     printf \
       '{"status_path":"/private/var/run/bloom/%s/containment/status.json","login_uid":%s,"maximum_age_ms":5000}' \
       "$enrolled_uid" \
       "$enrolled_uid"
   )"
-  if plutil -type network_containment "$config_file" >/dev/null 2>&1; then
-    plutil -replace network_containment -json "$containment_json" "$config_file"
-  else
-    plutil -insert network_containment -json "$containment_json" "$config_file"
-  fi
+  set_json_config_field "$config_file" network_containment "$containment_json"
 }
 
 render_template() {
@@ -1307,17 +1356,17 @@ prepare_upgrade_transaction() {
     cp -p "$signer_config" "$staged/signer.json"
     plutil -replace release_digest -string "$new_digest" \
       "$staged/enrollment.json"
-    plutil -replace build_digest -string "$new_digest" "$staged/broker.json"
-    plutil -replace build_digest -string "$new_digest" "$staged/signer.json"
+    set_json_config_field "$staged/broker.json" build_digest "\"$new_digest\""
+    set_json_config_field "$staged/signer.json" build_digest "\"$new_digest\""
     install_network_containment_config "$staged/broker.json" "$enrolled_uid"
     install_network_containment_config "$staged/signer.json" "$enrolled_uid"
     staged_digest="$(
       read_enrollment_field "$staged/enrollment.json" release_digest
     )"
     [[ "$staged_digest" == "$new_digest" ]]
-    staged_digest="$(read_enrollment_field "$staged/broker.json" build_digest)"
+    staged_digest="$(extract_json_config_field "$staged/broker.json" build_digest raw)"
     [[ "$staged_digest" == "$new_digest" ]]
-    staged_digest="$(read_enrollment_field "$staged/signer.json" build_digest)"
+    staged_digest="$(extract_json_config_field "$staged/signer.json" build_digest raw)"
     [[ "$staged_digest" == "$new_digest" ]]
     chown root:wheel "$staged/enrollment.json"
     chown "$BLOOM_MACOS_BROKER_UID:$BLOOM_MACOS_BROKER_GID" \
@@ -1932,11 +1981,11 @@ require_same_config_field() {
   old_config="$1"
   new_config="$2"
   field="$3"
-  # Compare the complete typed plist value. `raw` is only defined for scalar
+  # Compare the complete typed JSON value. `raw` is only defined for scalar
   # leaves and would silently make audit key-history arrays/objects impossible
   # to pin across a config-only rotation.
-  old_value="$(plutil -extract "$field" json -o - "$old_config")"
-  new_value="$(plutil -extract "$field" json -o - "$new_config")"
+  old_value="$(extract_json_config_field "$old_config" "$field" json)"
+  new_value="$(extract_json_config_field "$new_config" "$field" json)"
   [[ "$old_value" == "$new_value" ]] || {
     echo "config rotation may not change $field" >&2
     return 65
@@ -1947,7 +1996,7 @@ verify_config_rotation() {
   old_config="$1"
   new_config="$2"
   principal="$3"
-  plutil -convert json -o /dev/null -- "$new_config"
+  validate_json_config "$new_config"
   common_fields=(
     build_digest
     network_containment.status_path
@@ -1989,7 +2038,7 @@ verify_config_rotation() {
       ceremony_key_id
       ceremony_signing_seed_hex
     )
-    [[ "$(plutil -extract aws_kms_backends raw -o - "$new_config")" == "0" ]] || {
+    [[ "$(extract_json_config_field "$new_config" aws_kms_backends raw)" == "0" ]] || {
       echo "macOS Unix-principal Signer rotation requires LocalSignerBackend only" >&2
       return 65
     }
@@ -1998,7 +2047,7 @@ verify_config_rotation() {
     require_same_config_field "$old_config" "$new_config" "$field"
   done
   require_network_containment_config "$new_config" "$login_uid"
-  rotated_build="$(plutil -extract build_digest raw -o - "$new_config")"
+  rotated_build="$(extract_json_config_field "$new_config" build_digest raw)"
   [[ "$rotated_build" == "$BLOOM_RELEASE_DIGEST" ]]
 }
 
