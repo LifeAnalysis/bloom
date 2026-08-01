@@ -643,9 +643,16 @@ grep -Fi \
 
 broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
 broker_log="/private/var/db/bloom/$login_uid/broker/broker.log"
+broker_state="/private/var/db/bloom/$login_uid/broker"
 broker_startup_status="/private/var/run/bloom/$login_uid/status/broker-startup.json"
 containment_status="/private/var/run/bloom/$login_uid/containment/status.json"
 launchctl bootout "$broker_label"
+broker_durable_before="$(
+  find "$broker_state" -type f ! -name broker.log -exec shasum -a 256 {} \; |
+    LC_ALL=C sort |
+    shasum -a 256 |
+    awk '{print $1}'
+)"
 /usr/bin/nc -lk 127.0.0.1 18734 >/dev/null 2>&1 &
 foreign_listener_pid=$!
 deadline=$((SECONDS + 10))
@@ -719,6 +726,16 @@ then
   echo "Broker opened a fallback TCP listener after the canonical bind conflict" >&2
   exit 1
 fi
+broker_durable_after="$(
+  find "$broker_state" -type f ! -name broker.log -exec shasum -a 256 {} \; |
+    LC_ALL=C sort |
+    shasum -a 256 |
+    awk '{print $1}'
+)"
+[[ "$broker_durable_after" == "$broker_durable_before" ]] || {
+  echo "a Broker that lost the canonical listener mutated durable authority state" >&2
+  exit 1
+}
 kill "$foreign_listener_pid"
 wait "$foreign_listener_pid" 2>/dev/null || true
 foreign_listener_pid=""
