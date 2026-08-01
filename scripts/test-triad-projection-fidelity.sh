@@ -168,6 +168,18 @@ printf 'Building deterministic ceremony driver...\n'
 (cd "$broker_repo" && cargo build -p bloom-broker-debug-driver)
 start_stack
 
+# The frozen protocol contains credential add/remove prepare variants for
+# future consumers, but Machine currently retains exactly one credential-change
+# surface: `wallet rebind-passkey` (credential replacement).  Prove that from
+# the actual user-visible CLI and mounted namespace instead of inventing a new
+# Machine command merely to exercise otherwise-unexposed protocol variants.
+wallet_help="$(cli wallet --help)"
+credential_commands="$(printf '%s\n' "$wallet_help" |
+  sed -n 's/^  \([a-z][a-z-]*\)  *.*/\1/p' |
+  grep -E '(credential|passkey|authenticator)' || true)"
+[ "$credential_commands" = "rebind-passkey" ] ||
+  die "credential-change CLI inventory is not exactly rebind-passkey: ${credential_commands:-<none>}"
+
 printf 'MA-03: registering wallet through Broker/Signer...\n'
 registration_launch="$(cli wallet new ma03-registration)"
 registration_result="$(complete_launch "$registration_launch" registration-auth --sign-count 1)"
@@ -177,6 +189,10 @@ printf '%s' "$registered_projection" | jq -e '
   (.credentials | length) == 1 and (.keys | length) == 1
 ' >/dev/null || die "registration projection omitted public authority descriptors"
 original_credential="$(printf '%s' "$registered_projection" | jq -er '.credentials[0].credential_id')"
+wallet_entries="$(LC_ALL=C command ls -1 "$(mounted "/wallets/${registered_wallet}")")"
+if printf '%s\n' "$wallet_entries" | grep -Eiq '(credential|passkey|authenticator|rebind)'; then
+  die "unexpected mounted credential mutation surface is exposed"
+fi
 
 printf 'MA-03: importing wallet through Broker/Signer...\n'
 import_launch="$(cli wallet import ma03-import)"
@@ -197,6 +213,12 @@ replacement_credential="$(printf '%s' "$rebound_projection" | jq -er '.credentia
   die "credential replacement did not change the public credential descriptor"
 printf '%s' "$rebound_projection" | jq -e '(.credentials | length) == 1' >/dev/null ||
   die "credential replacement left an unexpected credential set"
+printf '%s' "$rebound_projection" | jq -e \
+  --arg original "$original_credential" --arg replacement "$replacement_credential" '
+    (.credentials | length) == 1 and
+    .credentials[0].credential_id == $replacement and
+    all(.credentials[]; .credential_id != $original)
+  ' >/dev/null || die "CLI and mounted projection did not expose only the replacement credential"
 
 printf 'MA-03: committing a policy update through its completed ceremony receipt...\n'
 fixture_hash="$(jq -er '.records[] | select(.subject.kind == "petal" and .subject.route == "r000001") | .subject.package_hash' \
@@ -243,6 +265,10 @@ after_key_count="$(printf '%s' "$derived_projection" | jq -er '.keys | length')"
 printf '%s' "$derived_projection" | jq -e '
   any(.keys[]; .key_ref.derivation != null)
 ' >/dev/null || die "derived key projection omitted public derivation metadata"
+printf '%s' "$derived_projection" | jq -e --arg replacement "$replacement_credential" '
+  (.credentials | length) == 1 and
+  .credentials[0].credential_id == $replacement
+' >/dev/null || die "later Broker projection refresh lost the replacement credential"
 
 printf 'MA-03: deleting the imported wallet through Broker/Signer...\n'
 delete_launch="$(cli wallet delete "$imported_wallet")"
@@ -265,6 +291,13 @@ after_restart_projection="$(assert_projection_pair "$registered_wallet" restart)
 after_restart="$(printf '%s' "$after_restart_projection" | jq -cS 'del(.observed_at_ms, .freshness)')"
 [ "$before_restart" = "$after_restart" ] ||
   die "retained Broker projection changed across Machine restart"
+printf '%s' "$after_restart_projection" | jq -e \
+  --arg original "$original_credential" --arg replacement "$replacement_credential" '
+    (.credentials | length) == 1 and
+    .credentials[0].credential_id == $replacement and
+    all(.credentials[]; .credential_id != $original)
+  ' >/dev/null ||
+  die "replacement credential was not preserved solely through Broker projection across restart"
 restart_list="$(cli wallet list)"
 printf '%s\n' "$restart_list" | grep -F "$registered_wallet" >/dev/null ||
   die "retained wallet did not survive Machine restart"
@@ -275,4 +308,4 @@ fi
   die "deleted wallet resurrected in the mounted VFS across restart"
 assert_no_legacy_record "$registered_wallet" "$imported_wallet"
 
-printf 'MA-03 projection fidelity passed: registration, import, credential replacement, policy update, Petal key derivation, deletion, and restart matched through CLI and mounted VFS.\n'
+printf 'MA-03 projection fidelity passed: the sole retained credential-change surface (replacement), registration, import, policy update, Petal key derivation, deletion, and restart matched through CLI and mounted VFS; no credential add/remove Machine surface exists.\n'
