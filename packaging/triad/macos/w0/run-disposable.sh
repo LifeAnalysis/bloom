@@ -1007,10 +1007,22 @@ kill -STOP "$interrupted_identity_rotation_pid"
 # The newly bootstrapped services continue while the installer is stopped.
 # A successful external health exchange proves the new application keys have
 # emitted and their heads have reached the independently retained roots.
-sudo -u "$login_user" \
-  "$machine_binary" \
-  --triad-health-check \
-  "$release_digest"
+identity_health_deadline=$((SECONDS + 30))
+while ! identity_health_output="$(
+  sudo -u "$login_user" \
+    "$machine_binary" \
+    --triad-health-check \
+    "$release_digest" 2>&1
+)"; do
+  if [[ $SECONDS -ge $identity_health_deadline ]]; then
+    printf '%s\n' "$identity_health_output" >&2
+    echo "newly activated services did not become healthy while the installer was stopped" >&2
+    kill -9 "$interrupted_identity_rotation_pid" 2>/dev/null || true
+    wait "$interrupted_identity_rotation_pid" 2>/dev/null || true
+    exit 1
+  fi
+  sleep 0.1
+done
 staged_edge_digest="$(
   shasum -a 256 \
     "/Library/Application Support/BloomTriad/rotation-transaction/staged/edge-manifest.json" |
