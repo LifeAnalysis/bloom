@@ -1,8 +1,9 @@
 # Machine Legacy Authority Removal
 
-**Status:** approved goal specification; M3 amended for Petal-scoped sub-keys
+**Status:** approved goal specification; M3 amended for Petal-scoped sub-keys;
+dependency-boundary clarification ratified
 
-**Date:** 2026-07-31; M3 amendment 2026-07-31
+**Date:** 2026-07-31; M3 amendment 2026-07-31; dependency clarification 2026-08-01
 
 **Audience:** Bloom engineers, security reviewers, release engineers, and implementation agents
 
@@ -126,6 +127,31 @@ Broker responses such as `WalletPublic`, `KeyPublic`, `CredentialPublic`, and
 simulation. It never authorizes signing or custody and cannot override a live
 Broker decision.
 
+### 3.4 Authority dependency and reachability
+
+A dependency is an authority dependency when production Machine deliberately
+uses it to construct, receive, retain, recover, or invoke wallet authority as
+defined in sections 3.1 and 3.2. A direct dependency on a Bloom legacy
+authority crate is forbidden. A Machine feature that activates a local wallet
+or signer adapter, a Machine source reference to such an adapter, or a callable
+Machine path to it is also forbidden.
+
+The mere presence of generic signing primitives or an unused local-signer
+convenience implementation inside a transitive third-party package is not, by
+itself, a Machine authority path. Cargo metadata is evidence for review, not a
+substitute for proving construction, key flow, reachability, and invocation.
+Release gates must distinguish those cases rather than reject a package solely
+because its source tree contains cryptographic implementation code.
+
+Bloom must not vendor, copy, fork, or apply a source patch to an upstream
+dependency solely to erase an inert transitive signer implementation or to
+make an absence gate pass. Such a change requires an independently reviewed
+product need and an explicit specification amendment. If an upstream feature
+coupling exposes an actual callable Machine authority path, the conforming
+choices are to remove or move the consuming functionality out of Machine, use
+an upstream-supported feature boundary, or stop for that amendment. Copying an
+upstream package into this repository is not a conforming workaround.
+
 ## 4. Current verified baseline
 
 At the inventory baseline:
@@ -182,9 +208,13 @@ backend handle.
 
 No production Machine object, field, closure, task, handler, store, or feature
 may contain key material as defined in section 3.2. This includes scoped and
-short-lived delegated keys. `EphemeralAgentKey`, `PrivateKeySigner`, local
-signer implementations, PRF decryption, and equivalents are forbidden in the
-production Machine dependency graph.
+short-lived delegated keys. Machine production source may not import,
+construct, configure, receive, retain, or invoke `EphemeralAgentKey`,
+`PrivateKeySigner`, a local wallet signer, PRF decryption, or an equivalent
+authority implementation. Direct dependencies and explicitly activated
+features that provide those Machine capabilities are forbidden. Inert
+transitive third-party implementation code is governed by section 3.4 and is
+not independently a violation.
 
 ### MI-03: Broker and Signer are authoritative
 
@@ -546,7 +576,10 @@ modules be deleted.
 - Add failing release gates before removing code.
 
 Completion: the inventory is exhaustive enough that adding a new forbidden
-dependency or marker fails CI/local release validation.
+direct authority dependency, authority-enabling feature, Machine source use,
+or callable fallback fails CI/local release validation. The inventory may flag
+transitive third-party signer code for review, but may not fail solely on its
+package name or source contents without evidence of a Machine authority path.
 
 ### M1 — public projection extraction
 
@@ -636,7 +669,9 @@ above.
 - Move any still-useful key-free DTOs to neutral crates rather than retaining
   a legacy authority dependency.
 - Strengthen AC-04 release validation with Cargo metadata, feature-matrix,
-  symbol/marker, and runtime negative tests.
+  Machine-source/call-path, symbol-provenance, and runtime negative tests.
+- Treat transitive third-party cryptographic code according to section 3.4;
+  do not vendor or fork dependencies to satisfy a package-name or marker gate.
 - Delete obsolete state writers and documentation.
 
 Completion: all acceptance criteria in section 14 pass on the packaged bundle.
@@ -684,9 +719,13 @@ Petal execution, VFS, request state, or public projection caching.
 - **MA-01 — dependency graph:** Every packaged production Machine feature set
   has no normal or build dependency path to `bloom-keystore`, `bloom-auth`, or
   `bloom-auth-api`. Dev-dependencies are absent from production artifacts.
-- **MA-02 — no private signer types:** Production Machine source and symbols
-  contain no local private signer, `EphemeralAgentKey`, signer cache, PRF
-  decryptor, recovery secret, or key-wrap implementation.
+- **MA-02 — no private signer capability:** Production Machine source, objects,
+  configuration, and Machine-owned symbols contain no construction, receipt,
+  retention, recovery, or invocation path for a local wallet signer,
+  `EphemeralAgentKey`, signer cache, PRF decryptor, recovery secret, or key-wrap
+  implementation. Symbols attributable solely to an inert transitive
+  third-party implementation are not a failure without a Machine source or
+  call-path edge to that implementation.
 - **MA-03 — projection fidelity:** Wallet registration, import, deletion,
   credential changes, key derivation, and policy updates become visible through
   CLI and mounted VFS solely from Broker projections, including across Machine
@@ -725,10 +764,15 @@ Petal execution, VFS, request state, or public projection caching.
 - **MA-12 — developer parity:** Deterministic Broker debug-driver tests and the
   real-passkey out-of-process mounted integration both pass with Machine built
   from the same key-free production code.
-- **MA-13 — production artifact gates:** Release validation rejects forbidden
-  Cargo dependencies, feature activation, symbols, strings, files, methods,
-  sockets, and runtime connector attempts. A short marker list alone is not
-  sufficient.
+- **MA-13 — production artifact gates:** Release validation rejects the named
+  Bloom legacy authority dependencies, authority-enabling Machine feature
+  activation, Machine source/call paths, Machine-owned authority symbols,
+  forbidden files and methods, Signer sockets, and runtime connector attempts.
+  A short marker list alone is not sufficient. A transitive third-party crate
+  or symbol is not rejected solely because it contains a generic or unused
+  signer implementation; the gate must prove a Machine authority path as
+  defined in section 3.4. No vendored or locally forked upstream source may be
+  introduced merely to satisfy this criterion.
 - **MA-14 — parent conformance:** AC-01 through AC-35 are rerun on the bundle.
   In particular AC-02, AC-04, AC-14, AC-24, AC-26, and AC-35 must pass after
   legacy source and dependencies are removed.
@@ -736,8 +780,12 @@ Petal execution, VFS, request state, or public projection caching.
 ## 15. Release-gate requirements
 
 The release build must evaluate the resolved Cargo graph for every production
-binary and allowed production feature set. It must fail if a forbidden crate
-is reachable even when no forbidden string appears in the final binary.
+binary and allowed production feature set. It must fail if one of the named
+Bloom legacy authority crates is reachable, or if a Machine-controlled feature
+activates a callable local authority adapter, even when no forbidden string
+appears in the final binary. It must report but not automatically reject an
+otherwise permitted transitive third-party cryptographic package solely by
+crate name or because that package internally contains signer code.
 
 It must also scan for at least these classes:
 
@@ -757,10 +805,12 @@ policy-session
 bloom.sign-hash
 ```
 
-String matching is defense in depth, not the dependency proof. False positives
-from user-facing migration diagnostics must be handled through structured
-allowlists tied to exact artifact and symbol provenance, not by weakening the
-gate globally.
+String matching is defense in depth, not authority-path proof. False positives
+from user-facing migration diagnostics and inert transitive dependency symbols
+must be handled through structured provenance tied to the exact artifact,
+package, feature, and Machine call path. An allowlist may classify evidence;
+it may not excuse a direct dependency, Machine construction site, private-key
+flow, or callable signing fallback.
 
 Runtime negative tests launch the packaged Machine with Broker and Signer
 stopped or replaced by hostile sockets and prove Machine neither opens legacy
@@ -796,6 +846,13 @@ conforming design, records it in the implementation log, and proceeds.
 No implementation phase may make a temporary production fallback easier to
 activate than the code it replaces. Intermediate commits must fail closed.
 
+An absence gate that can be satisfied only by copying, vendoring, forking, or
+patching unrelated upstream source is presumed to be specified at the wrong
+boundary. The implementer must not perform that expansion. Apply section 3.4,
+remove or relocate an actual Machine authority consumer, or seek a reviewed
+specification amendment when the upstream coupling creates a real callable
+authority path.
+
 ## 18. Proposed `/goal` prompt
 
 ```text
@@ -815,6 +872,11 @@ degraded operation without constructing legacy authority; replace embedded
 local integration with out-of-process deterministic and real-passkey triad
 harnesses; and enforce absence through dependency, artifact, feature, and
 runtime release gates.
+
+Apply dependency gates at the Machine authority boundary defined in section
+3.4. Do not reject inert transitive third-party signer implementations solely
+by package name or source contents, and do not vendor, copy, fork, or patch an
+upstream dependency merely to make an absence gate pass.
 
 Treat M0, M1, M2, M3, M4, M5, and M6 as the major work chunks. After completing
 the implementation and local tests for each chunk, stop before beginning the
@@ -888,6 +950,25 @@ the parent repository policy before treating this TODO as normative work; it is
 not part of M0--M6 unless separately ratified.
 
 ## 21. Implementation decision log
+
+### 2026-08-01 — authority-path dependency gates, not transitive source bans
+
+The first M6 implementation interpreted MI-02 as banning any transitive
+third-party package that compiled an unused local-signer convenience
+implementation. It copied four upstream package source trees into Bloom and
+patched those implementations out. That added 54,782 vendored lines while
+changing no Machine key flow or callable authority path. The vendored sources
+and workspace patches were removed in `ce4fb74`.
+
+That interpretation is rejected. The security invariant is that Machine
+cannot construct, receive, retain, recover, or invoke wallet authority outside
+Broker, not that every transitive cryptographic package must be devoid of
+signing code. Sections 3.4, MI-02, M0, M6, MA-02, MA-13, and the release-gate
+requirements now state the required provenance and reachability analysis.
+Future gates must fail direct legacy authority dependencies, enabled Machine
+authority adapters, Machine construction/call sites, key flows, and runtime
+fallbacks. They must not force repository-scale upstream source copies to
+erase inert code.
 
 ### 2026-07-31 — AC-18 authenticated journal-head transport (superseded)
 
