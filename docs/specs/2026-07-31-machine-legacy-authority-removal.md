@@ -152,6 +152,13 @@ choices are to remove or move the consuming functionality out of Machine, use
 an upstream-supported feature boundary, or stop for that amendment. Copying an
 upstream package into this repository is not a conforming workaround.
 
+This rule does not authorize a new dependency-ownership inventory, provenance
+ledger, approval manifest, or per-package ratification process. Enforce it with
+the ordinary dependency graph, Machine source/call-path checks, focused
+negative tests, and normal review of any actual source override. Do not add
+repository-wide compliance artifacts that are unrelated to a callable Machine
+authority path.
+
 ## 4. Current verified baseline
 
 At the inventory baseline:
@@ -964,7 +971,7 @@ That interpretation is rejected. The security invariant is that Machine
 cannot construct, receive, retain, recover, or invoke wallet authority outside
 Broker, not that every transitive cryptographic package must be devoid of
 signing code. Sections 3.4, MI-02, M0, M6, MA-02, MA-13, and the release-gate
-requirements now state the required provenance and reachability analysis.
+requirements now state the required dependency and reachability analysis.
 Future gates must fail direct legacy authority dependencies, enabled Machine
 authority adapters, Machine construction/call sites, key flows, and runtime
 fallbacks. They must not force repository-scale upstream source copies to
