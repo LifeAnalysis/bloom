@@ -80,8 +80,26 @@ mkdir -p \
   "$distribution_root" \
   "$verified_root"
 
-"$main_root/packaging/triad/release/check-machine-authority-boundary.sh" \
-  --require-clean
+run_authority_boundary_check() {
+  local attempt status
+  for attempt in 1 2 3; do
+    if "$main_root/packaging/triad/release/check-machine-authority-boundary.sh" \
+      --require-clean
+    then
+      return 0
+    else
+      status=$?
+    fi
+    if (( status <= 128 )); then
+      return "$status"
+    fi
+    echo "Machine authority boundary checker was terminated by signal (status $status), attempt $attempt" >&2
+    (( attempt == 3 )) || sleep 2
+  done
+  return "$status"
+}
+
+run_authority_boundary_check
 python3 "$main_root/packaging/triad/release/check-legacy-hash-only-routes.py"
 
 cargo build \
