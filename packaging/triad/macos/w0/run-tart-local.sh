@@ -220,12 +220,16 @@ start_vm() {
         ssh "${ssh_options[@]}" "admin@$guest_ip" /usr/bin/true \
         >/dev/null 2>&1
     then
-      # SSH can become reachable before macOS has fully settled the VirtioFS
-      # directory shares. Give the guest a short stabilization window; the
-      # release gate still retries and fails closed on abnormal reader exits.
-      sleep 30
-      if sshpass -p "$guest_password" \
-        ssh "${ssh_options[@]}" "admin@$guest_ip" /usr/bin/true \
+      # Tahoe guests can accept SSH while child-side fork initialization is
+      # still unstable. Wait past the observed early-boot window, then prove
+      # fresh processes can execute before attributing a failure to Bloom.
+      sleep 60
+      if printf '%s\n' \
+        'set -e' \
+        'for _fork_probe in {1..200}; do /usr/bin/true; done' \
+        '/usr/bin/python3 -c "pass"' |
+        sshpass -p "$guest_password" \
+          ssh "${ssh_options[@]}" "admin@$guest_ip" /bin/bash -s \
         >/dev/null 2>&1
       then
         return 0
