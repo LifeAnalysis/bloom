@@ -311,26 +311,13 @@ forbidden_dependencies() {
     bloom-keystore bloom-auth bloom-auth-api bloom-hyperliquid
 }
 
-forbidden_resolved_features() {
-  printf '%s\n' \
-    '*:local-integration' \
-    '*:unsafe-debug-signer' \
-    '*:triad-dev-harness' \
-    '*:unsigned-audit-test-seam' \
-    '*:audit-test-seam'
-}
-
 feature_is_forbidden() {
-  local observed="$1"
-  local forbidden
-  while IFS= read -r forbidden; do
-    [[ -z "$forbidden" ]] && continue
-    case "$forbidden" in
-      \*:*) [[ "${observed#*:}" == "${forbidden#*:}" ]] && return 0 ;;
-      *) [[ "$observed" == "$forbidden" ]] && return 0 ;;
-    esac
-  done < <(forbidden_resolved_features)
-  return 1
+  case "${1#*:}" in
+    local-integration|unsafe-debug-signer|triad-dev-harness|unsigned-audit-test-seam|audit-test-seam)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 production_source_roots() {
