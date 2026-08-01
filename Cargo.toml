@@ -144,13 +144,3 @@ bloom-machine-client = { path = "crates/bloom-machine-client" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-# These upstream protocol crates expose generic signing seams that Bloom routes
-# through Broker, but their published packages also compile convenience local
-# private-key adapters unconditionally. The maintained forks below remove only
-# those adapters so concrete signer custody cannot enter a Machine artifact.
-[patch.crates-io]
-alloy = { path = "third-party/alloy-heimdall" }
-mpp = { path = "third-party/mpp" }
-tempo-alloy = { path = "third-party/tempo-alloy" }
-x402-chain-eip155 = { path = "third-party/x402-chain-eip155" }
