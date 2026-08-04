@@ -17,7 +17,7 @@ const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
-const GASLESS_RELEASE_COMMIT: &str = "bef056fa9498bd092be9cdc2a3bd5fd17264e163";
+const GASLESS_RELEASE_COMMIT: &str = "727765fdde5ce3111a4cf65123c72de68649a6e2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
@@ -62,7 +62,7 @@ const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
     commit: GASLESS_RELEASE_COMMIT,
     release_tag: "v0.1.0",
     archive: "gasless-v0.1.0.petal.tar.gz",
-    expected_hash: Some("545cf8d2871adbcb90bad23ee23d35859ad0da48f414f23e47123a4d11f6c4f5"),
+    expected_hash: Some("d597058a892bb7b2dbc725ed081e4d07c934afa10ba379eb7a24cfa360f0b0d0"),
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
