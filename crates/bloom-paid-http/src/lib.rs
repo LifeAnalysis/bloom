@@ -46,7 +46,7 @@ pub struct PaidHttpSigningFacts {
 /// Host signing seam for paid-HTTP protocol adapters.
 ///
 /// x402 and MPP adapters must never touch wallet key material or a
-/// `PrivateKeySigner`. Instead they present the exact 32-byte hash they need
+/// concrete local private signer. Instead they present the exact 32-byte hash they need
 /// signed to this seam; the Bloom runtime enforces the live Sealed Approval
 /// grant, records a `SigningAttestation` built from `facts`, atomically
 /// consumes one signature allowance, and returns the 65-byte secp256k1

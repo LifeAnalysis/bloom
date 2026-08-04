@@ -60,83 +60,26 @@ record, LaunchDaemon definitions, session LaunchAgent, and packet-filter
 anchor. Broker and Signer state/checkpoint roots remain owned by their
 respective service UIDs and mode `0700`.
 
-Version upgrades are global because every enrollment executes through the one
-root-owned `current` link. The installer first publishes a complete immutable
-release directory, then writes a root-only transaction containing exact
-backups and staged Broker/Signer configurations, LaunchDaemon definitions,
-and packet-filter anchors for every enrollment, plus the global session
-LaunchAgent. It stops all loaded instances, swaps the complete set, repoints
-`current`, and reloads the root packet-filter ruleset. Because concurrent
-Brokers cannot both own the canonical listener, activation restores session
-and Signer jobs first, then bootstraps and health-checks each recorded Broker
-whose login-session job was active, exclusively in turn. Logged-out
-enrollments have no authenticated session to test; their root-owned staged
-files and release bindings still participate in the same atomic transaction.
-After each active Broker is stopped, the installer restores the complete prior
-loaded-job set. Rollback validates the old release the same way.
-Machine's private installer health mode asks Broker for the existing
-`broker.readiness`; Broker in turn requires the existing `signer.readiness` to
-report `ready` on the same build. A failed check restores the complete old set.
-An installer invocation that finds a non-committed transaction performs that
-same rollback before doing new work.
-
-Live Broker and Signer config rotation is separately root-journaled. The
-installer first validates the caller's replacement and then validates the
-root-staged copy again, rejecting changes to release identity, containment,
-state paths, cross-pinned keys, or service-principal identity. It records the
-previous config and exact loaded-job set, stops both services, atomically swaps
-the one service-owned config, restores only those jobs, and requires the
-authenticated triad health check when Broker was active. Failure or a later
-invocation after interruption restores the byte-identical prior config and
-job set. The disposable W0 lane exercises valid rotation, immutable-field
-rejection, and SIGKILL recovery.
-
-`rotate-identities` rotates only the five application identities used on the
-authenticated Unix edges (Machine, Broker, Signer, revoke client, and session)
-and their root-owned edge manifest. The installed, digest-bound Machine binary
-generates the replacement set from the OS CSPRNG; the root installer journals
-the complete old/new sets, stops the session agent and both services, swaps all
-cross-pins while they are unavailable, then restores them and requires
-authenticated health. It deliberately does not rotate Broker or Signer
-custody/signing authorities embedded in service config, whose persisted-key
-rollover is a separate semantic operation.
-
-Permanent per-login uninstall is also a root-journaled operation. The exact
-verified enrollment record is copied into a durable transaction before the
-public enrollment state becomes `uninstalling`. Teardown is idempotent: a
-later installer invocation resumes stopping integration, removing only the
-recorded login's files, deleting Directory Service records only when their
-numeric IDs still match, and finally removing global integration when no
-enrollment remains. The disposable W0 lane kills an uninstall after its
-journal becomes durable and verifies forward recovery.
-
-The distinct `retain-bloom-login-LOGIN_UID` confirmation removes the jobs,
-packet-filter integration, and public enrollment while preserving the exact
-service accounts, private configuration, and service-owned custody state. A
-root-only retained record carries the original numeric identities and release
-digest. Reinstalling that exact signed release verifies the retained
-filesystem and Directory Service boundaries, publishes only an `activating`
-record, and removes the retained record only after authenticated Broker and
-Signer health succeeds. Interrupted or failed restoration returns to the
-retained, unavailable state. When other enrollments are active, restoration
-also requires that their one global release already matches the retained
-release; the installer never downgrades or mixes the active set to satisfy a
-restore. `delete-bloom-login-LOGIN_UID` remains the separate irreversible path
-and can permanently delete an already-retained enrollment.
+The installer intentionally has only two operations: install one signed
+release for a login and permanently uninstall that login after an exact
+confirmation. Reinstalling the same digest verifies the existing immutable
+release bytes. Installing a different digest is rejected; the operator must
+explicitly uninstall first. Upgrade transactions, live configuration or
+identity rotation, retained-custody uninstall, and crash-recovery journals are
+not part of this installer. Their former implementation was deleted rather
+than moved behind helper scripts.
 
 Production enrollment invokes the installed Machine binary's root-only
 enrollment-material mode against the signed public templates in `config/`.
 Five application identities and the Broker/Signer signing authorities are
 fresh per login; only their public cross-pins enter the root-owned manifest.
 The temporary root-only generation directory is removed on success or error.
-Fresh enrollment is journaled before the first Directory Service mutation.
-Each record intent is durable before creation, so an interrupted installer can
-remove only names it first proved absent. The root-owned enrollment record is
-published as `activating`; only the session sentinel, PF monitor, and private
-installer health probe accept that state. Ordinary Machine discovery requires
-`active`, which is atomically published only after authenticated Broker and
-Signer health succeeds. A later installer invocation resumes a health-passed
-transaction or rolls an incomplete one back exactly.
+The root-owned enrollment record is published as `activating`; only the session
+sentinel, PF monitor, and private installer health probe accept that state.
+Ordinary Machine discovery requires `active`, which is atomically published
+only after authenticated Broker and Signer health succeeds. A failed fresh
+install removes Directory Service records created by that invocation. The
+operator must explicitly uninstall any other partial state before retrying.
 
 The packet-filter template denies new Broker IP flows and all Signer TCP/UDP
 flows by numeric effective UID. A root/wheel one-shot monitor is launched once

@@ -105,9 +105,26 @@ responsibility matrix. It must not execute in Machine.
 
 ### 3.2 Key material
 
-Key material includes root and child wallet keys, Petal-scoped sub-keys,
-exchange API-wallet keys, payment keys, decrypted signers, wrapping keys, PRF output,
-recovery secrets, and any secret from which those values can be recovered.
+Key material includes root and child wallet keys, Bloom-managed Petal-scoped
+sub-keys, decrypted wallet signers, wrapping keys, PRF output, recovery
+secrets, and any secret from which those values can be recovered.
+
+A Petal may independently generate, store, and use its own application keys,
+including exchange, payment, API, session, or protocol keys. Those keys are
+Petal-owned application data, not Bloom-managed wallet authority, provided
+that Machine treats their bytes as opaque guest data and never parses,
+receives through a host signing API, invokes, exports, or uses them on the
+Petal's behalf. Petals retain access to runtime randomness, private namespaced
+storage, WASM cryptography, networking, and payload construction. A Petal may
+ask the user to approve a Broker-mediated wallet payload that registers a
+Petal-owned public key with an external protocol; subsequent local use and
+external revocation of that key belong to the Petal and protocol rather than
+Bloom's `KeyRef`, policy, approval, audit, or revocation model.
+
+When a Petal requests a Bloom-managed derived `KeyRef`, section 9 applies:
+Signer owns the private bytes and the Petal receives only public metadata.
+The two models must remain explicit. A Petal-owned key must not be represented
+as, imported into, or granted the protections of a Signer-owned `KeyRef`.
 
 The following are not wallet key material and remain permitted in Machine:
 
@@ -116,6 +133,7 @@ The following are not wallet key material and remain permitted in Machine:
   signed public policy snapshots;
 - TLS or package-verification material required for Machine-owned networking;
   and
+- opaque Petal-owned application state described above;
 - installer/enrollment tooling credentials when that tooling is not reachable
   from the running Machine or Petals and cannot sign wallet payloads.
 
@@ -214,8 +232,11 @@ backend handle.
 ### MI-02: no key-bearing Machine
 
 No production Machine object, field, closure, task, handler, store, or feature
-may contain key material as defined in section 3.2. This includes scoped and
-short-lived delegated keys. Machine production source may not import,
+may contain Bloom-managed key material as defined in section 3.2. This includes
+scoped and short-lived delegated `KeyRef` keys. Opaque bytes held inside a
+Petal's guest memory or package-hash-namespaced private store are the explicit
+section 3.2 exception; Machine may provide byte storage but may not interpret
+or exercise the key. Machine production source may not import,
 construct, configure, receive, retain, or invoke `EphemeralAgentKey`,
 `PrivateKeySigner`, a local wallet signer, PRF decryption, or an equivalent
 authority implementation. Direct dependencies and explicitly activated
@@ -376,11 +397,13 @@ The CLI follows the same vocabulary. “Grant,” “standing session,” and
 
 ## 9. Petal-scoped sub-keys
 
-A Petal may need a stable or short-lived signing identity distinct from the
-wallet root: an exchange API wallet, builder identity, payment key, session
-agent, or protocol-specific child. Such a sub-key remains wallet key material.
-Signer owns it; neither Petal nor Machine receives its private bytes, an
-encrypted export, a wrapping key, or a direct Signer capability.
+A Petal may need a stable or short-lived Bloom-managed signing identity
+distinct from the wallet root: an exchange API wallet, builder identity,
+payment key, session agent, or protocol-specific child. When the Petal chooses
+Bloom-managed derivation, such a sub-key remains wallet key material. Signer
+owns it; neither Petal nor Machine receives its private bytes, an encrypted
+export, a wrapping key, or a direct Signer capability. This section does not
+restrict the separate Petal-owned application-key model in section 3.2.
 
 ### 9.1 Scope identity
 
@@ -753,12 +776,14 @@ Petal execution, VFS, request state, or public projection caching.
   entry point. Each observes a Broker operation ID
   and Signer receipt; direct or hash-only alternatives fail. Every retired
   native Hyperliquid write fails closed and performs no signing.
-- **MA-08 — Petal sub-key confinement:** Cross-Petal, cross-route,
+- **MA-08 — Bloom-managed Petal sub-key confinement:** Cross-Petal, cross-route,
   cross-wallet, System-subject, CLI-subject, expired-scope, revoked-approval,
   replay, restart, and fault tests prove a scoped child signs only for its
   pinned Petal identity. Machine receives only public `KeyRef` metadata and
   signatures; its filesystem, memory diagnostics, and crash artifacts contain
-  no sub-key or decryptable key blob.
+  no Bloom-managed sub-key or decryptable key blob. This criterion does not
+  scan or prohibit opaque Petal-owned application keys in guest memory or the
+  package-hash-namespaced Petal private store.
 - **MA-09 — legacy state absent:** A clean production start creates no legacy
   keystore, `auth.sqlite`, approval challenge, grant, policy-session, or signer
   cache state. Pre-existing legacy files are not opened or trusted.

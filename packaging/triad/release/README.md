@@ -77,10 +77,9 @@ Cargo metadata and walks the normal/build edge closure from the exact Machine
 root. It rejects legacy authority crates, concrete local/custody signer
 implementations, and authority-restoring resolved features; dev-dependencies
 are not treated as production edges. The same gate checks the reachable
-production source roots for forbidden authority markers and files. Any
-non-authority migration diagnostic exception must be an exact marker/file
-entry in `machine-authority-source-allowlist.tsv`; wildcard and artifact-wide
-exceptions are unsupported. Bundle assembly independently rejects forbidden
+production source roots for forbidden authority markers and files. There are
+no file-wide source-marker exceptions: a forbidden marker anywhere in a
+production source root fails the build. Bundle assembly independently rejects forbidden
 paths, printable markers, and retained Machine symbols, so stripping symbols
 or changing one source spelling cannot substitute for the Cargo graph proof.
 Debug and accepting-test artifacts remain forbidden across the entire bundle.

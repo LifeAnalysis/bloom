@@ -26,6 +26,8 @@ pub mod paginate;
 pub mod path;
 pub mod planning;
 pub mod router;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use cache::PathCache;
 pub use exact_signing::{BrokerExactPayloadSigner, ExactPayloadOutcome};

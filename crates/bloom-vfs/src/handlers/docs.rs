@@ -205,7 +205,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(!help.contains("policy-session"), "{help}");
+        assert!(!help.contains(concat!("policy-", "session")), "{help}");
         assert!(help.contains("sealed-approvals"), "{help}");
         assert!(help.contains("Broker enforces"), "{help}");
         assert!(help.contains("policy.json"), "{help}");

@@ -3,7 +3,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use bloom_keystore::Keystore;
 use bloom_machine_client::{
     CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient, WalletProjectionReader,
 };
@@ -265,8 +264,7 @@ fn broker_fixture(lose_prepare_response_once: bool) -> Arc<BrokerFixture> {
 #[tokio::test]
 async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
     let temp = tempfile::tempdir().unwrap();
-    let keystore = Keystore::new(temp.path().join("empty-keystore")).unwrap();
-    assert!(keystore.list().unwrap().is_empty());
+    assert!(!temp.path().join("keystore").exists());
     let fixture = broker_fixture(false);
     let expected_policy = fixture.baseline.canonical_policy.decode();
     let expected_policy_digest = fixture.baseline.policy_digest.clone();
@@ -345,10 +343,11 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
 #[tokio::test]
 async fn vfs_policy_write_without_broker_never_mutates_legacy_policy_bytes() {
     let temp = tempfile::tempdir().unwrap();
-    let keystore = Keystore::new(temp.path().join("keystore")).unwrap();
-    keystore.create_local("alice", "test-passphrase").unwrap();
-    let (before, _) = keystore.raw_policy("alice").unwrap();
-    let proposed_legacy_toml = format!("{before}\n# direct-write probe\n");
+    let legacy_policy = temp.path().join("keystore/alice/policy.toml");
+    std::fs::create_dir_all(legacy_policy.parent().unwrap()).unwrap();
+    let before = b"legacy policy bytes remain opaque\n";
+    std::fs::write(&legacy_policy, before).unwrap();
+    let proposed_legacy_toml = "# direct-write probe\n";
     let home = HomeDir::at(temp.path().join("home"));
     let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
     let handler = WalletsHandler::new(
@@ -370,14 +369,12 @@ async fn vfs_policy_write_without_broker_never_mutates_legacy_policy_bytes() {
     assert!(
         matches!(error, HandlerError::Unsupported(ref message) if message.contains("read-only"))
     );
-    assert_eq!(keystore.raw_policy("alice").unwrap().0, before);
+    assert_eq!(std::fs::read(legacy_policy).unwrap(), before);
 }
 
 #[tokio::test]
 async fn vfs_policy_prepare_response_loss_reconciles_the_persisted_operation_id() {
     let temp = tempfile::tempdir().unwrap();
-    let keystore = Keystore::new(temp.path().join("keystore")).unwrap();
-    keystore.create_local("alice", "test-passphrase").unwrap();
     let fixture = broker_fixture(true);
     let service: Arc<dyn MachineBrokerService> = fixture.clone();
     let home = HomeDir::at(temp.path().join("home"));
@@ -434,8 +431,6 @@ async fn vfs_policy_prepare_response_loss_reconciles_the_persisted_operation_id(
 #[tokio::test]
 async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_receipt() {
     let temp = tempfile::tempdir().unwrap();
-    let keystore = Keystore::new(temp.path().join("keystore")).unwrap();
-    keystore.create_local("alice", "test-passphrase").unwrap();
     let outbox = Outbox::new(temp.path().join("outbox")).unwrap();
     let fixture = broker_fixture(false);
     let service: Arc<dyn MachineBrokerService> = fixture.clone();
@@ -560,8 +555,6 @@ async fn vfs_policy_terminal_ceremony_states_clear_urls_and_fail_the_projection(
         CeremonyState::Failed,
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let keystore = Keystore::new(temp.path().join("keystore")).unwrap();
-        keystore.create_local("alice", "test-passphrase").unwrap();
         let fixture = broker_fixture(false);
         let service: Arc<dyn MachineBrokerService> = fixture.clone();
         let home = HomeDir::at(temp.path().join("home"));
@@ -620,8 +613,6 @@ async fn vfs_policy_non_actionable_ceremony_states_never_expose_launch_data() {
         CeremonyState::Committing,
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let keystore = Keystore::new(temp.path().join("keystore")).unwrap();
-        keystore.create_local("alice", "test-passphrase").unwrap();
         let fixture = broker_fixture(false);
         let service: Arc<dyn MachineBrokerService> = fixture.clone();
         let home = HomeDir::at(temp.path().join("home"));

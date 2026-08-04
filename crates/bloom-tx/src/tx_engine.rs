@@ -14,13 +14,15 @@ use alloy::primitives::{Address, B256, Bytes, Signature, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-#[cfg(test)]
-use alloy_signer_local::PrivateKeySigner;
 use bloom_evm::{ChainClient, ChainError, IERC20, NftKind};
 use bloom_machine_client::{
     ExactPayloadBatchSignRequest, ExactPayloadSignOutcome, ExactPayloadSignRequest,
     MachineBrokerClient,
 };
+
+#[cfg(test)]
+#[path = "../test-support/tx_engine_signing.rs"]
+mod test_signing;
 
 // Local NFT-write interfaces. `bloom-evm` declares the read shapes for
 // ERC-721/1155; we add the write functions here so calldata encoding stays
@@ -2709,22 +2711,6 @@ impl TxEngine {
         Ok(SignedRawTx { raw, hash })
     }
 
-    #[cfg(test)]
-    async fn build_signed_raw_tx(
-        &self,
-        staged: &StagedTx,
-        chain: &ChainClient,
-        signer: &PrivateKeySigner,
-    ) -> Result<SignedRawTx, TxEngineError> {
-        use alloy::signers::SignerSync;
-
-        let unsigned = self.build_unsigned_evm_tx(staged, chain)?;
-        let signature = signer
-            .sign_hash_sync(&Self::unsigned_signing_hash(&unsigned))
-            .map_err(|e| TxEngineError::Signer(e.to_string()))?;
-        self.assemble_signed_raw_tx(staged, unsigned, signature)
-    }
-
     async fn submit_signed_raw(
         &self,
         staged: &StagedTx,
@@ -3637,10 +3623,11 @@ impl TxEngine {
         &self,
         staged: &StagedTx,
         chain: &ChainClient,
-        signer: &PrivateKeySigner,
+        signature: Signature,
         policy: &Policy,
     ) -> Result<B256, TxEngineError> {
-        let signed = self.build_signed_raw_tx(staged, chain, signer).await?;
+        let unsigned = self.build_unsigned_evm_tx(staged, chain)?;
+        let signed = self.assemble_signed_raw_tx(staged, unsigned, signature)?;
         self.submit_signed_raw(staged, chain, policy, &signed)
             .await?;
         Ok(signed.hash)
@@ -4606,26 +4593,7 @@ mod tests {
         ServiceFuture, SigningPayloads, SigningResult, WalletPublic,
     };
 
-    const TEST_SIGNER_PK: &str =
-        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const TEST_SIGNER_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
-
-    fn test_signer() -> alloy_signer_local::PrivateKeySigner {
-        TEST_SIGNER_PK
-            .parse()
-            .expect("valid deterministic test key")
-    }
-
-    fn test_normalized_signature(payload: &[u8], crypto_suite: CryptoSuite) -> NormalizedSignature {
-        use alloy::signers::SignerSync as _;
-
-        let hash = alloy::primitives::keccak256(payload);
-        let signature = test_signer().sign_hash_sync(&hash).unwrap();
-        NormalizedSignature {
-            crypto_suite,
-            bytes: Base64UrlBytes::from_bytes(&signature.as_bytes()),
-        }
-    }
 
     struct TriadBrokerFixture {
         active: AtomicBool,
@@ -4710,8 +4678,7 @@ mod tests {
                             panic!("fixture expects one exact payload");
                         };
                         let hash = alloy::primitives::keccak256(payload.decode());
-                        use alloy::signers::SignerSync as _;
-                        let signature = test_signer().sign_hash_sync(&hash).unwrap();
+                        let signature = test_signing::sign_hash(&hash);
                         let result = SigningResult {
                             operation_id: request.operation_id,
                             operation_digest: request.operation_digest,
@@ -4738,7 +4705,10 @@ mod tests {
                         let signatures = children
                             .iter()
                             .map(|payload| {
-                                test_normalized_signature(&payload.decode(), request.crypto_suite)
+                                test_signing::normalized_signature(
+                                    &payload.decode(),
+                                    request.crypto_suite,
+                                )
                             })
                             .collect();
                         let result = SigningResult {
@@ -7095,7 +7065,6 @@ mod tests {
         spec.name = "sepolia".into();
         spec.chain_id = bloom_mempool::SEPOLIA_CHAIN_ID;
         let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
-        let signer = test_signer();
         let mut policy = bloom_proto::Policy::default();
         policy.private.enabled = true;
         policy.private.provider = "flashbots".into();
@@ -7111,9 +7080,10 @@ mod tests {
         let mut staged = fake_staged_1559("0001-private-sepolia");
         staged.chain = "sepolia".into();
         staged.chain_id = bloom_mempool::SEPOLIA_CHAIN_ID;
+        let signature = test_signing::transaction_signature(&engine, &staged, &chain);
 
         let hash = engine
-            .broadcast(&staged, &chain, &signer, &policy)
+            .broadcast(&staged, &chain, signature, &policy)
             .await
             .expect("private sepolia broadcast");
 
@@ -7128,15 +7098,15 @@ mod tests {
     async fn broadcast_rejects_private_on_non_mainnet() {
         let (engine, spec, _dir) = fake_engine(60_000);
         let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
-        let signer = test_signer();
         let mut policy = bloom_proto::Policy::default();
         policy.private.enabled = true;
         policy.private.provider = "mev_blocker".into();
 
         // fake_staged_1559 uses chain_id 31337 (anvil) — not mainnet.
         let staged = fake_staged_1559("0001-private-testnet");
+        let signature = test_signing::transaction_signature(&engine, &staged, &chain);
 
-        let r = engine.broadcast(&staged, &chain, &signer, &policy).await;
+        let r = engine.broadcast(&staged, &chain, signature, &policy).await;
         match r {
             Err(TxEngineError::PrivateNotSupportedOnChain(name)) => {
                 assert_eq!(name, "anvil");

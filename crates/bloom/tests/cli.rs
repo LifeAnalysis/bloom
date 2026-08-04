@@ -87,10 +87,14 @@ summary = "Demo app used by CLI tests."
 
 /// Seed a pre-migration wallet solely as a read/staging fixture. Production
 /// CLI custody commands must never call these keystore creation methods.
-fn seed_legacy_wallet_fixture(home: &Path, name: &str) -> String {
-    let keystore = bloom_keystore::Keystore::new(home.join("keystore")).unwrap();
-    let info = keystore.create_local(name, "test-only-passphrase").unwrap();
-    bloom_proto::checksum_address(&info.address)
+fn seed_legacy_wallet_fixture(home: &Path, name: &str) {
+    // Deliberately malformed-but-present pre-triad state. The production CLI
+    // must ignore the directory without linking the retired keystore parser.
+    write_file(
+        home,
+        &format!("keystore/{name}/wallet.json"),
+        b"legacy authority state must remain opaque",
+    );
 }
 
 /// Seed the authenticated, key-free public projection cache that production

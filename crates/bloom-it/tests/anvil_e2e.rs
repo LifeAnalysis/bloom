@@ -68,12 +68,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     write_config(&home_root, &rpc_url)?;
     let home = HomeDir::at(&home_root);
     let permit = Arc::new(HomeWritePermit::acquire(&home)?);
-    let passphrase = "integration-test-pass";
-    let keystore = bloom_keystore::Keystore::new(home.root().join("keystore"))
-        .map_err(|e| anyhow!("keystore: {e}"))?;
-    let info = keystore
-        .import_hex("alice", TEST_WALLET_PRIVATE_KEY, passphrase)
-        .map_err(|e| anyhow!("create_local: {e}"))?;
+    let test_signer: alloy_signer_local::PrivateKeySigner = TEST_WALLET_PRIVATE_KEY.parse()?;
     let (broker, fixture) = exact_signing_broker(TEST_WALLET_PRIVATE_KEY)?;
     let daemon = Daemon::from_home_with_permit_and_broker(
         home,
@@ -83,17 +78,9 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     )
     .map_err(|e| anyhow!("daemon: {e}"))?;
 
-    // 3. The local keystore is only a pre-triad public wallet projection for
-    // VFS staging. Exact signing below is performed exclusively by Broker.
-    let alice_addr = format!("{:#x}", info.address);
-
-    // Keep broadcast in fresh-review mode. The pre-minted Sealed Approval
-    // grant below is the explicit authorization used by this test.
-    let wallet_dir = tmp.path().join("keystore").join("alice");
-    std::fs::write(
-        wallet_dir.join("policy.toml"),
-        "[approval]\nagent_autonomy = \"prompt_all\"\n",
-    )?;
+    // The Broker fixture publishes the wallet projection and produces the
+    // exact signature. Machine owns no parallel keystore or policy fixture.
+    let alice_addr = format!("{:#x}", test_signer.address());
 
     // 4. Fund alice from anvil's prefunded #0 via `cast send`.
     fund_via_cast(&rpc_url, &alice_addr, 10).await?;
@@ -320,12 +307,7 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
     write_config(&home_root, &rpc_url)?;
     let home = HomeDir::at(&home_root);
     let permit = Arc::new(HomeWritePermit::acquire(&home)?);
-    let passphrase = "integration-test-pass";
-    let keystore = bloom_keystore::Keystore::new(home.root().join("keystore"))
-        .map_err(|e| anyhow!("keystore: {e}"))?;
-    let info = keystore
-        .import_hex("alice", TEST_WALLET_PRIVATE_KEY, passphrase)
-        .map_err(|e| anyhow!("create_local: {e}"))?;
+    let test_signer: alloy_signer_local::PrivateKeySigner = TEST_WALLET_PRIVATE_KEY.parse()?;
     let (broker, _fixture) = exact_signing_broker(TEST_WALLET_PRIVATE_KEY)?;
     let daemon = Daemon::from_home_with_permit_and_broker(
         home,
@@ -334,13 +316,7 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
         exact_signing_catalog(&["transaction.confirm"]),
     )
     .map_err(|e| anyhow!("daemon: {e}"))?;
-    let alice_addr = format!("{:#x}", info.address);
-
-    let wallet_dir = tmp.path().join("keystore").join("alice");
-    std::fs::write(
-        wallet_dir.join("policy.toml"),
-        "[approval]\nagent_autonomy = \"prompt_all\"\n",
-    )?;
+    let alice_addr = format!("{:#x}", test_signer.address());
 
     // Fund alice so gas is affordable — the refusal must be the nonce gap, not
     // an insufficient-funds error.

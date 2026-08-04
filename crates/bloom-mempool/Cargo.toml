@@ -32,7 +32,6 @@ tokio-tungstenite = { workspace = true, optional = true }
 
 [dev-dependencies]
 alloy-signer-local = "2.0.5"
-bloom-keystore.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber.workspace = true
 tempfile.workspace = true

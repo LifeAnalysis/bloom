@@ -9,7 +9,6 @@ use alloy::rpc::types::eth::TransactionRequest;
 use alloy::signers::SignerSync;
 use bloom_mempool::providers::flashbots::SEPOLIA_URL;
 
-const DEFAULT_WALLET: &str = "dest1";
 const DEFAULT_RECIPIENT: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 const DEFAULT_TRANSFER_WEI: u128 = 100_000_000_000_000; // 0.0001 Sepolia ETH
 const DEFAULT_PRIORITY_FEE_WEI: u128 = 50_000_000_000; // 50 gwei
@@ -28,12 +27,9 @@ async fn flashbots_sepolia_accepts_private_real_value_transfer() -> anyhow::Resu
     }
 
     let rpc_url = required_env_any(&["BLOOM_SEPOLIA_RPC_URL", "BETH_SEPOLIA_RPC_URL"])?;
-    let live_home = required_env_any(&["BLOOM_LIVE_HOME", "BETH_LIVE_HOME"])?;
-    let passphrase = required_env_any(&["BLOOM_PASSPHRASE", "BETH_PASSPHRASE"])?;
+    let private_key = required_env_any(&["BLOOM_SEPOLIA_TEST_PRIVATE_KEY"])?;
     let expected_sender: Address =
         required_env_any(&["BLOOM_LIVE_DEST1", "BETH_LIVE_DEST1"])?.parse()?;
-    let wallet_name = env_any(&["BLOOM_LIVE_WALLET", "BETH_LIVE_WALLET"])
-        .unwrap_or_else(|_| DEFAULT_WALLET.into());
     let recipient: Address = env_any(&["BLOOM_SEPOLIA_RECIPIENT", "BETH_SEPOLIA_RECIPIENT"])
         .or_else(|_| env_any(&["BLOOM_LIVE_DEST2", "BETH_LIVE_DEST2"]))
         .unwrap_or_else(|_| DEFAULT_RECIPIENT.into())
@@ -44,16 +40,12 @@ async fn flashbots_sepolia_accepts_private_real_value_transfer() -> anyhow::Resu
     )?;
     anyhow::ensure!(value_wei > 0, "Sepolia transfer amount must be > 0");
 
-    let keystore =
-        bloom_keystore::Keystore::new(std::path::Path::new(&live_home).join("keystore"))?;
-    let info = keystore.info(&wallet_name)?;
+    let signer: alloy_signer_local::PrivateKeySigner = private_key.parse()?;
     anyhow::ensure!(
-        info.address == expected_sender,
-        "wallet {wallet_name} address {} does not match BLOOM_LIVE_DEST1 {expected_sender}",
-        info.address
+        signer.address() == expected_sender,
+        "BLOOM_SEPOLIA_TEST_PRIVATE_KEY address {} does not match BLOOM_LIVE_DEST1 {expected_sender}",
+        signer.address()
     );
-    keystore.unlock(&wallet_name, &passphrase)?;
-    let signer = keystore.signer(&wallet_name)?;
 
     let chain_id = rpc_str(&rpc_url, "eth_chainId", serde_json::json!([])).await?;
     anyhow::ensure!(
@@ -126,7 +118,7 @@ async fn flashbots_sepolia_accepts_private_real_value_transfer() -> anyhow::Resu
         .with_max_fee_per_gas(max_fee)
         .with_max_priority_fee_per_gas(priority_fee);
 
-    let wallet = EthereumWallet::from((*signer).clone());
+    let wallet = EthereumWallet::from(signer.clone());
     let envelope = tx.build(&wallet).await?;
     let mut raw = Vec::new();
     envelope.encode_2718(&mut raw);

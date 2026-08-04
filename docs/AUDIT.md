@@ -118,7 +118,7 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 | Requirement | Status | Artifact |
 |---|---|---|
 | Long-running daemon (`bloom serve`) | shipped | `crates/bloom/src/main.rs::Cmd::Serve` → `IpcServer::serve` |
-| Persistent unlock cache (in-memory) | shipped | `crates/bloom-keystore/src/lib.rs::Keystore::unlock` (process-scoped; no on-disk persistence) |
+| Machine-local unlock cache | removed | Wallet custody and signing are available only through the authenticated Broker/Signer authority plane. |
 | Watch executor in daemon | shipped | `crates/bloom-watch/src/executor.rs::WatchExecutor`, instantiated and started by `crates/bloom-daemon/src/lib.rs::Daemon::from_home` |
 | UDS JSON-RPC IPC (`lookup`, `read`, `write`, `list`, `version`, `chains`, `shutdown`) | shipped | `crates/bloom-daemon/src/ipc.rs`; CLI surface via `Cmd::Ipc(IpcCmd::Call)` |
 | VFS auto-routes through socket when present | shipped | `crates/bloom/src/main.rs` checks `default_socket_path` for `Vfs::{Cat,Ls,Write}` |
@@ -156,7 +156,7 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 | Requirement | Status | Artifact |
 |---|---|---|
 | Per-chain `allow_broadcast` gate | shipped | Defaults to `true`; the daemon refuses to send when explicitly set to false. |
-| Encrypted keystore (argon2id + chacha20poly1305) | shipped | `crates/bloom-keystore`. |
+| Machine-local encrypted keystore | removed | Signer owns encrypted custody; Machine stores authenticated public wallet projections only. |
 | Hash-chained audit log | shipped | `crates/bloom-proto/src/audit.rs::AuditLog`; wired into the VFS router. |
 | Stage-confirm only write mode for txs | shipped | `tx_engine.rs::confirm` requires non-empty body. |
 | Daemon-level multi-user auth | deferred | Single-user only; spec §6.4 marked stretch. |
@@ -230,7 +230,7 @@ crates/
 ├── bloom-vfs            # Path router + 11 handler modules
 ├── bloom-chain          # alloy provider pool, ChainRegistry, ERC-20 reads
 ├── bloom-tx             # Tx engine, intent parser, policy_engine, RecipientResolver, PriceOracle, Outbox (rolling-USD)
-├── bloom-keystore       # argon2id + chacha20poly1305 encrypted keystore
+├── bloom-machine-client # authenticated Machine-to-Broker client and public projections
 ├── bloom-petals         # installed application packages and /petals/<name>/ routing
 ├── bloom-watch          # Subscription registry + executor task + event log rotation
 ├── bloom-tools          # Pure crypto/abi/encoding utilities

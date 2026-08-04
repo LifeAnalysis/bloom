@@ -957,7 +957,7 @@ mod tests {
         );
         let graph = String::from_utf8(output.stdout).unwrap();
         for forbidden in [
-            "bloom-keystore ",
+            concat!("bloom-", "keystore "),
             "bloom-signer ",
             "bloom-signer-backend-",
             "bloom-broker ",

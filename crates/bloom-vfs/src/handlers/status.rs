@@ -46,8 +46,6 @@ use serde::Serialize;
 use tokio::time::timeout;
 
 use bloom_evm::ChainRegistry;
-#[cfg(test)]
-use bloom_keystore::Keystore;
 use bloom_machine_client::WalletProjectionReader;
 use bloom_prices::PricesClient;
 use bloom_proto::{AuditLog, BackendsConfig};
@@ -105,8 +103,6 @@ pub use bloom_update::UpdateAvailable;
 #[derive(Clone)]
 pub struct StatusHandler {
     pub chains: ChainRegistry,
-    #[cfg(test)]
-    pub keystore: Keystore,
     pub wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     pub tx_engine: TxEngine,
     pub audit: Arc<AuditLog>,
@@ -142,11 +138,9 @@ impl StatusHandler {
     /// `cache/etherscan_entries` field; pass `None` if no etherscan cache
     /// has ever been wired. `etherscan_configured` reports whether the
     /// daemon's config provides etherscan credentials.
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         chains: ChainRegistry,
-        keystore: Keystore,
         tx_engine: TxEngine,
         audit: Arc<AuditLog>,
         prices: Option<PricesClient>,
@@ -155,10 +149,10 @@ impl StatusHandler {
         home: PathBuf,
         started_at: SystemTime,
         version: impl Into<String>,
+        wallet_projections: Arc<dyn WalletProjectionReader>,
     ) -> Self {
         Self::with_backends(
             chains,
-            keystore,
             tx_engine,
             audit,
             prices,
@@ -168,50 +162,15 @@ impl StatusHandler {
             home,
             started_at,
             version,
+            wallet_projections,
         )
     }
 
     /// Variant of [`Self::new`] that takes the per-feature backend
     /// declaration. Used by the daemon so `status/backends/...` reflects
     /// the live config; tests can call [`Self::new`] for the default.
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_backends(
-        chains: ChainRegistry,
-        keystore: Keystore,
-        tx_engine: TxEngine,
-        audit: Arc<AuditLog>,
-        prices: Option<PricesClient>,
-        etherscan_cache_dir: Option<PathBuf>,
-        etherscan_configured: bool,
-        backends: BackendsConfig,
-        home: PathBuf,
-        started_at: SystemTime,
-        version: impl Into<String>,
-    ) -> Self {
-        Self {
-            chains,
-            keystore,
-            wallet_projections: None,
-            tx_engine,
-            audit,
-            prices,
-            etherscan_cache_dir,
-            etherscan_configured,
-            backends,
-            home,
-            started_at,
-            version: version.into(),
-            update_snapshot_fn: None,
-            chain_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            mempool_statuses: Arc::new(RwLock::new(BTreeMap::new())),
-            private_rpc_healths: Arc::new(RwLock::new(BTreeMap::new())),
-        }
-    }
-
     /// Production constructor: wallet status is derived exclusively from the
     /// authenticated public projection. No key-bearing store is accepted.
-    #[cfg(not(test))]
     #[allow(clippy::too_many_arguments)]
     pub fn with_backends(
         chains: ChainRegistry,
@@ -476,21 +435,17 @@ impl StatusHandler {
     }
 
     async fn wallet_count(&self) -> Result<u64, HandlerError> {
-        if let Some(projections) = &self.wallet_projections {
-            return projections
-                .list_wallets()
-                .await
-                .map(|wallets| wallets.len() as u64)
-                .map_err(|error| HandlerError::backend(error.to_string()));
-        }
-        #[cfg(test)]
-        {
-            return Ok(self.keystore.list().map(|v| v.len() as u64).unwrap_or(0));
-        }
-        #[cfg(not(test))]
-        Err(HandlerError::backend(
-            "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
-        ))
+        self.wallet_projections
+            .as_ref()
+            .ok_or_else(|| {
+                HandlerError::backend(
+                    "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
+                )
+            })?
+            .list_wallets()
+            .await
+            .map(|wallets| wallets.len() as u64)
+            .map_err(|error| HandlerError::backend(error.to_string()))
     }
 
     fn outbox_pending_count(&self) -> u64 {
@@ -1213,13 +1168,11 @@ mod tests {
 
     fn make_handler(home: &std::path::Path) -> StatusHandler {
         let chains = ChainRegistry::default();
-        let keystore = Keystore::new(home.join("keystore")).unwrap();
         let outbox = Outbox::new(home.join("outbox")).unwrap();
         let tx_engine = TxEngine::new(outbox, 60_000);
         let audit = Arc::new(AuditLog::open(home.join("audit.jsonl")).unwrap());
         StatusHandler::new(
             chains,
-            keystore,
             tx_engine,
             audit,
             None,
@@ -1228,6 +1181,10 @@ mod tests {
             home.to_path_buf(),
             SystemTime::now() - StdDuration::from_secs(3),
             "0.0.0-test",
+            crate::test_support::wallet_projection_reader(
+                "alice",
+                "0x000000000000000000000000000000000000dEaD",
+            ),
         )
     }
 
@@ -1353,18 +1310,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wallet_count_tracks_keystore() {
+    async fn wallet_count_tracks_projection() {
         let dir = tempfile::tempdir().unwrap();
         let h = make_handler(dir.path());
         let p = VfsPath::parse("wallets/count").unwrap();
-        // Empty keystore.
-        let body = h.read(&p).await.unwrap();
-        assert_eq!(body, b"0\n");
-        // Add one watch wallet.
-        let addr: alloy::primitives::Address = "0x000000000000000000000000000000000000dEaD"
-            .parse()
-            .unwrap();
-        h.keystore.add_watch("alice", addr).unwrap();
         let body = h.read(&p).await.unwrap();
         assert_eq!(body, b"1\n");
     }

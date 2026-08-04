@@ -66,5 +66,4 @@ zeroize.workspace = true
 assert_cmd = "2"
 predicates = "3"
 async-trait.workspace = true
-bloom-keystore.workspace = true
 blake3.workspace = true

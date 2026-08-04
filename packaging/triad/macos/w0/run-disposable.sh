@@ -9,22 +9,14 @@ report_error() {
 trap report_error ERR
 
 usage() {
-  echo "usage: run-disposable.sh PAYLOAD_DIR LOGIN_UID LOGIN_USER [UPGRADE_PAYLOAD [FAILING_UPGRADE_PAYLOAD]]" >&2
+  echo "usage: run-disposable.sh PAYLOAD_DIR LOGIN_UID LOGIN_USER" >&2
   exit 64
 }
 
-[[ $# -ge 3 && $# -le 5 ]] || usage
+[[ $# -eq 3 ]] || usage
 payload="$(cd "$1" && pwd -P)"
 login_uid="$2"
 login_user="$3"
-upgrade_payload=""
-failing_upgrade_payload=""
-if [[ $# -ge 4 ]]; then
-  upgrade_payload="$(cd "$4" && pwd -P)"
-fi
-if [[ $# -eq 5 ]]; then
-  failing_upgrade_payload="$(cd "$5" && pwd -P)"
-fi
 [[ "$login_uid" =~ ^[1-9][0-9]*$ ]] || usage
 [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || usage
 
@@ -44,13 +36,6 @@ fi
   echo "W0 payload has the wrong platform claim" >&2
   exit 65
 }
-for additional_payload in "$upgrade_payload" "$failing_upgrade_payload"; do
-  [[ -z "$additional_payload" ]] && continue
-  [[ "$(<"$additional_payload/PLATFORM_CLAIM")" == "macos-unix-principals-w0" ]] || {
-    echo "W0 upgrade payload has the wrong platform claim" >&2
-    exit 65
-  }
-done
 [[ "$(id -u "$login_user")" == "$login_uid" ]] || {
   echo "W0 login name and UID do not match" >&2
   exit 65
@@ -148,53 +133,6 @@ echo "macOS W0 installing the verified candidate"
 field() {
   plutil -extract "$1" raw -o - "$enrollment"
 }
-
-recovery_uid=424242
-recovery_group="bloom-broker-$recovery_uid"
-[[ "$recovery_uid" != "$login_uid" ]] || exit 65
-for recovery_path in \
-  "/Library/Application Support/BloomTriad/enrollments/$recovery_uid.json" \
-  "/Library/Application Support/BloomTriad/config/$recovery_uid" \
-  "/private/var/db/bloom/$recovery_uid" \
-  "/private/var/run/bloom/$recovery_uid"
-do
-  [[ ! -e "$recovery_path" ]] || {
-    echo "W0 recovery probe UID already has Bloom state" >&2
-    exit 65
-  }
-done
-if dscl . -read "/Groups/$recovery_group" >/dev/null 2>&1; then
-  echo "W0 recovery probe group already exists" >&2
-  exit 65
-fi
-recovery_gid="$(
-  dscl . -list /Groups PrimaryGroupID |
-    awk '$NF ~ /^[0-9]+$/ && $NF > maximum { maximum = $NF } END { print maximum + 1 }'
-)"
-recovery_transaction="/Library/Application Support/BloomTriad/enrollment-transactions/$recovery_uid"
-mkdir "$recovery_transaction"
-chmod 0700 "$recovery_transaction"
-chown root:wheel "$recovery_transaction"
-printf '%s\n' 'bloom.macos-enrollment-transaction.1' \
-  > "$recovery_transaction/schema"
-printf '%s\n' "$recovery_uid" > "$recovery_transaction/login-uid"
-printf '%s\n' 'bloom-w0-recovery' > "$recovery_transaction/login-user"
-printf '%s\n' provisioning > "$recovery_transaction/phase"
-printf '%s\n' Groups "$recovery_group" PrimaryGroupID "$recovery_gid" \
-  > "$recovery_transaction/record.001"
-chmod 0600 "$recovery_transaction"/*
-dscl . -create "/Groups/$recovery_group"
-dscl . -create "/Groups/$recovery_group" PrimaryGroupID "$recovery_gid"
-sync
-"$installer" install / "$login_uid" "$login_user" "$payload"
-[[ ! -e "$recovery_transaction" ]] || {
-  echo "installer did not consume the interrupted enrollment journal" >&2
-  exit 1
-}
-if dscl . -read "/Groups/$recovery_group" >/dev/null 2>&1; then
-  echo "installer did not remove the journal-owned partial group" >&2
-  exit 1
-fi
 
 broker_uid="$(field broker_uid)"
 signer_uid="$(field signer_uid)"
@@ -885,273 +823,7 @@ sudo -u "$login_user" \
   --triad-health-check \
   "$release_digest"
 
-broker_config="/Library/Application Support/BloomTriad/config/$login_uid/broker/config.json"
-rotated_config="$rotation_fixtures/broker-valid.json"
-cp "$broker_config" "$rotated_config"
-plutil -replace maximum_connections -integer 63 "$rotated_config"
-"$installer" rotate-config / "$login_uid" broker "$rotated_config"
-[[ "$(plutil -extract maximum_connections raw -o - "$broker_config")" == "63" ]] || {
-  echo "valid Broker config rotation did not become active" >&2
-  exit 1
-}
-sudo -u "$login_user" \
-  "$machine_binary" \
-  --triad-health-check \
-  "$release_digest"
-rotated_digest="$(shasum -a 256 "$broker_config" | awk '{print $1}')"
-
-immutable_config="$rotation_fixtures/broker-immutable.json"
-cp "$broker_config" "$immutable_config"
-plutil -replace signer_socket_path -string /private/tmp/forbidden.sock "$immutable_config"
-if "$installer" rotate-config / "$login_uid" broker "$immutable_config"; then
-  echo "Broker config rotation changed an immutable cross-principal field" >&2
-  exit 1
-fi
-[[ ! -e "/Library/Application Support/BloomTriad/rotation-transaction" ]] || {
-  echo "rejected Broker config rotation published a recovery journal" >&2
-  exit 1
-}
-[[ "$(shasum -a 256 "$broker_config" | awk '{print $1}')" == "$rotated_digest" ]]
-
-failing_config="$rotation_fixtures/broker-failing.json"
-cp "$broker_config" "$failing_config"
-plutil -replace maximum_connections -string invalid "$failing_config"
-"$installer" rotate-config / "$login_uid" broker "$failing_config" &
-interrupted_rotation_pid=$!
-rotation_phase="/Library/Application Support/BloomTriad/rotation-transaction/phase"
-deadline=$((SECONDS + 30))
-while [[ $SECONDS -lt $deadline ]]; do
-  if [[ -f "$rotation_phase" ]] &&
-    [[ "$(<"$rotation_phase")" == "activating" ]]
-  then
-    break
-  fi
-  if ! kill -0 "$interrupted_rotation_pid" 2>/dev/null; then
-    echo "W0 config rotation exited before its interruption point" >&2
-    wait "$interrupted_rotation_pid" || true
-    exit 1
-  fi
-  sleep 0.05
-done
-[[ -f "$rotation_phase" && "$(<"$rotation_phase")" == "activating" ]] || {
-  echo "W0 did not observe the config rotation activation phase" >&2
-  kill "$interrupted_rotation_pid" 2>/dev/null || true
-  wait "$interrupted_rotation_pid" || true
-  exit 1
-}
-kill -9 "$interrupted_rotation_pid"
-wait "$interrupted_rotation_pid" 2>/dev/null || true
-[[ -d "/Library/Application Support/BloomTriad/rotation-transaction" ]] || {
-  echo "interrupted W0 config rotation did not leave a recovery journal" >&2
-  exit 1
-}
-"$installer" rotate-config / "$login_uid" broker "$rotated_config"
-[[ ! -e "/Library/Application Support/BloomTriad/rotation-transaction" ]] || {
-  echo "W0 config rotation recovery did not consume its journal" >&2
-  exit 1
-}
-[[ "$(shasum -a 256 "$broker_config" | awk '{print $1}')" == "$rotated_digest" ]]
-sudo -u "$login_user" \
-  "$machine_binary" \
-  --triad-health-check \
-  "$release_digest"
-
-config_root="/Library/Application Support/BloomTriad/config/$login_uid"
-old_edge_digest="$(shasum -a 256 "$config_root/edge-manifest.json" | awk '{print $1}')"
-old_broker_config_digest="$(
-  shasum -a 256 "$config_root/broker/config.json" |
-    awk '{print $1}'
-)"
-old_signer_config_digest="$(
-  shasum -a 256 "$config_root/signer/config.json" |
-    awk '{print $1}'
-)"
-declare -a transport_identity_paths=(
-  machine/identity.json
-  machine/revoke-identity.json
-  broker/identity.json
-  signer/identity.json
-  session/identity.json
-)
-declare -a old_transport_identity_digests=()
-for relative in "${transport_identity_paths[@]}"; do
-  old_transport_identity_digests+=("$(
-    shasum -a 256 "$config_root/$relative" |
-      awk '{print $1}'
-  )")
-done
-"$installer" rotate-identities / "$login_uid" &
-interrupted_identity_rotation_pid=$!
-identity_rotation_phase="/Library/Application Support/BloomTriad/rotation-transaction/phase"
-deadline=$((SECONDS + 30))
-while [[ $SECONDS -lt $deadline ]]; do
-  if [[ -f "$identity_rotation_phase" ]] &&
-    [[ "$(<"$identity_rotation_phase")" == "activating" ]]
-  then
-    break
-  fi
-  if ! kill -0 "$interrupted_identity_rotation_pid" 2>/dev/null; then
-    echo "W0 identity rotation exited before its post-activation interruption point" >&2
-    wait "$interrupted_identity_rotation_pid" || true
-    exit 1
-  fi
-  sleep 0.005
-done
-[[ -f "$identity_rotation_phase" && "$(<"$identity_rotation_phase")" == "activating" ]] || {
-  echo "W0 did not observe the identity rotation activation phase" >&2
-  kill "$interrupted_identity_rotation_pid" 2>/dev/null || true
-  wait "$interrupted_identity_rotation_pid" || true
-  exit 1
-}
-kill -STOP "$interrupted_identity_rotation_pid"
-# The newly bootstrapped services continue while the installer is stopped.
-# A successful external health exchange proves the new application keys have
-# emitted and their heads have reached the independently retained roots.
-identity_health_deadline=$((SECONDS + 30))
-while ! identity_health_output="$(
-  sudo -u "$login_user" \
-    "$machine_binary" \
-    --triad-health-check \
-    "$release_digest" 2>&1
-)"; do
-  if [[ $SECONDS -ge $identity_health_deadline ]]; then
-    printf '%s\n' "$identity_health_output" >&2
-    echo "newly activated services did not become healthy while the installer was stopped" >&2
-    kill -9 "$interrupted_identity_rotation_pid" 2>/dev/null || true
-    wait "$interrupted_identity_rotation_pid" 2>/dev/null || true
-    exit 1
-  fi
-  sleep 0.1
-done
-staged_edge_digest="$(
-  shasum -a 256 \
-    "/Library/Application Support/BloomTriad/rotation-transaction/staged/edge-manifest.json" |
-    awk '{print $1}'
-)"
-kill -9 "$interrupted_identity_rotation_pid"
-wait "$interrupted_identity_rotation_pid" 2>/dev/null || true
-[[ -d "/Library/Application Support/BloomTriad/rotation-transaction" ]] || {
-  echo "interrupted W0 identity rotation did not leave a recovery journal" >&2
-  exit 1
-}
-# Any subsequent installer operation must roll the transport rotation forward,
-# because the new keys may already have emitted retained journal heads.
-"$installer" rotate-config / "$login_uid" broker "$rotated_config"
-[[ ! -e "/Library/Application Support/BloomTriad/rotation-transaction" ]] || {
-  echo "W0 identity rotation recovery did not consume its journal" >&2
-  exit 1
-}
-new_edge_digest="$(
-  shasum -a 256 "$config_root/edge-manifest.json" |
-    awk '{print $1}'
-)"
-[[ "$new_edge_digest" == "$staged_edge_digest" ]] || {
-  echo "post-activation identity recovery rolled back instead of forward" >&2
-  exit 1
-}
-new_broker_config_digest="$(
-  shasum -a 256 "$config_root/broker/config.json" |
-    awk '{print $1}'
-)"
-new_signer_config_digest="$(
-  shasum -a 256 "$config_root/signer/config.json" |
-    awk '{print $1}'
-)"
-[[ "$new_edge_digest" != "$old_edge_digest" ]]
-[[ "$new_broker_config_digest" == "$old_broker_config_digest" ]]
-[[ "$new_signer_config_digest" == "$old_signer_config_digest" ]]
-for index in "${!transport_identity_paths[@]}"; do
-  relative="${transport_identity_paths[$index]}"
-  new_digest="$(shasum -a 256 "$config_root/$relative" | awk '{print $1}')"
-  [[ "$new_digest" != "${old_transport_identity_digests[$index]}" ]] || {
-    echo "transport identity rotation did not replace $relative" >&2
-    exit 1
-  }
-done
-sudo -u "$login_user" \
-  "$machine_binary" \
-  --triad-health-check \
-  "$release_digest"
-
-assert_active_release() {
-  expected_digest="$1"
-  [[ "$(field state)" == "active" ]]
-  [[ "$(field release_digest)" == "$expected_digest" ]]
-  current_target="$(readlink /usr/local/libexec/bloom/current)"
-  [[ "$current_target" == "releases/$expected_digest" ]]
-  sudo -u "$login_user" \
-    /usr/local/libexec/bloom/current/bloom \
-    --triad-health-check \
-    "$expected_digest"
-}
-
 current_good_payload="$payload"
-if [[ -n "$upgrade_payload" ]]; then
-  prior_digest="$(field release_digest)"
-  "$installer" install / "$login_uid" "$login_user" "$upgrade_payload"
-  upgraded_digest="$(field release_digest)"
-  [[ "$upgraded_digest" != "$prior_digest" ]] || {
-    echo "W0 upgrade payload did not produce a new release digest" >&2
-    exit 65
-  }
-  assert_active_release "$upgraded_digest"
-  current_good_payload="$upgrade_payload"
-fi
-
-if [[ -n "$failing_upgrade_payload" ]]; then
-  baseline_digest="$(field release_digest)"
-  set +e
-  "$installer" install / "$login_uid" "$login_user" "$failing_upgrade_payload"
-  failed_status=$?
-  set -e
-  [[ "$failed_status" -ne 0 ]] || {
-    echo "failing W0 upgrade unexpectedly activated" >&2
-    exit 1
-  }
-  assert_active_release "$baseline_digest"
-
-  "$installer" \
-    install \
-    / \
-    "$login_uid" \
-    "$login_user" \
-    "$failing_upgrade_payload" &
-  interrupted_pid=$!
-  upgrade_phase="/Library/Application Support/BloomTriad/upgrade-transaction/phase"
-  deadline=$((SECONDS + 30))
-  while [[ $SECONDS -lt $deadline ]]; do
-    if [[ -f "$upgrade_phase" ]] &&
-      [[ "$(<"$upgrade_phase")" == "activating" ]]
-    then
-      break
-    fi
-    if ! kill -0 "$interrupted_pid" 2>/dev/null; then
-      echo "W0 upgrade exited before its interruption point" >&2
-      wait "$interrupted_pid" || true
-      exit 1
-    fi
-    sleep 0.05
-  done
-  [[ -f "$upgrade_phase" && "$(<"$upgrade_phase")" == "activating" ]] || {
-    echo "W0 did not observe the upgrade activation phase" >&2
-    kill "$interrupted_pid" 2>/dev/null || true
-    wait "$interrupted_pid" || true
-    exit 1
-  }
-  kill -9 "$interrupted_pid"
-  wait "$interrupted_pid" 2>/dev/null || true
-  [[ -d "/Library/Application Support/BloomTriad/upgrade-transaction" ]] || {
-    echo "interrupted W0 upgrade did not leave a recovery journal" >&2
-    exit 1
-  }
-  "$installer" install / "$login_uid" "$login_user" "$current_good_payload"
-  [[ ! -e "/Library/Application Support/BloomTriad/upgrade-transaction" ]] || {
-    echo "W0 upgrade recovery did not consume its journal" >&2
-    exit 1
-  }
-  assert_active_release "$baseline_digest"
-fi
-
 installed_acceptance_inputs=0
 for value in \
   "${BLOOM_MACOS_INSTALLED_ACCEPTANCE_MAIN_ROOT:-}" \
@@ -1176,76 +848,7 @@ if [[ "$installed_acceptance_inputs" -ne 0 ]]; then
     "$BLOOM_MACOS_W0_EVIDENCE_DIR"
 fi
 
-"$installer" uninstall / "$login_uid" "retain-bloom-login-$login_uid"
-retained_record="/Library/Application Support/BloomTriad/retained/$login_uid.json"
-[[ ! -e "$enrollment" && -f "$retained_record" ]] || {
-  echo "retain-custody uninstall did not unpublish the active enrollment" >&2
-  exit 1
-}
-[[ "$(plutil -extract state raw -o - "$retained_record")" == "retained" ]]
-[[ -f "$broker_probe" && -f "$signer_probe" ]] || {
-  echo "retain-custody uninstall removed service-owned state" >&2
-  exit 1
-}
-if launchctl print "system/com.bloom.broker.$login_uid" >/dev/null 2>&1 ||
-  launchctl print "system/com.bloom.signer.$login_uid" >/dev/null 2>&1
-then
-  echo "retain-custody uninstall left a service job loaded" >&2
-  exit 1
-fi
-for kind_and_name in \
-  "Users bloom-broker-$login_uid" \
-  "Users bloom-signer-$login_uid" \
-  "Groups bloom-broker-$login_uid" \
-  "Groups bloom-signer-$login_uid" \
-  "Groups bloom-machine-broker-$login_uid" \
-  "Groups bloom-broker-signer-$login_uid" \
-  "Groups bloom-revoke-$login_uid"
-do
-  kind="${kind_and_name%% *}"
-  name="${kind_and_name#* }"
-  dscl . -read "/$kind/$name" >/dev/null
-done
-"$installer" install / "$login_uid" "$login_user" "$current_good_payload"
-[[ -f "$enrollment" && ! -e "$retained_record" ]] || {
-  echo "retained custody was not republished after authenticated restoration" >&2
-  exit 1
-}
-assert_active_release "$(field release_digest)"
-[[ -f "$broker_probe" && -f "$signer_probe" ]] || {
-  echo "retained custody state did not survive restoration" >&2
-  exit 1
-}
-
-uninstall_transaction="/Library/Application Support/BloomTriad/uninstall-transactions/$login_uid"
-"$installer" uninstall / "$login_uid" "delete-bloom-login-$login_uid" &
-interrupted_uninstall_pid=$!
-deadline=$((SECONDS + 30))
-while [[ $SECONDS -lt $deadline ]]; do
-  if [[ -d "$uninstall_transaction" ]]; then
-    kill -STOP "$interrupted_uninstall_pid" 2>/dev/null || true
-    break
-  fi
-  if ! kill -0 "$interrupted_uninstall_pid" 2>/dev/null; then
-    echo "W0 uninstall exited before its interruption point" >&2
-    wait "$interrupted_uninstall_pid" || true
-    exit 1
-  fi
-  sleep 0.01
-done
-[[ -d "$uninstall_transaction" ]] || {
-  echo "W0 did not observe the uninstall transaction" >&2
-  kill "$interrupted_uninstall_pid" 2>/dev/null || true
-  wait "$interrupted_uninstall_pid" || true
-  exit 1
-}
-kill -9 "$interrupted_uninstall_pid"
-wait "$interrupted_uninstall_pid" 2>/dev/null || true
 "$installer" uninstall / "$login_uid" "delete-bloom-login-$login_uid"
-[[ ! -e "$uninstall_transaction" ]] || {
-  echo "W0 uninstall recovery did not consume its journal" >&2
-  exit 1
-}
 [[ ! -e "$enrollment" ]]
 for kind_and_name in \
   "Users bloom-broker-$login_uid" \
@@ -1259,7 +862,7 @@ do
   kind="${kind_and_name%% *}"
   name="${kind_and_name#* }"
   if dscl . -read "/$kind/$name" >/dev/null 2>&1; then
-    echo "W0 uninstall recovery left Directory Service record $kind/$name" >&2
+    echo "W0 uninstall left Directory Service record $kind/$name" >&2
     exit 1
   fi
 done

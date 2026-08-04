@@ -6,7 +6,7 @@
 //! Sealed Approval grant. The upstream x402 clients are generic over
 //! [`SignerLike`], so injecting a host-backed signer reuses all of the
 //! crate's EIP-712 construction and header assembly without a
-//! `PrivateKeySigner` ever entering this crate.
+//! concrete local private signer ever entering this crate.
 
 use std::io::Write as _;
 use std::path::Path;

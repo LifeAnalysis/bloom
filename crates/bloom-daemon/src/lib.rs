@@ -1,4 +1,4 @@
-//! Daemon library — wires the engines (keystore, chain, tx, vfs) into a
+//! Daemon library — wires public projections, chain, transaction, and VFS into a
 //! single runtime that can serve VFS calls. The actual NFS mount lives
 //! in `bloom-mount` and is feature-gated; this library always exposes the
 //! VFS via [`Daemon`] for in-process consumers like the CLI.

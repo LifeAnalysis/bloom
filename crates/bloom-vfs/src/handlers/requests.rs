@@ -8,9 +8,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-#[cfg(test)]
-use bloom_keystore::Keystore;
-#[cfg(not(test))]
 use bloom_machine_client::WalletProjectionReader;
 use bloom_paid_http::{
     EmptyPaidHttpChainRpcResolver, NormalizedChallenge, PaidHttpChainRpcResolver,
@@ -33,7 +30,6 @@ use url::Url;
 
 use crate::BrokerExactPayloadSigner;
 use crate::ExactPayloadOutcome;
-#[cfg(not(test))]
 use crate::FileOperationIndex;
 use crate::OperationIndex;
 use crate::handler::{
@@ -65,44 +61,16 @@ impl OperationIndex for VenueLocalTestOperationIndex {
 #[derive(Clone)]
 pub struct RequestsHandler {
     root: PathBuf,
-    #[cfg(test)]
-    keystore: Keystore,
     default_wallet: Option<String>,
     client: reqwest::Client,
     x402_signer: Arc<dyn X402PaymentSigner>,
     paid_http_rpc_resolver: Arc<dyn PaidHttpChainRpcResolver>,
     operation_index: Arc<dyn OperationIndex>,
-    #[cfg(not(test))]
     wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     exact_signer: Option<BrokerExactPayloadSigner>,
 }
 
 impl RequestsHandler {
-    #[cfg(test)]
-    pub fn new(
-        root: impl Into<PathBuf>,
-        keystore: Keystore,
-        default_wallet: Option<String>,
-    ) -> Self {
-        let root = root.into();
-        #[cfg(not(test))]
-        let operation_index: Arc<dyn OperationIndex> =
-            Arc::new(FileOperationIndex::new(root.join("operations/index.json")));
-        #[cfg(test)]
-        let operation_index: Arc<dyn OperationIndex> = Arc::new(VenueLocalTestOperationIndex);
-        Self {
-            operation_index,
-            root,
-            keystore: keystore.clone(),
-            default_wallet,
-            client: reqwest::Client::new(),
-            x402_signer: Arc::new(HostX402PaymentSigner::new()),
-            paid_http_rpc_resolver: Arc::new(EmptyPaidHttpChainRpcResolver),
-            exact_signer: None,
-        }
-    }
-
-    #[cfg(not(test))]
     pub fn new_projected(
         root: impl Into<PathBuf>,
         default_wallet: Option<String>,
@@ -364,139 +332,74 @@ impl RequestsHandler {
     }
 
     async fn select_wallet(&self, explicit: Option<&str>) -> Result<String, HandlerError> {
-        #[cfg(test)]
+        let projections = self.wallet_projections.as_ref().ok_or_else(|| {
+            HandlerError::backend("SERVICE_UNAVAILABLE: wallet projections are not configured")
+        })?;
+        if let Some(wallet) = explicit.filter(|value| !value.trim().is_empty()).or(self
+            .default_wallet
+            .as_deref()
+            .filter(|value| !value.trim().is_empty()))
         {
-            if let Some(w) = explicit.filter(|s| !s.trim().is_empty()) {
-                self.keystore
-                    .info(w)
-                    .map_err(|e| HandlerError::invalid(e.to_string()))?;
-                return Ok(w.to_string());
-            }
-            if let Some(w) = self
-                .default_wallet
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-            {
-                self.keystore.info(w).map_err(|e| {
-                    HandlerError::invalid(format!(
-                        "configured default_wallet '{w}' is not usable: {e}"
-                    ))
-                })?;
-                return Ok(w.to_string());
-            }
-            let wallets = self
-                .keystore
-                .list()
-                .map_err(|e| HandlerError::backend(e.to_string()))?;
-            return match wallets.as_slice() {
-                [only] => Ok(only.name.clone()),
-                [] => Err(HandlerError::invalid(
-                    "No wallet specified and no wallets are available. Create a wallet or set wallet = \"<name>\" in the request.",
-                )),
-                many => Err(HandlerError::invalid(format!(
-                    "No wallet specified and multiple wallets are available. Set wallet = \"<name>\" in the request or configure default_wallet. Available wallets: {}",
-                    many.iter()
-                        .map(|w| w.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))),
-            };
-        }
-        #[cfg(not(test))]
-        {
-            let projections = self.wallet_projections.as_ref().ok_or_else(|| {
-                HandlerError::backend("SERVICE_UNAVAILABLE: wallet projections are not configured")
-            })?;
-            if let Some(wallet) = explicit.filter(|value| !value.trim().is_empty()).or(self
-                .default_wallet
-                .as_deref()
-                .filter(|value| !value.trim().is_empty()))
-            {
-                let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
-                    .map_err(|error| HandlerError::invalid(error.to_string()))?;
-                projections
-                    .get_wallet(&wallet_id)
-                    .await
-                    .map_err(|error| HandlerError::backend(error.to_string()))?;
-                return Ok(wallet.to_owned());
-            }
-            let wallets = projections
-                .list_wallets()
+            let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+                .map_err(|error| HandlerError::invalid(error.to_string()))?;
+            projections
+                .get_wallet(&wallet_id)
                 .await
                 .map_err(|error| HandlerError::backend(error.to_string()))?;
-            match wallets.as_slice() {
-                [only] => Ok(only.wallet.wallet_id.as_str().to_owned()),
-                [] => Err(HandlerError::invalid(
-                    "No wallet specified and no projected wallets are available. Create a wallet or set wallet = \"<name>\" in the request.",
-                )),
-                many => Err(HandlerError::invalid(format!(
-                    "No wallet specified and multiple projected wallets are available. Set wallet = \"<name>\" in the request or configure default_wallet. Available wallets: {}",
-                    many.iter()
-                        .map(|projection| projection.wallet.wallet_id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))),
-            }
+            return Ok(wallet.to_owned());
+        }
+        let wallets = projections
+            .list_wallets()
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        match wallets.as_slice() {
+            [only] => Ok(only.wallet.wallet_id.as_str().to_owned()),
+            [] => Err(HandlerError::invalid(
+                "No wallet specified and no projected wallets are available. Create a wallet or set wallet = \"<name>\" in the request.",
+            )),
+            many => Err(HandlerError::invalid(format!(
+                "No wallet specified and multiple projected wallets are available. Set wallet = \"<name>\" in the request or configure default_wallet. Available wallets: {}",
+                many.iter()
+                    .map(|projection| projection.wallet.wallet_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
         }
     }
 
     async fn wallet_policy(&self, wallet: &str) -> Result<Policy, HandlerError> {
-        #[cfg(test)]
-        {
-            self.keystore
-                .info(wallet)
-                .map(|i| i.policy)
-                .map_err(|e| HandlerError::backend(e.to_string()))
-        }
-        #[cfg(not(test))]
-        {
-            let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
-                .map_err(|error| HandlerError::invalid(error.to_string()))?;
-            let projection = self
-                .wallet_projections
-                .as_ref()
-                .ok_or_else(|| {
-                    HandlerError::backend(
-                        "SERVICE_UNAVAILABLE: wallet projections are not configured",
-                    )
-                })?
-                .get_wallet(&wallet_id)
-                .await
-                .map_err(|error| HandlerError::backend(error.to_string()))?;
-            crate::advisory_paid_http_policy(&projection).map_err(HandlerError::backend)
-        }
+        let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let projection = self
+            .wallet_projections
+            .as_ref()
+            .ok_or_else(|| {
+                HandlerError::backend("SERVICE_UNAVAILABLE: wallet projections are not configured")
+            })?
+            .get_wallet(&wallet_id)
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        crate::advisory_paid_http_policy(&projection).map_err(HandlerError::backend)
     }
 
     async fn wallet_address(
         &self,
         wallet: &str,
     ) -> Result<alloy::primitives::Address, HandlerError> {
-        #[cfg(test)]
-        {
-            self.keystore
-                .info(wallet)
-                .map(|info| info.address)
-                .map_err(|error| HandlerError::backend(error.to_string()))
-        }
-        #[cfg(not(test))]
-        {
-            let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
-                .map_err(|error| HandlerError::invalid(error.to_string()))?;
-            self.wallet_projections
-                .as_ref()
-                .ok_or_else(|| {
-                    HandlerError::backend(
-                        "SERVICE_UNAVAILABLE: wallet projections are not configured",
-                    )
-                })?
-                .get_wallet(&wallet_id)
-                .await
-                .map_err(|error| HandlerError::backend(error.to_string()))?
-                .primary_address()
-                .map_err(|error| HandlerError::backend(error.to_string()))?
-                .parse()
-                .map_err(|error| HandlerError::invalid(format!("wallet address: {error}")))
-        }
+        let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        self.wallet_projections
+            .as_ref()
+            .ok_or_else(|| {
+                HandlerError::backend("SERVICE_UNAVAILABLE: wallet projections are not configured")
+            })?
+            .get_wallet(&wallet_id)
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?
+            .primary_address()
+            .map_err(|error| HandlerError::backend(error.to_string()))?
+            .parse()
+            .map_err(|error| HandlerError::invalid(format!("wallet address: {error}")))
     }
 
     fn sum_paid_usd_last_24h(&self, wallet: &str) -> Result<f64, HandlerError> {
@@ -2255,9 +2158,15 @@ mod tests {
 
     fn handler() -> (tempfile::TempDir, RequestsHandler) {
         let tmp = tempfile::tempdir().unwrap();
-        let keystore = Keystore::new(tmp.path().join("keystore")).unwrap();
-        keystore.create_local("alice", "pw").unwrap();
-        let handler = RequestsHandler::new(tmp.path().join("home"), keystore, Some("alice".into()));
+        let handler = RequestsHandler::new_projected(
+            tmp.path().join("home"),
+            Some("alice".into()),
+            crate::test_support::wallet_projection_reader(
+                "alice",
+                "0x0000000000000000000000000000000000000001",
+            ),
+        )
+        .with_operation_index(Arc::new(VenueLocalTestOperationIndex));
         (tmp, handler)
     }
 

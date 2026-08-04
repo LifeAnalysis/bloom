@@ -3,18 +3,17 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 workspace="$(cd "$script_dir/../../.." && pwd -P)"
-baseline="${BLOOM_MACHINE_AUTHORITY_BASELINE:-$script_dir/machine-authority-baseline.tsv}"
 feature_sets="${BLOOM_MACHINE_PRODUCTION_FEATURE_SETS:-$script_dir/machine-production-feature-sets.tsv}"
 mode="${1:-}"
 scanner="$script_dir/machine-authority-scan.py"
 
 usage() {
-  echo "usage: $0 --check-baseline|--inventory|--require-clean" >&2
+  echo "usage: $0 --inventory|--require-clean" >&2
   exit 64
 }
 
 case "$mode" in
-  --check-baseline|--inventory|--require-clean) ;;
+  --inventory|--require-clean) ;;
   *) usage ;;
 esac
 
@@ -26,10 +25,6 @@ for command_name in cargo jq python3 awk sed sort uniq find; do
 done
 test -f "$scanner" || {
   echo "missing Machine authority scanner: $scanner" >&2
-  exit 66
-}
-test -f "$baseline" || {
-  echo "missing Machine authority baseline: $baseline" >&2
   exit 66
 }
 test -f "$feature_sets" || {
@@ -56,17 +51,6 @@ run_scanner() {
   return "$status"
 }
 
-count_occurrences() {
-  local marker="$1"
-  local relative="$2"
-  local path="$workspace/$relative"
-  if [[ ! -f "$path" ]]; then
-    echo 0
-    return
-  fi
-  run_scanner count --marker "$marker" "$path"
-}
-
 rustc_host_triple() {
   local attempt status=1 verbose line
   for attempt in 1 2 3; do
@@ -86,65 +70,6 @@ rustc_host_triple() {
     (( attempt == 3 )) || sleep 2
   done
   return "$status"
-}
-
-baseline_has_file() {
-  local marker="$1"
-  local relative="$2"
-  awk -F '\t' -v marker="$marker" -v relative="$relative" '
-    $0 !~ /^#/ && $1 == marker && $2 == relative { found = 1 }
-    END { exit(found ? 0 : 1) }
-  ' "$baseline"
-}
-
-check_source_ratchet() {
-  local failed=0
-  local marker relative maximum actual absolute matches baseline_markers
-  while IFS=$'\t' read -r marker relative maximum; do
-    [[ -z "$marker" || "$marker" == \#* ]] && continue
-    if ! actual="$(count_occurrences "$marker" "$relative")"; then
-      echo "failed to count Machine authority marker: $marker in $relative" >&2
-      failed=1
-      continue
-    fi
-    if (( actual > maximum )); then
-      echo "Machine authority marker expanded: $marker in $relative ($actual > $maximum)" >&2
-      failed=1
-    fi
-  done < "$baseline"
-
-  if ! baseline_markers="$(
-    awk -F '\t' '$0 !~ /^#/ && NF >= 3 { print $1 }' "$baseline" | sort -u
-  )"
-  then
-    echo "failed to enumerate Machine authority baseline markers" >&2
-    return 1
-  fi
-  while IFS= read -r marker; do
-    [[ -z "$marker" ]] && continue
-    if ! matches="$(
-      run_scanner files \
-        --marker "$marker" \
-        --suffix .rs \
-        --name Cargo.toml \
-        "${source_roots[@]}"
-    )"
-    then
-      echo "Machine authority source scan failed for marker: $marker" >&2
-      failed=1
-      continue
-    fi
-    while IFS= read -r absolute; do
-      [[ -z "$absolute" ]] && continue
-      relative="${absolute#"$workspace/"}"
-      if ! baseline_has_file "$marker" "$relative"; then
-        echo "Machine authority marker appeared in a new file: $marker in $relative" >&2
-        failed=1
-      fi
-    done <<<"$matches"
-  done <<<"$baseline_markers"
-
-  (( failed == 0 ))
 }
 
 cargo_tree_for_set() {
@@ -334,10 +259,7 @@ production_source_roots() {
     sed -n -E 's#^.* \((/[^)]*)\)( \(\*\))?$#\1#p' |
     sort -u |
     awk -v workspace="$workspace" '
-      index($0, workspace "/crates/") == 1 &&
-      $0 != workspace "/crates/bloom-keystore" &&
-      $0 != workspace "/crates/bloom-auth" &&
-      $0 != workspace "/crates/bloom-auth-api"
+      index($0, workspace "/crates/") == 1
     '
 }
 
@@ -455,17 +377,6 @@ require_clean_dependencies() {
   (( failed == 0 ))
 }
 
-source_marker_allowlisted() {
-  local marker="$1"
-  local relative="$2"
-  local allowlist="$script_dir/machine-authority-source-allowlist.tsv"
-  [[ -f "$allowlist" ]] || return 1
-  awk -F '\t' -v marker="$marker" -v relative="$relative" '
-    $0 !~ /^#/ && $1 == marker && $2 == relative { found = 1 }
-    END { exit(found ? 0 : 1) }
-  ' "$allowlist"
-}
-
 forbidden_source_markers() {
   printf '%s\n' \
     bloom-keystore bloom-auth bloom-auth-api bloom_hyperliquid \
@@ -500,10 +411,8 @@ require_clean_sources() {
       while IFS= read -r absolute; do
         [[ -z "$absolute" ]] && continue
         relative="${absolute#"$workspace/"}"
-        if ! source_marker_allowlisted "$marker" "$relative"; then
-          echo "forbidden production Machine source marker: $marker in $relative" >&2
-          failed=1
-        fi
+        echo "forbidden production Machine source marker: $marker in $relative" >&2
+        failed=1
       done <<<"$matches"
     done
   done < <(forbidden_source_markers)
@@ -583,24 +492,13 @@ require_clean_current_entry_docs() {
 }
 
 case "$mode" in
-  --check-baseline)
-    check_source_ratchet
-    echo "Machine authority source ratchet passed"
-    ;;
   --inventory)
     echo "schema: bloom.machine-authority-inventory.v1"
-    echo "baseline-revision: 2767153bfab6"
     echo "observed-revision: $(git -C "$workspace" rev-parse --short=12 HEAD)"
     inventory_dependencies
-    while IFS=$'\t' read -r marker relative maximum; do
-      [[ -z "$marker" || "$marker" == \#* ]] && continue
-      actual="$(count_occurrences "$marker" "$relative")"
-      [[ "$actual" == 0 ]] || echo "source-marker: $marker file=$relative count=$actual ceiling=$maximum"
-    done < "$baseline"
     ;;
   --require-clean)
     failed=0
-    check_source_ratchet || failed=1
     require_clean_dependencies || failed=1
     require_clean_sources || failed=1
     require_clean_current_entry_docs || failed=1
