@@ -24,6 +24,7 @@ members = [
   "crates/bloom-it",
   "crates/bloom-update",
   "crates/bloom-triad-protocol",
+  "crates/bloom-rpc-wire",
   "crates/bloom-triad-local-transport",
   "crates/bloom-service-activation",
   "crates/bloom-trusted-time",
@@ -129,6 +130,7 @@ bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev =
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
 bloom-triad-protocol = { path = "crates/bloom-triad-protocol" }
+bloom-rpc-wire = { path = "crates/bloom-rpc-wire" }
 bloom-triad-local-transport = { path = "crates/bloom-triad-local-transport" }
 bloom-service-activation = { path = "crates/bloom-service-activation" }
 bloom-trusted-time = { path = "crates/bloom-trusted-time" }
