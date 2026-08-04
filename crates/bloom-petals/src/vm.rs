@@ -1409,8 +1409,8 @@ fn component_payload_sign_record(
         match component_record_optional_bytes(fields, "key-ref-jcs")? {
             None => None,
             Some(bytes) => {
-                let key_ref: bloom_triad_protocol::KeyRef = serde_json::from_slice(&bytes)
-                    .map_err(|error| {
+                let key_ref: bloom_broker_api::KeyRef =
+                    serde_json::from_slice(&bytes).map_err(|error| {
                         HostError::Invalid(format!("decode explicit Petal KeyRef: {error}"))
                     })?;
                 let canonical = serde_jcs::to_vec(&key_ref).map_err(|error| {
@@ -1430,10 +1430,10 @@ fn component_payload_sign_record(
     let selector = if allow_explicit_key {
         match component_record_field(fields, "selector")? {
             ComponentVal::Enum(value) if value == "exact" => {
-                bloom_triad_protocol::PetalSignSelector::Exact
+                bloom_broker_api::PetalSignSelector::Exact
             }
             ComponentVal::Enum(value) if value == "reusable" => {
-                bloom_triad_protocol::PetalSignSelector::Reusable
+                bloom_broker_api::PetalSignSelector::Reusable
             }
             ComponentVal::Enum(value) => {
                 return Err(HostError::Invalid(format!(
@@ -1447,7 +1447,7 @@ fn component_payload_sign_record(
             }
         }
     } else {
-        bloom_triad_protocol::PetalSignSelector::Reusable
+        bloom_broker_api::PetalSignSelector::Reusable
     };
     Ok(PayloadSignRequest {
         wallet,
@@ -3668,14 +3668,14 @@ paths = ["/status"]
         let vm = PetalVm::new().unwrap();
         let component = Component::from_binary(&vm.engine, &wat(FIXTURE)).unwrap();
         let host = Arc::new(MockHost::default());
-        let key_ref = bloom_triad_protocol::KeyRef {
-            backend: bloom_triad_protocol::Token::new("local").unwrap(),
-            backend_instance: bloom_triad_protocol::Token::new("default").unwrap(),
+        let key_ref = bloom_broker_api::KeyRef {
+            backend: bloom_broker_api::Token::new("local").unwrap(),
+            backend_instance: bloom_broker_api::Token::new("default").unwrap(),
             locator: "wallet/primary/petals/7".into(),
-            key_spec: bloom_triad_protocol::KeySpec::Secp256k1,
-            public_key_fingerprint: bloom_triad_protocol::Digest32::from_bytes([7; 32]),
-            derivation: Some(bloom_triad_protocol::DerivationRef::Bip32Secp256k1 {
-                root_key_id: bloom_triad_protocol::Token::new("primary-root").unwrap(),
+            key_spec: bloom_broker_api::KeySpec::Secp256k1,
+            public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([7; 32]),
+            derivation: Some(bloom_broker_api::DerivationRef::Bip32Secp256k1 {
+                root_key_id: bloom_broker_api::Token::new("primary-root").unwrap(),
                 path: "m/44'/60'/0'/18734/7".into(),
             }),
         };
@@ -3763,7 +3763,7 @@ paths = ["/status"]
         assert_eq!(host.sign_calls.lock()[0].key_ref.as_ref(), Some(&key_ref));
         assert_eq!(
             host.sign_calls.lock()[0].selector,
-            bloom_triad_protocol::PetalSignSelector::Reusable
+            bloom_broker_api::PetalSignSelector::Reusable
         );
         assert_eq!(*host.authority_calls.lock(), ["derive", "derive", "sign"]);
     }
@@ -3773,14 +3773,14 @@ paths = ["/status"]
         let host = Arc::new(MockHost::default());
         let mut store =
             component_test_store(BTreeSet::from([Capability::Sign]), None, host.clone());
-        let key_ref = bloom_triad_protocol::KeyRef {
-            backend: bloom_triad_protocol::Token::new("local").unwrap(),
-            backend_instance: bloom_triad_protocol::Token::new("default").unwrap(),
+        let key_ref = bloom_broker_api::KeyRef {
+            backend: bloom_broker_api::Token::new("local").unwrap(),
+            backend_instance: bloom_broker_api::Token::new("default").unwrap(),
             locator: "wallet/primary/petals/7".into(),
-            key_spec: bloom_triad_protocol::KeySpec::Secp256k1,
-            public_key_fingerprint: bloom_triad_protocol::Digest32::from_bytes([7; 32]),
-            derivation: Some(bloom_triad_protocol::DerivationRef::Bip32Secp256k1 {
-                root_key_id: bloom_triad_protocol::Token::new("primary-root").unwrap(),
+            key_spec: bloom_broker_api::KeySpec::Secp256k1,
+            public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([7; 32]),
+            derivation: Some(bloom_broker_api::DerivationRef::Bip32Secp256k1 {
+                root_key_id: bloom_broker_api::Token::new("primary-root").unwrap(),
                 path: "m/44'/60'/0'/18734/7".into(),
             }),
         };
@@ -3797,7 +3797,7 @@ paths = ["/status"]
         assert!(host.sign_calls.lock()[0].key_ref.is_none());
         assert_eq!(
             host.sign_calls.lock()[0].selector,
-            bloom_triad_protocol::PetalSignSelector::Reusable,
+            bloom_broker_api::PetalSignSelector::Reusable,
             "v0.2 retains reusable Petal-selector behavior"
         );
 
@@ -3819,7 +3819,7 @@ paths = ["/status"]
         assert_eq!(host.sign_calls.lock()[1].key_ref.as_ref(), Some(&key_ref));
         assert_eq!(
             host.sign_calls.lock()[1].selector,
-            bloom_triad_protocol::PetalSignSelector::Reusable
+            bloom_broker_api::PetalSignSelector::Reusable
         );
 
         let before = host.sign_calls.lock().len();

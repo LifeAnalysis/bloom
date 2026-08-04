@@ -252,7 +252,7 @@ run_as_login() {
 run_as_login test \
   --manifest-path "$main_root/Cargo.toml" \
   --locked \
-  -p bloom-triad-protocol \
+  -p bloom-rpc-wire \
   -p bloom-triad-local-transport \
   -p bloom-service-activation \
   -p bloom-audit-checkpoint \

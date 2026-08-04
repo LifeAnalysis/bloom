@@ -1,8 +1,8 @@
 //! Key-free advisory planning views derived from authenticated Broker policy.
 
+use bloom_broker_api::CanonicalWalletPolicy;
 use bloom_machine_client::WalletProjection;
 use bloom_proto::Policy;
-use bloom_triad_protocol::CanonicalWalletPolicy;
 
 /// Translate the canonical Broker policy fields understood by the legacy EVM
 /// planner into a conservative, non-authorizing view. Broker independently
@@ -49,11 +49,11 @@ pub fn advisory_paid_http_policy(projection: &WalletProjection) -> Result<Policy
 
 #[cfg(test)]
 mod tests {
-    use bloom_machine_client::{ProjectionFreshness, ProjectionVerification};
-    use bloom_triad_protocol::{
+    use bloom_broker_api::{
         Base64UrlBytes, DecimalU64, Digest32, PolicyDestination, SignedPolicySnapshot, Token,
         WalletPublic,
     };
+    use bloom_machine_client::{ProjectionFreshness, ProjectionVerification};
     use sha2::Digest as _;
 
     use super::*;

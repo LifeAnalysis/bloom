@@ -9,12 +9,13 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use bloom_machine_client::{CeremonyProjection, MachineBrokerClient};
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     Base64UrlBytes, CanonicalWalletPolicy, CeremonyKind, CeremonyState, CustodyResult, Digest32,
     Empty, MachineBrokerRequest, MachineBrokerResponse, OperationId, OperationRequest,
     PolicyCommitUpdateRequest, PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, Token,
-    canonical_policy_authority_diff,
+};
+use bloom_machine_client::{
+    CeremonyProjection, MachineBrokerClient, claimed_policy_authority_diff_digest,
 };
 use clap::{Parser, Subcommand};
 use rand::RngCore as _;
@@ -358,7 +359,8 @@ async fn prepare_policy_update(
         "Broker policy baseline names another wallet"
     );
 
-    let authority_diff = canonical_policy_authority_diff(&baseline_policy, &proposed);
+    let authority_diff_digest = claimed_policy_authority_diff_digest(&baseline_policy, &proposed)
+        .context("digest claimed policy authority diff")?;
     let mut operation_bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut operation_bytes);
     let request = PolicyUpdateRequest {
@@ -368,9 +370,7 @@ async fn prepare_policy_update(
         baseline_digest: baseline.policy_digest,
         proposed_canonical_policy: Base64UrlBytes::from_bytes(&proposed_bytes),
         proposed_policy_digest: Digest32::from_bytes(Sha256::digest(&proposed_bytes).into()),
-        authority_diff_digest: authority_diff
-            .digest()
-            .context("digest canonical policy authority diff")?,
+        authority_diff_digest,
         assurance_level,
     };
     let prepared = broker
@@ -851,12 +851,12 @@ mod tests {
     fn projection_is_atomic_owner_only_and_drops_terminal_url() {
         let temp = tempfile::tempdir().unwrap();
         let operation_id = OperationId::from_bytes([44; 32]);
-        let status = bloom_triad_protocol::CeremonyPublicStatus {
+        let status = bloom_broker_api::CeremonyPublicStatus {
             ceremony_id: Digest32::from_bytes([45; 32]),
             ceremony_kind: CeremonyKind::PolicyUpdate,
             operation_id: operation_id.clone(),
             state: CeremonyState::AwaitingUser,
-            expires_at_ms: bloom_triad_protocol::DecimalU64::new(u64::MAX),
+            expires_at_ms: bloom_broker_api::DecimalU64::new(u64::MAX),
             ceremony_url: Some("http://localhost:18734/ceremony/owner-secret".into()),
             receipt_digest: None,
         };
@@ -880,7 +880,7 @@ mod tests {
         let mut terminal = projection;
         terminal
             .reconcile_custody(
-                &bloom_triad_protocol::CeremonyPublicStatus {
+                &bloom_broker_api::CeremonyPublicStatus {
                     state: CeremonyState::Succeeded,
                     ceremony_url: None,
                     receipt_digest: Some(Digest32::from_bytes([46; 32])),
@@ -896,12 +896,12 @@ mod tests {
     fn raw_result_path_atomically_clears_stored_launch_url() {
         let temp = tempfile::tempdir().unwrap();
         let operation_id = OperationId::from_bytes([47; 32]);
-        let awaiting = bloom_triad_protocol::CeremonyPublicStatus {
+        let awaiting = bloom_broker_api::CeremonyPublicStatus {
             ceremony_id: Digest32::from_bytes([48; 32]),
             ceremony_kind: CeremonyKind::PolicyUpdate,
             operation_id: operation_id.clone(),
             state: CeremonyState::AwaitingUser,
-            expires_at_ms: bloom_triad_protocol::DecimalU64::new(u64::MAX),
+            expires_at_ms: bloom_broker_api::DecimalU64::new(u64::MAX),
             ceremony_url: Some("http://localhost:18734/ceremony/raw-owner-secret".into()),
             receipt_digest: None,
         };

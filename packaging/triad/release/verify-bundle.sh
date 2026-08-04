@@ -57,8 +57,36 @@ done
   cd "$payload"
   shasum -a 256 -c SHA256SUMS
 )
-grep -Fx 'downgrade = "forbidden"' "$payload/compatibility-v1.toml" >/dev/null
-grep -Fx 'adjacent_versions_supported = false' "$payload/compatibility-v1.toml" >/dev/null
+compatibility="$payload/compatibility-v1.toml"
+compat_value() {
+  local section="$1" key="$2"
+  awk -v section="[$section]" -v key="$key" '
+    /^\[/ { active = ($0 == section) }
+    active && $1 == key && $2 == "=" { print $3 }
+  ' "$compatibility"
+}
+require_compat_value() {
+  local section="$1" key="$2" expected="$3" actual
+  actual="$(compat_value "$section" "$key")"
+  [[ "$actual" == "$expected" ]] || {
+    echo "bundle compatibility has invalid $section.$key" >&2
+    exit 65
+  }
+}
+for authority_edge in machine_broker broker_signer; do
+  require_compat_value "protocols.$authority_edge" major 1
+  require_compat_value "protocols.$authority_edge" minor_min 1
+  require_compat_value "protocols.$authority_edge" minor_max 1
+done
+for support_edge in signer_control session; do
+  require_compat_value "protocols.$support_edge" major 1
+  require_compat_value "protocols.$support_edge" minor_min 0
+  require_compat_value "protocols.$support_edge" minor_max 1
+done
+if grep -Eq '^[[:space:]]*(protocol_major|protocol_minor_min|protocol_minor_max)[[:space:]]*=' "$compatibility"; then
+  echo "bundle compatibility must not declare a global protocol range" >&2
+  exit 65
+fi
 platform_claim="$(<"$payload/PLATFORM_CLAIM")"
 case "$platform_claim" in
   linux)

@@ -17,7 +17,7 @@ use alloy::sol_types::SolCall;
 use bloom_evm::{ChainClient, ChainError, IERC20, NftKind};
 use bloom_machine_client::{
     ExactPayloadBatchSignRequest, ExactPayloadSignOutcome, ExactPayloadSignRequest,
-    MachineBrokerClient,
+    MachineBrokerClient, SignOperationIdentity,
 };
 
 #[cfg(test)]
@@ -47,16 +47,16 @@ sol! {
         ) external;
     }
 }
+use bloom_broker_api::{
+    ApprovalLifecycleState, CryptoSuite, DecimalU64, Digest32, OperationId, OperationState,
+    ProtocolErrorCode, ProvenanceCatalog, ProvenanceRecord, ProvenanceSubject, RequestNonce,
+    SigningResult, Token,
+};
 use bloom_proto::plan::ExecutionOrigin;
 use bloom_proto::{
     AddressBook, ChainSpec, HomeWritePermit, NftAction, NftRef, Policy, RawIntent, RawIntentBody,
     StagedTx, TokenRef, TxActionKind, TxStatus, ValuationPolicy, parse_amount, parse_eth,
     parse_units,
-};
-use bloom_triad_protocol::{
-    ApprovalLifecycleState, CryptoSuite, DecimalU64, Digest32, OperationId, OperationState,
-    ProtocolErrorCode, ProvenanceCatalog, ProvenanceRecord, ProvenanceSubject, RequestNonce,
-    SignOperationIdentity, SigningResult, Token,
 };
 use parking_lot::RwLock;
 use sha2::Digest as _;
@@ -4319,9 +4319,9 @@ fn write_triad_signing_state(
     result.map_err(|error| TxEngineError::Outbox(error.into()))
 }
 
-fn protocol_signing_error(error: bloom_triad_protocol::ProtocolError) -> TxEngineError {
+fn protocol_signing_error(error: bloom_broker_api::ProtocolError) -> TxEngineError {
     match error.code {
-        bloom_triad_protocol::ProtocolErrorCode::ServiceUnavailable => {
+        bloom_broker_api::ProtocolErrorCode::ServiceUnavailable => {
             TxEngineError::ApprovalServiceUnavailable(format!(
                 "{}: {}",
                 error.code.as_str(),
@@ -4585,13 +4585,13 @@ mod tests {
     };
 
     use super::*;
-    use bloom_proto::TxStatus;
-    use bloom_triad_protocol::{
+    use bloom_broker_api::{
         ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes, KeyRef, KeySpec,
         MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, NormalizedSignature,
         OperationPublicStatus, ProvenanceCatalog, ProvenanceFeeAsset, ProvenanceOperationClass,
         ServiceFuture, SigningPayloads, SigningResult, WalletPublic,
     };
+    use bloom_proto::TxStatus;
 
     const TEST_SIGNER_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
@@ -4624,7 +4624,7 @@ mod tests {
                     }
                     MachineBrokerRequest::SealedApprovalPrepare(request) => {
                         Ok(MachineBrokerResponse::SealedApprovalPrepare(
-                            bloom_triad_protocol::SealedApprovalPrepareResponse {
+                            bloom_broker_api::SealedApprovalPrepareResponse {
                                 approval_id: request.terms.approval_id()?,
                                 state: ApprovalPrepareState::AwaitingCeremony,
                                 ceremony_url: "http://localhost:18734/ceremony/triad-test-secret"
@@ -4655,7 +4655,7 @@ mod tests {
                     ),
                     MachineBrokerRequest::OperationStatus(request) => {
                         let mut result = self.completed_result.lock().clone().ok_or_else(|| {
-                            bloom_triad_protocol::ProtocolError::new(
+                            bloom_broker_api::ProtocolError::new(
                                 ProtocolErrorCode::ApprovalNotFound,
                                 "operation not found",
                             )
@@ -4691,7 +4691,7 @@ mod tests {
                         };
                         *self.completed_result.lock() = Some(result.clone());
                         if self.lose_sign_response_once.swap(false, Ordering::SeqCst) {
-                            return Err(bloom_triad_protocol::ProtocolError::new(
+                            return Err(bloom_broker_api::ProtocolError::new(
                                 ProtocolErrorCode::ServiceUnavailable,
                                 "simulated local response loss after Broker commit",
                             ));
@@ -4720,7 +4720,7 @@ mod tests {
                         };
                         *self.completed_result.lock() = Some(result.clone());
                         if self.lose_sign_response_once.swap(false, Ordering::SeqCst) {
-                            return Err(bloom_triad_protocol::ProtocolError::new(
+                            return Err(bloom_broker_api::ProtocolError::new(
                                 ProtocolErrorCode::ServiceUnavailable,
                                 "simulated local batch response loss after Broker commit",
                             ));
@@ -4735,7 +4735,7 @@ mod tests {
 
     fn triad_catalog() -> ProvenanceCatalog {
         ProvenanceCatalog {
-            schema: bloom_triad_protocol::PROVENANCE_CATALOG_SCHEMA.into(),
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![ProvenanceRecord {
                 subject: ProvenanceSubject::System {
                     component_id: Token::new("bloom-machine").unwrap(),

@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 bloom-machine-client.workspace = true
-bloom-triad-protocol.workspace = true
+bloom-broker-api.workspace = true
 clap.workspace = true
 hex.workspace = true
 rand.workspace = true

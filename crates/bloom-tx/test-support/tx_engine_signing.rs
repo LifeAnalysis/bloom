@@ -1,7 +1,7 @@
 use alloy::primitives::{B256, Signature};
 use alloy::signers::SignerSync as _;
 use alloy_signer_local::PrivateKeySigner;
-use bloom_triad_protocol::{Base64UrlBytes, CryptoSuite, NormalizedSignature};
+use bloom_broker_api::{Base64UrlBytes, CryptoSuite, NormalizedSignature};
 
 use super::{ChainClient, StagedTx, TxEngine};
 

@@ -2,11 +2,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bloom_broker_api::{DerivationRef, Digest32, KeyRef, KeySpec, Token};
 use bloom_petals::{
     HostError, HostVfsEntry, PayloadSignRequest, PetalHost, PetalKeyOutcome, PetalKeyRequest,
     PetalRouter, PetalRunner, PetalStore, PetalVm, SignOutcome,
 };
-use bloom_triad_protocol::{DerivationRef, Digest32, KeyRef, KeySpec, Token};
 use bloom_vfs::path::VfsPath;
 use bloom_vfs::{Handler, Vfs};
 use parking_lot::Mutex;

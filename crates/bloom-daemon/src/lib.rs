@@ -220,7 +220,7 @@ struct DaemonPetalHost {
     tx_outbox: Option<PetalTxOutbox>,
     tx_stage_lock: tokio::sync::Mutex<()>,
     broker: Option<MachineBrokerClient>,
-    provenance_catalog: Option<bloom_triad_protocol::ProvenanceCatalog>,
+    provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     petal_key_state_root: Option<PathBuf>,
     petal_key_lock: tokio::sync::Mutex<()>,
 }
@@ -236,16 +236,16 @@ const PETAL_KEY_INPUT_CLASS: &str = "petal-key-scope-v1";
 struct PetalKeyRequestState {
     schema: String,
     request_id: String,
-    scope: bloom_triad_protocol::PetalKeyScope,
-    scope_digest: bloom_triad_protocol::Digest32,
+    scope: bloom_broker_api::PetalKeyScope,
+    scope_digest: bloom_broker_api::Digest32,
     /// Digest of the installer-signed provenance record that Broker will
     /// independently require for a Petal-scoped Sealed Approval. This is
     /// public authorization metadata, not a capability or secret.
-    provenance_digest: Option<bloom_triad_protocol::Digest32>,
+    provenance_digest: Option<bloom_broker_api::Digest32>,
     status: String,
     ceremony_url: Option<String>,
-    ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64,
-    public_key: Option<bloom_triad_protocol::KeyPublic>,
+    ceremony_expires_at_ms: bloom_broker_api::DecimalU64,
+    public_key: Option<bloom_broker_api::KeyPublic>,
 }
 
 impl PetalKeyRequestState {
@@ -350,7 +350,7 @@ impl DaemonPetalHost {
 
     fn with_provenance_catalog(
         mut self,
-        provenance_catalog: Option<bloom_triad_protocol::ProvenanceCatalog>,
+        provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     ) -> Self {
         self.provenance_catalog = provenance_catalog;
         self
@@ -596,9 +596,9 @@ impl PetalHost for DaemonPetalHost {
                 "Petal key request_id must contain 1-256 bytes without control characters".into(),
             ));
         }
-        let wallet_id = bloom_triad_protocol::Token::new(req.wallet_id.clone())
+        let wallet_id = bloom_broker_api::Token::new(req.wallet_id.clone())
             .map_err(|error| HostError::Invalid(error.to_string()))?;
-        let purpose = bloom_triad_protocol::Token::new(req.purpose.clone())
+        let purpose = bloom_broker_api::Token::new(req.purpose.clone())
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         if req.maximum_lifetime_ms == 0 {
             return Err(HostError::Invalid(
@@ -609,9 +609,9 @@ impl PetalHost for DaemonPetalHost {
             .allowed_crypto_suites
             .iter()
             .map(|suite| {
-                serde_json::from_value::<bloom_triad_protocol::CryptoSuite>(
-                    serde_json::Value::String(suite.clone()),
-                )
+                serde_json::from_value::<bloom_broker_api::CryptoSuite>(serde_json::Value::String(
+                    suite.clone(),
+                ))
                 .map_err(|_| HostError::Invalid(format!("unsupported crypto suite {suite:?}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -646,23 +646,23 @@ impl PetalHost for DaemonPetalHost {
             .as_bytes(),
         );
         let custody_operation_id =
-            bloom_triad_protocol::OperationId::from_bytes(*operation_hash.as_bytes());
-        let scope = bloom_triad_protocol::PetalKeyScope {
+            bloom_broker_api::OperationId::from_bytes(*operation_hash.as_bytes());
+        let scope = bloom_broker_api::PetalKeyScope {
             wallet_id: wallet_id.clone(),
             parent_key_ref: parent_key_ref.clone(),
-            package_hash: bloom_triad_protocol::Digest32::new(context.package_hash.clone())
+            package_hash: bloom_broker_api::Digest32::new(context.package_hash.clone())
                 .map_err(|error| HostError::Invalid(error.to_string()))?,
             route: context.route_id.clone(),
             agent_id: req.agent_id.clone(),
             purpose,
             allowed_crypto_suites: suites,
-            maximum_lifetime_ms: bloom_triad_protocol::DecimalU64::new(req.maximum_lifetime_ms),
+            maximum_lifetime_ms: bloom_broker_api::DecimalU64::new(req.maximum_lifetime_ms),
             custody_operation_id: custody_operation_id.clone(),
         };
         let scope_digest = scope
             .digest()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
-        let provenance_subject = bloom_triad_protocol::ProvenanceSubject::Petal {
+        let provenance_subject = bloom_broker_api::ProvenanceSubject::Petal {
             package_hash: scope.package_hash.clone(),
             route: scope.route.clone(),
         };
@@ -695,13 +695,13 @@ impl PetalHost for DaemonPetalHost {
                 ));
             }
             match broker
-                .custody_result(bloom_triad_protocol::OperationRequest {
+                .custody_result(bloom_broker_api::OperationRequest {
                     operation_id: custody_operation_id.clone(),
                 })
                 .await
             {
                 Ok(result) => {
-                    if result.ceremony_kind != bloom_triad_protocol::CeremonyKind::KeyDerive
+                    if result.ceremony_kind != bloom_broker_api::CeremonyKind::KeyDerive
                         || result.custody_operation_id != custody_operation_id
                         || result.wallet_id.as_ref() != Some(&wallet_id)
                         || result.encrypted_browser_result.is_some()
@@ -717,7 +717,7 @@ impl PetalHost for DaemonPetalHost {
                         ));
                     };
                     let public = broker
-                        .key(bloom_triad_protocol::KeyRequest {
+                        .key(bloom_broker_api::KeyRequest {
                             key_ref: derived_key_ref.clone(),
                         })
                         .await
@@ -751,7 +751,7 @@ impl PetalHost for DaemonPetalHost {
                     return stored.guest_outcome();
                 }
                 Err(error)
-                    if error.code == bloom_triad_protocol::ProtocolErrorCode::ApprovalNotFound =>
+                    if error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound =>
                 {
                     let now_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -777,13 +777,13 @@ impl PetalHost for DaemonPetalHost {
         let prepared = broker
             .prepare_custody(
                 bloom_machine_client::CustodyPrepareMethod::KeyDerive,
-                bloom_triad_protocol::CustodyPrepareRequest {
-                    ceremony_kind: bloom_triad_protocol::CeremonyKind::KeyDerive,
+                bloom_broker_api::CustodyPrepareRequest {
+                    ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                     custody_operation_id: custody_operation_id.clone(),
                     wallet_id: Some(wallet_id),
                     key_ref: Some(parent_key_ref.clone()),
                     exact_terms_digest: scope_digest.clone(),
-                    expected_input_class: bloom_triad_protocol::Token::new(PETAL_KEY_INPUT_CLASS)
+                    expected_input_class: bloom_broker_api::Token::new(PETAL_KEY_INPUT_CLASS)
                         .expect("static Petal key input class is valid"),
                     browser_output_recipient_key: None,
                     petal_key_scope: Some(scope.clone()),
@@ -793,7 +793,7 @@ impl PetalHost for DaemonPetalHost {
             .map_err(|error| {
                 HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
             })?;
-        if prepared.ceremony_kind != bloom_triad_protocol::CeremonyKind::KeyDerive
+        if prepared.ceremony_kind != bloom_broker_api::CeremonyKind::KeyDerive
             || prepared.custody_operation_id != custody_operation_id
         {
             return Err(HostError::Denied(
@@ -1022,12 +1022,12 @@ impl PetalHost for DaemonPetalHost {
         })?;
         let crypto_suite = match req.signature_algorithm.as_str() {
             "secp256k1-keccak256-recoverable" => {
-                bloom_triad_protocol::CryptoSuite::Secp256k1Keccak256Recoverable
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable
             }
             "secp256k1-sha256-recoverable" => {
-                bloom_triad_protocol::CryptoSuite::Secp256k1Sha256Recoverable
+                bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable
             }
-            "ed25519-message" => bloom_triad_protocol::CryptoSuite::Ed25519Message,
+            "ed25519-message" => bloom_broker_api::CryptoSuite::Ed25519Message,
             _ => {
                 return Err(HostError::Invalid(format!(
                     "unsupported signature algorithm {:?}",
@@ -1035,7 +1035,7 @@ impl PetalHost for DaemonPetalHost {
                 )));
             }
         };
-        let claim: bloom_triad_protocol::PetalUseClaim =
+        let claim: bloom_broker_api::PetalUseClaim =
             serde_json::from_slice(&req.petal_use_claim_jcs)
                 .map_err(|error| HostError::Invalid(format!("decode PetalUseClaim: {error}")))?;
         let canonical_claim = serde_jcs::to_vec(&claim)
@@ -1047,26 +1047,25 @@ impl PetalHost for DaemonPetalHost {
         }
         let approval_id = req
             .approval_hint
-            .map(bloom_triad_protocol::Digest32::new)
+            .map(bloom_broker_api::Digest32::new)
             .transpose()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
-        let trusted_package_hash =
-            bloom_triad_protocol::Digest32::new(context.package_hash.clone())
-                .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let trusted_package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
         let selected_key_ref = req.key_ref;
         let trusted_request = TrustedPetalSignRequest {
-            wallet_id: bloom_triad_protocol::Token::new(req.wallet)
+            wallet_id: bloom_broker_api::Token::new(req.wallet)
                 .map_err(|error| HostError::Invalid(error.to_string()))?,
             preimage: req.preimage,
-            claimed_hash: bloom_triad_protocol::Digest32::from_bytes(req.claimed_hash),
+            claimed_hash: bloom_broker_api::Digest32::from_bytes(req.claimed_hash),
             crypto_suite,
-            operation_class: bloom_triad_protocol::Token::new(req.operation_class)
+            operation_class: bloom_broker_api::Token::new(req.operation_class)
                 .map_err(|error| HostError::Invalid(error.to_string()))?,
             selector: req.selector,
             claim,
             claim_assurance_evidence: req.claim_assurance_evidence,
             approval_id,
-            trusted_provenance: bloom_triad_protocol::ProvenanceSubject::Petal {
+            trusted_provenance: bloom_broker_api::ProvenanceSubject::Petal {
                 package_hash: trusted_package_hash,
                 route: context.route_id.clone(),
             },
@@ -1091,9 +1090,8 @@ impl PetalHost for DaemonPetalHost {
         };
         let bytes = signature.bytes.decode();
         match signature.crypto_suite.signature_encoding() {
-            bloom_triad_protocol::SignatureEncoding::Secp256k1Recoverable65
-                if bytes.len() == 65 => {}
-            bloom_triad_protocol::SignatureEncoding::Ed25519Raw64 if bytes.len() == 64 => {}
+            bloom_broker_api::SignatureEncoding::Secp256k1Recoverable65 if bytes.len() == 65 => {}
+            bloom_broker_api::SignatureEncoding::Ed25519Raw64 if bytes.len() == 64 => {}
             _ => {
                 return Err(HostError::Backend(
                     "Broker returned an invalid normalized signature".into(),
@@ -1133,7 +1131,7 @@ impl PetalHost for DaemonPetalHost {
                 "data-hex must be canonical 0x-prefixed hex".into(),
             ));
         }
-        let wallet_id = bloom_triad_protocol::Token::new(req.wallet.clone())
+        let wallet_id = bloom_broker_api::Token::new(req.wallet.clone())
             .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?;
         let wallet_projection = service
             .wallet_projections
@@ -1260,7 +1258,7 @@ impl PetalHost for DaemonPetalHost {
                 "outbox entry was not staged by this trusted Petal".into(),
             ));
         }
-        let wallet_id = bloom_triad_protocol::Token::new(wallet.clone())
+        let wallet_id = bloom_broker_api::Token::new(wallet.clone())
             .map_err(|error| HostError::Invalid(format!("wallet: {error}")))?;
         let wallet_projection = service
             .wallet_projections
@@ -1666,10 +1664,10 @@ struct MachineAuditHeadProvider(Arc<AuditLog>);
 impl MachineJournalHeadProvider for MachineAuditHeadProvider {
     fn verified_head(
         &self,
-    ) -> Result<(u64, bloom_triad_protocol::Digest32), bloom_triad_protocol::ProtocolError> {
+    ) -> Result<(u64, bloom_broker_api::Digest32), bloom_broker_api::ProtocolError> {
         if let Some(reason) = self.0.mutation_degradation() {
-            return Err(bloom_triad_protocol::ProtocolError::new(
-                bloom_triad_protocol::ProtocolErrorCode::ServiceUnavailable,
+            return Err(bloom_broker_api::ProtocolError::new(
+                bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
                 format!("Machine audit journal is degraded: {reason}"),
             ));
         }
@@ -1679,10 +1677,7 @@ impl MachineJournalHeadProvider for MachineAuditHeadProvider {
         } else {
             hash
         };
-        Ok((
-            self.0.sequence(),
-            bloom_triad_protocol::Digest32::new(hash)?,
-        ))
+        Ok((self.0.sequence(), bloom_broker_api::Digest32::new(hash)?))
     }
 
     fn latch_mutations(&self, reason: String) {
@@ -1735,7 +1730,7 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
             if !(1..=32).contains(&request.txs.len()) {
                 return Err("transaction batch must contain 1 to 32 children".into());
             }
-            let wallet_id = bloom_triad_protocol::Token::new(request.wallet.clone())
+            let wallet_id = bloom_broker_api::Token::new(request.wallet.clone())
                 .map_err(|error| format!("invalid wallet ID: {error}"))?;
             let projection = self
                 .wallet_projections
@@ -1936,7 +1931,7 @@ impl Daemon {
     pub fn from_home_with_broker(
         home: HomeDir,
         broker: MachineBrokerClient,
-        provenance_catalog: bloom_triad_protocol::ProvenanceCatalog,
+        provenance_catalog: bloom_broker_api::ProvenanceCatalog,
     ) -> Result<Self, DaemonError> {
         Self::from_home_inner(home, None, Some(broker), Some(provenance_catalog))
     }
@@ -1945,7 +1940,7 @@ impl Daemon {
         home: HomeDir,
         permit: Arc<HomeWritePermit>,
         broker: MachineBrokerClient,
-        provenance_catalog: bloom_triad_protocol::ProvenanceCatalog,
+        provenance_catalog: bloom_broker_api::ProvenanceCatalog,
     ) -> Result<Self, DaemonError> {
         Self::from_home_inner(home, Some(permit), Some(broker), Some(provenance_catalog))
     }
@@ -1954,7 +1949,7 @@ impl Daemon {
         home: HomeDir,
         home_write_permit: Option<Arc<HomeWritePermit>>,
         broker: Option<MachineBrokerClient>,
-        provenance_catalog: Option<bloom_triad_protocol::ProvenanceCatalog>,
+        provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     ) -> Result<Self, DaemonError> {
         home.ensure()?;
         let config_path = home.config_path();
@@ -3201,7 +3196,7 @@ fn render_petal_discovery_markdown(installed: &[bloom_petals::package::PetalDisc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloom_triad_protocol::{MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService};
+    use bloom_broker_api::{MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService};
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Handler;
     use bloom_vfs::handler::{Entry, HandlerError};
@@ -3239,7 +3234,7 @@ mod tests {
     impl WalletProjectionReader for ProjectionRefreshFixture {
         async fn list_wallets(
             &self,
-        ) -> Result<Vec<bloom_machine_client::WalletProjection>, bloom_triad_protocol::ProtocolError>
+        ) -> Result<Vec<bloom_machine_client::WalletProjection>, bloom_broker_api::ProtocolError>
         {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Vec::new())
@@ -3247,18 +3242,18 @@ mod tests {
 
         async fn get_wallet(
             &self,
-            _wallet_id: &bloom_triad_protocol::Token,
-        ) -> Result<bloom_machine_client::WalletProjection, bloom_triad_protocol::ProtocolError>
+            _wallet_id: &bloom_broker_api::Token,
+        ) -> Result<bloom_machine_client::WalletProjection, bloom_broker_api::ProtocolError>
         {
-            Err(bloom_triad_protocol::ProtocolError::new(
-                bloom_triad_protocol::ProtocolErrorCode::ServiceUnavailable,
+            Err(bloom_broker_api::ProtocolError::new(
+                bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
                 "fixture has no wallet",
             ))
         }
 
         fn cached_wallets(
             &self,
-        ) -> Result<Vec<bloom_machine_client::WalletProjection>, bloom_triad_protocol::ProtocolError>
+        ) -> Result<Vec<bloom_machine_client::WalletProjection>, bloom_broker_api::ProtocolError>
         {
             Ok(Vec::new())
         }
@@ -3293,25 +3288,23 @@ mod tests {
     struct PetalKeyBrokerFixture {
         completed: std::sync::atomic::AtomicBool,
         prepares: std::sync::atomic::AtomicUsize,
-        parent: bloom_triad_protocol::KeyRef,
-        child: bloom_triad_protocol::KeyRef,
+        parent: bloom_broker_api::KeyRef,
+        child: bloom_broker_api::KeyRef,
     }
 
     impl PetalKeyBrokerFixture {
         fn new() -> Self {
-            let key_ref = |locator: &str, fingerprint: u8| bloom_triad_protocol::KeyRef {
-                backend: bloom_triad_protocol::Token::new("local").unwrap(),
-                backend_instance: bloom_triad_protocol::Token::new("default").unwrap(),
+            let key_ref = |locator: &str, fingerprint: u8| bloom_broker_api::KeyRef {
+                backend: bloom_broker_api::Token::new("local").unwrap(),
+                backend_instance: bloom_broker_api::Token::new("default").unwrap(),
                 locator: locator.into(),
-                key_spec: bloom_triad_protocol::KeySpec::Secp256k1,
-                public_key_fingerprint: bloom_triad_protocol::Digest32::from_bytes(
-                    [fingerprint; 32],
-                ),
+                key_spec: bloom_broker_api::KeySpec::Secp256k1,
+                public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([fingerprint; 32]),
                 derivation: None,
             };
             let mut child = key_ref("wallet/primary/petals/7", 2);
-            child.derivation = Some(bloom_triad_protocol::DerivationRef::Bip32Secp256k1 {
-                root_key_id: bloom_triad_protocol::Token::new("primary-root").unwrap(),
+            child.derivation = Some(bloom_broker_api::DerivationRef::Bip32Secp256k1 {
+                root_key_id: bloom_broker_api::Token::new("primary-root").unwrap(),
                 path: "m/44'/60'/0'/18734/7".into(),
             });
             Self {
@@ -3327,20 +3320,20 @@ mod tests {
         fn dispatch<'a>(
             &'a self,
             request: MachineBrokerRequest,
-        ) -> bloom_triad_protocol::ServiceFuture<'a, MachineBrokerResponse> {
+        ) -> bloom_broker_api::ServiceFuture<'a, MachineBrokerResponse> {
             Box::pin(async move {
                 match request {
                     MachineBrokerRequest::WalletGetPublic(request) => {
                         Ok(MachineBrokerResponse::WalletGetPublic(
-                            bloom_triad_protocol::WalletPublic {
+                            bloom_broker_api::WalletPublic {
                                 wallet_id: request.wallet_id,
-                                wallet_kind: bloom_triad_protocol::Token::new("local").unwrap(),
+                                wallet_kind: bloom_broker_api::Token::new("local").unwrap(),
                                 // A previously derived Petal child is also in the public
                                 // projection. It must never make root selection ambiguous.
                                 key_refs: vec![self.parent.clone(), self.child.clone()],
-                                policy_version: bloom_triad_protocol::DecimalU64::new(1),
-                                policy_digest: bloom_triad_protocol::Digest32::from_bytes([3; 32]),
-                                wallet_revocation_epoch: bloom_triad_protocol::DecimalU64::new(0),
+                                policy_version: bloom_broker_api::DecimalU64::new(1),
+                                policy_digest: bloom_broker_api::Digest32::from_bytes([3; 32]),
+                                wallet_revocation_epoch: bloom_broker_api::DecimalU64::new(0),
                             },
                         ))
                     }
@@ -3349,41 +3342,38 @@ mod tests {
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         request.validate_petal_key_scope_binding()?;
                         Ok(MachineBrokerResponse::KeyDerivePrepare(
-                            bloom_triad_protocol::CustodyPrepareResponse {
-                                ceremony_kind: bloom_triad_protocol::CeremonyKind::KeyDerive,
+                            bloom_broker_api::CustodyPrepareResponse {
+                                ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                                 custody_operation_id: request.custody_operation_id,
-                                state: bloom_triad_protocol::CustodyPrepareState::AwaitingUser,
+                                state: bloom_broker_api::CustodyPrepareState::AwaitingUser,
                                 ceremony_url: "http://127.0.0.1:18734/ceremony/owner-only".into(),
-                                ceremony_expires_at_ms: bloom_triad_protocol::DecimalU64::new(
-                                    u64::MAX,
+                                ceremony_expires_at_ms: bloom_broker_api::DecimalU64::new(u64::MAX),
+                                signer_contribution_digest: bloom_broker_api::Digest32::from_bytes(
+                                    [4; 32],
                                 ),
-                                signer_contribution_digest:
-                                    bloom_triad_protocol::Digest32::from_bytes([4; 32]),
                             },
                         ))
                     }
                     MachineBrokerRequest::CustodyResult(request) => {
                         if !self.completed.load(std::sync::atomic::Ordering::SeqCst) {
-                            return Err(bloom_triad_protocol::ProtocolError::new(
-                                bloom_triad_protocol::ProtocolErrorCode::ApprovalNotFound,
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                bloom_broker_api::ProtocolErrorCode::ApprovalNotFound,
                                 "custody result not found",
                             ));
                         }
                         Ok(MachineBrokerResponse::CustodyResult(
-                            bloom_triad_protocol::CustodyResult {
-                                ceremony_kind: bloom_triad_protocol::CeremonyKind::KeyDerive,
+                            bloom_broker_api::CustodyResult {
+                                ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                                 custody_operation_id: request.operation_id,
-                                public_status: bloom_triad_protocol::CeremonyState::Succeeded,
-                                wallet_id: Some(
-                                    bloom_triad_protocol::Token::new("primary").unwrap(),
-                                ),
+                                public_status: bloom_broker_api::CeremonyState::Succeeded,
+                                wallet_id: Some(bloom_broker_api::Token::new("primary").unwrap()),
                                 public_key_refs: vec![self.child.clone()],
                                 credential_summaries: Vec::new(),
                                 initial_policy: None,
-                                receipt_digest: bloom_triad_protocol::Digest32::from_bytes([5; 32]),
+                                receipt_digest: bloom_broker_api::Digest32::from_bytes([5; 32]),
                                 encrypted_browser_result: None,
-                                signer_key_id: bloom_triad_protocol::Token::new("signer").unwrap(),
-                                signer_signature: bloom_triad_protocol::Base64UrlBytes::from_bytes(
+                                signer_key_id: bloom_broker_api::Token::new("signer").unwrap(),
+                                signer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(
                                     &[6; 64],
                                 ),
                             },
@@ -3393,19 +3383,20 @@ mod tests {
                         if request.key_ref == self.child =>
                     {
                         Ok(MachineBrokerResponse::KeyGetPublic(
-                            bloom_triad_protocol::KeyPublic {
+                            bloom_broker_api::KeyPublic {
                                 key_ref: self.child.clone(),
-                                canonical_public_key:
-                                    bloom_triad_protocol::Base64UrlBytes::from_bytes(&[7; 33]),
+                                canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(
+                                    &[7; 33],
+                                ),
                                 addresses: vec![
                                     "0x1111111111111111111111111111111111111111".into(),
                                 ],
                                 supported_crypto_suites: vec![
-                                    bloom_triad_protocol::CryptoSuite::Secp256k1Keccak256Recoverable,
+                                    bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
                                     // Public key capability may be broader than this
                                     // Petal's immutable scope. Signer enforces the
                                     // narrower scope independently on every use.
-                                    bloom_triad_protocol::CryptoSuite::Secp256k1Sha256Recoverable,
+                                    bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
                                 ],
                             },
                         ))
@@ -3625,24 +3616,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         let fixture = Arc::new(PetalKeyBrokerFixture::new());
-        let provenance_record = bloom_triad_protocol::ProvenanceRecord {
-            subject: bloom_triad_protocol::ProvenanceSubject::Petal {
-                package_hash: bloom_triad_protocol::Digest32::from_bytes([0xaa; 32]),
+        let provenance_record = bloom_broker_api::ProvenanceRecord {
+            subject: bloom_broker_api::ProvenanceSubject::Petal {
+                package_hash: bloom_broker_api::Digest32::from_bytes([0xaa; 32]),
                 route: "r000007".into(),
             },
-            publisher: bloom_triad_protocol::Token::new("fixture-publisher").unwrap(),
-            operation_classes: vec![bloom_triad_protocol::ProvenanceOperationClass {
-                operation_class: bloom_triad_protocol::Token::new("exchange-agent").unwrap(),
+            publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
+            operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                operation_class: bloom_broker_api::Token::new("exchange-agent").unwrap(),
                 fee_asset: None,
             }],
-            installer_key_id: bloom_triad_protocol::Token::new("fixture-installer").unwrap(),
-            installer_signature: bloom_triad_protocol::Base64UrlBytes::from_bytes(&[0x55; 64]),
+            installer_key_id: bloom_broker_api::Token::new("fixture-installer").unwrap(),
+            installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[0x55; 64]),
         };
         let expected_provenance_digest = provenance_record.digest().unwrap();
         let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit)
             .with_broker(Some(MachineBrokerClient::new(fixture.clone())))
-            .with_provenance_catalog(Some(bloom_triad_protocol::ProvenanceCatalog {
-                schema: bloom_triad_protocol::PROVENANCE_CATALOG_SCHEMA.into(),
+            .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
+                schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![provenance_record],
             }))
             .with_petal_key_state_root(dir.path().join("petal-key-requests"));

@@ -1,12 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bloom_machine_client::{
-    MachineBrokerClient, ProjectionFreshness, ProjectionVerification, WalletProjection,
-    WalletProjectionReader,
-};
-use bloom_paid_http::PaidHttpChainRpcResolver;
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     ApprovalPrepareState, ApprovalSubject, Base64UrlBytes, CanonicalWalletPolicy, CredentialPublic,
     CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef, KeySpec, MachineBrokerRequest,
     MachineBrokerResponse, MachineBrokerService, NormalizedSignature, PROVENANCE_CATALOG_SCHEMA,
@@ -14,6 +9,11 @@ use bloom_triad_protocol::{
     ProvenanceRecord, ProvenanceSubject, SealedApprovalPrepareResponse, ServiceFuture,
     SignedPolicySnapshot, SigningResult, Token, WalletPublic,
 };
+use bloom_machine_client::{
+    MachineBrokerClient, ProjectionFreshness, ProjectionVerification, WalletProjection,
+    WalletProjectionReader,
+};
+use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_vfs::handlers::RequestsHandler;
 use bloom_vfs::{BrokerExactPayloadSigner, Handler, HandlerError, VfsPath};
 use mpp::protocol::core::Base64UrlJson;

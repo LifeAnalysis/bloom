@@ -244,7 +244,7 @@ fn configured_raw_broker_client_with_activation(
 }
 
 async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
-    use bloom_triad_protocol::{
+    use bloom_broker_api::{
         Digest32, Empty, MachineBrokerRequest, MachineBrokerResponse, ReadinessState,
     };
 
@@ -290,7 +290,7 @@ fn configured_broker_connection(
     _home: &HomeDir,
 ) -> Result<(
     bloom_machine_client::MachineBrokerClient,
-    bloom_triad_protocol::ProvenanceCatalog,
+    bloom_broker_api::ProvenanceCatalog,
 )> {
     // Daemon construction attaches this raw authenticated client to the exact
     // AuditLog instance it owns before any RPC can be dispatched.
@@ -678,10 +678,10 @@ struct ConfiguredMachineAuditHead(Arc<AuditLog>);
 impl MachineJournalHeadProvider for ConfiguredMachineAuditHead {
     fn verified_head(
         &self,
-    ) -> Result<(u64, bloom_triad_protocol::Digest32), bloom_triad_protocol::ProtocolError> {
+    ) -> Result<(u64, bloom_broker_api::Digest32), bloom_broker_api::ProtocolError> {
         if let Some(reason) = self.0.mutation_degradation() {
-            return Err(bloom_triad_protocol::ProtocolError::new(
-                bloom_triad_protocol::ProtocolErrorCode::ServiceUnavailable,
+            return Err(bloom_broker_api::ProtocolError::new(
+                bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
                 format!("Machine audit journal is degraded: {reason}"),
             ));
         }
@@ -691,10 +691,7 @@ impl MachineJournalHeadProvider for ConfiguredMachineAuditHead {
         } else {
             hash
         };
-        Ok((
-            self.0.sequence(),
-            bloom_triad_protocol::Digest32::new(hash)?,
-        ))
+        Ok((self.0.sequence(), bloom_broker_api::Digest32::new(hash)?))
     }
 
     fn latch_mutations(&self, reason: String) {
@@ -754,8 +751,8 @@ async fn launch_custody_ceremony(
     home: &HomeDir,
     requested_name: &str,
     method: bloom_machine_client::CustodyPrepareMethod,
-    ceremony_kind: bloom_triad_protocol::CeremonyKind,
-    wallet_id: Option<bloom_triad_protocol::Token>,
+    ceremony_kind: bloom_broker_api::CeremonyKind,
+    wallet_id: Option<bloom_broker_api::Token>,
     expected_input_class: &str,
 ) -> Result<()> {
     use rand::RngCore as _;
@@ -763,13 +760,13 @@ async fn launch_custody_ceremony(
 
     validate_wallet_name(requested_name)
         .context("requested wallet name must be a safe single path segment")?;
-    bloom_triad_protocol::Token::new(requested_name.to_owned())
+    bloom_broker_api::Token::new(requested_name.to_owned())
         .context("requested wallet name must be a protocol token")?;
     let client = configured_broker_client(home)
         .context("custody requires the authenticated Machine-to-Broker edge")?;
     let mut operation_bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut operation_bytes);
-    let operation_id = bloom_triad_protocol::OperationId::from_bytes(operation_bytes);
+    let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
     let reviewed_terms = serde_jcs::to_vec(&serde_json::json!({
         "ceremony_kind": ceremony_kind,
         "requested_machine_name": requested_name,
@@ -779,15 +776,15 @@ async fn launch_custody_ceremony(
     let response = client
         .prepare_custody(
             method,
-            bloom_triad_protocol::CustodyPrepareRequest {
+            bloom_broker_api::CustodyPrepareRequest {
                 ceremony_kind,
                 custody_operation_id: operation_id,
                 wallet_id,
                 key_ref: None,
-                exact_terms_digest: bloom_triad_protocol::Digest32::from_bytes(
+                exact_terms_digest: bloom_broker_api::Digest32::from_bytes(
                     sha2::Sha256::digest(reviewed_terms).into(),
                 ),
-                expected_input_class: bloom_triad_protocol::Token::new(expected_input_class)
+                expected_input_class: bloom_broker_api::Token::new(expected_input_class)
                     .context("custody input class")?,
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
@@ -827,9 +824,9 @@ async fn prepare_policy_update(
 
     validate_wallet_name(requested_name)
         .context("wallet name must be a safe single path segment")?;
-    let wallet_id = bloom_triad_protocol::Token::new(requested_name.to_owned())
+    let wallet_id = bloom_broker_api::Token::new(requested_name.to_owned())
         .context("wallet name must be a protocol token")?;
-    let assurance_level = bloom_triad_protocol::Token::new(assurance_level.to_owned())
+    let assurance_level = bloom_broker_api::Token::new(assurance_level.to_owned())
         .context("assurance level must be a protocol token")?;
     let metadata = std::fs::metadata(policy_file)
         .with_context(|| format!("inspect proposed policy {}", policy_file.display()))?;
@@ -839,7 +836,7 @@ async fn prepare_policy_update(
     );
     let input = std::fs::read(policy_file)
         .with_context(|| format!("read proposed policy {}", policy_file.display()))?;
-    let proposed: bloom_triad_protocol::CanonicalWalletPolicy = serde_json::from_slice(&input)
+    let proposed: bloom_broker_api::CanonicalWalletPolicy = serde_json::from_slice(&input)
         .with_context(|| {
             format!(
                 "parse proposed policy {} as canonical policy JSON",
@@ -862,11 +859,11 @@ async fn prepare_policy_update(
         .context("read Signer-authenticated policy baseline from Broker")?;
     let baseline_bytes = baseline.canonical_policy.decode();
     anyhow::ensure!(
-        bloom_triad_protocol::Digest32::from_bytes(sha2::Sha256::digest(&baseline_bytes).into())
+        bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&baseline_bytes).into())
             == baseline.policy_digest,
         "Broker policy baseline digest does not match its canonical bytes"
     );
-    let baseline_policy: bloom_triad_protocol::CanonicalWalletPolicy =
+    let baseline_policy: bloom_broker_api::CanonicalWalletPolicy =
         serde_json::from_slice(&baseline_bytes).context("parse Broker policy baseline")?;
     anyhow::ensure!(
         serde_jcs::to_vec(&baseline_policy).context("canonicalize Broker policy baseline")?
@@ -878,26 +875,23 @@ async fn prepare_policy_update(
         "Broker policy baseline names another wallet"
     );
 
-    let authority_diff =
-        bloom_triad_protocol::canonical_policy_authority_diff(&baseline_policy, &proposed);
+    let authority_diff_digest =
+        bloom_machine_client::claimed_policy_authority_diff_digest(&baseline_policy, &proposed)
+            .map_err(anyhow::Error::new)
+            .context("digest claimed policy authority diff")?;
     let mut operation_bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut operation_bytes);
-    let operation_id = bloom_triad_protocol::OperationId::from_bytes(operation_bytes);
-    let request = bloom_triad_protocol::PolicyUpdateRequest {
+    let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
+    let request = bloom_broker_api::PolicyUpdateRequest {
         operation_id,
         wallet_id,
         baseline_version: baseline.version,
         baseline_digest: baseline.policy_digest,
-        proposed_canonical_policy: bloom_triad_protocol::Base64UrlBytes::from_bytes(
-            &proposed_bytes,
-        ),
-        proposed_policy_digest: bloom_triad_protocol::Digest32::from_bytes(
+        proposed_canonical_policy: bloom_broker_api::Base64UrlBytes::from_bytes(&proposed_bytes),
+        proposed_policy_digest: bloom_broker_api::Digest32::from_bytes(
             sha2::Sha256::digest(&proposed_bytes).into(),
         ),
-        authority_diff_digest: authority_diff
-            .digest()
-            .map_err(anyhow::Error::new)
-            .context("digest canonical policy authority diff")?,
+        authority_diff_digest,
         assurance_level,
     };
     let response = client
@@ -926,12 +920,12 @@ async fn prepare_policy_update(
 }
 
 async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<()> {
-    let operation_id = bloom_triad_protocol::OperationId::new(operation_id)
+    let operation_id = bloom_broker_api::OperationId::new(operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
     let client = configured_broker_client(home)
         .context("policy commit requires the authenticated Machine-to-Broker edge")?;
     let ceremony_receipt = client
-        .custody_result(bloom_triad_protocol::OperationRequest {
+        .custody_result(bloom_broker_api::OperationRequest {
             operation_id: operation_id.clone(),
         })
         .await
@@ -943,7 +937,7 @@ async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<()
     );
 
     let receipt = client
-        .commit_policy_update(bloom_triad_protocol::PolicyCommitUpdateRequest {
+        .commit_policy_update(bloom_broker_api::PolicyCommitUpdateRequest {
             operation_id: operation_id.clone(),
             ceremony_receipt,
         })
@@ -981,12 +975,12 @@ async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<()
 }
 
 fn is_completed_policy_update_receipt(
-    receipt: &bloom_triad_protocol::CustodyResult,
-    operation_id: &bloom_triad_protocol::OperationId,
+    receipt: &bloom_broker_api::CustodyResult,
+    operation_id: &bloom_broker_api::OperationId,
 ) -> bool {
     receipt.custody_operation_id == *operation_id
-        && receipt.ceremony_kind == bloom_triad_protocol::CeremonyKind::PolicyUpdate
-        && receipt.public_status == bloom_triad_protocol::CeremonyState::Succeeded
+        && receipt.ceremony_kind == bloom_broker_api::CeremonyKind::PolicyUpdate
+        && receipt.public_status == bloom_broker_api::CeremonyState::Succeeded
 }
 
 fn current_unix_ms() -> u64 {
@@ -1050,7 +1044,7 @@ fn persist_ceremony_projection(
 
 fn load_ceremony_projection(
     home: &HomeDir,
-    operation_id: &bloom_triad_protocol::OperationId,
+    operation_id: &bloom_broker_api::OperationId,
 ) -> Result<Option<bloom_machine_client::CeremonyProjection>> {
     let path = ceremony_projection_path(home, operation_id.as_str());
     match std::fs::read(&path) {
@@ -1070,13 +1064,13 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<()> {
         CeremonyCmd::Cancel { operation_id } => (operation_id, "cancel"),
         CeremonyCmd::Result { operation_id } => (operation_id, "result"),
     };
-    let operation_id = bloom_triad_protocol::OperationId::new(operation_id)
+    let operation_id = bloom_broker_api::OperationId::new(operation_id)
         .context("operation ID must be 64 lowercase hexadecimal characters")?;
     let client = configured_broker_client(home)
         .context("ceremony operations require the authenticated Machine-to-Broker edge")?;
     if action == "result" {
         let result = client
-            .custody_result(bloom_triad_protocol::OperationRequest {
+            .custody_result(bloom_broker_api::OperationRequest {
                 operation_id: operation_id.clone(),
             })
             .await
@@ -1832,8 +1826,7 @@ async fn run(cli: Cli) -> Result<()> {
             {
                 Ok(wallets) => Some(wallets),
                 Err(error)
-                    if error.code
-                        == bloom_triad_protocol::ProtocolErrorCode::ServiceUnavailable =>
+                    if error.code == bloom_broker_api::ProtocolErrorCode::ServiceUnavailable =>
                 {
                     None
                 }
@@ -2104,7 +2097,7 @@ async fn run(cli: Cli) -> Result<()> {
                 &home,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::WalletRegistration,
-                bloom_triad_protocol::CeremonyKind::WalletRegistration,
+                bloom_broker_api::CeremonyKind::WalletRegistration,
                 None,
                 "passkey-prf",
             )
@@ -2115,7 +2108,7 @@ async fn run(cli: Cli) -> Result<()> {
                 &home,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::WalletImport,
-                bloom_triad_protocol::CeremonyKind::WalletImport,
+                bloom_broker_api::CeremonyKind::WalletImport,
                 None,
                 "raw-wallet-import",
             )
@@ -2135,8 +2128,8 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Wallet(WalletCmd::Projection { name }) => {
             let reader = configured_wallet_projection_reader(&home)?;
-            let wallet_id = bloom_triad_protocol::Token::new(name)
-                .context("wallet ID must be a protocol token")?;
+            let wallet_id =
+                bloom_broker_api::Token::new(name).context("wallet ID must be a protocol token")?;
             let projection = reader.get_wallet(&wallet_id).await?;
             println!(
                 "{}",
@@ -2147,8 +2140,8 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Wallet(WalletCmd::Address { name, qr, qr_out }) => {
             let reader = configured_wallet_projection_reader(&home)?;
-            let wallet_id = bloom_triad_protocol::Token::new(name)
-                .context("wallet ID must be a protocol token")?;
+            let wallet_id =
+                bloom_broker_api::Token::new(name).context("wallet ID must be a protocol token")?;
             let projection = reader.get_wallet(&wallet_id).await?;
             let address: alloy::primitives::Address = projection
                 .primary_address()?
@@ -2186,26 +2179,26 @@ async fn run(cli: Cli) -> Result<()> {
             commit_policy_update(&home, operation_id).await
         }
         Cmd::Wallet(WalletCmd::RebindPasskey { name }) => {
-            let wallet_id = bloom_triad_protocol::Token::new(name.clone())
+            let wallet_id = bloom_broker_api::Token::new(name.clone())
                 .context("wallet ID must be a protocol token")?;
             launch_custody_ceremony(
                 &home,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::CredentialReplace,
-                bloom_triad_protocol::CeremonyKind::CredentialReplace,
+                bloom_broker_api::CeremonyKind::CredentialReplace,
                 Some(wallet_id),
                 "credential-prf",
             )
             .await
         }
         Cmd::Wallet(WalletCmd::Delete { name }) => {
-            let wallet_id = bloom_triad_protocol::Token::new(name.clone())
+            let wallet_id = bloom_broker_api::Token::new(name.clone())
                 .context("wallet ID must be a protocol token")?;
             launch_custody_ceremony(
                 &home,
                 &name,
                 bloom_machine_client::CustodyPrepareMethod::WalletDelete,
-                bloom_triad_protocol::CeremonyKind::WalletDelete,
+                bloom_broker_api::CeremonyKind::WalletDelete,
                 Some(wallet_id),
                 "none",
             )
@@ -2241,7 +2234,7 @@ async fn run(cli: Cli) -> Result<()> {
             debug!("cli.wallet.stage.via_inproc: no daemon socket present");
             let (home_permit, d) = build_write_daemon(home)?;
             let parsed = bloom_tx::intent_parser::parse(&body).context("parse intent")?;
-            let wallet_id = bloom_triad_protocol::Token::new(wallet.clone())
+            let wallet_id = bloom_broker_api::Token::new(wallet.clone())
                 .context("wallet ID must be a protocol token")?;
             let projection = d
                 .wallet_projections
@@ -2937,9 +2930,9 @@ mod tests {
         let home = bloom_proto::HomeDir::at(temp.path());
         let path = home.audit_path();
         let identity = bloom_triad_local_transport::LocalIdentity {
-            service_id: bloom_triad_protocol::Token::new("bloom-machine").unwrap(),
-            boot_epoch: bloom_triad_protocol::BootEpoch::from_bytes([7; 16]),
-            application_key_id: bloom_triad_protocol::Token::new("machine-app").unwrap(),
+            service_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+            boot_epoch: bloom_broker_api::BootEpoch::from_bytes([7; 16]),
+            application_key_id: bloom_broker_api::Token::new("machine-app").unwrap(),
             signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7; 32])),
         };
         let audit = open_machine_audit_with_history(
@@ -3010,13 +3003,13 @@ mod tests {
     fn custody_projection_persists_atomically_and_without_secret_world_access() {
         let temp = tempfile::tempdir().unwrap();
         let home = bloom_proto::HomeDir::at(temp.path());
-        let operation_id = bloom_triad_protocol::OperationId::from_bytes([61; 32]);
-        let status = bloom_triad_protocol::CeremonyPublicStatus {
-            ceremony_id: bloom_triad_protocol::Digest32::from_bytes([62; 32]),
-            ceremony_kind: bloom_triad_protocol::CeremonyKind::WalletImport,
+        let operation_id = bloom_broker_api::OperationId::from_bytes([61; 32]);
+        let status = bloom_broker_api::CeremonyPublicStatus {
+            ceremony_id: bloom_broker_api::Digest32::from_bytes([62; 32]),
+            ceremony_kind: bloom_broker_api::CeremonyKind::WalletImport,
             operation_id: operation_id.clone(),
-            state: bloom_triad_protocol::CeremonyState::AwaitingUser,
-            expires_at_ms: bloom_triad_protocol::DecimalU64::new(u64::MAX),
+            state: bloom_broker_api::CeremonyState::AwaitingUser,
+            expires_at_ms: bloom_broker_api::DecimalU64::new(u64::MAX),
             ceremony_url: Some("http://localhost:18734/ceremony/owner-readable-secret".into()),
             receipt_digest: None,
         };
@@ -3051,7 +3044,7 @@ mod tests {
 
     #[test]
     fn ac26_every_custody_kind_exposes_launch_data_only_while_awaiting() {
-        use bloom_triad_protocol::{
+        use bloom_broker_api::{
             CeremonyKind, CeremonyPublicStatus, CeremonyState, CustodyPrepareResponse, DecimalU64,
             Digest32, OperationId,
         };
@@ -3093,7 +3086,7 @@ mod tests {
             let prepared = CustodyPrepareResponse {
                 ceremony_kind: kind,
                 custody_operation_id: operation_id.clone(),
-                state: bloom_triad_protocol::CustodyPrepareState::AwaitingUser,
+                state: bloom_broker_api::CustodyPrepareState::AwaitingUser,
                 ceremony_url: expected_url.clone(),
                 ceremony_expires_at_ms: DecimalU64::new(10_000),
                 signer_contribution_digest: Digest32::from_bytes([ordinal as u8 + 32; 32]),
@@ -3185,26 +3178,26 @@ mod tests {
 
     #[test]
     fn policy_commit_accepts_only_matching_completed_generic_custody_receipt() {
-        let operation_id = bloom_triad_protocol::OperationId::from_bytes([71; 32]);
-        let mut receipt = bloom_triad_protocol::CustodyResult {
-            ceremony_kind: bloom_triad_protocol::CeremonyKind::PolicyUpdate,
+        let operation_id = bloom_broker_api::OperationId::from_bytes([71; 32]);
+        let mut receipt = bloom_broker_api::CustodyResult {
+            ceremony_kind: bloom_broker_api::CeremonyKind::PolicyUpdate,
             custody_operation_id: operation_id.clone(),
-            public_status: bloom_triad_protocol::CeremonyState::Succeeded,
-            wallet_id: Some(bloom_triad_protocol::Token::new("wallet").unwrap()),
+            public_status: bloom_broker_api::CeremonyState::Succeeded,
+            wallet_id: Some(bloom_broker_api::Token::new("wallet").unwrap()),
             public_key_refs: Vec::new(),
             credential_summaries: Vec::new(),
             initial_policy: None,
-            receipt_digest: bloom_triad_protocol::Digest32::from_bytes([72; 32]),
+            receipt_digest: bloom_broker_api::Digest32::from_bytes([72; 32]),
             encrypted_browser_result: None,
-            signer_key_id: bloom_triad_protocol::Token::new("signer-ceremony-key").unwrap(),
-            signer_signature: bloom_triad_protocol::Base64UrlBytes::from_bytes(&[73; 64]),
+            signer_key_id: bloom_broker_api::Token::new("signer-ceremony-key").unwrap(),
+            signer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[73; 64]),
         };
         assert!(is_completed_policy_update_receipt(&receipt, &operation_id));
 
-        receipt.public_status = bloom_triad_protocol::CeremonyState::Completed;
+        receipt.public_status = bloom_broker_api::CeremonyState::Completed;
         assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
-        receipt.public_status = bloom_triad_protocol::CeremonyState::Succeeded;
-        receipt.ceremony_kind = bloom_triad_protocol::CeremonyKind::WalletDelete;
+        receipt.public_status = bloom_broker_api::CeremonyState::Succeeded;
+        receipt.ceremony_kind = bloom_broker_api::CeremonyKind::WalletDelete;
         assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
     }
 

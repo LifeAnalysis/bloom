@@ -30,7 +30,8 @@ bloom-proto.workspace = true
 bloom-daemon.workspace = true
 bloom-machine-client.workspace = true
 bloom-triad-local-transport.workspace = true
-bloom-triad-protocol.workspace = true
+bloom-service-activation.workspace = true
+bloom-broker-api.workspace = true
 blake3.workspace = true
 bloom-mount = { workspace = true, optional = true }
 bloom-evm.workspace = true

@@ -11,7 +11,7 @@ default = []
 [dependencies]
 bloom-machine-client.workspace = true
 bloom-proto.workspace = true
-bloom-triad-protocol.workspace = true
+bloom-broker-api.workspace = true
 bloom-evm.workspace = true
 bloom-rpc.workspace = true
 bloom-mempool.workspace = true

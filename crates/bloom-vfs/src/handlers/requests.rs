@@ -340,7 +340,7 @@ impl RequestsHandler {
             .as_deref()
             .filter(|value| !value.trim().is_empty()))
         {
-            let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+            let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
                 .map_err(|error| HandlerError::invalid(error.to_string()))?;
             projections
                 .get_wallet(&wallet_id)
@@ -368,7 +368,7 @@ impl RequestsHandler {
     }
 
     async fn wallet_policy(&self, wallet: &str) -> Result<Policy, HandlerError> {
-        let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+        let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         let projection = self
             .wallet_projections
@@ -386,7 +386,7 @@ impl RequestsHandler {
         &self,
         wallet: &str,
     ) -> Result<alloy::primitives::Address, HandlerError> {
-        let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+        let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         self.wallet_projections
             .as_ref()
@@ -893,7 +893,7 @@ impl PaidHttpHostSigner for BrokerPaidHttpHostSigner {
                 &self.wallet,
                 operation_class,
                 preimage,
-                bloom_triad_protocol::Digest32::from_bytes(signing_hash),
+                bloom_broker_api::Digest32::from_bytes(signing_hash),
                 &facts_json,
             )
             .await?

@@ -233,7 +233,8 @@ forbidden_dependencies() {
     return
   fi
   printf '%s\n' \
-    bloom-keystore bloom-auth bloom-auth-api bloom-hyperliquid
+    bloom-keystore bloom-auth bloom-auth-api bloom-hyperliquid \
+    bloom-triad-protocol bloom-signer-api bloom-signer
 }
 
 feature_is_forbidden() {
@@ -379,6 +380,7 @@ require_clean_dependencies() {
 
 forbidden_source_markers() {
   printf '%s\n' \
+    bloom_triad_protocol bloom_signer_api bloom_signer \
     bloom-keystore bloom-auth bloom-auth-api bloom_hyperliquid \
     bloom_keystore bloom_auth KeystorePetalHost StoreApprovalVerifier \
     KeystoreApprovalSignatureVerifier SignerCache EphemeralAgentKey \

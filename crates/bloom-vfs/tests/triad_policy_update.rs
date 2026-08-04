@@ -3,17 +3,17 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use bloom_machine_client::{
-    CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient, WalletProjectionReader,
-};
-use bloom_proto::{AddressBook, HomeDir, HomeWritePermit};
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     Base64UrlBytes, CanonicalWalletPolicy, CeremonyKind, CeremonyPublicStatus, CeremonyState,
     CredentialPublic, CryptoSuite, CustodyResult, DecimalU64, Digest32, KeyPublic, KeyRef, KeySpec,
     MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, OperationId,
     PolicyCommitReceipt, PolicyUpdatePrepareResponse, ProtocolError, ProtocolErrorCode,
     ServiceFuture, SignedPolicySnapshot, Token, WalletPublic, WalletRequest,
 };
+use bloom_machine_client::{
+    CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient, WalletProjectionReader,
+};
+use bloom_proto::{AddressBook, HomeDir, HomeWritePermit};
 use bloom_tx::{outbox::Outbox, tx_engine::TxEngine};
 use bloom_vfs::{Handler, HandlerError, VfsPath, handlers::wallets::WalletsHandler};
 use sha2::{Digest as _, Sha256};
@@ -159,8 +159,8 @@ impl MachineBrokerService for BrokerFixture {
                         .lose_prepare_response_once
                         .swap(false, Ordering::SeqCst)
                     {
-                        return Err(bloom_triad_protocol::ProtocolError::new(
-                            bloom_triad_protocol::ProtocolErrorCode::ServiceUnavailable,
+                        return Err(bloom_broker_api::ProtocolError::new(
+                            bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
                             "simulated response loss after durable policy prepare",
                         ));
                     }

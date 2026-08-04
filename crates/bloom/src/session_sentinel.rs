@@ -14,6 +14,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use bloom_service_activation::{SESSION_PROTOCOL_CURRENT, SESSION_PROTOCOL_RANGE};
 #[cfg(feature = "triad-dev-harness")]
 use bloom_triad_local_transport::load_developer_identity_and_manifest;
 use bloom_triad_local_transport::{
@@ -76,7 +77,7 @@ pub async fn run() -> Result<()> {
                 bloom_triad_local_transport::LocalIdentity,
                 bloom_triad_local_transport::EdgeManifest,
             ),
-            bloom_triad_protocol::ProtocolError,
+            bloom_triad_local_transport::TransportError,
         >,
     > = None;
     let (identity, manifest) = loaded_developer
@@ -166,7 +167,13 @@ async fn serve_authenticated_services(
             let _permit = permit;
             let authenticated = tokio::time::timeout(
                 Duration::from_secs(2),
-                authenticate_server_one_of(&mut stream, &identity, &peers),
+                authenticate_server_one_of(
+                    &mut stream,
+                    &identity,
+                    &peers,
+                    SESSION_PROTOCOL_CURRENT,
+                    SESSION_PROTOCOL_RANGE,
+                ),
             )
             .await;
             let peer = match authenticated {

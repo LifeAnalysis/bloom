@@ -57,40 +57,37 @@ const POLICY_UPDATE_STATES: &[&str] = &["pending", "confirmed", "failed"];
 #[serde(deny_unknown_fields)]
 struct TriadPolicyUpdateProjection {
     schema: String,
-    wallet_id: bloom_triad_protocol::Token,
-    operation_id: bloom_triad_protocol::OperationId,
-    baseline_version: bloom_triad_protocol::DecimalU64,
-    baseline_digest: bloom_triad_protocol::Digest32,
-    proposed_policy_digest: bloom_triad_protocol::Digest32,
-    authority_diff_digest: bloom_triad_protocol::Digest32,
-    assurance_level: bloom_triad_protocol::Token,
-    review_manifest_digest: Option<bloom_triad_protocol::Digest32>,
-    ceremony_state: bloom_triad_protocol::CeremonyState,
+    wallet_id: bloom_broker_api::Token,
+    operation_id: bloom_broker_api::OperationId,
+    baseline_version: bloom_broker_api::DecimalU64,
+    baseline_digest: bloom_broker_api::Digest32,
+    proposed_policy_digest: bloom_broker_api::Digest32,
+    authority_diff_digest: bloom_broker_api::Digest32,
+    assurance_level: bloom_broker_api::Token,
+    review_manifest_digest: Option<bloom_broker_api::Digest32>,
+    ceremony_state: bloom_broker_api::CeremonyState,
     ceremony_url: Option<String>,
-    ceremony_expires_at_ms: Option<bloom_triad_protocol::DecimalU64>,
+    ceremony_expires_at_ms: Option<bloom_broker_api::DecimalU64>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ApprovalCeremonyProjection {
     schema: String,
-    wallet_id: bloom_triad_protocol::Token,
-    operation_id: bloom_triad_protocol::OperationId,
-    source_approval_id: Option<bloom_triad_protocol::Digest32>,
-    response: bloom_triad_protocol::SealedApprovalPrepareResponse,
+    wallet_id: bloom_broker_api::Token,
+    operation_id: bloom_broker_api::OperationId,
+    source_approval_id: Option<bloom_broker_api::Digest32>,
+    response: bloom_broker_api::SealedApprovalPrepareResponse,
 }
 
 impl TriadPolicyUpdateProjection {
-    fn request(
-        &self,
-        proposed_canonical_policy: &[u8],
-    ) -> bloom_triad_protocol::PolicyUpdateRequest {
-        bloom_triad_protocol::PolicyUpdateRequest {
+    fn request(&self, proposed_canonical_policy: &[u8]) -> bloom_broker_api::PolicyUpdateRequest {
+        bloom_broker_api::PolicyUpdateRequest {
             operation_id: self.operation_id.clone(),
             wallet_id: self.wallet_id.clone(),
             baseline_version: self.baseline_version.clone(),
             baseline_digest: self.baseline_digest.clone(),
-            proposed_canonical_policy: bloom_triad_protocol::Base64UrlBytes::from_bytes(
+            proposed_canonical_policy: bloom_broker_api::Base64UrlBytes::from_bytes(
                 proposed_canonical_policy,
             ),
             proposed_policy_digest: self.proposed_policy_digest.clone(),
@@ -101,10 +98,10 @@ impl TriadPolicyUpdateProjection {
 
     fn adopt_prepare(
         &mut self,
-        prepared: bloom_triad_protocol::PolicyUpdatePrepareResponse,
+        prepared: bloom_broker_api::PolicyUpdatePrepareResponse,
     ) -> Result<(), HandlerError> {
         if prepared.operation_id != self.operation_id
-            || prepared.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate
+            || prepared.ceremony_kind != bloom_broker_api::CeremonyKind::PolicyUpdate
             || prepared.ceremony_url.trim().is_empty()
             || prepared.ceremony_expires_at_ms.get() <= now_ms_u64()
         {
@@ -113,7 +110,7 @@ impl TriadPolicyUpdateProjection {
             ));
         }
         self.review_manifest_digest = Some(prepared.review_manifest_digest);
-        self.ceremony_state = bloom_triad_protocol::CeremonyState::AwaitingUser;
+        self.ceremony_state = bloom_broker_api::CeremonyState::AwaitingUser;
         self.ceremony_url = Some(prepared.ceremony_url);
         self.ceremony_expires_at_ms = Some(prepared.ceremony_expires_at_ms);
         Ok(())
@@ -182,7 +179,7 @@ impl WalletsHandler {
     }
 
     async fn wallet_projection(&self, wallet: &str) -> Result<WalletProjection, HandlerError> {
-        let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+        let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         self.wallet_projections
             .as_ref()
@@ -329,13 +326,13 @@ impl WalletsHandler {
         })
     }
 
-    fn approval_id(value: &str) -> Result<bloom_triad_protocol::Digest32, HandlerError> {
-        bloom_triad_protocol::Digest32::new(value.to_owned())
+    fn approval_id(value: &str) -> Result<bloom_broker_api::Digest32, HandlerError> {
+        bloom_broker_api::Digest32::new(value.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))
     }
 
-    fn wallet_id(value: &str) -> Result<bloom_triad_protocol::Token, HandlerError> {
-        bloom_triad_protocol::Token::new(value.to_owned())
+    fn wallet_id(value: &str) -> Result<bloom_broker_api::Token, HandlerError> {
+        bloom_broker_api::Token::new(value.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))
     }
 
@@ -357,9 +354,9 @@ impl WalletsHandler {
     fn store_approval_ceremony_projection(
         &self,
         wallet: &str,
-        operation_id: bloom_triad_protocol::OperationId,
-        source_approval_id: Option<bloom_triad_protocol::Digest32>,
-        response: bloom_triad_protocol::SealedApprovalPrepareResponse,
+        operation_id: bloom_broker_api::OperationId,
+        source_approval_id: Option<bloom_broker_api::Digest32>,
+        response: bloom_broker_api::SealedApprovalPrepareResponse,
     ) -> Result<(), HandlerError> {
         let path = self
             .approval_projection_path(wallet, source_approval_id.as_ref().map(|id| id.as_str()));
@@ -400,20 +397,20 @@ impl WalletsHandler {
             .await
             .map_err(|error| HandlerError::backend(error.to_string()))?;
         if ceremony.operation_id != projection.operation_id
-            || ceremony.ceremony_kind != bloom_triad_protocol::CeremonyKind::SealedApproval
+            || ceremony.ceremony_kind != bloom_broker_api::CeremonyKind::SealedApproval
         {
             return Err(HandlerError::backend(
                 "Broker returned a mismatched Sealed Approval ceremony projection",
             ));
         }
-        if ceremony.state != bloom_triad_protocol::CeremonyState::AwaitingUser {
+        if ceremony.state != bloom_broker_api::CeremonyState::AwaitingUser {
             if matches!(
                 ceremony.state,
-                bloom_triad_protocol::CeremonyState::Completed
-                    | bloom_triad_protocol::CeremonyState::Succeeded
-                    | bloom_triad_protocol::CeremonyState::Cancelled
-                    | bloom_triad_protocol::CeremonyState::Expired
-                    | bloom_triad_protocol::CeremonyState::Failed
+                bloom_broker_api::CeremonyState::Completed
+                    | bloom_broker_api::CeremonyState::Succeeded
+                    | bloom_broker_api::CeremonyState::Cancelled
+                    | bloom_broker_api::CeremonyState::Expired
+                    | bloom_broker_api::CeremonyState::Failed
             ) {
                 match std::fs::remove_file(&path) {
                     Ok(()) => {}
@@ -435,8 +432,8 @@ impl WalletsHandler {
             .await?;
         if !matches!(
             status.state,
-            bloom_triad_protocol::ApprovalLifecycleState::Prepared
-                | bloom_triad_protocol::ApprovalLifecycleState::AwaitingCeremony
+            bloom_broker_api::ApprovalLifecycleState::Prepared
+                | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
         ) {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -454,7 +451,7 @@ impl WalletsHandler {
         &self,
         wallet: &str,
         approval_id: &str,
-    ) -> Result<bloom_triad_protocol::ApprovalPublicStatus, HandlerError> {
+    ) -> Result<bloom_broker_api::ApprovalPublicStatus, HandlerError> {
         let wallet_id = Self::wallet_id(wallet)?;
         let status = self
             .broker()?
@@ -484,7 +481,7 @@ impl WalletsHandler {
     async fn approval_list_for_wallet(
         &self,
         wallet: &str,
-    ) -> Result<Vec<bloom_triad_protocol::ApprovalPublicStatus>, HandlerError> {
+    ) -> Result<Vec<bloom_broker_api::ApprovalPublicStatus>, HandlerError> {
         let wallet_id = Self::wallet_id(wallet)?;
         let mut statuses = self
             .broker()?
@@ -536,7 +533,7 @@ impl WalletsHandler {
     }
 
     async fn prepare_sealed_approval(&self, wallet: &str, data: &[u8]) -> Result<(), HandlerError> {
-        let request: bloom_triad_protocol::ApprovalPrepareRequest = serde_json::from_slice(data)
+        let request: bloom_broker_api::ApprovalPrepareRequest = serde_json::from_slice(data)
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         if request.terms.wallet_id != Self::wallet_id(wallet)? {
             return Err(HandlerError::invalid(
@@ -571,7 +568,7 @@ impl WalletsHandler {
         approval_id: &str,
         data: &[u8],
     ) -> Result<(), HandlerError> {
-        let request: bloom_triad_protocol::ApprovalRenewRequest = serde_json::from_slice(data)
+        let request: bloom_broker_api::ApprovalRenewRequest = serde_json::from_slice(data)
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         let path_id = Self::approval_id(approval_id)?;
         if request.old_approval_id != path_id
@@ -609,7 +606,7 @@ impl WalletsHandler {
         approval_id: &str,
         data: &[u8],
     ) -> Result<(), HandlerError> {
-        let request: bloom_triad_protocol::RevokeRequest = serde_json::from_slice(data)
+        let request: bloom_broker_api::RevokeRequest = serde_json::from_slice(data)
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         if request.wallet_id != Self::wallet_id(wallet)?
             || request.approval_id != Self::approval_id(approval_id)?
@@ -630,7 +627,7 @@ impl WalletsHandler {
         wallet: &str,
         data: &[u8],
     ) -> Result<(), HandlerError> {
-        let request: bloom_triad_protocol::WalletOperationRequest = serde_json::from_slice(data)
+        let request: bloom_broker_api::WalletOperationRequest = serde_json::from_slice(data)
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         if request.wallet_id != Self::wallet_id(wallet)? {
             return Err(HandlerError::invalid(
@@ -647,21 +644,20 @@ impl WalletsHandler {
     async fn read_triad_wallet_policy(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
         use sha2::Digest as _;
 
-        let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+        let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         let snapshot = self.wallet_projection(wallet).await?.policy;
         let canonical = snapshot.canonical_policy.decode();
         if snapshot.wallet_id != wallet_id
-            || bloom_triad_protocol::Digest32::from_bytes(sha2::Sha256::digest(&canonical).into())
+            || bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&canonical).into())
                 != snapshot.policy_digest
         {
             return Err(HandlerError::backend(
                 "Broker policy projection has invalid wallet or digest binding",
             ));
         }
-        let policy: bloom_triad_protocol::CanonicalWalletPolicy =
-            serde_json::from_slice(&canonical)
-                .map_err(|error| HandlerError::backend(format!("parse Broker policy: {error}")))?;
+        let policy: bloom_broker_api::CanonicalWalletPolicy = serde_json::from_slice(&canonical)
+            .map_err(|error| HandlerError::backend(format!("parse Broker policy: {error}")))?;
         if policy.wallet_id != wallet_id
             || serde_jcs::to_vec(&policy)
                 .map_err(|error| HandlerError::backend(error.to_string()))?
@@ -706,7 +702,7 @@ impl WalletsHandler {
         {
             Ok(status) => status,
             Err(error)
-                if error.code == bloom_triad_protocol::ProtocolErrorCode::ApprovalNotFound
+                if error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound
                     && projection.review_manifest_digest.is_none() =>
             {
                 // The pre-prepare journal is authoritative, but a read cannot
@@ -721,14 +717,14 @@ impl WalletsHandler {
             Err(error) => return Err(HandlerError::backend(error.to_string())),
         };
         if status.operation_id != projection.operation_id
-            || status.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate
+            || status.ceremony_kind != bloom_broker_api::CeremonyKind::PolicyUpdate
         {
             return Err(HandlerError::backend(
                 "Broker policy ceremony status changed operation identity or kind",
             ));
         }
         projection.ceremony_state = status.state;
-        if status.state == bloom_triad_protocol::CeremonyState::AwaitingUser {
+        if status.state == bloom_broker_api::CeremonyState::AwaitingUser {
             projection.ceremony_url = Some(status.ceremony_url.ok_or_else(|| {
                 HandlerError::backend(
                     "awaiting Broker policy ceremony omitted its owner-visible URL",
@@ -741,13 +737,13 @@ impl WalletsHandler {
         }
         write_atomic_json(&projection_path, &projection)?;
         match status.state {
-            bloom_triad_protocol::CeremonyState::Cancelled
-            | bloom_triad_protocol::CeremonyState::Expired
-            | bloom_triad_protocol::CeremonyState::Failed => {
+            bloom_broker_api::CeremonyState::Cancelled
+            | bloom_broker_api::CeremonyState::Expired
+            | bloom_broker_api::CeremonyState::Failed => {
                 self.policy_update_transition(wallet, operation_id, "pending", "failed")?;
                 Ok("failed".into())
             }
-            bloom_triad_protocol::CeremonyState::Completed => Err(HandlerError::backend(
+            bloom_broker_api::CeremonyState::Completed => Err(HandlerError::backend(
                 "policy_update ceremony reported the wallet-registration-only COMPLETED state",
             )),
             _ => Ok("pending".into()),
@@ -773,9 +769,9 @@ impl WalletsHandler {
                 "SERVICE_UNAVAILABLE: policy update requires the authenticated Broker edge",
             )
         })?;
-        let wallet_id = bloom_triad_protocol::Token::new(wallet.to_owned())
+        let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
-        let proposed: bloom_triad_protocol::CanonicalWalletPolicy = serde_json::from_slice(data)
+        let proposed: bloom_broker_api::CanonicalWalletPolicy = serde_json::from_slice(data)
             .map_err(|error| {
                 HandlerError::invalid(format!(
                     "triad policy writes require canonical policy JSON: {error}"
@@ -788,9 +784,8 @@ impl WalletsHandler {
         }
         let proposed_bytes = serde_jcs::to_vec(&proposed)
             .map_err(|error| HandlerError::invalid(format!("canonicalize policy: {error}")))?;
-        let proposed_policy_digest = bloom_triad_protocol::Digest32::from_bytes(
-            sha2::Sha256::digest(&proposed_bytes).into(),
-        );
+        let proposed_policy_digest =
+            bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&proposed_bytes).into());
         if let Some(operation_id) = self.policy_update_latest_pending_id(wallet) {
             let action_dir = self.policy_update_action_dir(wallet, "pending", &operation_id);
             let projection_path = action_dir.join(APPROVAL_CHALLENGE_FILE);
@@ -811,8 +806,7 @@ impl WalletsHandler {
                 {
                     Ok(status) => status,
                     Err(error)
-                        if error.code
-                            == bloom_triad_protocol::ProtocolErrorCode::ApprovalNotFound =>
+                        if error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound =>
                     {
                         let prepared = broker
                             .validate_policy_update(projection.request(&proposed_bytes))
@@ -831,14 +825,14 @@ impl WalletsHandler {
                     .map_err(|error| HandlerError::backend(error.to_string()))?
             };
             if status.operation_id != projection.operation_id
-                || status.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate
+                || status.ceremony_kind != bloom_broker_api::CeremonyKind::PolicyUpdate
             {
                 return Err(HandlerError::backend(
                     "Broker policy ceremony status changed operation identity or kind",
                 ));
             }
             projection.ceremony_state = status.state;
-            if status.state == bloom_triad_protocol::CeremonyState::AwaitingUser {
+            if status.state == bloom_broker_api::CeremonyState::AwaitingUser {
                 projection.ceremony_url = Some(status.ceremony_url.ok_or_else(|| {
                     HandlerError::backend(
                         "awaiting Broker policy ceremony omitted its owner-visible URL",
@@ -852,23 +846,23 @@ impl WalletsHandler {
             write_atomic_json(&projection_path, &projection)?;
 
             match status.state {
-                bloom_triad_protocol::CeremonyState::Succeeded => {
+                bloom_broker_api::CeremonyState::Succeeded => {
                     let receipt = broker
-                        .custody_result(bloom_triad_protocol::OperationRequest {
+                        .custody_result(bloom_broker_api::OperationRequest {
                             operation_id: projection.operation_id.clone(),
                         })
                         .await
                         .map_err(|error| HandlerError::backend(error.to_string()))?;
                     if receipt.custody_operation_id != projection.operation_id
-                        || receipt.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate
-                        || receipt.public_status != bloom_triad_protocol::CeremonyState::Succeeded
+                        || receipt.ceremony_kind != bloom_broker_api::CeremonyKind::PolicyUpdate
+                        || receipt.public_status != bloom_broker_api::CeremonyState::Succeeded
                     {
                         return Err(HandlerError::backend(
                             "policy commit requires the matching completed policy_update receipt",
                         ));
                     }
                     let commit = broker
-                        .commit_policy_update(bloom_triad_protocol::PolicyCommitUpdateRequest {
+                        .commit_policy_update(bloom_broker_api::PolicyCommitUpdateRequest {
                             operation_id: projection.operation_id.clone(),
                             ceremony_receipt: receipt,
                         })
@@ -899,9 +893,9 @@ impl WalletsHandler {
                     )?;
                     return Ok(());
                 }
-                bloom_triad_protocol::CeremonyState::Cancelled
-                | bloom_triad_protocol::CeremonyState::Expired
-                | bloom_triad_protocol::CeremonyState::Failed => {
+                bloom_broker_api::CeremonyState::Cancelled
+                | bloom_broker_api::CeremonyState::Expired
+                | bloom_broker_api::CeremonyState::Failed => {
                     projection.ceremony_url = None;
                     projection.ceremony_expires_at_ms = None;
                     write_atomic_json(&projection_path, &projection)?;
@@ -925,14 +919,14 @@ impl WalletsHandler {
             .await
             .map_err(|error| HandlerError::backend(error.to_string()))?;
         let baseline_bytes = baseline.canonical_policy.decode();
-        if bloom_triad_protocol::Digest32::from_bytes(sha2::Sha256::digest(&baseline_bytes).into())
+        if bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&baseline_bytes).into())
             != baseline.policy_digest
         {
             return Err(HandlerError::backend(
                 "Broker policy baseline digest does not match its canonical bytes",
             ));
         }
-        let baseline_policy: bloom_triad_protocol::CanonicalWalletPolicy =
+        let baseline_policy: bloom_broker_api::CanonicalWalletPolicy =
             serde_json::from_slice(&baseline_bytes)
                 .map_err(|error| HandlerError::backend(format!("parse Broker policy: {error}")))?;
         if baseline_policy.wallet_id != wallet_id
@@ -944,14 +938,12 @@ impl WalletsHandler {
                 "Broker policy baseline is noncanonical or names another wallet",
             ));
         }
-        let authority_diff =
-            bloom_triad_protocol::canonical_policy_authority_diff(&baseline_policy, &proposed);
-        let authority_diff_digest = authority_diff
-            .digest()
-            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let authority_diff_digest =
+            bloom_machine_client::claimed_policy_authority_diff_digest(&baseline_policy, &proposed)
+                .map_err(|error| HandlerError::invalid(error.to_string()))?;
         let mut operation_bytes = [0_u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut operation_bytes);
-        let operation_id = bloom_triad_protocol::OperationId::from_bytes(operation_bytes);
+        let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
         let mut projection = TriadPolicyUpdateProjection {
             schema: "bloom.machine-policy-update-projection.1".into(),
             wallet_id,
@@ -960,10 +952,10 @@ impl WalletsHandler {
             baseline_digest: baseline.policy_digest,
             proposed_policy_digest,
             authority_diff_digest,
-            assurance_level: bloom_triad_protocol::Token::new("user_verified")
+            assurance_level: bloom_broker_api::Token::new("user_verified")
                 .map_err(|error| HandlerError::invalid(error.to_string()))?,
             review_manifest_digest: None,
-            ceremony_state: bloom_triad_protocol::CeremonyState::Prepared,
+            ceremony_state: bloom_broker_api::CeremonyState::Prepared,
             ceremony_url: None,
             ceremony_expires_at_ms: None,
         };
@@ -1158,7 +1150,7 @@ impl WalletsHandler {
                 "Broker ceremony failed or the staged baseline changed; restage the policy update",
             ),
             _ if triad_projection.as_ref().is_some_and(|projection| {
-                projection.ceremony_state == bloom_triad_protocol::CeremonyState::Succeeded
+                projection.ceremony_state == bloom_broker_api::CeremonyState::Succeeded
             }) =>
             {
                 (
@@ -1192,7 +1184,7 @@ impl WalletsHandler {
             projection
                 .ceremony_expires_at_ms
                 .as_ref()
-                .map(bloom_triad_protocol::DecimalU64::get)
+                .map(bloom_broker_api::DecimalU64::get)
         });
         let body = serde_json::json!({
             "schema": "bloom.wallet_policy_update_view.v1",
@@ -1769,7 +1761,7 @@ impl WalletsHandler {
             }
             "policy.toml" => {
                 let projection = self.wallet_projection(wallet).await?;
-                let policy: bloom_triad_protocol::CanonicalWalletPolicy =
+                let policy: bloom_broker_api::CanonicalWalletPolicy =
                     serde_json::from_slice(&projection.policy.canonical_policy.decode())
                         .map_err(err_be)?;
                 let body = toml::to_string_pretty(&policy).map_err(err_be)?;
@@ -2541,9 +2533,7 @@ impl WalletsHandler {
 mod tests {
     use super::*;
     use alloy::primitives::Address;
-    use bloom_machine_client::{ProjectionFreshness, ProjectionVerification};
-    use bloom_proto::AddressBook;
-    use bloom_triad_protocol::{
+    use bloom_broker_api::{
         ActivationMode, ApprovalLifecycleState, ApprovalLimitState, ApprovalLimits,
         ApprovalPrepareRequest, ApprovalPrepareState, ApprovalPublicStatus, ApprovalRenewRequest,
         ApprovalSelector, ApprovalSubject, Base64UrlBytes, CanonicalWalletPolicy, CeremonyKind,
@@ -2553,6 +2543,8 @@ mod tests {
         RevocationState, RevokeRequest, SealedApprovalPrepareResponse, SealedApprovalTerms,
         ServiceFuture, SignedPolicySnapshot, Token, WalletOperationRequest, WalletPublic,
     };
+    use bloom_machine_client::{ProjectionFreshness, ProjectionVerification};
+    use bloom_proto::AddressBook;
     use bloom_tx::outbox::Outbox;
     use bloom_tx::tx_engine::TxEngine;
     use sha2::Digest as _;
@@ -2582,14 +2574,14 @@ mod tests {
     impl WalletProjectionReader for StaticProjection {
         async fn list_wallets(
             &self,
-        ) -> Result<Vec<WalletProjection>, bloom_triad_protocol::ProtocolError> {
+        ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
             Ok(vec![self.0.clone()])
         }
 
         async fn get_wallet(
             &self,
             wallet_id: &Token,
-        ) -> Result<WalletProjection, bloom_triad_protocol::ProtocolError> {
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
             if self.0.wallet.wallet_id == *wallet_id {
                 Ok(self.0.clone())
             } else {
@@ -2600,9 +2592,7 @@ mod tests {
             }
         }
 
-        fn cached_wallets(
-            &self,
-        ) -> Result<Vec<WalletProjection>, bloom_triad_protocol::ProtocolError> {
+        fn cached_wallets(&self) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
             Ok(vec![self.0.clone()])
         }
     }

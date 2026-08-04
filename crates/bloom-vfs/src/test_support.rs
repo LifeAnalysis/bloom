@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bloom_machine_client::{
-    ProjectionFreshness, ProjectionVerification, WalletProjection, WalletProjectionReader,
-};
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     Base64UrlBytes, CanonicalWalletPolicy, CredentialPublic, CryptoSuite, DecimalU64, Digest32,
     KeyPublic, KeyRef, KeySpec, ProtocolError, ProtocolErrorCode, SignedPolicySnapshot, Token,
     WalletPublic,
+};
+use bloom_machine_client::{
+    ProjectionFreshness, ProjectionVerification, WalletProjection, WalletProjectionReader,
 };
 use sha2::Digest as _;
 

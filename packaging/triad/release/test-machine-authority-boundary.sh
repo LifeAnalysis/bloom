@@ -21,6 +21,40 @@ fi
 grep -F 'forbidden production Machine dependency in bloom-default: bloom-proto' \
   "$work/forbidden-dependency.out" >/dev/null
 
+cat >"$work/forbidden-authority-dependency-metadata.json" <<'EOF'
+{
+  "packages": [
+    {"id":"bloom-id","name":"bloom","manifest_path":"/synthetic/bloom/Cargo.toml"},
+    {"id":"triad-id","name":"bloom-triad-protocol","manifest_path":"/synthetic/bloom-triad-protocol/Cargo.toml"},
+    {"id":"api-id","name":"bloom-signer-api","manifest_path":"/synthetic/bloom-signer-api/Cargo.toml"},
+    {"id":"signer-id","name":"bloom-signer","manifest_path":"/synthetic/bloom-signer/Cargo.toml"}
+  ],
+  "resolve": {"nodes": [
+    {"id":"bloom-id","deps":[
+      {"pkg":"triad-id","dep_kinds":[{"kind":null}]},
+      {"pkg":"api-id","dep_kinds":[{"kind":"build"}]},
+      {"pkg":"signer-id","dep_kinds":[{"kind":null}]}
+    ],"features":[]},
+    {"id":"triad-id","deps":[],"features":[]},
+    {"id":"api-id","deps":[],"features":[]},
+    {"id":"signer-id","deps":[],"features":[]}
+  ]}
+}
+EOF
+printf '%s\t%s\t%s\t%s\n' forbidden-authority-dependencies bloom yes - \
+  >"$work/forbidden-authority-dependency-feature-sets.tsv"
+if BLOOM_MACHINE_PRODUCTION_FEATURE_SETS="$work/forbidden-authority-dependency-feature-sets.tsv" \
+  BLOOM_MACHINE_METADATA_FIXTURE="$work/forbidden-authority-dependency-metadata.json" \
+  "$checker" --require-clean >"$work/forbidden-authority-dependencies.out" 2>&1
+then
+  echo "synthetic forbidden authority dependencies unexpectedly passed" >&2
+  exit 1
+fi
+for dependency in bloom-triad-protocol bloom-signer-api bloom-signer; do
+  grep -F "forbidden production Machine dependency in forbidden-authority-dependencies: $dependency" \
+    "$work/forbidden-authority-dependencies.out" >/dev/null
+done
+
 cat >"$work/forbidden-feature-sets.tsv" <<'EOF'
 # label	package	default-features	features
 forbidden-dev-harness	bloom	no	triad-dev-harness
@@ -122,6 +156,21 @@ grep -F 'forbidden production Machine source marker: SessionStore' \
   "$work/forbidden-clean-source.out" >/dev/null
 grep -F 'forbidden production Machine source marker: backend_policy_for_wallet' \
   "$work/forbidden-clean-source.out" >/dev/null
+
+mkdir "$work/forbidden-authority-imports"
+mkdir "$work/forbidden-authority-imports/src"
+printf 'use bloom_triad_protocol::Request;\nuse bloom_signer_api::SignerClient;\nuse bloom_signer::Signer;\n' \
+  >"$work/forbidden-authority-imports/src/lib.rs"
+if BLOOM_MACHINE_AUTHORITY_EXTRA_SOURCE_ROOTS="$work/forbidden-authority-imports" \
+  "$checker" --require-clean >"$work/forbidden-authority-imports.out" 2>&1
+then
+  echo "synthetic forbidden authority imports unexpectedly passed" >&2
+  exit 1
+fi
+for marker in bloom_triad_protocol bloom_signer_api bloom_signer; do
+  grep -F "forbidden production Machine source marker: $marker" \
+    "$work/forbidden-authority-imports.out" >/dev/null
+done
 
 printf '%s\n' \
   'Run the in-process daemon, unlock the keystore, and mint a grant.' \

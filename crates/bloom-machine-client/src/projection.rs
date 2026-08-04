@@ -11,7 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     CredentialPublic, Digest32, KeyPublic, ProtocolError, ProtocolErrorCode, SignedPolicySnapshot,
     Token, WalletPublic,
 };
@@ -487,11 +487,12 @@ impl ProjectionCache {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "projection")]
+#[allow(clippy::large_enum_variant)]
 enum CachedWallet {
     Live(WalletProjection),
     Tombstone {
-        policy_version: bloom_triad_protocol::DecimalU64,
-        wallet_revocation_epoch: bloom_triad_protocol::DecimalU64,
+        policy_version: bloom_broker_api::DecimalU64,
+        wallet_revocation_epoch: bloom_broker_api::DecimalU64,
         response_digest: Digest32,
         observed_at_ms: u64,
     },
@@ -639,7 +640,7 @@ fn unavailable(message: impl Into<String>) -> ProtocolError {
 mod tests {
     use std::sync::Mutex;
 
-    use bloom_triad_protocol::{
+    use bloom_broker_api::{
         Base64UrlBytes, CryptoSuite, DecimalU64, KeyRef, KeySpec, MachineBrokerRequest,
         MachineBrokerResponse, MachineBrokerService, ServiceFuture, WalletRequest,
     };

@@ -6,11 +6,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bloom_machine_client::{ExactPayloadSignOutcome, ExactPayloadSignRequest, MachineBrokerClient};
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     CryptoSuite, DecimalU64, Digest32, OperationId, ProvenanceCatalog, ProvenanceSubject,
     RequestNonce, Token,
 };
+use bloom_machine_client::{ExactPayloadSignOutcome, ExactPayloadSignRequest, MachineBrokerClient};
 use fs2::FileExt as _;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -290,7 +290,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use bloom_triad_protocol::{
+    use bloom_broker_api::{
         ApprovalPrepareState, Base64UrlBytes, KeyRef, KeySpec, MachineBrokerRequest,
         MachineBrokerResponse, MachineBrokerService, NormalizedSignature,
         PROVENANCE_CATALOG_SCHEMA, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,

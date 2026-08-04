@@ -19,11 +19,11 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use async_trait::async_trait;
-use bloom_machine_client::{ProjectionFreshness, ProjectionVerification, WalletProjection};
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     Base64UrlBytes, CanonicalWalletPolicy, CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef,
     KeySpec, SignedPolicySnapshot, Token, WalletPublic,
 };
+use bloom_machine_client::{ProjectionFreshness, ProjectionVerification, WalletProjection};
 use bloom_vfs::{Entry, Handler, HandlerError, VfsPath};
 use predicates::prelude::*;
 use serde::Serialize;
@@ -106,7 +106,7 @@ fn seed_wallet_projection_fixture(home: &Path, name: &str) {
         schema: &'static str,
         wallet: &'a WalletPublic,
         keys: &'a [KeyPublic],
-        credentials: &'a [bloom_triad_protocol::CredentialPublic],
+        credentials: &'a [bloom_broker_api::CredentialPublic],
         policy: &'a SignedPolicySnapshot,
     }
 

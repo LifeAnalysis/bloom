@@ -15,8 +15,7 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use bloom_machine_client::MachineBrokerClient;
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes,
     CanonicalWalletPolicy, CredentialPublic, CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef,
     KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
@@ -24,6 +23,7 @@ use bloom_triad_protocol::{
     ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, ServiceFuture,
     SignedPolicySnapshot, SigningPayloads, SigningResult, Token, WalletPublic, WalletRequest,
 };
+use bloom_machine_client::MachineBrokerClient;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -138,7 +138,7 @@ impl MachineBrokerService for ExactSigningBrokerFixture {
                 }
                 MachineBrokerRequest::SealedApprovalPrepare(request) => {
                     Ok(MachineBrokerResponse::SealedApprovalPrepare(
-                        bloom_triad_protocol::SealedApprovalPrepareResponse {
+                        bloom_broker_api::SealedApprovalPrepareResponse {
                             approval_id: request.terms.approval_id()?,
                             state: ApprovalPrepareState::AwaitingCeremony,
                             ceremony_url:
@@ -216,7 +216,7 @@ pub fn exact_signing_broker(
 
 pub fn exact_signing_catalog(operation_classes: &[&str]) -> ProvenanceCatalog {
     ProvenanceCatalog {
-        schema: bloom_triad_protocol::PROVENANCE_CATALOG_SCHEMA.into(),
+        schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
         records: operation_classes
             .iter()
             .map(|operation_class| ProvenanceRecord {

@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     Base64UrlBytes, PROVENANCE_RECORD_SIGNATURE_DOMAIN, ProvenanceCatalog, Token,
 };
 use ed25519_dalek::{Signer as _, SigningKey};

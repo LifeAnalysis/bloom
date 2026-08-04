@@ -53,10 +53,10 @@ pub struct PayloadSignRequest {
     pub advisory: Option<Vec<u8>>,
     /// v0.2 always supplies `Reusable`; v0.3 requires the guest to choose an
     /// exact or reusable approval selector explicitly.
-    pub selector: bloom_triad_protocol::PetalSignSelector,
+    pub selector: bloom_broker_api::PetalSignSelector,
     /// Explicit Signer-owned sub-key selected by the v0.3 interface. The
     /// v0.2 interface always leaves this absent and retains root-key behavior.
-    pub key_ref: Option<bloom_triad_protocol::KeyRef>,
+    pub key_ref: Option<bloom_broker_api::KeyRef>,
     pub context: Option<PetalRouteContext>,
 }
 

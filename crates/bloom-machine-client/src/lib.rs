@@ -14,6 +14,7 @@ pub use projection::{
 };
 
 use std::{
+    collections::BTreeSet,
     future::Future,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -39,24 +40,56 @@ where
 
 pub use bloom_audit_checkpoint::AuthorityEdgeHistory;
 use bloom_audit_checkpoint::{CheckpointSink, CheckpointStore, PinnedAuditKey};
-use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
-use bloom_triad_protocol::{
+use bloom_broker_api::{
     ActivationMode, ApprovalLifecycleState, ApprovalLimitState, ApprovalLimits,
     ApprovalPrepareRequest, ApprovalPublicStatus, ApprovalRenewRequest, ApprovalSelector,
-    ApprovalSubject, Base64UrlBytes, CeremonyPublicStatus, CeremonyState, CredentialPublic,
-    CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse, CustodyResult, DecimalU64,
-    Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest, MachineBrokerRequest,
-    MachineBrokerResponse, MachineBrokerService, MachineSignRequest, OperationId,
-    OperationPublicStatus, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
+    ApprovalSubject, BROKER_API_CURRENT, BROKER_API_RANGE, Base64UrlBytes, CeremonyPublicStatus,
+    CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse,
+    CustodyResult, DecimalU64, Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest,
+    MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
+    OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
     PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
     ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, RevocationState,
-    RevokeRequest, SealedApprovalPrepareResponse, SealedApprovalTerms, SignOperationIdentity,
-    SignedPolicySnapshot, SigningPayloads, SigningResult, Token, TypedRequestMethod,
-    WalletOperationRequest, WalletPublic, WalletRequest,
+    RevokeRequest, SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot,
+    SigningPayloads, SigningResult, Token, TypedRequestMethod, WalletOperationRequest,
+    WalletPublic, WalletRequest, is_read_only_method,
 };
+use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
+
+const SIGN_OPERATION_DOMAIN: &[u8] = b"bloom-sign-operation/v1";
+
+/// Machine-owned identity used to bind a logical north-edge signing operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignOperationIdentity {
+    pub operation_id: OperationId,
+    pub approval_id: Digest32,
+    pub key_ref: KeyRef,
+    pub crypto_suite: CryptoSuite,
+    pub ordered_payload_digests: Vec<Digest32>,
+    pub ordered_hashes: Vec<Digest32>,
+    pub petal_use_claim_digest: Option<Digest32>,
+    pub claim_assurance_digest: Option<Digest32>,
+    pub policy_version: DecimalU64,
+    pub policy_digest: Digest32,
+}
+
+impl SignOperationIdentity {
+    pub fn digest(&self) -> Result<Digest32, ProtocolError> {
+        let mut hasher = Sha256::new();
+        hasher.update(SIGN_OPERATION_DOMAIN);
+        hasher.update(serde_jcs::to_vec(self).map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                format!("operation identity JCS encoding failed: {error}"),
+            )
+        })?);
+        Ok(Digest32::from_bytes(hasher.finalize().into()))
+    }
+}
 
 /// Production Machine→Broker connector. It carries only the public typed
 /// protocol over mutually authenticated, signed, bounded Unix socket frames.
@@ -169,7 +202,7 @@ impl UnixMachineBrokerService {
                     provider.latch_mutations(format!(
                         "persist Machine authority-edge audit head: {error}"
                     ));
-                    if !bloom_triad_local_transport::is_read_only_method(&method) {
+                    if !is_read_only_method(&method) {
                         return Err(service_unavailable(format!(
                             "persist Machine audit head before Broker dispatch: {error}"
                         )));
@@ -177,7 +210,7 @@ impl UnixMachineBrokerService {
                 }
                 head
             }
-            Err(_error) if bloom_triad_local_transport::is_read_only_method(&method) => checkpoints
+            Err(_error) if is_read_only_method(&method) => checkpoints
                 .latest(&self.identity.service_id)
                 .map_err(|failure| {
                     service_unavailable(format!("load retained Machine audit head: {failure}"))
@@ -194,6 +227,8 @@ impl UnixMachineBrokerService {
             &mut stream,
             &self.identity,
             &self.broker,
+            BROKER_API_CURRENT,
+            BROKER_API_RANGE,
             request,
             30_000,
             sender_head,
@@ -202,7 +237,7 @@ impl UnixMachineBrokerService {
                     provider.latch_mutations(format!(
                         "persist Broker authority-edge audit head: {error}"
                     ));
-                    if !bloom_triad_local_transport::is_read_only_method(&method) {
+                    if !is_read_only_method(&method) {
                         return Err(service_unavailable(format!(
                             "persist Broker audit checkpoint before publishing mutation result: {error}"
                         )));
@@ -219,7 +254,7 @@ impl MachineBrokerService for UnixMachineBrokerService {
     fn dispatch<'a>(
         &'a self,
         request: MachineBrokerRequest,
-    ) -> bloom_triad_protocol::ServiceFuture<'a, MachineBrokerResponse> {
+    ) -> bloom_broker_api::ServiceFuture<'a, MachineBrokerResponse> {
         Box::pin(async move { self.dispatch_head_aware(request).await })
     }
 }
@@ -296,7 +331,7 @@ impl MachineBrokerClient {
                     async move {
                         periodic
                             .dispatch_head_aware(MachineBrokerRequest::BrokerReadiness(
-                                bloom_triad_protocol::Empty {},
+                                bloom_broker_api::Empty {},
                             ))
                             .await
                     }
@@ -434,7 +469,7 @@ impl MachineBrokerClient {
         selected_key_ref: Option<KeyRef>,
     ) -> Result<SigningResult, ProtocolError> {
         request.validate()?;
-        if request.selector == bloom_triad_protocol::PetalSignSelector::Exact
+        if request.selector == bloom_broker_api::PetalSignSelector::Exact
             && selected_key_ref.is_none()
         {
             return Err(ProtocolError::new(
@@ -500,8 +535,8 @@ impl MachineBrokerClient {
         let operation_id = request.operation_id()?;
         let (claim_digest, assurance_digest, petal_use_claim, claim_assurance_evidence) =
             match request.selector {
-                bloom_triad_protocol::PetalSignSelector::Exact => (None, None, None, None),
-                bloom_triad_protocol::PetalSignSelector::Reusable => (
+                bloom_broker_api::PetalSignSelector::Exact => (None, None, None, None),
+                bloom_broker_api::PetalSignSelector::Reusable => (
                     Some(jcs_digest(&request.claim)?),
                     Some(jcs_digest(&request.claim.claim_assurance)?),
                     Some(request.claim),
@@ -931,7 +966,7 @@ impl MachineBrokerClient {
     pub async fn wallets(&self) -> Result<Vec<WalletPublic>, ProtocolError> {
         match self
             .request(MachineBrokerRequest::WalletListPublic(
-                bloom_triad_protocol::Empty {},
+                bloom_broker_api::Empty {},
             ))
             .await?
         {
@@ -1109,8 +1144,8 @@ impl ExpectedSigningResult {
 
     fn validate(&self, result: SigningResult) -> Result<SigningResult, ProtocolError> {
         let expected_length = match self.crypto_suite.signature_encoding() {
-            bloom_triad_protocol::SignatureEncoding::Secp256k1Recoverable65 => 65,
-            bloom_triad_protocol::SignatureEncoding::Ed25519Raw64 => 64,
+            bloom_broker_api::SignatureEncoding::Secp256k1Recoverable65 => 65,
+            bloom_broker_api::SignatureEncoding::Ed25519Raw64 => 64,
         };
         if result.operation_id != self.operation_id
             || result.operation_digest != self.operation_digest
@@ -1136,7 +1171,7 @@ pub struct TrustedPetalSignRequest {
     pub claimed_hash: Digest32,
     pub crypto_suite: CryptoSuite,
     pub operation_class: Token,
-    pub selector: bloom_triad_protocol::PetalSignSelector,
+    pub selector: bloom_broker_api::PetalSignSelector,
     pub claim: PetalUseClaim,
     pub claim_assurance_evidence: Option<Vec<u8>>,
     pub approval_id: Option<Digest32>,
@@ -1253,7 +1288,7 @@ enum CeremonyProjectionIdentity {
     },
     Custody {
         operation_id: OperationId,
-        ceremony_kind: bloom_triad_protocol::CeremonyKind,
+        ceremony_kind: bloom_broker_api::CeremonyKind,
     },
 }
 
@@ -1269,7 +1304,7 @@ impl CeremonyProjection {
         response: &SealedApprovalPrepareResponse,
         now_ms: u64,
     ) -> Result<Self, ProtocolError> {
-        if response.state != bloom_triad_protocol::ApprovalPrepareState::AwaitingCeremony {
+        if response.state != bloom_broker_api::ApprovalPrepareState::AwaitingCeremony {
             return Err(projection_mismatch(
                 "approval prepare is not awaiting ceremony",
             ));
@@ -1290,7 +1325,7 @@ impl CeremonyProjection {
         response: &CustodyPrepareResponse,
         now_ms: u64,
     ) -> Result<Self, ProtocolError> {
-        if response.state != bloom_triad_protocol::CustodyPrepareState::AwaitingUser {
+        if response.state != bloom_broker_api::CustodyPrepareState::AwaitingUser {
             return Err(projection_mismatch("custody prepare is not awaiting user"));
         }
         Self::awaiting(
@@ -1310,7 +1345,7 @@ impl CeremonyProjection {
         response: &PolicyUpdatePrepareResponse,
         now_ms: u64,
     ) -> Result<Self, ProtocolError> {
-        if response.ceremony_kind != bloom_triad_protocol::CeremonyKind::PolicyUpdate {
+        if response.ceremony_kind != bloom_broker_api::CeremonyKind::PolicyUpdate {
             return Err(projection_mismatch(
                 "policy prepare did not return policy_update ceremony kind",
             ));
@@ -1501,7 +1536,7 @@ impl CeremonyProjection {
         }
     }
 
-    pub fn ceremony_kind(&self) -> Option<bloom_triad_protocol::CeremonyKind> {
+    pub fn ceremony_kind(&self) -> Option<bloom_broker_api::CeremonyKind> {
         match self.identity.as_ref() {
             Some(CeremonyProjectionIdentity::Custody { ceremony_kind, .. }) => Some(*ceremony_kind),
             _ => None,
@@ -1697,7 +1732,7 @@ impl TrustedPetalSignRequest {
             claimed_hash: &'a Digest32,
             crypto_suite: CryptoSuite,
             operation_class: &'a Token,
-            selector: bloom_triad_protocol::PetalSignSelector,
+            selector: bloom_broker_api::PetalSignSelector,
             claim_digest: Digest32,
             trusted_provenance: &'a ProvenanceSubject,
             frozen_action_digest: Option<Digest32>,
@@ -1761,6 +1796,103 @@ fn jcs_digest<T: Serialize>(value: &T) -> Result<Digest32, ProtocolError> {
     Ok(Digest32::from_bytes(
         Sha256::digest(serde_jcs::to_vec(value).map_err(canonical_error)?).into(),
     ))
+}
+
+const CLAIMED_POLICY_AUTHORITY_DIFF_DOMAIN: &[u8] = b"bloom-policy-authority-diff/v1";
+
+#[derive(Serialize)]
+struct ClaimedPolicyAuthorityDiff {
+    maximum_approval_lifetime_ms_before: DecimalU64,
+    maximum_approval_lifetime_ms_after: DecimalU64,
+    added_petal_packages: Vec<Digest32>,
+    removed_petal_packages: Vec<Digest32>,
+    added_destinations: Vec<ClaimedPolicyAuthorityDestination>,
+    removed_destinations: Vec<ClaimedPolicyAuthorityDestination>,
+    added_required_verifiers: Vec<ClaimedPolicyAuthorityVerifier>,
+    removed_required_verifiers: Vec<ClaimedPolicyAuthorityVerifier>,
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct ClaimedPolicyAuthorityDestination {
+    chain: Token,
+    destination: String,
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct ClaimedPolicyAuthorityVerifier {
+    verifier_id: Token,
+    verifier_digest: Digest32,
+}
+
+/// Computes Machine's claimed authority-diff digest for policy-update
+/// preflight. Broker independently recomputes the canonical review delta and
+/// rejects any mismatch; this helper confers no policy or review authority.
+pub fn claimed_policy_authority_diff_digest(
+    current: &bloom_broker_api::CanonicalWalletPolicy,
+    proposed: &bloom_broker_api::CanonicalWalletPolicy,
+) -> Result<Digest32, ProtocolError> {
+    fn set_diff<T: Ord + Clone>(
+        before: impl IntoIterator<Item = T>,
+        after: impl IntoIterator<Item = T>,
+    ) -> (Vec<T>, Vec<T>) {
+        let before = before.into_iter().collect::<BTreeSet<_>>();
+        let after = after.into_iter().collect::<BTreeSet<_>>();
+        (
+            after.difference(&before).cloned().collect(),
+            before.difference(&after).cloned().collect(),
+        )
+    }
+
+    let (added_petal_packages, removed_petal_packages) = set_diff(
+        current.allowed_petal_packages.iter().cloned(),
+        proposed.allowed_petal_packages.iter().cloned(),
+    );
+    let (added_destinations, removed_destinations) = set_diff(
+        current
+            .allowed_destinations
+            .iter()
+            .map(|value| ClaimedPolicyAuthorityDestination {
+                chain: value.chain.clone(),
+                destination: value.destination.clone(),
+            }),
+        proposed
+            .allowed_destinations
+            .iter()
+            .map(|value| ClaimedPolicyAuthorityDestination {
+                chain: value.chain.clone(),
+                destination: value.destination.clone(),
+            }),
+    );
+    let (added_required_verifiers, removed_required_verifiers) = set_diff(
+        current
+            .required_verifiers
+            .iter()
+            .map(|value| ClaimedPolicyAuthorityVerifier {
+                verifier_id: value.verifier_id.clone(),
+                verifier_digest: value.verifier_digest.clone(),
+            }),
+        proposed
+            .required_verifiers
+            .iter()
+            .map(|value| ClaimedPolicyAuthorityVerifier {
+                verifier_id: value.verifier_id.clone(),
+                verifier_digest: value.verifier_digest.clone(),
+            }),
+    );
+    let claimed = ClaimedPolicyAuthorityDiff {
+        maximum_approval_lifetime_ms_before: DecimalU64::new(current.maximum_approval_lifetime_ms),
+        maximum_approval_lifetime_ms_after: DecimalU64::new(proposed.maximum_approval_lifetime_ms),
+        added_petal_packages,
+        removed_petal_packages,
+        added_destinations,
+        removed_destinations,
+        added_required_verifiers,
+        removed_required_verifiers,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(CLAIMED_POLICY_AUTHORITY_DIFF_DOMAIN);
+    hasher.update(serde_jcs::to_vec(&claimed).map_err(canonical_error)?);
+    Ok(Digest32::from_bytes(hasher.finalize().into()))
 }
 
 fn canonical_error(error: serde_json::Error) -> ProtocolError {
@@ -1839,11 +1971,73 @@ mod tests {
         },
     };
 
-    use bloom_triad_protocol::{
+    use bloom_broker_api::{
         ApprovalPrepareState, CeremonyKind, CustodyPrepareState, DeclaredFee, KeySpec,
         NormalizedSignature, RequestNonce, ServiceFuture, SignatureEncoding,
     };
     use ed25519_dalek::SigningKey;
+
+    #[derive(Deserialize)]
+    struct MachineSignOperationVector {
+        operation_identity: SignOperationIdentity,
+        operation_canonical_jcs: String,
+        operation_digest: Digest32,
+    }
+
+    #[test]
+    fn machine_sign_operation_identity_matches_reviewed_artifact() {
+        let vector: MachineSignOperationVector =
+            serde_json::from_str(include_str!("../vectors/sign-operation-local-v1.json")).unwrap();
+        assert_eq!(
+            String::from_utf8(serde_jcs::to_vec(&vector.operation_identity).unwrap()).unwrap(),
+            vector.operation_canonical_jcs
+        );
+        assert_eq!(
+            vector.operation_identity.digest().unwrap(),
+            vector.operation_digest
+        );
+    }
+
+    #[test]
+    fn claimed_policy_authority_diff_digest_matches_reviewed_v1_vector() {
+        let current = bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: Token::new("wallet").unwrap(),
+            maximum_approval_lifetime_ms: 10,
+            allowed_petal_packages: vec![
+                Digest32::from_bytes([2; 32]),
+                Digest32::from_bytes([1; 32]),
+                Digest32::from_bytes([2; 32]),
+            ],
+            allowed_destinations: vec![bloom_broker_api::PolicyDestination {
+                chain: Token::new("ethereum").unwrap(),
+                destination: "old".into(),
+            }],
+            required_verifiers: vec![bloom_broker_api::RequiredVerifier {
+                verifier_id: Token::new("human").unwrap(),
+                verifier_digest: Digest32::from_bytes([3; 32]),
+            }],
+        };
+        let proposed = bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: Token::new("wallet").unwrap(),
+            maximum_approval_lifetime_ms: 20,
+            allowed_petal_packages: vec![
+                Digest32::from_bytes([4; 32]),
+                Digest32::from_bytes([2; 32]),
+                Digest32::from_bytes([4; 32]),
+            ],
+            allowed_destinations: vec![bloom_broker_api::PolicyDestination {
+                chain: Token::new("ethereum").unwrap(),
+                destination: "new".into(),
+            }],
+            required_verifiers: Vec::new(),
+        };
+        assert_eq!(
+            claimed_policy_authority_diff_digest(&current, &proposed)
+                .unwrap()
+                .as_str(),
+            "3cb245d0d885a2802566aca5c7af7caed5a069d4d205ec484538a1e4f67b9e42"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn idle_machine_broker_exchange_completes_with_margin_inside_sixty_seconds() {
@@ -2093,7 +2287,7 @@ mod tests {
             claimed_hash: payload_digest.clone(),
             crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
             operation_class: token("order.place"),
-            selector: bloom_triad_protocol::PetalSignSelector::Reusable,
+            selector: bloom_broker_api::PetalSignSelector::Reusable,
             claim: PetalUseClaim {
                 package_hash: digest(40),
                 route: "orders/place".into(),
@@ -2105,7 +2299,7 @@ mod tests {
                 declared_destinations: vec![],
                 declared_fee: DeclaredFee::None,
                 nonce: RequestNonce::from_bytes([5; 16]),
-                claim_assurance: bloom_triad_protocol::ClaimAssurance::MachineAsserted,
+                claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
             },
             claim_assurance_evidence: Some(b"machine evidence".to_vec()),
             approval_id: Some(digest(50)),
@@ -2162,7 +2356,7 @@ mod tests {
             claimed_hash: payload_digest.clone(),
             crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
             operation_class: token("order.cancel"),
-            selector: bloom_triad_protocol::PetalSignSelector::Reusable,
+            selector: bloom_broker_api::PetalSignSelector::Reusable,
             claim: PetalUseClaim {
                 package_hash: digest(40),
                 route: "orders/cancel".into(),
@@ -2174,7 +2368,7 @@ mod tests {
                 declared_destinations: vec![],
                 declared_fee: DeclaredFee::None,
                 nonce: RequestNonce::from_bytes([5; 16]),
-                claim_assurance: bloom_triad_protocol::ClaimAssurance::MachineAsserted,
+                claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
             },
             claim_assurance_evidence: Some(b"machine evidence".to_vec()),
             approval_id: Some(digest(50)),
@@ -2218,7 +2412,7 @@ mod tests {
 
         broker.requests.lock().unwrap().clear();
         let mut exact_request = request.clone();
-        exact_request.selector = bloom_triad_protocol::PetalSignSelector::Exact;
+        exact_request.selector = bloom_broker_api::PetalSignSelector::Exact;
         client
             .sign_petal_payload_with_key(exact_request, delegated_key_ref.clone())
             .await
@@ -2548,7 +2742,7 @@ mod tests {
                 claimed_hash: hash.clone(),
                 crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
                 operation_class: token("order.place"),
-                selector: bloom_triad_protocol::PetalSignSelector::Reusable,
+                selector: bloom_broker_api::PetalSignSelector::Reusable,
                 claim: PetalUseClaim {
                     package_hash: digest(41),
                     route: "forged/route".into(),
@@ -2560,7 +2754,7 @@ mod tests {
                     declared_destinations: vec![],
                     declared_fee: DeclaredFee::None,
                     nonce: RequestNonce::from_bytes([8; 16]),
-                    claim_assurance: bloom_triad_protocol::ClaimAssurance::MachineAsserted,
+                    claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
                 },
                 claim_assurance_evidence: None,
                 approval_id: Some(digest(52)),
@@ -2736,7 +2930,7 @@ mod tests {
                 claimed_hash: hash.clone(),
                 crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
                 operation_class: token("order.place"),
-                selector: bloom_triad_protocol::PetalSignSelector::Reusable,
+                selector: bloom_broker_api::PetalSignSelector::Reusable,
                 claim: PetalUseClaim {
                     package_hash: digest(40),
                     route: "orders/place".into(),
@@ -2748,7 +2942,7 @@ mod tests {
                     declared_destinations: vec![],
                     declared_fee: DeclaredFee::None,
                     nonce: RequestNonce::from_bytes([9; 16]),
-                    claim_assurance: bloom_triad_protocol::ClaimAssurance::MachineAsserted,
+                    claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
                 },
                 claim_assurance_evidence: None,
                 approval_id: Some(digest(52)),
@@ -2968,6 +3162,9 @@ mod tests {
                 &mut stream,
                 &server_identity,
                 &machine_acl,
+                BROKER_API_CURRENT,
+                BROKER_API_RANGE,
+                bloom_broker_api::JournalHeadPolicy::Required,
             )
             .await
             .unwrap();
@@ -3055,7 +3252,7 @@ mod tests {
     fn local_identity(service: &str, key_id: &str, byte: u8) -> LocalIdentity {
         LocalIdentity {
             service_id: token(service),
-            boot_epoch: bloom_triad_protocol::BootEpoch::from_bytes([byte; 16]),
+            boot_epoch: bloom_broker_api::BootEpoch::from_bytes([byte; 16]),
             application_key_id: token(key_id),
             signing_key: Arc::new(SigningKey::from_bytes(&[byte; 32])),
         }

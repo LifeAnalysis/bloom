@@ -177,7 +177,7 @@ Bloom is a Rust Cargo workspace. The main user-facing/runtime crates are:
 | `bloom` | Machine CLI/runtime; reads, stages, simulates, and delegates every authority operation to Broker. |
 | `bloom-daemon` | Wires key-free public projections, config, chains, VFS, IPC, ENS, watches, and execution adapters. |
 | `bloom-machine-client` | Authenticated Machine-to-Broker client and rollback-safe public projection cache. |
-| `bloom-triad-protocol` | Shared authenticated triad wire contracts. |
+| `bloom-rpc-wire` | Authority-neutral authenticated RPC wire primitives. |
 | `bloom-vfs` | Path router, handler trait, per-path caching, and vendored docs. |
 | `bloom-evm` / `bloom-rpc` | RPC pools, per-chain engines, chain reads, and provider health. |
 | `bloom-tx` | Unsigned transaction staging, simulation, Broker signing orchestration, broadcast, and nonce management. |
