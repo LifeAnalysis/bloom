@@ -29,7 +29,7 @@ An agent using Bloom can:
 - inspect live balances, nonces, blocks, gas, contracts, storage, events, NFTs, ENS, prices, and address history through file reads;
 - create or import encrypted local wallets without exposing private keys through the filesystem;
 - stage native ETH, ERC-20, NFT, contract-call, signing, and DeFi intents by writing plain-language or structured files;
-- query Hyperliquid market and account state, and submit bounded signed exchange and agent-session actions through the default-installed `/petals/hyperliquid/...` application;
+- query Hyperliquid market and account state, and submit signed exchange or explicitly bounded agent-session actions through the default-installed `/petals/hyperliquid/...` application;
 - read a generated `plan.md` before any transaction is signed;
 - confirm a staged transaction only after user approval;
 - make free or paid HTTP requests through `/requests`, with paid HTTP 402

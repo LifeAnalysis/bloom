@@ -382,10 +382,12 @@ local-app signing and outbox contracts.
 
 **Hyperliquid**
 
-Owner-signed actions (`approveAgent`, `usdSend`, recovery) and bounded
-agent-session trading are provided by the standalone `bloom-petal-hyperliquid`
-package. The Petal uses the generic local-app signing and outbox contracts;
-Bloom does not mount a native Hyperliquid VFS subtree or CLI.
+Owner-signed actions (`approveAgent`, `usdSend`, recovery) and optionally
+bounded agent-session trading are provided by the standalone
+`bloom-petal-hyperliquid` package. Session enforcement and cleanup are
+version-specific Petal behavior, not a Bloom-core guarantee. The Petal uses the
+generic local-app signing and outbox contracts; Bloom does not mount a native
+Hyperliquid VFS subtree or CLI.
 
 **DeFi**
 

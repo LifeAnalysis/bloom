@@ -387,12 +387,6 @@ function heroStat(parent,title,text){
   card.appendChild(body);
   parent.appendChild(card);
 }
-function summaryLineValue(lines,prefix){
-  for(const line of (lines||[])){
-    if(String(line).startsWith(prefix)) return String(line).slice(prefix.length).trim();
-  }
-  return '';
-}
 function setPolicyModePresentation(mode){
   const title=document.getElementById('policyTitle');
   const details=document.getElementById('rawPolicyDetails');
@@ -409,47 +403,9 @@ function setPolicyModePresentation(mode){
     plain.textContent='Selected: Bloom must ask before money moves. These rules can still block unsafe actions.';
   }
 }
-function isHyperliquidIntent(i){
-  const subj=i&&i.canonical_subject?i.canonical_subject:{};
-  return subj.kind==='hyperliquid_agent_session_grant' || subj.kind==='hyperliquid_vfs_write';
-}
 function buttonLabelForIntent(i){
-  if(isHyperliquidIntent(i)){
-    const summary=i&&i.summary_lines?i.summary_lines:[];
-    if((i.canonical_subject||{}).kind==='hyperliquid_agent_session_grant'){
-      const markets=lineValue((i.policy_lines||[]).join('\n'),'allowed_assets')||'Trading';
-      return 'Authorize '+markets+' Trading Session';
-    }
-    const file=(i.canonical_subject||{}).file||summaryLineValue(summary,'Action file:');
-    if(file==='order.json') return 'Authorize Hyperliquid Order';
-    if(file==='cancel.json') return 'Authorize Hyperliquid Cancel';
-    if(file==='schedule_cancel.json') return 'Authorize Dead-Man Switch';
-    if(file==='update_leverage.json') return 'Authorize Leverage Update';
-    return 'Authorize Hyperliquid Action';
-  }
   if(isPolicyIntent(i)) return 'Approve Policy';
   return 'Approve and Continue';
-}
-function sessionDurationText(raw){
-  const secs=parseInt(String(raw||''),10);
-  if(!isFinite(secs)||secs<=0) return 'Not stated';
-  if(secs%3600===0) return (secs/3600)+' hour'+(secs===3600?'':'s');
-  if(secs%60===0) return (secs/60)+' minute'+(secs===60?'':'s');
-  return secs+' seconds';
-}
-function renderHyperliquidReview(text,subject){
-  const parent=document.getElementById('policySimple');
-  parent.textContent='';
-  const network=subject&&subject.network?subject.network:'mainnet';
-  simpleCard(parent,'Allowed','Bloom can trade on Hyperliquid '+network+' only inside these limits.');
-  simpleCard(parent,'Duration',sessionDurationText(lineValue(text,'max_session_secs')));
-  simpleCard(parent,'Markets',lineValue(text,'allowed_assets')||'Not stated');
-  simpleCard(parent,'Order types',lineValue(text,'allowed_order_types')||'Not stated');
-  simpleCard(parent,'Max position',lineValue(text,'max_position_usd')||'Not stated');
-  simpleCard(parent,'Max order size',lineValue(text,'max_notional_usd')||'Not stated');
-  simpleCard(parent,'Max loss',lineValue(text,'max_loss_usd')||'Not stated');
-  simpleCard(parent,'Max leverage',lineValue(text,'max_leverage')||'Not stated');
-  simpleCard(parent,'Cannot do','Withdrawals and third-party transfers are blocked.');
 }
 function renderHero(i){
   const wrap=document.getElementById('heroWrap');
@@ -460,25 +416,6 @@ function renderHero(i){
   const grid=document.getElementById('heroGrid');
   grid.textContent='';
   wrap.classList.remove('hidden');
-  if(isHyperliquidIntent(i)){
-    const text=(i.policy_lines||[]).join('\n');
-    const isSession=(i.canonical_subject||{}).kind==='hyperliquid_agent_session_grant';
-    title.textContent=isSession?'Let Bloom trade on Hyperliquid?':'Approve this Hyperliquid action?';
-    copy.textContent=isSession
-      ?'Bloom can place trades only within the limits shown below. It cannot withdraw your funds.'
-      :'Bloom will sign one Hyperliquid action after this review.';
-    heroStat(grid,'Wallet',i.wallet||'Unknown');
-    heroStat(grid,'Markets',lineValue(text,'allowed_assets')||'Not stated');
-    heroStat(grid,'Duration',sessionDurationText(lineValue(text,'max_session_secs')));
-    heroStat(grid,'Max Order',lineValue(text,'max_notional_usd')||'Not stated');
-    heroStat(grid,'Max Position',lineValue(text,'max_position_usd')||'Not stated');
-    heroStat(grid,'Max Loss',lineValue(text,'max_loss_usd')||'Not stated');
-    what.textContent=isSession
-      ?'Bloom creates a trade-only Hyperliquid key. That key can trade within these limits until it expires or you stop it.'
-      :'Bloom will submit exactly one Hyperliquid action. This does not grant an open-ended trading session.';
-    prompt.textContent='Your device will ask you to confirm. The important details are the limits on this page.';
-    return;
-  }
   if(isPolicyIntent(i)){
     title.textContent='Set wallet safety rules';
     copy.textContent='Choose how much Bloom can do later. Signing this does not move money right now.';
@@ -602,10 +539,6 @@ async function loadIntent(){
     if(isPolicyIntent(i)){
       document.getElementById('policyDecision').classList.toggle('hidden',!EDITABLE_POLICY);
       document.getElementById('policyEditNotice').classList.toggle('hidden',EDITABLE_POLICY);
-    }else if(isHyperliquidIntent(i)){
-      document.getElementById('policyTitle').textContent='Trading Bounds';
-      document.getElementById('rawPolicyDetails').open=false;
-      document.getElementById('rawPolicyDetails').querySelector('summary').textContent='Technical details';
     }else{
       document.getElementById('policyTitle').textContent='Transaction Details';
       document.getElementById('rawPolicyDetails').open=true;
@@ -614,12 +547,8 @@ async function loadIntent(){
     const policy=document.getElementById('policy');
     policy.textContent='';
     i.policy_lines.forEach((x,idx)=>policyLine(policy,x,idx+1));
-    if(isHyperliquidIntent(i)){
-      renderHyperliquidReview(i.policy_lines.join('\n'),i.canonical_subject||{});
-    }else{
-      renderSimplePolicy(i.policy_lines.join('\n'));
-      setSelectedAutonomy(getAutonomyMode(i.policy_lines.join('\n')));
-    }
+    renderSimplePolicy(i.policy_lines.join('\n'));
+    setSelectedAutonomy(getAutonomyMode(i.policy_lines.join('\n')));
   }
   if(i.risk_lines&&i.risk_lines.length){
     document.getElementById('riskWrap').classList.toggle('hidden',i.kind==='wallet_unlock');
@@ -639,9 +568,7 @@ async function loadIntent(){
   }
   const approve=document.getElementById('approve');
   approve.textContent=buttonLabelForIntent(i);
-  if(isHyperliquidIntent(i)){
-    st.textContent='Review the trading bounds above. The next OS prompt only confirms bloom/localhost.';
-  }else if(isPolicyIntent(i)){
+  if(isPolicyIntent(i)){
     st.textContent=EDITABLE_POLICY
       ?'Choose the approval mode, review the plain-language summary, then sign.'
       :'Review the plain-language summary. This page signs the policy exactly as shown.';

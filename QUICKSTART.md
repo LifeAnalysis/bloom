@@ -216,7 +216,7 @@ it expire after the configured TTL) cancels the stage.
 - **Prices** — keyless DefiLlama at `prices/spot/<coin>(.usd)` and
   `prices/change_24h/<coin>`.
 - **Hyperliquid** — `bloom init` provisions the pinned default
-  `bloom-petal-hyperliquid` package. Perp/spot reads and bounded signed actions
+  `bloom-petal-hyperliquid` package. Perp/spot reads and signed exchange actions
   appear at `/petals/hyperliquid/<network>/...`. Read
   `/petals/hyperliquid/README.md` for the installed workflow.
 - **Polymarket** — `bloom init` provisions the pinned default

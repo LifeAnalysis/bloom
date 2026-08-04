@@ -26,7 +26,8 @@ bloom gatekeeps every value-moving action through capabilities:
   cross an owner gate (passkey ceremony or local passphrase unlock).
 - **Automated action uses a capability.** Create a bounded session/capability
   first — the human approves the bounds once, then the agent operates inside
-  them without re-prompting until expiry, breach, or revocation.
+  the checks implemented by that extension. Inspect the extension's lifecycle,
+  expiry, cleanup, and revocation semantics before relying on it.
 - **The owner key is never handed off.** For capabilities that depend on owner
   signing (EVM and installed Petals), the key will
   reside in daemon RAM for a bounded window and auto-lock on expiry.
@@ -269,22 +270,21 @@ REQUEST
 Prefer request-local USD caps. If `plan.md` says policy is denied, do not retry
 blindly; inspect the wallet policy or ask the human to change it.
 
-## Hyperliquid (session-first)
+## Hyperliquid
 
 Hyperliquid trading uses Sealed Approval for owner authority:
 
-- **Agent sessions (RECOMMENDED):** write an explicit session id to
-  `petals/hyperliquid/mainnet/agent_sessions/<wallet>/new.json`. If the write returns
-  permission denied, read that session directory's `approval_challenge.json`,
-  open or forward its `ceremony_url`, complete the grant ceremony, then retry
-  the same write. The resulting ephemeral API wallet trades inside policy
-  bounds at `petals/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json`
-  without additional owner prompts until the session expires or is stopped.
-
-- **Owner actions:** `petals/hyperliquid/<network>/exchange/<wallet>/send_asset.json`
-  follows the same challenge/grant/retry flow and requires `transfer_cap_usd`.
-  Generic owner-signed order/cancel/update-leverage writes are disabled; use
-  agent sessions.
+- **Read the installed contract first.** Inspect
+  `petals/hyperliquid/README.md`, `AGENTS.md`, and `ASSET_IDS.md`; request bodies
+  and supported cleanup routes are version-specific.
+- **Agent sessions are advanced delegated authority.** Set `assets`,
+  `max_notional_usd`, and `max_leverage` explicitly. In v0.1.4 those checks run
+  per route write; there is no background loss/position monitor or automatic
+  flattening. Expiry or `stop` blocks later writes but does not cancel orders,
+  close positions, or revoke venue authority.
+- **Owner actions:** use the exact tagged action schemas documented by the
+  installed Petal. An accepted write is not evidence of a fill; inspect its
+  durable response and error files.
 
 ## Petals
 

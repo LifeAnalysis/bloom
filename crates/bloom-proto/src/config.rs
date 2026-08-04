@@ -96,6 +96,8 @@ fn default_preinstalled_petals() -> Vec<String> {
     ]
 }
 
+const PRE_HYPERLIQUID_DEFAULT_PETALS: [&str; 3] = ["polymarket", "near-intents", "enso"];
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PetalRuntimeConfig {
     #[serde(default)]
@@ -535,14 +537,21 @@ impl Config {
                 .or_insert_with(|| origin.to_string());
         }
 
-        // Configs generated before Hyperliquid became a default Petal contain
-        // the old native endpoint keys and the then-default Polymarket-only
-        // list. Preserve out-of-box Hyperliquid availability for that exact
-        // legacy shape without overriding an empty or customized list.
+        // Configs generated immediately before Hyperliquid became a default
+        // Petal contain the old native endpoint keys and the then-default
+        // Polymarket/Near/Enso list. Preserve out-of-box Hyperliquid
+        // availability for that exact serialized legacy shape without
+        // overriding an empty or customized list.
         let had_legacy_hyperliquid_surface = legacy_hyperliquid.is_some_and(|table| {
             table.get("mainnet_url").is_some() || table.get("testnet_url").is_some()
         });
-        if had_legacy_hyperliquid_surface && self.petals.preinstalled == ["polymarket"] {
+        let had_pre_hyperliquid_defaults = self
+            .petals
+            .preinstalled
+            .iter()
+            .map(String::as_str)
+            .eq(PRE_HYPERLIQUID_DEFAULT_PETALS);
+        if had_legacy_hyperliquid_surface && had_pre_hyperliquid_defaults {
             self.petals.preinstalled.push("hyperliquid".into());
         }
 
@@ -880,43 +889,72 @@ mod tests {
     }
 
     #[test]
-    fn load_migrates_legacy_hyperliquid_endpoints_and_default_install() {
+    fn load_migrates_serialized_pre_hyperliquid_default_config() {
         let td = tempdir().unwrap();
         let path = td.path().join("config.toml");
-        let mut source = Config::local_default();
-        source.petals.preinstalled = vec!["polymarket".into()];
-        source.petals.runtime.insert(
-            "hyperliquid".into(),
-            PetalRuntimeConfig {
-                endpoints: BTreeMap::from([(
-                    "mainnet".into(),
-                    "https://new-mainnet.example".into(),
-                )]),
-                values: BTreeMap::new(),
-            },
-        );
-        let mut document: toml::Value =
-            toml::from_str(&toml::to_string_pretty(&source).unwrap()).unwrap();
-        let hyperliquid = document["hyperliquid"].as_table_mut().unwrap();
-        hyperliquid.insert(
-            "mainnet_url".into(),
-            toml::Value::String("https://legacy-mainnet.example".into()),
-        );
-        hyperliquid.insert(
-            "testnet_url".into(),
-            toml::Value::String("https://legacy-testnet.example".into()),
-        );
-        std::fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            include_str!("../tests/fixtures/pre-hyperliquid-default-config.toml"),
+        )
+        .unwrap();
 
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.petals.preinstalled, ["polymarket", "hyperliquid"]);
+        assert_eq!(
+            cfg.petals.preinstalled,
+            ["polymarket", "near-intents", "enso", "hyperliquid"]
+        );
         let endpoints = &cfg.petals.runtime["hyperliquid"].endpoints;
-        assert_eq!(endpoints["mainnet"], "https://new-mainnet.example");
-        assert_eq!(endpoints["testnet"], "https://legacy-testnet.example");
+        assert_eq!(endpoints["mainnet"], "https://api.hyperliquid.xyz");
+        assert_eq!(endpoints["testnet"], "https://api.hyperliquid-testnet.xyz");
         assert_eq!(
             cfg.hyperliquid.as_ref().unwrap().bridge_address,
             crate::hyperliquid::MAINNET_BRIDGE
         );
+    }
+
+    #[test]
+    fn load_legacy_hyperliquid_migration_preserves_new_endpoint_override() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut document: toml::Value = toml::from_str(include_str!(
+            "../tests/fixtures/pre-hyperliquid-default-config.toml"
+        ))
+        .unwrap();
+        document["petals"]["runtime"] = toml::from_str(
+            r#"
+[hyperliquid.endpoints]
+mainnet = "https://new-mainnet.example"
+"#,
+        )
+        .unwrap();
+        std::fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        let endpoints = &cfg.petals.runtime["hyperliquid"].endpoints;
+        assert_eq!(endpoints["mainnet"], "https://new-mainnet.example");
+        assert_eq!(endpoints["testnet"], "https://api.hyperliquid-testnet.xyz");
+    }
+
+    #[test]
+    fn load_legacy_hyperliquid_migration_preserves_explicit_install_choices() {
+        for expected in [Vec::<&str>::new(), vec!["polymarket"], vec!["enso"]] {
+            let td = tempdir().unwrap();
+            let path = td.path().join("config.toml");
+            let mut document: toml::Value = toml::from_str(include_str!(
+                "../tests/fixtures/pre-hyperliquid-default-config.toml"
+            ))
+            .unwrap();
+            document["petals"]["preinstalled"] = toml::Value::Array(
+                expected
+                    .iter()
+                    .map(|name| toml::Value::String((*name).into()))
+                    .collect(),
+            );
+            std::fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+
+            let cfg = Config::load(&path).unwrap();
+            assert_eq!(cfg.petals.preinstalled, expected, "fixture: {document}");
+        }
     }
 
     #[test]

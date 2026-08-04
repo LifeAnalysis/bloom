@@ -988,7 +988,6 @@ async fn run(cli: Cli) -> Result<()> {
                 "default_wallet: {}",
                 d.config.default_wallet.as_deref().unwrap_or("<none>")
             );
-            println!("hyperliquid_vfs: default Petal (/petals/hyperliquid)");
             println!("try: bloom vfs ls /");
             if d.keystore.list()?.is_empty() {
                 println!("no wallets yet — create one with bloom wallet new main");

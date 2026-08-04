@@ -1453,42 +1453,103 @@ cat /bloom/petals/hyperliquid/mainnet/users/0xYourAddress/open_orders.json
 cat /bloom/petals/hyperliquid/mainnet/users/0xYourAddress/fills.json
 ```
 
-### Automated trading via agent session (RECOMMENDED)
+### Agent sessions (advanced)
 
-One `approveAgent` ceremony creates an ephemeral trading key. The agent
-trades inside policy bounds without further prompts. Sessions auto-expire
-and auto-flatten on risk breach.
+One `approveAgent` ceremony creates an ephemeral trading key. In the pinned
+v0.1.4 Petal, `assets`, `max_notional_usd`, and `max_leverage` are optional, so
+set all three explicitly. These are per-write checks: `max_notional_usd` caps
+the non-reduce-only notional in one submitted order action, and the leverage
+cap is enforced on `updateLeverage` writes.
+
+There is no background position/loss monitor or automatic flattening. Expiry
+and `stop` reject later session writes but do not cancel open orders, close
+positions, or revoke the agent at Hyperliquid. Perform those actions explicitly
+before treating a session as quiesced.
+
+Save this bounded session request as `hyperliquid-session.json`:
+
+<!-- docs-test:hyperliquid-session -->
+
+```json
+{
+  "id": "bounded-session",
+  "duration_ms": 3600000,
+  "max_notional_usd": "1000",
+  "max_leverage": 3,
+  "assets": ["0"]
+}
+```
+
+Hyperliquid exchange writes use a tagged `action` and numeric asset IDs. Read
+`/petals/hyperliquid/ASSET_IDS.md` before constructing a request. Save this
+example as `hyperliquid-order.json`:
+
+<!-- docs-test:hyperliquid-order -->
+
+```json
+{
+  "action": {
+    "type": "order",
+    "orders": [
+      {
+        "a": 0,
+        "b": true,
+        "p": "30000",
+        "s": "0.001",
+        "r": false,
+        "t": { "limit": { "tif": "Gtc" } }
+      }
+    ],
+    "grouping": "na"
+  }
+}
+```
 
 ```sh
 # 1) Owner unlocks (one time)
-bloom wallet unlock <wallet>
+bloom wallet unlock <wallet-name>
+bloom wallet address <wallet-name> # use this as <wallet-address> below
 
 # 2) Create the session (one approveAgent signature)
-echo '{"id":"bounded-session"}' \
-  > /bloom/petals/hyperliquid/mainnet/agent_sessions/<wallet>/new.json
+bloom vfs write /petals/hyperliquid/testnet/agent_sessions/<wallet-address>/new.json \
+  --data "$(cat hyperliquid-session.json)"
 # 3) Trade through the session
-echo '{"asset":"ETH","is_buy":true,"order_type":"Limit",
-  "price":"3000","sz":"0.01","reduce_only":false}' \
-  > /bloom/petals/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json
+bloom vfs write /petals/hyperliquid/testnet/agent_sessions/<wallet-address>/<session>/order.json \
+  --data "$(cat hyperliquid-order.json)"
 
 # 4) Inspect session status
-cat /bloom/petals/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/status.json
+bloom vfs cat /petals/hyperliquid/testnet/agent_sessions/<wallet-address>/<session>/status.json
 
 # 5) Stop the session early
-echo stop > /bloom/petals/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/stop
+bloom vfs write /petals/hyperliquid/testnet/agent_sessions/<wallet-address>/<session>/stop \
+  --data stop
 ```
 
 ### Direct exchange writes (ADVANCED)
 
-Owner-signed one-off actions. Requires the wallet to stay unlocked.
+Owner-signed one-off actions require the wallet to stay unlocked. Reuse
+`hyperliquid-order.json` for an order. Save this leverage request as
+`hyperliquid-update-leverage.json`:
+
+<!-- docs-test:hyperliquid-update-leverage -->
+
+```json
+{
+  "action": {
+    "type": "updateLeverage",
+    "asset": 0,
+    "isCross": false,
+    "leverage": 3
+  }
+}
+```
 
 ```sh
-echo '{"asset":"ETH","is_buy":true,"order_type":"Limit",
-  "price":"3000","sz":"0.01","reduce_only":false}' \
-  > /bloom/petals/hyperliquid/mainnet/exchange/<wallet>/order.json
+bloom vfs write /petals/hyperliquid/testnet/exchange/<wallet-address>/order.json \
+  --data "$(cat hyperliquid-order.json)"
 
-echo '{"asset":"ETH","is_cross":false,"leverage":5}' \
-  > /bloom/petals/hyperliquid/mainnet/exchange/<wallet>/update_leverage.json
+bloom vfs write /petals/hyperliquid/testnet/exchange/<wallet-address>/update_leverage.json \
+  --data "$(cat hyperliquid-update-leverage.json)"
 ```
 
 ---

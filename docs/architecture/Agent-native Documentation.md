@@ -46,7 +46,7 @@ from the release it ships with.
 - the mounted Sealed Approval lifecycle for the EVM slice: permission-denied
   confirm writes, `approval_challenge.json`, `ceremony_url`, grant / grant +
   execute, and retrying after a grant-only approval;
-- Hyperliquid session-first trading and discovery of installed Petal docs;
+- Hyperliquid trading and discovery of the installed Petal's versioned docs;
 - passkey policy signing and `under_policy` semantics.
 
 As additional Petals adopt the mounted Sealed Approval flow described in
