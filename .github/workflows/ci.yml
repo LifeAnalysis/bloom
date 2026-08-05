@@ -222,7 +222,7 @@ jobs:
             "$unit_dir"/*.service \
             "$unit_dir/bloom-signer@1000.service"
       - name: Run Linux packaging assertions
-        run: cargo test -p bloom-service-activation --test linux_packaging --locked
+        run: cargo test -p bloom-it --test linux_packaging --locked
       - name: Build UID-isolation test as the unprivileged runner
         id: linux-w0-test
         run: |
