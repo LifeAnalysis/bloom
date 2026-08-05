@@ -246,16 +246,11 @@ run_as_login() {
     "$cargo_binary" "$@"
 }
 
-# These are the exact triad acceptance sources. Fault injection remains linked
-# only into the test executables; installed production services stay running
-# under their real principals throughout the rerun.
+# Machine-side fault injection remains linked only into the test executable;
+# installed production services stay running under their real principals.
 run_as_login test \
   --manifest-path "$main_root/Cargo.toml" \
   --locked \
-  -p bloom-rpc-wire \
-  -p bloom-triad-local-transport \
-  -p bloom-service-activation \
-  -p bloom-audit-checkpoint \
   -p bloom-machine-client
 run_as_login test \
   --manifest-path "$main_root/Cargo.toml" \

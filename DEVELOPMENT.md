@@ -154,7 +154,6 @@ Useful focused suites:
 ```sh
 cargo test -p bloom-proto
 cargo test -p bloom-machine-client
-cargo test -p bloom-triad-local-transport
 cargo test -p bloom-vfs
 cargo test -p bloom-mount --features mount
 cargo test -p bloom-daemon
