@@ -17,6 +17,7 @@ const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
+const PRIVACY_POOLS_RELEASE_COMMIT: &str = "ae01a7d398416af4fa38a985b684ac973e128208";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
@@ -53,6 +54,15 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.2",
     archive: "enso-v0.1.2.petal.tar.gz",
     expected_hash: Some("82e541b237cd8dde0a566dfca7f3d20d6e688aacd23f62b1d0f1306f9c76ecb7"),
+};
+
+const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
+    name: "privacy-pools",
+    repository: "https://github.com/bloom-directory/bloom-petal-privacy-pools",
+    commit: PRIVACY_POOLS_RELEASE_COMMIT,
+    release_tag: "v0.1.2",
+    archive: "privacy-pools-v0.1.2.petal.tar.gz",
+    expected_hash: Some("f86cf4fac3dcd5dc86fa6d60daadeb2377b7d3a655774f64a109a7f5aca446b4"),
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,6 +581,7 @@ fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
         "polymarket" => Some(&PREINSTALLED_POLYMARKET),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "enso" => Some(&PREINSTALLED_ENSO),
+        "privacy-pools" => Some(&PREINSTALLED_PRIVACY_POOLS),
         _ => None,
     }
 }
