@@ -335,6 +335,7 @@ fn installed_macos_triad_paths() -> Result<Option<InstalledMacosTriadPaths>> {
     installed_macos_triad_paths_with_activation(false)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn enrollment_state_is_usable(state: &str, allow_activating: bool) -> bool {
     state == "active" || (allow_activating && state == "activating")
 }
