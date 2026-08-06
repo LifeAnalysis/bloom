@@ -278,9 +278,14 @@ Broker and Signer protocols.
 
 Production Machine does not open, create, migrate, or write the old keystore,
 `auth/auth.sqlite`, approval challenge artifacts, signer cache, or
-policy-session state. There are no deployed users requiring an authority-state
-migration. Old files may be ignored or diagnosed as obsolete, but their
-presence must not alter runtime behavior.
+policy-session state. Old approval, policy-session, and debug-signer state is
+not migrated. The sole compatibility exception is the bounded v1 passkey-wallet
+conversion defined by the parent architecture: a separate Signer-owned staging
+tool may read an explicitly selected legacy wallet directory and Signer may
+decrypt that staged envelope only after authenticating its existing passkey.
+Machine never reads the legacy secret-bearing files and no legacy runtime
+backend remains after conversion. Other old files may be ignored or diagnosed
+as obsolete, but their presence must not alter Machine runtime behavior.
 
 ## 6. Machine public projection architecture
 
@@ -858,8 +863,10 @@ state nor attempts the Signer endpoint.
   effect state into Broker.
 - Claiming production process isolation for the same-UID development harness.
 - Adding new Machine-to-Broker or Broker-to-Signer methods.
-- Preserving legacy approval, policy-session, keystore, or debug-signer state
-  compatibility; the parent architecture permits a clean break.
+- Preserving legacy approval, policy-session, or debug-signer state
+  compatibility. Legacy keystore compatibility is limited to the parent
+  architecture's one-time, Signer-owned v1 passkey-wallet conversion; it is not
+  a Machine runtime compatibility path or a permanent Signer backend.
 - Deleting useful test vectors before equivalent Broker/Signer coverage exists.
 
 ## 17. Stop conditions and implementation discipline

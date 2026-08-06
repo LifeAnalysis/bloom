@@ -61,6 +61,7 @@ mkdir -p "$work/staging/bin" "$work/dist-a" "$work/dist-b"
 cp "$main_root/target/release/bloom" "$work/staging/bin/"
 cp "$broker_root/target/release/bloom-broker" "$work/staging/bin/"
 cp "$signer_root/target/release/bloom-signer" "$work/staging/bin/"
+cp "$signer_root/target/release/bloom-signer-migrate" "$work/staging/bin/"
 if $test_key; then
   signing_key="$work/test-only-release-key"
   /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$signing_key"

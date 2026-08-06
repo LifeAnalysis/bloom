@@ -438,6 +438,7 @@ impl WalletsHandler {
                         .map_err(|error| HandlerError::invalid(error.to_string()))?,
                     browser_output_recipient_key: None,
                     petal_key_scope: None,
+                    legacy_passkey_migration: None,
                 },
             )
             .await

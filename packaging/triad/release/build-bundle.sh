@@ -158,7 +158,7 @@ EOF
   echo "SOURCE_DATE_EPOCH must be an unsigned decimal integer" >&2
   exit 64
 }
-for binary in bloom bloom-broker bloom-signer; do
+for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
   test -f "$staging/bin/$binary" || {
     echo "missing production binary: bin/$binary" >&2
     exit 66
@@ -198,7 +198,7 @@ cp -R "$staging/." "$payload/"
 platform_claim="${BLOOM_PLATFORM_CLAIM:-test-unclaimed}"
 case "$platform_claim" in
   linux)
-    for binary in bloom bloom-broker bloom-signer; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
       file -b "$staging/bin/$binary" | grep -F 'ELF ' >/dev/null || {
         echo "Linux platform claim requires ELF production binaries" >&2
         exit 65
@@ -211,7 +211,7 @@ case "$platform_claim" in
       echo "macOS W0 claim requires its disposable Darwin build lane" >&2
       exit 65
     }
-    for binary in bloom bloom-broker bloom-signer; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
       file -b "$staging/bin/$binary" | grep -F 'Mach-O ' >/dev/null || {
         echo "macOS W0 claim requires Mach-O production binaries" >&2
         exit 65
@@ -223,7 +223,7 @@ case "$platform_claim" in
       echo "production macOS claim requires a Darwin release builder" >&2
       exit 69
     }
-    for binary in bloom bloom-broker bloom-signer; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
       file -b "$staging/bin/$binary" | grep -F 'Mach-O ' >/dev/null || {
         echo "production macOS claim requires Mach-O production binaries" >&2
         exit 65

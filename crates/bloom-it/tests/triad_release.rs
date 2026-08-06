@@ -33,7 +33,7 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     let compatibility = fs::read_to_string(release.join("compatibility-v1.toml")).unwrap();
     for exact_authority in ["machine_broker", "broker_signer"] {
         let block =
-            format!("[protocols.{exact_authority}]\nmajor = 1\nminor_min = 2\nminor_max = 2");
+            format!("[protocols.{exact_authority}]\nmajor = 1\nminor_min = 3\nminor_max = 3");
         assert!(compatibility.contains(&block));
     }
     for compatible_support in ["signer_control", "session"] {
@@ -120,7 +120,12 @@ fn generate_ed25519_key(path: &Path) {
 fn make_staging(root: &Path) -> PathBuf {
     let staging = root.join("staging");
     fs::create_dir_all(staging.join("bin")).unwrap();
-    for binary in ["bloom", "bloom-broker", "bloom-signer"] {
+    for binary in [
+        "bloom",
+        "bloom-broker",
+        "bloom-signer",
+        "bloom-signer-migrate",
+    ] {
         let path = staging.join("bin").join(binary);
         let version = if binary == "bloom" { "0.1.3" } else { "0.1.0" };
         fs::write(&path, format!("#!/bin/sh\necho {binary} {version}\n")).unwrap();

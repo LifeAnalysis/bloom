@@ -884,6 +884,7 @@ impl PetalHost for DaemonPetalHost {
                         .expect("static Petal key input class is valid"),
                     browser_output_recipient_key: None,
                     petal_key_scope: Some(scope.clone()),
+                    legacy_passkey_migration: None,
                 },
             )
             .await

@@ -62,6 +62,7 @@ case "$action" in
       bin/bloom \
       bin/bloom-broker \
       bin/bloom-signer \
+      bin/bloom-signer-migrate \
       config/edge-manifest.json \
       config/broker.json \
       config/signer.json \
@@ -113,7 +114,7 @@ case "$action" in
 
     binary_root="$root/usr/libexec/bloom"
     mkdir -p "$binary_root"
-    for binary in bloom bloom-broker bloom-signer; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
       atomic_install "$payload/bin/$binary" "$binary_root/$binary" 0755
     done
 

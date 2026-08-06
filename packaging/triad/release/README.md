@@ -2,11 +2,12 @@
 
 `compatibility-v1.toml` is the closed v1 service matrix. It declares each edge
 independently: the Machine–Broker and Broker–Signer authority APIs require
-exactly 1.1, while Signer control and login-session liveness accept 1.0–1.1.
+exactly 1.3, while Signer control and login-session liveness accept 1.0–1.1.
 Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
 
-`build-bundle.sh` accepts three already-built production binaries and a
+`build-bundle.sh` accepts the three service binaries, the bounded
+`bloom-signer-migrate` staging tool, and a
 reviewed Ed25519 release key. It verifies semantic versions, scans every
 staged and generated bundle file for release-blocking markers, records all
 three Git revisions, embeds both platform installers, signs the internal

@@ -115,7 +115,7 @@ allocate_accounts() {
 }
 
 verify_payload() {
-  for path in bin/bloom bin/bloom-broker bin/bloom-signer PLATFORM_CLAIM; do [[ -f "$payload/$path" ]] || die "payload missing $path"; done
+  for path in bin/bloom bin/bloom-broker bin/bloom-signer bin/bloom-signer-migrate PLATFORM_CLAIM; do [[ -f "$payload/$path" ]] || die "payload missing $path"; done
   claim="$(<"$payload/PLATFORM_CLAIM")"
   if $live; then
     case "$claim" in
@@ -211,14 +211,15 @@ install_release() {
   release="$release_base/releases/$BLOOM_RELEASE_DIGEST"; mkdir -p "$release_base/releases"
   if [[ -e "$release" ]]; then
     [[ -d "$release" && ! -L "$release" ]] || die "invalid digest-named release"
-    for binary in bloom bloom-broker bloom-signer; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
       [[ -f "$release/$binary" && ! -L "$release/$binary" ]] && cmp "$payload/bin/$binary" "$release/$binary" >/dev/null || \
         die "digest-named release does not match the verified payload"
     done
   else
     stage="$release_base/.release.$$.new"; mkdir "$stage"
     install -m 0755 "$payload/bin/bloom" "$stage/bloom"; install -m 0755 "$payload/bin/bloom-broker" "$stage/bloom-broker"
-    install -m 0755 "$payload/bin/bloom-signer" "$stage/bloom-signer"; $live && chown -R root:wheel "$stage"; mv "$stage" "$release"
+    install -m 0755 "$payload/bin/bloom-signer" "$stage/bloom-signer"; install -m 0755 "$payload/bin/bloom-signer-migrate" "$stage/bloom-signer-migrate"
+    $live && chown -R root:wheel "$stage"; mv "$stage" "$release"
   fi
   old_current="$(readlink "$release_base/current" 2>/dev/null || true)"; ln -s "releases/$BLOOM_RELEASE_DIGEST" "$release_base/current.new.$$"
   $live && chown -h root:wheel "$release_base/current.new.$$"; mv -f "$release_base/current.new.$$" "$release_base/current"

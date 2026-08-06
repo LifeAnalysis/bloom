@@ -121,6 +121,7 @@ cargo build \
 cp "$CARGO_TARGET_DIR/release/bloom" "$staging_root/bin/"
 cp "$CARGO_TARGET_DIR/release/bloom-broker" "$staging_root/bin/"
 cp "$CARGO_TARGET_DIR/release/bloom-signer" "$staging_root/bin/"
+cp "$CARGO_TARGET_DIR/release/bloom-signer-migrate" "$staging_root/bin/"
 
 ssh-keygen -q -t ed25519 -N '' -f "$release_key"
 
