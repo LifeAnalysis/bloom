@@ -715,11 +715,12 @@ mod tests {
                 .unwrap();
             assert_eq!(credential.header_name, "Payment-Signature");
         }
-        let preimages = host.preimages.lock().unwrap();
-        assert_eq!(preimages.len(), 2);
-        assert_eq!(preimages[0], preimages[1]);
-        assert_eq!(preimages[0].len(), 66);
-        drop(preimages);
+        {
+            let preimages = host.preimages.lock().unwrap();
+            assert_eq!(preimages.len(), 2);
+            assert_eq!(preimages[0], preimages[1]);
+            assert_eq!(preimages[0].len(), 66);
+        }
 
         let encoded = std::fs::read_to_string(&draft).unwrap();
         let mut payload: serde_json::Value =

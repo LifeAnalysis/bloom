@@ -487,6 +487,7 @@ impl DaemonPetalHost {
         Ok(correlation_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn audit_http_fetch(
         &self,
         correlation_id: &str,
@@ -530,6 +531,7 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Backend(format!("Machine audit unavailable: {error}")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn audited_http_error(
         &self,
         correlation_id: &str,

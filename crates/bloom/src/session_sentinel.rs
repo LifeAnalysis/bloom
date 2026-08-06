@@ -62,29 +62,24 @@ pub async fn run() -> Result<()> {
     let manifest_path = config_root.join("edge-manifest.json");
     require_login_owned_private_file(&identity_path, effective_uid)?;
     #[cfg(feature = "triad-dev-harness")]
-    let loaded_developer = developer_root.as_ref().map(|root| {
-        load_developer_identity_and_manifest(
-            root,
-            &identity_path,
-            &manifest_path,
-            SESSION_SERVICE_ID,
-        )
-    });
-    #[cfg(not(feature = "triad-dev-harness"))]
-    let loaded_developer: Option<
-        Result<
-            (
-                bloom_triad_local_transport::LocalIdentity,
-                bloom_triad_local_transport::EdgeManifest,
-            ),
-            bloom_triad_local_transport::TransportError,
-        >,
-    > = None;
-    let (identity, manifest) = loaded_developer
+    let (identity, manifest) = developer_root
+        .as_ref()
+        .map(|root| {
+            load_developer_identity_and_manifest(
+                root,
+                &identity_path,
+                &manifest_path,
+                SESSION_SERVICE_ID,
+            )
+        })
         .unwrap_or_else(|| {
             load_identity_and_manifest(&identity_path, &manifest_path, SESSION_SERVICE_ID)
         })
         .context("load authenticated session identity")?;
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let (identity, manifest) =
+        load_identity_and_manifest(&identity_path, &manifest_path, SESSION_SERVICE_ID)
+            .context("load authenticated session identity")?;
     let broker_acl = manifest
         .broker
         .into_acl()

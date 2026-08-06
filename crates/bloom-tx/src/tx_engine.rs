@@ -2036,10 +2036,8 @@ impl TxEngine {
 
         // Verify and assemble every signature before exposing any raw child.
         let mut signed = Vec::with_capacity(prepared.len());
-        for ((entry, prepared), normalized) in entries
-            .iter()
-            .zip(prepared.into_iter())
-            .zip(result.signatures.iter())
+        for ((entry, prepared), normalized) in
+            entries.iter().zip(prepared).zip(result.signatures.iter())
         {
             if normalized.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable
                 || normalized.bytes.decode().len() != 65
