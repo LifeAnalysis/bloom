@@ -2,13 +2,13 @@ schema = "bloom.triad-compatibility/1"
 
 [protocols.machine_broker]
 major = 1
-minor_min = 1
-minor_max = 1
+minor_min = 2
+minor_max = 2
 
 [protocols.broker_signer]
 major = 1
-minor_min = 1
-minor_max = 1
+minor_min = 2
+minor_max = 2
 
 [protocols.signer_control]
 major = 1

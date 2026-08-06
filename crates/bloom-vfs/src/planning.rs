@@ -50,8 +50,8 @@ pub fn advisory_paid_http_policy(projection: &WalletProjection) -> Result<Policy
 #[cfg(test)]
 mod tests {
     use bloom_broker_api::{
-        Base64UrlBytes, DecimalU64, Digest32, PolicyDestination, SignedPolicySnapshot, Token,
-        WalletPublic,
+        Base64UrlBytes, CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef, KeyRole, KeySpec,
+        PolicyDestination, SignedPolicySnapshot, Token, WalletPublic,
     };
     use bloom_machine_client::{ProjectionFreshness, ProjectionVerification};
     use sha2::Digest as _;
@@ -60,6 +60,14 @@ mod tests {
 
     fn projection(destinations: Vec<PolicyDestination>) -> WalletProjection {
         let wallet_id = Token::new("alice").unwrap();
+        let root_key_ref = KeyRef {
+            backend: Token::new("test").unwrap(),
+            backend_instance: Token::new("projection").unwrap(),
+            locator: "alice/root".into(),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: Digest32::from_bytes([1; 32]),
+            derivation: None,
+        };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 60_000,
@@ -72,12 +80,19 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: Token::new("passkey").unwrap(),
-                key_refs: Vec::new(),
+                root_key_ref: root_key_ref.clone(),
+                key_refs: vec![root_key_ref.clone()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: Digest32::from_bytes(sha2::Sha256::digest(&canonical).into()),
                 wallet_revocation_epoch: DecimalU64::new(0),
             },
-            keys: Vec::new(),
+            keys: vec![KeyPublic {
+                key_ref: root_key_ref,
+                role: KeyRole::WalletRoot,
+                canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
+                addresses: vec!["0x0000000000000000000000000000000000000001".into()],
+                supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+            }],
             credentials: Vec::new(),
             policy: SignedPolicySnapshot {
                 wallet_id,

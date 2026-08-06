@@ -10,8 +10,9 @@ use async_trait::async_trait;
 
 use crate::abi::{
     ChainRequest, ChainResponse, EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest,
-    HttpRequest, HttpResponse, PayloadSignRequest, PetalKeyOutcome, PetalKeyRequest,
-    PetalRouteContext, SignBatchOutcome, SignBatchRequest, SignOutcome, SignRequest,
+    HttpRequest, HttpResponse, PayloadBatchSignOutcome, PayloadBatchSignRequest,
+    PayloadSignRequest, PetalKeyOutcome, PetalKeyRequest, PetalRouteContext, SignBatchOutcome,
+    SignBatchRequest, SignOutcome, SignRequest,
 };
 use crate::policy::NetPolicy;
 
@@ -121,6 +122,15 @@ pub trait PetalHost: Send + Sync {
         _req: PayloadSignRequest,
     ) -> Result<SignOutcome, HostError> {
         Err(HostError::Denied("sign_payload".into()))
+    }
+
+    /// Atomically sign an exact ordered payload set through the authority
+    /// boundary. Implementations must never return partial signatures.
+    async fn sign_payload_batch_outcome(
+        &self,
+        _req: PayloadBatchSignRequest,
+    ) -> Result<PayloadBatchSignOutcome, HostError> {
+        Err(HostError::Denied("sign_payload_batch".into()))
     }
 
     /// Request or poll a Signer-owned sub-key. Implementations must use the

@@ -5,6 +5,7 @@ set -euo pipefail
 socket=""
 mount_dir=""
 ready_file=""
+machine_home=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --machine-socket)
@@ -19,14 +20,18 @@ while [ "$#" -gt 0 ]; do
       ready_file="$2"
       shift 2
       ;;
+    --machine-home)
+      machine_home="$2"
+      shift 2
+      ;;
     *)
       shift
       ;;
   esac
 done
-[ -n "$socket" ] && [ -n "$mount_dir" ] && [ -n "$ready_file" ]
+[ -n "$socket" ] && [ -n "$mount_dir" ] && [ -n "$ready_file" ] && [ -n "$machine_home" ]
 
-exec python3 - "$socket" "$mount_dir" "$ready_file" <<'PY'
+exec python3 - "$socket" "$mount_dir" "$ready_file" "$machine_home" <<'PY'
 import json
 import hashlib
 import os
@@ -41,15 +46,21 @@ socket_path = Path(sys.argv[1])
 mount = Path(sys.argv[2])
 state = Path(os.environ.get("BLOOM_FAKE_STATE", "/tmp/bloom-fake-state"))
 ready_file = Path(sys.argv[3])
+machine_home = Path(sys.argv[4])
 wallet = "test-passkey"
 address = "0x0000000000000000000000000000000000000001"
 session = "manual-mainnet-integration"
-pm_signing_abi = os.environ.get("BLOOM_FAKE_PM_SIGNING_ABI", "0.3.0")
+pm_signing_abi = os.environ.get("BLOOM_FAKE_PM_SIGNING_ABI", "0.4.0")
 fixture_package_hash = "2e2344e74b7ed11d4bb4c939671be9da72e13147dd16c3f6b6c347ae2c84d1ad"
 fixture_provenance_digest = "66" * 32
 mutate_approval_policy_digest = (
     os.environ.get("BLOOM_FAKE_MUTATE_APPROVAL_POLICY_DIGEST", "0") == "1"
 )
+state.mkdir(parents=True, exist_ok=True)
+state.joinpath("machine-home").write_text(str(machine_home))
+projection = machine_home / "cache/wallet-projections.json"
+if projection.is_file():
+    state.joinpath("wallet-projection-copy").write_bytes(projection.read_bytes())
 fixture_key_ref = {
     "backend": "local",
     "backend_instance": "fixture",
@@ -125,19 +136,11 @@ addresses_path = write_json(
 )
 write_json(
     "petals/polymarket/meta/route-contract.json",
-    (
-        {
-            "schema": "fake.route-contract.v1",
-            "abi": "0.1",
-            "generic_ipc_only": ["bloom:sign/signing@0.1.0"],
-        }
-        if pm_signing_abi == "0.1.0"
-        else {
-            "schema": "fake.route-contract.v1",
-            "abi": "0.1",
-            "interfaces": ["bloom:sign/signing@0.3.0"],
-        }
-    ),
+    {
+        "schema": "fake.route-contract.v1",
+        "abi": "0.1",
+        "interfaces": [f"bloom:sign/signing@{pm_signing_abi}"],
+    },
 )
 write_json(
     f"petals/polymarket/onboard/{wallet}/status.json",
@@ -165,7 +168,6 @@ write_json(
 )
 (mount / f"petals/polymarket/trade/{wallet}/drafts").mkdir(parents=True)
 (mount / f"petals/polymarket/trade/{wallet}/receipts").mkdir(parents=True)
-state.mkdir(parents=True, exist_ok=True)
 
 policy_committed = threading.Event()
 committed_policy_digest = None

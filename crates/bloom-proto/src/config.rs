@@ -83,12 +83,7 @@ impl Default for PetalsConfig {
 }
 
 fn default_preinstalled_petals() -> Vec<String> {
-    vec![
-        "polymarket".to_string(),
-        "hyperliquid".to_string(),
-        "near-intents".to_string(),
-        "enso".to_string(),
-    ]
+    vec!["near-intents".to_string(), "enso".to_string()]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -453,26 +448,9 @@ impl Config {
     ///
     /// Currently infers `op_stack` for well-known OP-stack chain IDs
     /// (Optimism=10, Base=8453, …) that predate the `op_stack` field.
-    fn migrate(&mut self, document: &toml::Value) {
+    fn migrate(&mut self, _document: &toml::Value) {
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
-        }
-
-        // Bloom versions immediately before native Polymarket removal used
-        // `[polymarket] enabled = false` as the persistent opt-out. Preserve
-        // that explicit choice unless the operator has already configured the
-        // replacement `petals.preinstalled` list.
-        let legacy_polymarket_disabled = document
-            .get("polymarket")
-            .and_then(|value| value.get("enabled"))
-            .and_then(toml::Value::as_bool)
-            == Some(false);
-        let preinstalled_is_explicit = document
-            .get("petals")
-            .and_then(|value| value.get("preinstalled"))
-            .is_some();
-        if legacy_polymarket_disabled && !preinstalled_is_explicit {
-            self.petals.preinstalled.retain(|name| name != "polymarket");
         }
     }
 
@@ -551,10 +529,7 @@ impl Config {
         let mut seen_preinstalled = std::collections::BTreeSet::new();
         for name in &self.petals.preinstalled {
             validate_petal_runtime_name("preinstalled entry", name)?;
-            if !matches!(
-                name.as_str(),
-                "polymarket" | "hyperliquid" | "near-intents" | "enso"
-            ) {
+            if !matches!(name.as_str(), "near-intents" | "enso") {
                 return Err(ConfigError::Invalid(format!(
                     "unknown preinstalled Petal {name:?}"
                 )));
@@ -633,10 +608,7 @@ mod tests {
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-        assert_eq!(
-            cfg.petals.preinstalled,
-            ["polymarket", "hyperliquid", "near-intents", "enso"]
-        );
+        assert_eq!(cfg.petals.preinstalled, ["near-intents", "enso"]);
         assert_eq!(cfg.chains.len(), 13);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
@@ -731,6 +703,20 @@ mod tests {
         cfg.petals.preinstalled = vec!["near-intents".into()];
         cfg.validate().unwrap();
 
+        cfg.petals.preinstalled = vec!["hyperliquid".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("unknown preinstalled Petal \"hyperliquid\""),
+            "{err}"
+        );
+
+        cfg.petals.preinstalled = vec!["polymarket".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("unknown preinstalled Petal \"polymarket\""),
+            "{err}"
+        );
+
         cfg.petals.preinstalled = vec!["unknown".into()];
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
@@ -738,10 +724,10 @@ mod tests {
             "{err}"
         );
 
-        cfg.petals.preinstalled = vec!["polymarket".into(), "polymarket".into()];
+        cfg.petals.preinstalled = vec!["near-intents".into(), "near-intents".into()];
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
-            err.contains("duplicate preinstalled Petal \"polymarket\""),
+            err.contains("duplicate preinstalled Petal \"near-intents\""),
             "{err}"
         );
     }
@@ -830,35 +816,6 @@ allow_broadcast = false
         let cfg = Config::load_or_init(&path).unwrap();
         assert!(!cfg.chains["anvil"].allow_broadcast);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
-    }
-
-    #[test]
-    fn load_preserves_legacy_polymarket_opt_out_until_new_setting_is_explicit() {
-        let td = tempdir().unwrap();
-        let path = td.path().join("config.toml");
-        let default = toml::to_string_pretty(&Config::local_default()).unwrap();
-        let mut legacy_document: toml::Value = toml::from_str(&default).unwrap();
-        legacy_document
-            .get_mut("petals")
-            .and_then(toml::Value::as_table_mut)
-            .unwrap()
-            .remove("preinstalled");
-        let legacy = toml::to_string_pretty(&legacy_document).unwrap();
-        assert!(!legacy.contains("preinstalled"));
-        std::fs::write(&path, format!("{legacy}\n[polymarket]\nenabled = false\n")).unwrap();
-
-        let migrated = Config::load(&path).unwrap();
-        assert_eq!(
-            migrated.petals.preinstalled,
-            vec!["hyperliquid", "near-intents", "enso"]
-        );
-
-        std::fs::write(&path, format!("{default}\n[polymarket]\nenabled = false\n")).unwrap();
-        let explicitly_enabled = Config::load(&path).unwrap();
-        assert_eq!(
-            explicitly_enabled.petals.preinstalled,
-            vec!["polymarket", "hyperliquid", "near-intents", "enso"]
-        );
     }
 
     #[test]

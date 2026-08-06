@@ -62,6 +62,7 @@ pub(crate) fn wallet_projection_reader(
         wallet: WalletPublic {
             wallet_id: wallet_id.clone(),
             wallet_kind: Token::new("passkey").unwrap(),
+            root_key_ref: key_ref.clone(),
             key_refs: vec![key_ref.clone()],
             policy_version: DecimalU64::new(1),
             policy_digest: policy_digest.clone(),
@@ -69,6 +70,7 @@ pub(crate) fn wallet_projection_reader(
         },
         keys: vec![KeyPublic {
             key_ref,
+            role: bloom_broker_api::KeyRole::WalletRoot,
             canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
             addresses: vec![address.to_owned()],
             supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],

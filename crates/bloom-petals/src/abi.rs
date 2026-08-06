@@ -60,6 +60,34 @@ pub struct PayloadSignRequest {
     pub context: Option<PetalRouteContext>,
 }
 
+/// One exact payload in an atomic v0.4 signing batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadSignItem {
+    pub preimage: Vec<u8>,
+    pub claimed_hash: [u8; 32],
+}
+
+/// Payload-bearing atomic batch used by `bloom:sign/signing@0.4.0`.
+///
+/// All authority and policy fields apply to the complete ordered payload set;
+/// the host must return either one signature per item, in the same order, or a
+/// pending approval. Partial results are not representable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadBatchSignRequest {
+    pub wallet: String,
+    pub payloads: Vec<PayloadSignItem>,
+    pub signature_algorithm: String,
+    pub operation_class: String,
+    pub petal_use_claim_jcs: Vec<u8>,
+    pub claim_assurance_evidence: Option<Vec<u8>>,
+    pub approval_hint: Option<String>,
+    pub action: Option<Vec<u8>>,
+    pub advisory: Option<Vec<u8>>,
+    pub selector: bloom_broker_api::PetalSignSelector,
+    pub key_ref: Option<bloom_broker_api::KeyRef>,
+    pub context: Option<PetalRouteContext>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignBatchRequest {
     pub requests: Vec<SignRequest>,
@@ -77,9 +105,20 @@ pub struct ApprovalRequired {
     pub expires_ms: u64,
 }
 
+/// Safe component-visible pending state used by signing v0.4.
+///
+/// Ceremony URLs remain owner-only and are deliberately absent from this
+/// projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalPending {
+    pub action_id: String,
+    pub expires_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignOutcome {
     Signature(Vec<u8>),
+    ApprovalPending(ApprovalPending),
     ApprovalRequired(ApprovalRequired),
 }
 
@@ -87,6 +126,12 @@ pub enum SignOutcome {
 pub enum SignBatchOutcome {
     Signatures(Vec<Vec<u8>>),
     ApprovalRequired(ApprovalRequired),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadBatchSignOutcome {
+    Signatures(Vec<Vec<u8>>),
+    ApprovalPending(ApprovalPending),
 }
 
 /// A generic EVM transaction prepared by a Petal route. Route provenance is

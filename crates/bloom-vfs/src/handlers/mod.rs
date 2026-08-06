@@ -9,6 +9,7 @@ pub mod docs;
 pub mod ens;
 pub mod outbox;
 pub mod petal_key_requests;
+pub mod petal_signing_requests;
 pub mod prices;
 pub mod requests;
 pub mod simulate;
@@ -25,6 +26,9 @@ pub use docs::DocsHandler;
 pub use ens::EnsHandler;
 pub use outbox::{CentralOutbox, OutboxHandler};
 pub use petal_key_requests::PetalKeyRequestsHandler;
+pub use petal_signing_requests::{
+    PETAL_SIGNING_STATE_SCHEMA, PetalSigningRequestProjection, PetalSigningRequestsHandler,
+};
 pub use prices::PricesHandler;
 pub use requests::RequestsHandler;
 pub use simulate::SimulateHandler;

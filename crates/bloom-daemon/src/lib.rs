@@ -33,8 +33,9 @@ use bloom_petals::abi::{
     EvmTransactionRequest, PetalRouteContext,
 };
 use bloom_petals::{
-    HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy,
-    PayloadSignRequest, PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignOutcome,
+    ApprovalPending, HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry,
+    NetPolicy, PayloadBatchSignOutcome, PayloadBatchSignRequest, PayloadSignRequest, PetalHost,
+    PetalRouter, PetalRunner, PetalStore, PetalVm, SignOutcome,
 };
 use bloom_prices::PricesClient;
 use bloom_proto::audit::AuditRecord;
@@ -56,7 +57,8 @@ use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
     AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, OutboxHandler,
-    PetalKeyRequestsHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler,
+    PETAL_SIGNING_STATE_SCHEMA, PetalKeyRequestsHandler, PetalSigningRequestProjection,
+    PetalSigningRequestsHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler,
     ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::{
@@ -64,6 +66,7 @@ use bloom_vfs::{
 };
 use bloom_watch::{WatchExecutor, WatchRegistry};
 use futures::StreamExt;
+use sha2::Digest as _;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -223,6 +226,8 @@ struct DaemonPetalHost {
     provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     petal_key_state_root: Option<PathBuf>,
     petal_key_lock: tokio::sync::Mutex<()>,
+    petal_signing_state_root: Option<PathBuf>,
+    petal_signing_lock: tokio::sync::Mutex<()>,
 }
 
 const PETAL_KEY_STATE_SCHEMA: &str = "bloom.machine.petal-key-request.v1";
@@ -282,17 +287,22 @@ impl DaemonPetalHost {
     fn authorize_guest_vfs_path(path: &str) -> Result<(), HostError> {
         let parsed = VfsPath::parse(path)
             .map_err(|error| HostError::Invalid(format!("Petal VFS path: {error}")))?;
-        if parsed.first() == Some("petal-key-requests") {
+        if matches!(
+            parsed.first(),
+            Some("petal-key-requests" | "petal-signing-requests")
+        ) {
             return Err(HostError::Denied(
-                "petal-key-requests is an owner-only ceremony projection".into(),
+                "Petal ceremony request projections are owner-only".into(),
             ));
         }
         let segments = parsed.segments();
         let owner_wallet_ceremony_projection = segments.first().map(String::as_str)
             == Some("wallets")
-            && ((segments.len() == 4
-                && segments[2] == "sealed-approvals"
-                && segments[3] == "new.json")
+            && ((segments.len() == 2 && segments[1] == "new")
+                || (segments.len() >= 2 && segments[1] == "registrations")
+                || (segments.len() == 4
+                    && segments[2] == "sealed-approvals"
+                    && segments[3] == "new.json")
                 || (segments.len() == 5
                     && segments[2] == "sealed-approvals"
                     && segments[4] == "renew")
@@ -335,6 +345,8 @@ impl DaemonPetalHost {
             provenance_catalog: None,
             petal_key_state_root: None,
             petal_key_lock: tokio::sync::Mutex::new(()),
+            petal_signing_state_root: None,
+            petal_signing_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -358,6 +370,11 @@ impl DaemonPetalHost {
 
     fn with_petal_key_state_root(mut self, root: PathBuf) -> Self {
         self.petal_key_state_root = Some(root);
+        self
+    }
+
+    fn with_petal_signing_state_root(mut self, root: PathBuf) -> Self {
+        self.petal_signing_state_root = Some(root);
         self
     }
 
@@ -433,6 +450,84 @@ impl DaemonPetalHost {
             ))
         })?;
         Ok(())
+    }
+
+    fn petal_signing_paths(
+        &self,
+        context: &PetalRouteContext,
+        wallet: &str,
+        operation_class: &str,
+        claimed_hash: &[u8; 32],
+        canonical_claim: &[u8],
+    ) -> Result<(String, PathBuf, PathBuf), HostError> {
+        let root = self.petal_signing_state_root.as_ref().ok_or_else(|| {
+            HostError::Backend("Petal exact signing state is not configured".into())
+        })?;
+        let mut identity = blake3::Hasher::new();
+        identity.update(b"bloom-petal-exact-signing/v1\0");
+        for part in [
+            context.package_hash.as_bytes(),
+            context.route_id.as_bytes(),
+            wallet.as_bytes(),
+            operation_class.as_bytes(),
+            claimed_hash,
+            canonical_claim,
+        ] {
+            identity.update(&(part.len() as u64).to_be_bytes());
+            identity.update(part);
+        }
+        let request_id = identity.finalize().to_hex().to_string();
+        Ok((
+            request_id.clone(),
+            root.join(".state").join(format!("{request_id}.json")),
+            root.join(format!("{request_id}.json")),
+        ))
+    }
+
+    fn write_petal_signing_projection(
+        path: &Path,
+        state: &PetalSigningRequestProjection,
+    ) -> Result<(), HostError> {
+        let parent = path.parent().ok_or_else(|| {
+            HostError::Backend("Petal signing projection has no parent directory".into())
+        })?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            HostError::Backend(format!(
+                "create Petal signing projection directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
+            HostError::Backend(format!("encode Petal signing projection: {error}"))
+        })?;
+        let temporary = path.with_extension("json.tmp");
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).map_err(|error| {
+            HostError::Backend(format!(
+                "open Petal signing projection {}: {error}",
+                temporary.display()
+            ))
+        })?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| {
+                HostError::Backend(format!(
+                    "write Petal signing projection {}: {error}",
+                    temporary.display()
+                ))
+            })?;
+        std::fs::rename(&temporary, path).map_err(|error| {
+            HostError::Backend(format!(
+                "commit Petal signing projection {}: {error}",
+                path.display()
+            ))
+        })
     }
 
     fn petal_execution_origin(
@@ -1047,12 +1142,128 @@ impl PetalHost for DaemonPetalHost {
                 "PetalUseClaim must use exact RFC 8785 canonical JSON".into(),
             ));
         }
+        let trusted_package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        if req.selector == bloom_broker_api::PetalSignSelector::Exact {
+            if req.key_ref.is_some() {
+                return Err(HostError::Denied(
+                    "exact Petal signing uses Machine-owned root selection and approval state"
+                        .into(),
+                ));
+            }
+            let trusted_subject = bloom_broker_api::ProvenanceSubject::Petal {
+                package_hash: trusted_package_hash.clone(),
+                route: context.route_id.clone(),
+            };
+            let (request_id, exact_state_path, owner_projection_path) = self.petal_signing_paths(
+                context,
+                &req.wallet,
+                &req.operation_class,
+                &req.claimed_hash,
+                &canonical_claim,
+            )?;
+            if req
+                .approval_hint
+                .as_deref()
+                .is_some_and(|hint| hint != request_id)
+            {
+                return Err(HostError::Denied(
+                    "approval artifact does not match the exact Petal operation".into(),
+                ));
+            }
+            let payload_digest =
+                bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&req.preimage).into());
+            let canonical_facts = serde_json::json!({
+                "schema": "bloom.machine.petal-exact-facts.v1",
+                "request_id": request_id,
+                "package_hash": context.package_hash,
+                "route": context.route_id,
+                "wallet": req.wallet,
+                "operation_class": req.operation_class,
+                "crypto_suite": crypto_suite,
+                "payload_digest": payload_digest,
+                "claimed_hash": hex::encode(req.claimed_hash),
+                "petal_use_claim_digest": bloom_broker_api::Digest32::from_bytes(
+                    sha2::Sha256::digest(&canonical_claim).into()
+                ),
+                "claim_assurance_evidence_digest": req.claim_assurance_evidence.as_ref()
+                    .map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
+                "action_digest": req.action.as_ref().map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
+                "advisory_digest": req.advisory.as_ref().map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
+            });
+            let catalog = self.provenance_catalog.clone().ok_or_else(|| {
+                HostError::Backend("installer provenance catalog is not configured".into())
+            })?;
+            let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog);
+            let _guard = self.petal_signing_lock.lock().await;
+            let outcome = signer
+                .sign_or_prepare_petal(
+                    &exact_state_path,
+                    &request_id,
+                    &req.wallet,
+                    &req.operation_class,
+                    &req.preimage,
+                    bloom_broker_api::Digest32::from_bytes(req.claimed_hash),
+                    crypto_suite,
+                    &canonical_facts,
+                    &trusted_subject,
+                    &claim,
+                    req.claim_assurance_evidence.as_deref(),
+                )
+                .await
+                .map_err(HostError::Denied)?;
+            return match outcome {
+                bloom_vfs::ExactPayloadOutcome::ApprovalRequired {
+                    approval_id,
+                    ceremony_url,
+                    ceremony_expires_at_ms,
+                } => {
+                    Self::write_petal_signing_projection(
+                        &owner_projection_path,
+                        &PetalSigningRequestProjection {
+                            schema: PETAL_SIGNING_STATE_SCHEMA.into(),
+                            request_id: request_id.clone(),
+                            package_hash: context.package_hash.clone(),
+                            route_id: context.route_id.clone(),
+                            wallet: req.wallet.clone(),
+                            operation_class: req.operation_class.clone(),
+                            payload_digest: payload_digest.as_str().into(),
+                            approval_id: Some(approval_id.as_str().into()),
+                            status: "awaiting_owner_approval".into(),
+                            ceremony_url: Some(ceremony_url),
+                            ceremony_expires_at_ms: Some(ceremony_expires_at_ms),
+                        },
+                    )?;
+                    Ok(SignOutcome::ApprovalPending(ApprovalPending {
+                        action_id: request_id,
+                        expires_ms: ceremony_expires_at_ms,
+                    }))
+                }
+                bloom_vfs::ExactPayloadOutcome::Signed(bytes) => {
+                    Self::write_petal_signing_projection(
+                        &owner_projection_path,
+                        &PetalSigningRequestProjection {
+                            schema: PETAL_SIGNING_STATE_SCHEMA.into(),
+                            request_id,
+                            package_hash: context.package_hash.clone(),
+                            route_id: context.route_id.clone(),
+                            wallet: req.wallet.clone(),
+                            operation_class: req.operation_class.clone(),
+                            payload_digest: payload_digest.as_str().into(),
+                            approval_id: None,
+                            status: "signed".into(),
+                            ceremony_url: None,
+                            ceremony_expires_at_ms: None,
+                        },
+                    )?;
+                    Ok(SignOutcome::Signature(bytes))
+                }
+            };
+        }
         let approval_id = req
             .approval_hint
             .map(bloom_broker_api::Digest32::new)
             .transpose()
-            .map_err(|error| HostError::Invalid(error.to_string()))?;
-        let trusted_package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let selected_key_ref = req.key_ref;
         let trusted_request = TrustedPetalSignRequest {
@@ -1101,6 +1312,213 @@ impl PetalHost for DaemonPetalHost {
             }
         }
         Ok(SignOutcome::Signature(bytes))
+    }
+
+    async fn sign_payload_batch_outcome(
+        &self,
+        req: PayloadBatchSignRequest,
+    ) -> Result<PayloadBatchSignOutcome, HostError> {
+        if req.selector != bloom_broker_api::PetalSignSelector::Exact || req.key_ref.is_some() {
+            return Err(HostError::Denied(
+                "Petal payload batches require Machine-owned exact approval and root selection"
+                    .into(),
+            ));
+        }
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            HostError::Backend("SERVICE_UNAVAILABLE: Broker client is not configured".into())
+        })?;
+        let context = req.context.as_ref().ok_or_else(|| {
+            HostError::Denied("payload batch signing requires trusted Petal provenance".into())
+        })?;
+        let crypto_suite = match req.signature_algorithm.as_str() {
+            "secp256k1-keccak256-recoverable" => {
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable
+            }
+            "secp256k1-sha256-recoverable" => {
+                bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable
+            }
+            "ed25519-message" => bloom_broker_api::CryptoSuite::Ed25519Message,
+            _ => {
+                return Err(HostError::Invalid(format!(
+                    "unsupported signature algorithm {:?}",
+                    req.signature_algorithm
+                )));
+            }
+        };
+        let claim: bloom_broker_api::PetalUseClaim =
+            serde_json::from_slice(&req.petal_use_claim_jcs)
+                .map_err(|error| HostError::Invalid(format!("decode PetalUseClaim: {error}")))?;
+        let canonical_claim = serde_jcs::to_vec(&claim)
+            .map_err(|error| HostError::Invalid(format!("canonicalize PetalUseClaim: {error}")))?;
+        if canonical_claim != req.petal_use_claim_jcs {
+            return Err(HostError::Invalid(
+                "PetalUseClaim must use exact RFC 8785 canonical JSON".into(),
+            ));
+        }
+        let preimages = req
+            .payloads
+            .iter()
+            .map(|item| item.preimage.clone())
+            .collect::<Vec<_>>();
+        let claimed_hashes = req
+            .payloads
+            .iter()
+            .map(|item| bloom_broker_api::Digest32::from_bytes(item.claimed_hash))
+            .collect::<Vec<_>>();
+        let recomputed_hashes = preimages
+            .iter()
+            .map(|payload| match crypto_suite {
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable => {
+                    bloom_broker_api::Digest32::from_bytes(
+                        alloy::primitives::keccak256(payload).into(),
+                    )
+                }
+                bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable
+                | bloom_broker_api::CryptoSuite::Ed25519Message => {
+                    bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(payload).into())
+                }
+            })
+            .collect::<Vec<_>>();
+        if claimed_hashes != recomputed_hashes {
+            return Err(HostError::Denied(
+                "payload batch claimed hashes do not match exact payload bytes".into(),
+            ));
+        }
+        let mut batch_hasher = sha2::Sha256::new();
+        batch_hasher.update(b"bloom.petal.payload-batch.v1\0");
+        batch_hasher.update((preimages.len() as u64).to_be_bytes());
+        for payload in &preimages {
+            batch_hasher.update((payload.len() as u64).to_be_bytes());
+            batch_hasher.update(payload);
+        }
+        let batch_digest_bytes: [u8; 32] = batch_hasher.finalize().into();
+        let batch_digest = bloom_broker_api::Digest32::from_bytes(batch_digest_bytes);
+        let trusted_package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        if claim.package_hash != trusted_package_hash
+            || claim.route != context.route_id
+            || claim.operation_class.as_str() != req.operation_class
+            || claim.crypto_suite != crypto_suite
+            || claim.payload_digest != batch_digest
+            || claim.ordered_hashes != recomputed_hashes
+        {
+            return Err(HostError::Denied(
+                "payload batch claim does not match trusted route or exact ordered payloads".into(),
+            ));
+        }
+        let trusted_subject = bloom_broker_api::ProvenanceSubject::Petal {
+            package_hash: trusted_package_hash,
+            route: context.route_id.clone(),
+        };
+        let (request_id, exact_state_path, owner_projection_path) = self.petal_signing_paths(
+            context,
+            &req.wallet,
+            &req.operation_class,
+            &batch_digest_bytes,
+            &canonical_claim,
+        )?;
+        if req
+            .approval_hint
+            .as_deref()
+            .is_some_and(|hint| hint != request_id)
+        {
+            return Err(HostError::Denied(
+                "approval artifact does not match the exact Petal batch operation".into(),
+            ));
+        }
+        let payload_digests = preimages
+            .iter()
+            .map(|payload| {
+                bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(payload).into())
+            })
+            .collect::<Vec<_>>();
+        let canonical_facts = serde_json::json!({
+            "schema": "bloom.machine.petal-exact-batch-facts.v1",
+            "request_id": request_id,
+            "package_hash": context.package_hash,
+            "route": context.route_id,
+            "wallet": req.wallet,
+            "operation_class": req.operation_class,
+            "crypto_suite": crypto_suite,
+            "batch_payload_digest": batch_digest,
+            "ordered_payload_digests": payload_digests,
+            "ordered_hashes": recomputed_hashes,
+            "petal_use_claim_digest": bloom_broker_api::Digest32::from_bytes(
+                sha2::Sha256::digest(&canonical_claim).into()
+            ),
+            "claim_assurance_evidence_digest": req.claim_assurance_evidence.as_ref()
+                .map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
+            "action_digest": req.action.as_ref().map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
+            "advisory_digest": req.advisory.as_ref().map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
+        });
+        let catalog = self.provenance_catalog.clone().ok_or_else(|| {
+            HostError::Backend("installer provenance catalog is not configured".into())
+        })?;
+        let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog);
+        let _guard = self.petal_signing_lock.lock().await;
+        let outcome = signer
+            .sign_or_prepare_petal_batch(
+                &exact_state_path,
+                &request_id,
+                &req.wallet,
+                &req.operation_class,
+                &preimages,
+                &claimed_hashes,
+                crypto_suite,
+                &canonical_facts,
+                &trusted_subject,
+                &claim,
+                req.claim_assurance_evidence.as_deref(),
+            )
+            .await
+            .map_err(HostError::Denied)?;
+        match outcome {
+            bloom_vfs::ExactPayloadBatchOutcome::ApprovalRequired {
+                approval_id,
+                ceremony_url,
+                ceremony_expires_at_ms,
+            } => {
+                Self::write_petal_signing_projection(
+                    &owner_projection_path,
+                    &PetalSigningRequestProjection {
+                        schema: PETAL_SIGNING_STATE_SCHEMA.into(),
+                        request_id: request_id.clone(),
+                        package_hash: context.package_hash.clone(),
+                        route_id: context.route_id.clone(),
+                        wallet: req.wallet,
+                        operation_class: req.operation_class,
+                        payload_digest: batch_digest.as_str().into(),
+                        approval_id: Some(approval_id.as_str().into()),
+                        status: "awaiting_owner_approval".into(),
+                        ceremony_url: Some(ceremony_url),
+                        ceremony_expires_at_ms: Some(ceremony_expires_at_ms),
+                    },
+                )?;
+                Ok(PayloadBatchSignOutcome::ApprovalPending(ApprovalPending {
+                    action_id: request_id,
+                    expires_ms: ceremony_expires_at_ms,
+                }))
+            }
+            bloom_vfs::ExactPayloadBatchOutcome::Signed(signatures) => {
+                Self::write_petal_signing_projection(
+                    &owner_projection_path,
+                    &PetalSigningRequestProjection {
+                        schema: PETAL_SIGNING_STATE_SCHEMA.into(),
+                        request_id,
+                        package_hash: context.package_hash.clone(),
+                        route_id: context.route_id.clone(),
+                        wallet: req.wallet,
+                        operation_class: req.operation_class,
+                        payload_digest: batch_digest.as_str().into(),
+                        approval_id: None,
+                        status: "signed".into(),
+                        ceremony_url: None,
+                        ceremony_expires_at_ms: None,
+                    },
+                )?;
+                Ok(PayloadBatchSignOutcome::Signatures(signatures))
+            }
+        }
     }
 
     async fn evm_tx_stage(
@@ -2445,6 +2863,7 @@ impl Daemon {
             .with_broker(broker.clone())
             .with_provenance_catalog(provenance_catalog.clone())
             .with_petal_key_state_root(home.cache_dir().join("petal-key-requests"))
+            .with_petal_signing_state_root(home.cache_dir().join("petal-signing-requests"))
             .with_tx_outbox(PetalTxOutbox {
                 tx_engine: tx_engine.clone(),
                 chains: chains.clone(),
@@ -2463,6 +2882,13 @@ impl Daemon {
                 "petal-key-requests",
                 Arc::new(PetalKeyRequestsHandler::new(
                     home.cache_dir().join("petal-key-requests"),
+                )) as _,
+            )
+            .mount(
+                "petal-signing-requests",
+                Arc::new(PetalSigningRequestsHandler::new(
+                    home.cache_dir().join("petal-signing-requests"),
+                    broker.clone(),
                 )) as _,
             )
             .mount(
@@ -3294,6 +3720,164 @@ mod tests {
         child: bloom_broker_api::KeyRef,
     }
 
+    struct PetalExactBrokerFixture {
+        active: std::sync::atomic::AtomicBool,
+        requests: std::sync::Mutex<Vec<MachineBrokerRequest>>,
+        root: bloom_broker_api::KeyRef,
+    }
+
+    impl PetalExactBrokerFixture {
+        fn new() -> Self {
+            Self {
+                active: std::sync::atomic::AtomicBool::new(false),
+                requests: std::sync::Mutex::new(Vec::new()),
+                root: bloom_broker_api::KeyRef {
+                    backend: bloom_broker_api::Token::new("local").unwrap(),
+                    backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
+                    locator: "wallet/primary/root".into(),
+                    key_spec: bloom_broker_api::KeySpec::Secp256k1,
+                    public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([0x31; 32]),
+                    derivation: None,
+                },
+            }
+        }
+    }
+
+    impl MachineBrokerService for PetalExactBrokerFixture {
+        fn dispatch<'a>(
+            &'a self,
+            request: MachineBrokerRequest,
+        ) -> bloom_broker_api::ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async move {
+                self.requests.lock().unwrap().push(request.clone());
+                match request {
+                    MachineBrokerRequest::WalletGetPublic(request) => Ok(
+                        MachineBrokerResponse::WalletGetPublic(bloom_broker_api::WalletPublic {
+                            wallet_id: request.wallet_id,
+                            wallet_kind: bloom_broker_api::Token::new("local").unwrap(),
+                            root_key_ref: self.root.clone(),
+                            key_refs: vec![self.root.clone()],
+                            policy_version: bloom_broker_api::DecimalU64::new(1),
+                            policy_digest: bloom_broker_api::Digest32::from_bytes([0x32; 32]),
+                            wallet_revocation_epoch: bloom_broker_api::DecimalU64::new(0),
+                        }),
+                    ),
+                    MachineBrokerRequest::KeyGetPublic(request) => {
+                        assert_eq!(request.key_ref, self.root);
+                        Ok(MachineBrokerResponse::KeyGetPublic(
+                            bloom_broker_api::KeyPublic {
+                                key_ref: self.root.clone(),
+                                role: bloom_broker_api::KeyRole::WalletRoot,
+                                canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(
+                                    &[0x02; 33],
+                                ),
+                                addresses: vec![
+                                    "0x0000000000000000000000000000000000000001".into(),
+                                ],
+                                supported_crypto_suites: vec![
+                                    bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
+                                ],
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::SealedApprovalPrepare(request) => {
+                        Ok(MachineBrokerResponse::SealedApprovalPrepare(
+                            bloom_broker_api::SealedApprovalPrepareResponse {
+                                approval_id: request.terms.approval_id()?,
+                                state: bloom_broker_api::ApprovalPrepareState::AwaitingCeremony,
+                                ceremony_url: "http://localhost:18734/ceremony/exact-owner-secret"
+                                    .into(),
+                                ceremony_expires_at_ms: request.terms.expires_at_ms,
+                                review_manifest_digest: bloom_broker_api::Digest32::from_bytes(
+                                    [0x33; 32],
+                                ),
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::SealedApprovalStatus(request) => {
+                        let active = self.active.load(std::sync::atomic::Ordering::SeqCst);
+                        Ok(MachineBrokerResponse::SealedApprovalStatus(
+                            bloom_broker_api::ApprovalPublicStatus {
+                                approval_id: request.id,
+                                wallet_id: bloom_broker_api::Token::new("primary").unwrap(),
+                                state: if active {
+                                    bloom_broker_api::ApprovalLifecycleState::Active
+                                } else {
+                                    bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
+                                },
+                                effective_claim_assurance: None,
+                                ceremony_url: (!active).then(|| {
+                                    "http://localhost:18734/ceremony/exact-owner-secret".into()
+                                }),
+                                ceremony_expires_at_ms: (!active)
+                                    .then(|| bloom_broker_api::DecimalU64::new(u64::MAX)),
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::SigningSign(request) => {
+                        if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                bloom_broker_api::ProtocolErrorCode::ApprovalNotFound,
+                                "approval is not active",
+                            ));
+                        }
+                        Ok(MachineBrokerResponse::SigningSign(
+                            bloom_broker_api::SigningResult {
+                                operation_id: request.operation_id,
+                                operation_digest: request.operation_digest,
+                                signatures: vec![bloom_broker_api::NormalizedSignature {
+                                    crypto_suite: request.crypto_suite,
+                                    bytes: bloom_broker_api::Base64UrlBytes::from_bytes(
+                                        &[0x34; 65],
+                                    ),
+                                }],
+                                signer_receipt_digest: bloom_broker_api::Digest32::from_bytes(
+                                    [0x35; 32],
+                                ),
+                                broker_receipt_digest: bloom_broker_api::Digest32::from_bytes(
+                                    [0x36; 32],
+                                ),
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::SigningSignBatch(request) => {
+                        if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                bloom_broker_api::ProtocolErrorCode::ApprovalNotFound,
+                                "approval is not active",
+                            ));
+                        }
+                        let count = match &request.payloads {
+                            bloom_broker_api::SigningPayloads::Batch { children } => children.len(),
+                            bloom_broker_api::SigningPayloads::Single { .. } => 1,
+                        };
+                        Ok(MachineBrokerResponse::SigningSignBatch(
+                            bloom_broker_api::SigningResult {
+                                operation_id: request.operation_id,
+                                operation_digest: request.operation_digest,
+                                signatures: (0..count)
+                                    .map(|index| bloom_broker_api::NormalizedSignature {
+                                        crypto_suite: request.crypto_suite,
+                                        bytes: bloom_broker_api::Base64UrlBytes::from_bytes(
+                                            &[0x40 + index as u8; 65],
+                                        ),
+                                    })
+                                    .collect(),
+                                signer_receipt_digest: bloom_broker_api::Digest32::from_bytes(
+                                    [0x35; 32],
+                                ),
+                                broker_receipt_digest: bloom_broker_api::Digest32::from_bytes(
+                                    [0x36; 32],
+                                ),
+                            },
+                        ))
+                    }
+                    other => panic!("unexpected exact Petal Broker request: {other:?}"),
+                }
+            })
+        }
+    }
+
     impl PetalKeyBrokerFixture {
         fn new() -> Self {
             let key_ref = |locator: &str, fingerprint: u8| bloom_broker_api::KeyRef {
@@ -3330,6 +3914,7 @@ mod tests {
                             bloom_broker_api::WalletPublic {
                                 wallet_id: request.wallet_id,
                                 wallet_kind: bloom_broker_api::Token::new("local").unwrap(),
+                                root_key_ref: self.parent.clone(),
                                 // A previously derived Petal child is also in the public
                                 // projection. It must never make root selection ambiguous.
                                 key_refs: vec![self.parent.clone(), self.child.clone()],
@@ -3387,6 +3972,7 @@ mod tests {
                         Ok(MachineBrokerResponse::KeyGetPublic(
                             bloom_broker_api::KeyPublic {
                                 key_ref: self.child.clone(),
+                                role: bloom_broker_api::KeyRole::Derived,
                                 canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(
                                     &[7; 33],
                                 ),
@@ -3734,6 +4320,304 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_petal_approval_is_owner_only_and_retries_the_frozen_payload_after_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("petal-signing-requests");
+        let broker = Arc::new(PetalExactBrokerFixture::new());
+        let machine_broker = MachineBrokerClient::new(broker.clone());
+        let late_vfs = Arc::new(LateVfsHost::new());
+        let owner_vfs = Arc::new(
+            Vfs::builder()
+                .mount(
+                    "petal-signing-requests",
+                    Arc::new(PetalSigningRequestsHandler::new(
+                        state_root.clone(),
+                        Some(machine_broker.clone()),
+                    )),
+                )
+                .build(),
+        );
+        late_vfs.set(owner_vfs.clone());
+        let subject = bloom_broker_api::ProvenanceSubject::Petal {
+            package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
+            route: "r000009".into(),
+        };
+        let host = DaemonPetalHost::new(
+            late_vfs,
+            Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap()),
+        )
+        .with_broker(Some(machine_broker))
+        .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![bloom_broker_api::ProvenanceRecord {
+                subject: subject.clone(),
+                publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
+                operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    operation_class: bloom_broker_api::Token::new("order.place").unwrap(),
+                    fee_asset: None,
+                }],
+                installer_key_id: bloom_broker_api::Token::new("fixture-installer").unwrap(),
+                installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[0x55; 64]),
+            }],
+        }))
+        .with_petal_signing_state_root(state_root.clone());
+        let context = PetalRouteContext {
+            petal_root: "exchange".into(),
+            package_hash: "bb".repeat(32),
+            route_id: "r000009".into(),
+            op: "write".into(),
+            path: "orders/new".into(),
+            params: Vec::new(),
+            actor: None,
+        };
+        let payload = b"exact owner order".to_vec();
+        let payload_digest =
+            bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&payload).into());
+        let claim = bloom_broker_api::PetalUseClaim {
+            package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
+            route: context.route_id.clone(),
+            operation_class: bloom_broker_api::Token::new("order.place").unwrap(),
+            crypto_suite: bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
+            payload_digest: payload_digest.clone(),
+            ordered_hashes: vec![payload_digest.clone()],
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: bloom_broker_api::DeclaredFee::None,
+            nonce: bloom_broker_api::RequestNonce::from_bytes([0x37; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        };
+        let mut request = PayloadSignRequest {
+            wallet: "primary".into(),
+            preimage: payload.clone(),
+            claimed_hash: payload_digest.to_bytes(),
+            signature_algorithm: "secp256k1-sha256-recoverable".into(),
+            operation_class: "order.place".into(),
+            petal_use_claim_jcs: serde_jcs::to_vec(&claim).unwrap(),
+            claim_assurance_evidence: Some(b"fixture-assurance".to_vec()),
+            approval_hint: None,
+            action: Some(b"place BTC order".to_vec()),
+            advisory: None,
+            selector: bloom_broker_api::PetalSignSelector::Exact,
+            key_ref: None,
+            context: Some(context),
+        };
+
+        let SignOutcome::ApprovalPending(pending) =
+            host.sign_payload_outcome(request.clone()).await.unwrap()
+        else {
+            panic!("first exact attempt must return a safe pending result");
+        };
+        assert!(!pending.action_id.contains("ceremony"));
+        assert!(!pending.action_id.contains("exact-owner-secret"));
+        let record = format!("{}.json", pending.action_id);
+        let owner_path = VfsPath::parse(&format!("petal-signing-requests/{record}")).unwrap();
+        let awaiting: PetalSigningRequestProjection =
+            serde_json::from_slice(&owner_vfs.read(&owner_path).await.unwrap()).unwrap();
+        assert_eq!(awaiting.status, "awaiting_owner_approval");
+        assert_eq!(
+            awaiting.ceremony_url.as_deref(),
+            Some("http://localhost:18734/ceremony/exact-owner-secret")
+        );
+        assert_ne!(pending.action_id, awaiting.approval_id.as_deref().unwrap());
+        let guest_error = host
+            .vfs_read(&format!("petal-signing-requests/{record}"))
+            .await
+            .unwrap_err();
+        assert!(matches!(guest_error, HostError::Denied(_)));
+
+        broker
+            .active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        request.approval_hint = Some(pending.action_id);
+        let active: PetalSigningRequestProjection =
+            serde_json::from_slice(&owner_vfs.read(&owner_path).await.unwrap()).unwrap();
+        assert_eq!(active.status, "approved_retry_required");
+        assert!(active.ceremony_url.is_none());
+
+        let signed = host.sign_payload_outcome(request).await.unwrap();
+        assert_eq!(signed, SignOutcome::Signature(vec![0x34; 65]));
+        let completed: PetalSigningRequestProjection =
+            serde_json::from_slice(&owner_vfs.read(&owner_path).await.unwrap()).unwrap();
+        assert_eq!(completed.status, "signed");
+        assert!(completed.ceremony_url.is_none());
+        assert!(completed.approval_id.is_none());
+
+        let requests = broker.requests.lock().unwrap();
+        let prepared = requests.iter().find_map(|request| match request {
+            MachineBrokerRequest::SealedApprovalPrepare(request) => Some(request),
+            _ => None,
+        });
+        let signed = requests.iter().find_map(|request| match request {
+            MachineBrokerRequest::SigningSign(request) => Some(request),
+            _ => None,
+        });
+        let (prepared, signed) = (prepared.unwrap(), signed.unwrap());
+        assert_eq!(
+            prepared.terms.selector,
+            bloom_broker_api::ApprovalSelector::Exact {
+                ordered_payload_digests: vec![payload_digest.clone()],
+                ordered_hashes: vec![payload_digest],
+            }
+        );
+        assert_eq!(
+            signed.payloads,
+            bloom_broker_api::SigningPayloads::Single {
+                payload: bloom_broker_api::Base64UrlBytes::from_bytes(&payload),
+            }
+        );
+        assert_eq!(
+            signed.crypto_suite,
+            bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_petal_batch_is_atomic_and_rejects_an_old_hint_after_reorder() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("petal-signing-requests");
+        let broker = Arc::new(PetalExactBrokerFixture::new());
+        let machine_broker = MachineBrokerClient::new(broker.clone());
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap()),
+        )
+        .with_broker(Some(machine_broker))
+        .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![bloom_broker_api::ProvenanceRecord {
+                subject: bloom_broker_api::ProvenanceSubject::Petal {
+                    package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
+                    route: "r000010".into(),
+                },
+                publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
+                operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    operation_class: bloom_broker_api::Token::new("order.batch").unwrap(),
+                    fee_asset: None,
+                }],
+                installer_key_id: bloom_broker_api::Token::new("fixture-installer").unwrap(),
+                installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[0x55; 64]),
+            }],
+        }))
+        .with_petal_signing_state_root(state_root);
+        let context = PetalRouteContext {
+            petal_root: "exchange".into(),
+            package_hash: "bb".repeat(32),
+            route_id: "r000010".into(),
+            op: "write".into(),
+            path: "orders/batch".into(),
+            params: Vec::new(),
+            actor: None,
+        };
+        let preimages = [b"first exact payload".to_vec(), b"second".to_vec()];
+        let hashes = preimages
+            .iter()
+            .map(|payload| {
+                bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(payload).into())
+            })
+            .collect::<Vec<_>>();
+        let batch_digest = |payloads: &[Vec<u8>]| {
+            let mut digest = sha2::Sha256::new();
+            digest.update(b"bloom.petal.payload-batch.v1\0");
+            digest.update((payloads.len() as u64).to_be_bytes());
+            for payload in payloads {
+                digest.update((payload.len() as u64).to_be_bytes());
+                digest.update(payload);
+            }
+            bloom_broker_api::Digest32::from_bytes(digest.finalize().into())
+        };
+        let claim = bloom_broker_api::PetalUseClaim {
+            package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
+            route: context.route_id.clone(),
+            operation_class: bloom_broker_api::Token::new("order.batch").unwrap(),
+            crypto_suite: bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
+            payload_digest: batch_digest(&preimages),
+            ordered_hashes: hashes.clone(),
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: bloom_broker_api::DeclaredFee::None,
+            nonce: bloom_broker_api::RequestNonce::from_bytes([0x48; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        };
+        let mut request = PayloadBatchSignRequest {
+            wallet: "primary".into(),
+            payloads: preimages
+                .iter()
+                .zip(&hashes)
+                .map(|(preimage, hash)| bloom_petals::PayloadSignItem {
+                    preimage: preimage.clone(),
+                    claimed_hash: hash.to_bytes(),
+                })
+                .collect(),
+            signature_algorithm: "secp256k1-sha256-recoverable".into(),
+            operation_class: "order.batch".into(),
+            petal_use_claim_jcs: serde_jcs::to_vec(&claim).unwrap(),
+            claim_assurance_evidence: None,
+            approval_hint: None,
+            action: Some(b"two exact orders".to_vec()),
+            advisory: None,
+            selector: bloom_broker_api::PetalSignSelector::Exact,
+            key_ref: None,
+            context: Some(context),
+        };
+
+        let PayloadBatchSignOutcome::ApprovalPending(pending) = host
+            .sign_payload_batch_outcome(request.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("first batch attempt must return a safe pending result");
+        };
+        assert!(!pending.action_id.contains("ceremony"));
+        request.approval_hint = Some(pending.action_id.clone());
+        let mut reordered = request.clone();
+        reordered.payloads.swap(0, 1);
+        let reordered_preimages = reordered
+            .payloads
+            .iter()
+            .map(|item| item.preimage.clone())
+            .collect::<Vec<_>>();
+        let mut reordered_claim = claim;
+        reordered_claim.payload_digest = batch_digest(&reordered_preimages);
+        reordered_claim.ordered_hashes.reverse();
+        reordered.petal_use_claim_jcs = serde_jcs::to_vec(&reordered_claim).unwrap();
+        let error = host
+            .sign_payload_batch_outcome(reordered)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("approval artifact does not match")
+        );
+
+        broker
+            .active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let PayloadBatchSignOutcome::Signatures(signatures) =
+            host.sign_payload_batch_outcome(request).await.unwrap()
+        else {
+            panic!("approved retry must return the complete signature batch");
+        };
+        assert_eq!(signatures, vec![vec![0x40; 65], vec![0x41; 65]]);
+        let requests = broker.requests.lock().unwrap();
+        let signed = requests.iter().find_map(|request| match request {
+            MachineBrokerRequest::SigningSignBatch(request) => Some(request),
+            _ => None,
+        });
+        let bloom_broker_api::SigningPayloads::Batch { children } = &signed.unwrap().payloads
+        else {
+            panic!("Petal batch must use signing.sign_batch");
+        };
+        assert_eq!(
+            children,
+            &preimages
+                .iter()
+                .map(|payload| bloom_broker_api::Base64UrlBytes::from_bytes(payload))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn petal_guest_vfs_cannot_reach_owner_only_key_ceremony_projection() {
         let directory = tempfile::tempdir().unwrap();
         let state_root = directory.path().join("petal-key-requests");
@@ -3807,6 +4691,11 @@ mod tests {
         let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
         let guest = DaemonPetalHost::new(late_vfs, audit);
         let protected = vec![
+            "wallets/new".to_string(),
+            "wallets/registrations".to_string(),
+            format!("wallets/registrations/{}/status.json", "22".repeat(32)),
+            format!("wallets/registrations/{}/result.json", "22".repeat(32)),
+            format!("wallets/registrations/{}/cancel", "22".repeat(32)),
             "wallets/alice/sealed-approvals/new.json".to_string(),
             format!("wallets/alice/sealed-approvals/{}/renew", "11".repeat(32)),
             "wallets/alice/policy-updates/latest/approval_challenge.json".to_string(),

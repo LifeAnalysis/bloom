@@ -21,7 +21,7 @@ use assert_cmd::Command;
 use async_trait::async_trait;
 use bloom_broker_api::{
     Base64UrlBytes, CanonicalWalletPolicy, CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef,
-    KeySpec, SignedPolicySnapshot, Token, WalletPublic,
+    KeyRole, KeySpec, SignedPolicySnapshot, Token, WalletPublic,
 };
 use bloom_machine_client::{ProjectionFreshness, ProjectionVerification, WalletProjection};
 use bloom_vfs::{Entry, Handler, HandlerError, VfsPath};
@@ -131,6 +131,7 @@ fn seed_wallet_projection_fixture(home: &Path, name: &str) {
     let wallet = WalletPublic {
         wallet_id: wallet_id.clone(),
         wallet_kind: Token::new("passkey").unwrap(),
+        root_key_ref: key_ref.clone(),
         key_refs: vec![key_ref.clone()],
         policy_version: DecimalU64::new(1),
         policy_digest: policy_digest.clone(),
@@ -138,6 +139,7 @@ fn seed_wallet_projection_fixture(home: &Path, name: &str) {
     };
     let keys = vec![KeyPublic {
         key_ref,
+        role: KeyRole::WalletRoot,
         canonical_public_key: Base64UrlBytes::from_bytes(&[4; 33]),
         addresses: vec!["0x0000000000000000000000000000000000000001".into()],
         supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],

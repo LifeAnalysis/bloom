@@ -43,8 +43,9 @@ use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
     ChainRequest, ChainResponse, DispatchOp, DispatchRequest, DispatchResponse,
-    EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest, PayloadSignRequest,
-    PetalKeyGuestRequest, PetalKeyRequest, PetalRouteContext, SignOutcome,
+    EvmOutboxInspection, EvmOutboxOutcome, EvmTransactionRequest, PayloadBatchSignOutcome,
+    PayloadBatchSignRequest, PayloadSignItem, PayloadSignRequest, PetalKeyGuestRequest,
+    PetalKeyRequest, PetalRouteContext, SignOutcome,
 };
 use crate::error::PetalError;
 use crate::host::{HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
@@ -57,6 +58,9 @@ const DEFAULT_MEMORY_PAGES: u32 = 256; // 16 MiB (64 KiB pages).
 const STDOUT_CAP: usize = 1 << 20; // 1 MiB.
 const DEFAULT_HTTP_RESPONSE_CAP: usize = 8 * 1024 * 1024;
 const DEFAULT_RANDOM_BYTES_CAP: u32 = 1024 * 1024;
+const MAX_SIGN_BATCH_ITEMS: usize = 32;
+const MAX_SIGN_BATCH_CHILD_BYTES: usize = 64 * 1024;
+const MAX_SIGN_BATCH_PAYLOAD_BYTES: usize = 512 * 1024;
 pub(crate) const COMPONENT_NOT_A_DIR_CODE: i32 = -101;
 pub(crate) const COMPONENT_UNSUPPORTED_CODE: i32 = -102;
 
@@ -812,6 +816,15 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
         })?;
     }
     {
+        let mut sign = linker.instance("bloom:sign/signing@0.4.0")?;
+        sign.func_new_async("sign-payload", |store, params, results| {
+            Box::new(async move { component_sign_payload_v4(store, params, results).await })
+        })?;
+        sign.func_new_async("sign-payload-batch", |store, params, results| {
+            Box::new(async move { component_sign_payload_batch(store, params, results).await })
+        })?;
+    }
+    {
         let mut key = linker.instance("bloom:key/derive@0.1.0")?;
         key.func_new_async("request", |store, params, results| {
             Box::new(async move { component_petal_key_request(store, params, results).await })
@@ -1226,7 +1239,7 @@ async fn component_sign_payload(
     params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
-    component_sign_payload_versioned(store, params, results, false).await
+    component_sign_payload_versioned(store, params, results, false, false).await
 }
 
 async fn component_sign_payload_scoped(
@@ -1234,7 +1247,15 @@ async fn component_sign_payload_scoped(
     params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
-    component_sign_payload_versioned(store, params, results, true).await
+    component_sign_payload_versioned(store, params, results, true, false).await
+}
+
+async fn component_sign_payload_v4(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    component_sign_payload_versioned(store, params, results, true, true).await
 }
 
 async fn component_sign_payload_versioned(
@@ -1242,8 +1263,14 @@ async fn component_sign_payload_versioned(
     params: &[ComponentVal],
     results: &mut [ComponentVal],
     allow_explicit_key: bool,
+    safe_pending: bool,
 ) -> anyhow::Result<()> {
-    let req = match component_payload_sign_request(store.data(), params, allow_explicit_key) {
+    let req = match component_payload_sign_request(
+        store.data(),
+        params,
+        allow_explicit_key,
+        safe_pending,
+    ) {
         Ok(req) => req,
         Err(err) => return set_component_result(results, component_host_err(err)),
     };
@@ -1261,13 +1288,70 @@ async fn component_sign_payload_versioned(
                 "sign-payload returned a signature with the wrong normalized encoding".into(),
             )),
         ),
+        Ok(SignOutcome::ApprovalPending(approval)) if safe_pending => set_component_result(
+            results,
+            component_sign_approval_pending(approval.action_id, approval.expires_ms),
+        ),
+        Ok(SignOutcome::ApprovalPending(approval)) => set_component_result(
+            results,
+            component_host_err(legacy_approval_pending_error(
+                &approval.action_id,
+                approval.expires_ms,
+            )),
+        ),
+        Ok(SignOutcome::ApprovalRequired(approval)) if safe_pending => set_component_result(
+            results,
+            component_sign_approval_pending(approval.action_id, approval.expires_ms),
+        ),
         Ok(SignOutcome::ApprovalRequired(approval)) => set_component_result(
             results,
-            component_sign_approval_required(
-                approval.action_id,
-                approval.ceremony_url,
+            component_host_err(legacy_approval_pending_error(
+                &approval.action_id,
                 approval.expires_ms,
-            ),
+            )),
+        ),
+        Err(err) => set_component_result(results, component_host_err(err)),
+    }
+}
+
+fn legacy_approval_pending_error(action_id: &str, expires_ms: u64) -> HostError {
+    const MAX_ACTION_ID_CHARS: usize = 128;
+    let bounded_action_id: String = action_id.chars().take(MAX_ACTION_ID_CHARS).collect();
+    HostError::Backend(format!(
+        "APPROVAL_PENDING action_id={bounded_action_id:?} expires_ms={expires_ms}; retry after owner approval"
+    ))
+}
+
+async fn component_sign_payload_batch(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    let req = match component_payload_batch_sign_request(store.data(), params) {
+        Ok(req) => req,
+        Err(err) => return set_component_result(results, component_host_err(err)),
+    };
+    let expected_count = req.payloads.len();
+    let expected_signature_len = payload_signature_len(&req.signature_algorithm);
+    let host = store.data().host.clone();
+    match host.sign_payload_batch_outcome(req).await {
+        Ok(PayloadBatchSignOutcome::Signatures(signatures))
+            if signatures.len() == expected_count
+                && expected_signature_len.is_some_and(|length| {
+                    signatures.iter().all(|signature| signature.len() == length)
+                }) =>
+        {
+            set_component_result(results, component_sign_batch_signatures(signatures))
+        }
+        Ok(PayloadBatchSignOutcome::Signatures(_)) => set_component_result(
+            results,
+            component_host_err(HostError::Backend(
+                "sign-payload-batch returned the wrong count or normalized encoding".into(),
+            )),
+        ),
+        Ok(PayloadBatchSignOutcome::ApprovalPending(approval)) => set_component_result(
+            results,
+            component_sign_approval_pending(approval.action_id, approval.expires_ms),
         ),
         Err(err) => set_component_result(results, component_host_err(err)),
     }
@@ -1352,6 +1436,7 @@ fn component_payload_sign_request(
     data: &StoreData,
     params: &[ComponentVal],
     allow_explicit_key: bool,
+    validate_claim_jcs: bool,
 ) -> Result<PayloadSignRequest, HostError> {
     if !data.caps.contains(&Capability::Sign) {
         log_denied(data, "component_sign_payload");
@@ -1362,7 +1447,7 @@ fn component_payload_sign_request(
             "invalid bloom:sign.sign-payload params".into(),
         ));
     };
-    component_payload_sign_record(data, fields, allow_explicit_key)
+    component_payload_sign_record(data, fields, allow_explicit_key, validate_claim_jcs)
 }
 
 fn payload_signature_len(algorithm: &str) -> Option<usize> {
@@ -1377,6 +1462,7 @@ fn component_payload_sign_record(
     data: &StoreData,
     fields: &[(String, ComponentVal)],
     allow_explicit_key: bool,
+    validate_claim_jcs: bool,
 ) -> Result<PayloadSignRequest, HostError> {
     let wallet = component_record_string(fields, "wallet")?;
     let preimage = component_record_bytes(fields, "preimage")?;
@@ -1402,6 +1488,19 @@ fn component_payload_sign_record(
         return Err(HostError::Denied(format!(
             "sign operation class {operation_class:?} is not allowed"
         )));
+    }
+    if validate_claim_jcs {
+        validate_petal_use_claim_jcs(&petal_use_claim_jcs)?;
+        if preimage.is_empty() {
+            return Err(HostError::Invalid(
+                "sign-payload requires a non-empty preimage".into(),
+            ));
+        }
+        if payload_signature_len(&signature_algorithm).is_none() {
+            return Err(HostError::Invalid(format!(
+                "unsupported payload signature algorithm {signature_algorithm:?}"
+            )));
+        }
     }
     let mut hash32 = [0u8; 32];
     hash32.copy_from_slice(&claimed_hash);
@@ -1469,6 +1568,153 @@ fn component_payload_sign_record(
     })
 }
 
+fn component_payload_batch_sign_request(
+    data: &StoreData,
+    params: &[ComponentVal],
+) -> Result<PayloadBatchSignRequest, HostError> {
+    if !data.caps.contains(&Capability::Sign) {
+        log_denied(data, "component_sign_payload_batch");
+        return Err(HostError::Denied("sign".into()));
+    }
+    let [ComponentVal::Record(fields)] = params else {
+        return Err(HostError::Invalid(
+            "invalid bloom:sign.sign-payload-batch params".into(),
+        ));
+    };
+    let wallet = component_record_string(fields, "wallet")?;
+    let signature_algorithm = component_record_string(fields, "signature-algorithm")?;
+    let operation_class = component_record_string(fields, "operation-class")?;
+    let petal_use_claim_jcs = component_record_bytes(fields, "petal-use-claim-jcs")?;
+    if wallet.trim().is_empty() || operation_class.trim().is_empty() {
+        return Err(HostError::Invalid(
+            "payload batch identity fields must be non-empty".into(),
+        ));
+    }
+    if payload_signature_len(&signature_algorithm).is_none() {
+        return Err(HostError::Invalid(format!(
+            "unsupported payload signature algorithm {signature_algorithm:?}"
+        )));
+    }
+    if !sign_intent_allowed(data, &operation_class) {
+        return Err(HostError::Denied(format!(
+            "sign operation class {operation_class:?} is not allowed"
+        )));
+    }
+    validate_petal_use_claim_jcs(&petal_use_claim_jcs)?;
+
+    let ComponentVal::List(items) = component_record_field(fields, "payloads")? else {
+        return Err(HostError::Invalid(
+            "payloads must be a list of payload-sign-item records".into(),
+        ));
+    };
+    if items.is_empty() || items.len() > MAX_SIGN_BATCH_ITEMS {
+        return Err(HostError::Invalid(format!(
+            "payload batch must contain 1..={MAX_SIGN_BATCH_ITEMS} items"
+        )));
+    }
+    let mut total_bytes = 0usize;
+    let mut payloads = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let ComponentVal::Record(item_fields) = item else {
+            return Err(HostError::Invalid(format!(
+                "payload item {index} must be a record"
+            )));
+        };
+        let preimage = component_record_bytes(item_fields, "preimage")?;
+        if preimage.is_empty() {
+            return Err(HostError::Invalid(format!(
+                "payload item {index} has an empty preimage"
+            )));
+        }
+        if preimage.len() > MAX_SIGN_BATCH_CHILD_BYTES {
+            return Err(HostError::Invalid(format!(
+                "payload item {index} exceeds {MAX_SIGN_BATCH_CHILD_BYTES} bytes"
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(preimage.len())
+            .ok_or_else(|| HostError::Invalid("payload batch byte count overflowed".into()))?;
+        if total_bytes > MAX_SIGN_BATCH_PAYLOAD_BYTES {
+            return Err(HostError::Invalid(format!(
+                "payload batch exceeds {MAX_SIGN_BATCH_PAYLOAD_BYTES} bytes"
+            )));
+        }
+        let claimed_hash = component_record_bytes(item_fields, "claimed-hash")?;
+        if claimed_hash.len() != 32 {
+            return Err(HostError::Invalid(format!(
+                "payload item {index} requires a 32-byte claimed-hash"
+            )));
+        }
+        let mut hash32 = [0u8; 32];
+        hash32.copy_from_slice(&claimed_hash);
+        payloads.push(PayloadSignItem {
+            preimage,
+            claimed_hash: hash32,
+        });
+    }
+
+    let selector = match component_record_field(fields, "selector")? {
+        ComponentVal::Enum(value) if value == "exact" => bloom_broker_api::PetalSignSelector::Exact,
+        ComponentVal::Enum(value) if value == "reusable" => {
+            bloom_broker_api::PetalSignSelector::Reusable
+        }
+        other => {
+            return Err(HostError::Invalid(format!(
+                "component selector expected exact|reusable enum, got {other:?}"
+            )));
+        }
+    };
+    let key_ref = match component_record_optional_bytes(fields, "key-ref-jcs")? {
+        None => None,
+        Some(bytes) => {
+            let key_ref: bloom_broker_api::KeyRef =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    HostError::Invalid(format!("decode explicit Petal KeyRef: {error}"))
+                })?;
+            let canonical = serde_jcs::to_vec(&key_ref).map_err(|error| {
+                HostError::Invalid(format!("canonicalize explicit Petal KeyRef: {error}"))
+            })?;
+            if canonical != bytes {
+                return Err(HostError::Invalid(
+                    "explicit Petal KeyRef must use exact RFC 8785 canonical JSON".into(),
+                ));
+            }
+            Some(key_ref)
+        }
+    };
+
+    Ok(PayloadBatchSignRequest {
+        wallet,
+        payloads,
+        signature_algorithm,
+        operation_class,
+        petal_use_claim_jcs,
+        claim_assurance_evidence: component_record_optional_bytes(
+            fields,
+            "claim-assurance-evidence",
+        )?,
+        approval_hint: component_record_optional_string(fields, "approval-hint")?,
+        action: component_record_optional_bytes(fields, "action")?,
+        advisory: component_record_optional_bytes(fields, "advisory")?,
+        selector,
+        key_ref,
+        context: data.sign_context.clone(),
+    })
+}
+
+fn validate_petal_use_claim_jcs(bytes: &[u8]) -> Result<(), HostError> {
+    let claim: bloom_broker_api::PetalUseClaim = serde_json::from_slice(bytes)
+        .map_err(|error| HostError::Invalid(format!("decode PetalUseClaim: {error}")))?;
+    let canonical = serde_jcs::to_vec(&claim)
+        .map_err(|error| HostError::Invalid(format!("canonicalize PetalUseClaim: {error}")))?;
+    if canonical != bytes {
+        return Err(HostError::Invalid(
+            "PetalUseClaim must use exact RFC 8785 canonical JSON".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn component_sign_signature(signature: Vec<u8>) -> ComponentVal {
     ComponentVal::Result(Ok(Some(Box::new(ComponentVal::Variant(
         "signature".into(),
@@ -1476,18 +1722,22 @@ fn component_sign_signature(signature: Vec<u8>) -> ComponentVal {
     )))))
 }
 
-fn component_sign_approval_required(
-    action_id: String,
-    ceremony_url: String,
-    expires_ms: u64,
-) -> ComponentVal {
+fn component_sign_approval_pending(action_id: String, expires_ms: u64) -> ComponentVal {
     ComponentVal::Result(Ok(Some(Box::new(ComponentVal::Variant(
-        "approval-required".into(),
+        "approval-pending".into(),
         Some(Box::new(ComponentVal::Record(vec![
             ("action-id".into(), ComponentVal::String(action_id)),
-            ("ceremony-url".into(), ComponentVal::String(ceremony_url)),
             ("expires-ms".into(), ComponentVal::U64(expires_ms)),
         ]))),
+    )))))
+}
+
+fn component_sign_batch_signatures(signatures: Vec<Vec<u8>>) -> ComponentVal {
+    ComponentVal::Result(Ok(Some(Box::new(ComponentVal::Variant(
+        "signatures".into(),
+        Some(Box::new(ComponentVal::List(
+            signatures.into_iter().map(component_bytes).collect(),
+        ))),
     )))))
 }
 
@@ -2488,7 +2738,7 @@ mod tests {
     use super::*;
     use crate::abi::{
         DispatchOp, DispatchRequest, DispatchResponse, HttpRequest, HttpResponse,
-        PayloadSignRequest,
+        PayloadBatchSignOutcome, PayloadBatchSignRequest, PayloadSignRequest,
     };
     use crate::host::DenyHost;
     use crate::meta::PetalMode;
@@ -2560,6 +2810,74 @@ mod tests {
             ComponentVal::Option(key_ref_jcs.map(|bytes| Box::new(component_bytes(bytes)))),
         ));
         ComponentVal::Record(fields)
+    }
+
+    fn canonical_test_claim() -> Vec<u8> {
+        let digest = bloom_broker_api::Digest32::from_bytes([3; 32]);
+        serde_jcs::to_vec(&bloom_broker_api::PetalUseClaim {
+            package_hash: bloom_broker_api::Digest32::from_bytes([4; 32]),
+            route: "r000001".into(),
+            operation_class: bloom_broker_api::Token::new("orders.place").unwrap(),
+            crypto_suite: bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: digest.clone(),
+            ordered_hashes: vec![digest],
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: bloom_broker_api::DeclaredFee::None,
+            nonce: bloom_broker_api::RequestNonce::from_bytes([5; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        })
+        .unwrap()
+    }
+
+    fn component_payload_batch_request(bytes: &[u8]) -> ComponentVal {
+        let payloads = bytes
+            .iter()
+            .map(|byte| {
+                ComponentVal::Record(vec![
+                    ("preimage".into(), component_bytes(vec![*byte; 48])),
+                    ("claimed-hash".into(), component_bytes(vec![*byte; 32])),
+                ])
+            })
+            .collect();
+        ComponentVal::Record(vec![
+            ("wallet".into(), ComponentVal::String("primary".into())),
+            ("payloads".into(), ComponentVal::List(payloads)),
+            (
+                "signature-algorithm".into(),
+                ComponentVal::String("secp256k1-keccak256-recoverable".into()),
+            ),
+            (
+                "operation-class".into(),
+                ComponentVal::String("orders.place".into()),
+            ),
+            (
+                "petal-use-claim-jcs".into(),
+                component_bytes(canonical_test_claim()),
+            ),
+            (
+                "claim-assurance-evidence".into(),
+                ComponentVal::Option(None),
+            ),
+            ("approval-hint".into(), ComponentVal::Option(None)),
+            ("action".into(), ComponentVal::Option(None)),
+            ("advisory".into(), ComponentVal::Option(None)),
+            ("selector".into(), ComponentVal::Enum("exact".into())),
+            ("key-ref-jcs".into(), ComponentVal::Option(None)),
+        ])
+    }
+
+    fn component_v4_payload_request() -> ComponentVal {
+        let mut request = component_scoped_payload_request("primary", 3, "orders.place", None);
+        let ComponentVal::Record(fields) = &mut request else {
+            unreachable!();
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name == "petal-use-claim-jcs")
+            .unwrap()
+            .1 = component_bytes(canonical_test_claim());
+        request
     }
 
     /// Compile a WAT snippet to wasm bytes.
@@ -2710,6 +3028,8 @@ mod tests {
         http_calls: Mutex<Vec<HttpRequest>>,
         sign_calls: Mutex<Vec<PayloadSignRequest>>,
         sign_outcome: Mutex<Option<SignOutcome>>,
+        payload_batch_calls: Mutex<Vec<PayloadBatchSignRequest>>,
+        payload_batch_outcome: Mutex<Option<PayloadBatchSignOutcome>>,
         petal_key_calls: Mutex<Vec<PetalKeyRequest>>,
         petal_key_outcomes: Mutex<Vec<crate::abi::PetalKeyOutcome>>,
         authority_calls: Mutex<Vec<&'static str>>,
@@ -2794,6 +3114,19 @@ mod tests {
                 .lock()
                 .clone()
                 .unwrap_or_else(|| SignOutcome::Signature(vec![7u8; 65])))
+        }
+
+        async fn sign_payload_batch_outcome(
+            &self,
+            req: PayloadBatchSignRequest,
+        ) -> Result<PayloadBatchSignOutcome, HostError> {
+            let count = req.payloads.len();
+            self.payload_batch_calls.lock().push(req);
+            Ok(self
+                .payload_batch_outcome
+                .lock()
+                .clone()
+                .unwrap_or_else(|| PayloadBatchSignOutcome::Signatures(vec![vec![8; 65]; count])))
         }
 
         async fn petal_key_request(
@@ -3861,7 +4194,7 @@ paths = ["/status"]
     }
 
     #[tokio::test]
-    async fn component_sign_returns_machine_readable_approval_required() {
+    async fn legacy_component_pending_fails_closed_without_ceremony_url() {
         let host = Arc::new(MockHost::default());
         *host.sign_outcome.lock() = Some(SignOutcome::ApprovalRequired(
             crate::abi::ApprovalRequired {
@@ -3883,34 +4216,203 @@ paths = ["/status"]
         .await
         .unwrap();
 
+        assert_component_err_contains(&result[0], "APPROVAL_PENDING");
+        assert!(!format!("{:?}", result[0]).contains("bloom://ceremony"));
+        assert_eq!(host.sign_calls.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn component_v4_pending_projection_never_exposes_ceremony_url() {
+        let host = Arc::new(MockHost::default());
+        *host.sign_outcome.lock() =
+            Some(SignOutcome::ApprovalPending(crate::abi::ApprovalPending {
+                action_id: "action-v4".into(),
+                expires_ms: 444,
+            }));
+        let mut store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
+        let mut result = vec![ComponentVal::Bool(false)];
+        component_sign_payload_v4(
+            store.as_context_mut(),
+            &[component_v4_payload_request()],
+            &mut result,
+        )
+        .await
+        .unwrap();
+
         let ComponentVal::Result(Ok(Some(value))) = &result[0] else {
-            panic!(
-                "expected successful structured sign result: {:?}",
-                result[0]
-            );
+            panic!("expected successful pending result: {:?}", result[0]);
         };
         let ComponentVal::Variant(name, Some(record)) = value.as_ref() else {
-            panic!("expected approval-required variant: {value:?}");
+            panic!("expected approval-pending variant: {value:?}");
         };
-        assert_eq!(name, "approval-required");
+        assert_eq!(name, "approval-pending");
         let ComponentVal::Record(fields) = record.as_ref() else {
-            panic!("expected approval-required record: {record:?}");
+            panic!("expected approval-pending record: {record:?}");
         };
         assert_eq!(
             fields,
             &vec![
-                (
-                    "action-id".into(),
-                    ComponentVal::String("action-123".into())
-                ),
-                (
-                    "ceremony-url".into(),
-                    ComponentVal::String("bloom://ceremony/action-123".into()),
-                ),
-                ("expires-ms".into(), ComponentVal::U64(123_456)),
+                ("action-id".into(), ComponentVal::String("action-v4".into())),
+                ("expires-ms".into(), ComponentVal::U64(444)),
             ]
         );
-        assert_eq!(host.sign_calls.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn component_v4_batch_is_bounded_validated_and_preserves_order_and_context() {
+        let host = Arc::new(MockHost::default());
+        let mut store =
+            component_test_store(BTreeSet::from([Capability::Sign]), None, host.clone());
+        let context = PetalRouteContext {
+            petal_root: "venue".into(),
+            package_hash: VALID_HASH.into(),
+            route_id: "r000001".into(),
+            op: "write".into(),
+            path: "orders/new".into(),
+            params: Vec::new(),
+            actor: None,
+        };
+        store.data_mut().sign_context = Some(context.clone());
+
+        let mut result = vec![ComponentVal::Bool(false)];
+        component_sign_payload_batch(
+            store.as_context_mut(),
+            &[component_payload_batch_request(&[1, 2, 3])],
+            &mut result,
+        )
+        .await
+        .unwrap();
+        {
+            let calls = host.payload_batch_calls.lock();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0]
+                    .payloads
+                    .iter()
+                    .map(|item| item.preimage[0])
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+            assert_eq!(calls[0].context, Some(context));
+        }
+
+        let mut malformed_hash = component_payload_batch_request(&[9]);
+        let ComponentVal::Record(fields) = &mut malformed_hash else {
+            unreachable!();
+        };
+        let ComponentVal::List(payloads) = fields
+            .iter_mut()
+            .find(|(name, _)| name == "payloads")
+            .unwrap()
+            .1
+            .clone()
+        else {
+            unreachable!();
+        };
+        let ComponentVal::Record(mut item) = payloads[0].clone() else {
+            unreachable!();
+        };
+        item.iter_mut()
+            .find(|(name, _)| name == "claimed-hash")
+            .unwrap()
+            .1 = component_bytes(vec![0; 31]);
+        fields
+            .iter_mut()
+            .find(|(name, _)| name == "payloads")
+            .unwrap()
+            .1 = ComponentVal::List(vec![ComponentVal::Record(item)]);
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_sign_payload_batch(store.as_context_mut(), &[malformed_hash], &mut denied)
+            .await
+            .unwrap();
+        assert_component_err_contains(&denied[0], "32-byte");
+        assert_eq!(host.payload_batch_calls.lock().len(), 1);
+
+        let mut noncanonical_claim = component_payload_batch_request(&[9]);
+        let ComponentVal::Record(fields) = &mut noncanonical_claim else {
+            unreachable!();
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name == "petal-use-claim-jcs")
+            .unwrap()
+            .1 = component_bytes([b" ".as_slice(), &canonical_test_claim()].concat());
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_sign_payload_batch(store.as_context_mut(), &[noncanonical_claim], &mut denied)
+            .await
+            .unwrap();
+        assert_component_err_contains(&denied[0], "canonical JSON");
+        assert_eq!(host.payload_batch_calls.lock().len(), 1);
+
+        let mut malformed_key_ref = component_payload_batch_request(&[9]);
+        let ComponentVal::Record(fields) = &mut malformed_key_ref else {
+            unreachable!();
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name == "key-ref-jcs")
+            .unwrap()
+            .1 = ComponentVal::Option(Some(Box::new(component_bytes(b"not-json".to_vec()))));
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_sign_payload_batch(store.as_context_mut(), &[malformed_key_ref], &mut denied)
+            .await
+            .unwrap();
+        assert_component_err_contains(&denied[0], "Petal KeyRef");
+        assert_eq!(host.payload_batch_calls.lock().len(), 1);
+
+        let mut empty_batch = component_payload_batch_request(&[9]);
+        let ComponentVal::Record(fields) = &mut empty_batch else {
+            unreachable!();
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name == "payloads")
+            .unwrap()
+            .1 = ComponentVal::List(Vec::new());
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_sign_payload_batch(store.as_context_mut(), &[empty_batch], &mut denied)
+            .await
+            .unwrap();
+        assert_component_err_contains(&denied[0], "1..=");
+        assert_eq!(host.payload_batch_calls.lock().len(), 1);
+
+        let mut oversized_child = component_payload_batch_request(&[9]);
+        let ComponentVal::Record(fields) = &mut oversized_child else {
+            unreachable!();
+        };
+        let ComponentVal::List(payloads) = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name == "payloads")
+            .unwrap()
+            .1
+        else {
+            unreachable!();
+        };
+        let ComponentVal::Record(item) = &mut payloads[0] else {
+            unreachable!();
+        };
+        item.iter_mut()
+            .find(|(name, _)| name == "preimage")
+            .unwrap()
+            .1 = component_bytes(vec![0; MAX_SIGN_BATCH_CHILD_BYTES + 1]);
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_sign_payload_batch(store.as_context_mut(), &[oversized_child], &mut denied)
+            .await
+            .unwrap();
+        assert_component_err_contains(&denied[0], "exceeds");
+        assert_eq!(host.payload_batch_calls.lock().len(), 1);
+
+        let mut no_cap_store = component_test_store(BTreeSet::new(), None, host.clone());
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_sign_payload_batch(
+            no_cap_store.as_context_mut(),
+            &[component_payload_batch_request(&[9])],
+            &mut denied,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&denied[0], "denied");
+        assert_eq!(host.payload_batch_calls.lock().len(), 1);
     }
 
     #[tokio::test]

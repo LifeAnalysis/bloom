@@ -45,7 +45,7 @@ use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalPublicStatus, ApprovalRenewRequest, ApprovalSelector,
     ApprovalSubject, BROKER_API_CURRENT, BROKER_API_RANGE, Base64UrlBytes, CeremonyPublicStatus,
     CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse,
-    CustodyResult, DecimalU64, Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest,
+    CustodyResult, DecimalU64, Digest32, IdRequest, KeyPublic, KeyRef, KeyRequest, KeyRole,
     MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, MachineSignRequest,
     OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim, PolicyCommitReceipt,
     PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
@@ -587,11 +587,6 @@ impl MachineBrokerClient {
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
         request.validate()?;
         let wallet = self.wallet(request.wallet_id.clone()).await?;
-        let key_ref = unique_key_for_suite(&wallet.key_refs, request.crypto_suite)?;
-        let activation_mode = request
-            .activation_mode
-            .clone()
-            .unwrap_or_else(|| default_activation_mode(&key_ref));
         let payload_digest = Digest32::from_bytes(Sha256::digest(&request.preimage).into());
         let ordered_hash = suite_hash(request.crypto_suite, &request.preimage);
         if request.claimed_hash != ordered_hash {
@@ -600,6 +595,57 @@ impl MachineBrokerClient {
                 "exact payload hash does not match the selected CryptoSuite",
             ));
         }
+        let (petal_use_claim_digest, claim_assurance_digest) = match &request.petal_use_claim {
+            Some(claim) => {
+                let ProvenanceSubject::Petal {
+                    package_hash,
+                    route,
+                } = &request.provenance
+                else {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ProvenanceMismatch,
+                        "PetalUseClaim requires trusted Petal provenance",
+                    ));
+                };
+                if &claim.package_hash != package_hash
+                    || &claim.route != route
+                    || claim.crypto_suite != request.crypto_suite
+                    || claim.payload_digest != payload_digest
+                    || claim.ordered_hashes.as_slice() != [ordered_hash.clone()]
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ProvenanceMismatch,
+                        "exact Petal claim does not match trusted provenance or payload",
+                    ));
+                }
+                (
+                    Some(jcs_digest(claim)?),
+                    Some(jcs_digest(&claim.claim_assurance)?),
+                )
+            }
+            None => {
+                if matches!(request.provenance, ProvenanceSubject::Petal { .. }) {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ProvenanceMismatch,
+                        "trusted Petal exact signing requires a PetalUseClaim",
+                    ));
+                }
+                if request.claim_assurance_evidence.is_some() {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::MalformedFrame,
+                        "claim assurance evidence requires a PetalUseClaim",
+                    ));
+                }
+                (None, None)
+            }
+        };
+        let key_ref = self
+            .verified_wallet_root(&wallet, request.crypto_suite)
+            .await?;
+        let activation_mode = request
+            .activation_mode
+            .clone()
+            .unwrap_or_else(|| default_activation_mode(&key_ref));
 
         if let Some(approval_id) = request.approval_id {
             let operation_digest = SignOperationIdentity {
@@ -609,8 +655,8 @@ impl MachineBrokerClient {
                 crypto_suite: request.crypto_suite,
                 ordered_payload_digests: vec![payload_digest],
                 ordered_hashes: vec![ordered_hash],
-                petal_use_claim_digest: None,
-                claim_assurance_digest: None,
+                petal_use_claim_digest,
+                claim_assurance_digest,
                 policy_version: wallet.policy_version,
                 policy_digest: wallet.policy_digest,
             }
@@ -625,8 +671,11 @@ impl MachineBrokerClient {
                     payloads: SigningPayloads::Single {
                         payload: Base64UrlBytes::from_bytes(&request.preimage),
                     },
-                    petal_use_claim: None,
-                    claim_assurance_evidence: None,
+                    petal_use_claim: request.petal_use_claim,
+                    claim_assurance_evidence: request
+                        .claim_assurance_evidence
+                        .as_deref()
+                        .map(Base64UrlBytes::from_bytes),
                     provenance: request.provenance,
                 })
                 .await
@@ -684,11 +733,6 @@ impl MachineBrokerClient {
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
         request.validate()?;
         let wallet = self.wallet(request.wallet_id.clone()).await?;
-        let key_ref = unique_key_for_suite(&wallet.key_refs, request.crypto_suite)?;
-        let activation_mode = request
-            .activation_mode
-            .clone()
-            .unwrap_or_else(|| default_activation_mode(&key_ref));
         let ordered_payload_digests = request
             .preimages
             .iter()
@@ -705,6 +749,57 @@ impl MachineBrokerClient {
                 "exact batch payload hashes do not match the selected CryptoSuite",
             ));
         }
+        let (petal_use_claim_digest, claim_assurance_digest) = match &request.petal_use_claim {
+            Some(claim) => {
+                let ProvenanceSubject::Petal {
+                    package_hash,
+                    route,
+                } = &request.provenance
+                else {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ProvenanceMismatch,
+                        "PetalUseClaim requires trusted Petal provenance",
+                    ));
+                };
+                if &claim.package_hash != package_hash
+                    || &claim.route != route
+                    || claim.crypto_suite != request.crypto_suite
+                    || claim.payload_digest != petal_batch_payload_digest(&request.preimages)
+                    || claim.ordered_hashes != ordered_hashes
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ProvenanceMismatch,
+                        "exact Petal batch claim does not match trusted provenance or payloads",
+                    ));
+                }
+                (
+                    Some(jcs_digest(claim)?),
+                    Some(jcs_digest(&claim.claim_assurance)?),
+                )
+            }
+            None => {
+                if matches!(request.provenance, ProvenanceSubject::Petal { .. }) {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ProvenanceMismatch,
+                        "trusted Petal exact batch signing requires a PetalUseClaim",
+                    ));
+                }
+                if request.claim_assurance_evidence.is_some() {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::MalformedFrame,
+                        "claim assurance evidence requires a PetalUseClaim",
+                    ));
+                }
+                (None, None)
+            }
+        };
+        let key_ref = self
+            .verified_wallet_root(&wallet, request.crypto_suite)
+            .await?;
+        let activation_mode = request
+            .activation_mode
+            .clone()
+            .unwrap_or_else(|| default_activation_mode(&key_ref));
 
         if let Some(approval_id) = request.approval_id {
             let operation_digest = SignOperationIdentity {
@@ -714,8 +809,8 @@ impl MachineBrokerClient {
                 crypto_suite: request.crypto_suite,
                 ordered_payload_digests: ordered_payload_digests.clone(),
                 ordered_hashes: ordered_hashes.clone(),
-                petal_use_claim_digest: None,
-                claim_assurance_digest: None,
+                petal_use_claim_digest,
+                claim_assurance_digest,
                 policy_version: wallet.policy_version,
                 policy_digest: wallet.policy_digest,
             }
@@ -734,8 +829,11 @@ impl MachineBrokerClient {
                             .map(|payload| Base64UrlBytes::from_bytes(payload))
                             .collect(),
                     },
-                    petal_use_claim: None,
-                    claim_assurance_evidence: None,
+                    petal_use_claim: request.petal_use_claim,
+                    claim_assurance_evidence: request
+                        .claim_assurance_evidence
+                        .as_deref()
+                        .map(Base64UrlBytes::from_bytes),
                     provenance: request.provenance,
                 })
                 .await
@@ -897,6 +995,24 @@ impl MachineBrokerClient {
         }
     }
 
+    /// Cancel a Broker operation only while Broker can prove it has not crossed
+    /// the downstream-acceptance boundary. This is deliberately distinct from
+    /// ceremony cancellation and never attempts backend or Signer cancellation.
+    pub async fn cancel_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<OperationPublicStatus, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::OperationCancel(OperationRequest {
+                operation_id,
+            }))
+            .await?
+        {
+            MachineBrokerResponse::OperationCancel(status) => Ok(status),
+            _ => Err(response_mismatch("operation.cancel")),
+        }
+    }
+
     pub async fn policy(&self, wallet_id: Token) -> Result<SignedPolicySnapshot, ProtocolError> {
         match self
             .request(MachineBrokerRequest::PolicyRead(WalletRequest {
@@ -1007,6 +1123,44 @@ impl MachineBrokerClient {
             MachineBrokerResponse::KeyGetPublic(key) => Ok(key),
             _ => Err(response_mismatch("key.get_public")),
         }
+    }
+
+    async fn verified_wallet_root(
+        &self,
+        wallet: &WalletPublic,
+        suite: CryptoSuite,
+    ) -> Result<KeyRef, ProtocolError> {
+        let root = wallet.root_key_ref.clone();
+        if !wallet.key_refs.contains(&root) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "wallet root key is absent from the wallet key set",
+            ));
+        }
+        if root.key_spec != suite.key_spec() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::SuiteNotAllowed,
+                "wallet root key is incompatible with the requested CryptoSuite",
+            ));
+        }
+        let public = self
+            .key(KeyRequest {
+                key_ref: root.clone(),
+            })
+            .await?;
+        if public.key_ref != root || public.role != KeyRole::WalletRoot {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "Broker did not confirm the selected wallet root",
+            ));
+        }
+        if !public.supported_crypto_suites.contains(&suite) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::SuiteNotAllowed,
+                "wallet root does not support the requested CryptoSuite",
+            ));
+        }
+        Ok(root)
     }
 
     pub async fn credentials(
@@ -1198,6 +1352,8 @@ pub struct ExactPayloadSignRequest {
     pub expires_at_ms: DecimalU64,
     pub canonical_plan_facts_digest: Digest32,
     pub approval_id: Option<Digest32>,
+    pub petal_use_claim: Option<PetalUseClaim>,
+    pub claim_assurance_evidence: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1218,6 +1374,8 @@ pub struct ExactPayloadBatchSignRequest {
     pub expires_at_ms: DecimalU64,
     pub canonical_plan_facts_digest: Digest32,
     pub approval_id: Option<Digest32>,
+    pub petal_use_claim: Option<PetalUseClaim>,
+    pub claim_assurance_evidence: Option<Vec<u8>>,
 }
 
 impl ExactPayloadBatchSignRequest {
@@ -1792,6 +1950,17 @@ fn suite_hash(suite: CryptoSuite, payload: &[u8]) -> Digest32 {
     }
 }
 
+fn petal_batch_payload_digest(payloads: &[Vec<u8>]) -> Digest32 {
+    let mut digest = Sha256::new();
+    digest.update(b"bloom.petal.payload-batch.v1\0");
+    digest.update((payloads.len() as u64).to_be_bytes());
+    for payload in payloads {
+        digest.update((payload.len() as u64).to_be_bytes());
+        digest.update(payload);
+    }
+    Digest32::from_bytes(digest.finalize().into())
+}
+
 fn jcs_digest<T: Serialize>(value: &T) -> Result<Digest32, ProtocolError> {
     Ok(Digest32::from_bytes(
         Sha256::digest(serde_jcs::to_vec(value).map_err(canonical_error)?).into(),
@@ -2095,12 +2264,20 @@ mod tests {
                             if returned_key_ref.locator.contains("unsupported-suite") {
                                 vec![]
                             } else {
-                                vec![CryptoSuite::Secp256k1Sha256Recoverable]
+                                vec![
+                                    CryptoSuite::Secp256k1Keccak256Recoverable,
+                                    CryptoSuite::Secp256k1Sha256Recoverable,
+                                ]
                             };
                         if returned_key_ref.locator.contains("wrong-key") {
                             returned_key_ref.locator = "wallet/delegated/substituted".into();
                         }
                         Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
+                            role: if returned_key_ref.locator.contains("delegated") {
+                                KeyRole::Derived
+                            } else {
+                                KeyRole::WalletRoot
+                            },
                             key_ref: returned_key_ref,
                             canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
                             addresses: vec!["0x0000000000000000000000000000000000000001".into()],
@@ -2254,6 +2431,24 @@ mod tests {
                             },
                         ))
                     }
+                    MachineBrokerRequest::OperationStatus(request) => Ok(
+                        MachineBrokerResponse::OperationStatus(OperationPublicStatus {
+                            operation_id: request.operation_id,
+                            operation_digest: digest(83),
+                            state: bloom_broker_api::OperationState::Validated,
+                            result: None,
+                            error: None,
+                        }),
+                    ),
+                    MachineBrokerRequest::OperationCancel(request) => Ok(
+                        MachineBrokerResponse::OperationCancel(OperationPublicStatus {
+                            operation_id: request.operation_id,
+                            operation_digest: digest(83),
+                            state: bloom_broker_api::OperationState::Cancelled,
+                            result: None,
+                            error: None,
+                        }),
+                    ),
                     _ => Err(ProtocolError::new(
                         ProtocolErrorCode::UnknownMethod,
                         "unexpected mock request",
@@ -2270,6 +2465,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
+                root_key_ref: key_ref.clone(),
                 key_refs: vec![key_ref.clone()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -2337,6 +2533,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
+                root_key_ref: root_key_ref.clone(),
                 key_refs: vec![root_key_ref],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -2494,6 +2691,8 @@ mod tests {
             expires_at_ms: DecimalU64::new(601_000),
             canonical_plan_facts_digest: digest(64),
             approval_id,
+            petal_use_claim: None,
+            claim_assurance_evidence: None,
         }
     }
 
@@ -2523,16 +2722,22 @@ mod tests {
             expires_at_ms: DecimalU64::new(601_000),
             canonical_plan_facts_digest: digest(68),
             approval_id,
+            petal_use_claim: None,
+            claim_assurance_evidence: None,
         }
     }
 
     #[tokio::test]
     async fn exact_payload_prepares_then_signs_without_a_hash_only_path() {
+        let root_key_ref = key_ref();
+        let mut derived_key_ref = key_ref();
+        derived_key_ref.locator = "wallet/derived/same-suite".into();
         let broker = Arc::new(MockBroker {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
-                key_refs: vec![key_ref()],
+                root_key_ref: root_key_ref.clone(),
+                key_refs: vec![derived_key_ref, root_key_ref.clone()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
                 wallet_revocation_epoch: DecimalU64::new(2),
@@ -2552,8 +2757,8 @@ mod tests {
 
         {
             let requests = broker.requests.lock().unwrap();
-            let MachineBrokerRequest::SealedApprovalPrepare(request) = &requests[1] else {
-                panic!("second call must be sealed_approval.prepare");
+            let MachineBrokerRequest::SealedApprovalPrepare(request) = &requests[2] else {
+                panic!("third call must be sealed_approval.prepare");
             };
             assert_eq!(
                 request.terms.selector,
@@ -2565,6 +2770,7 @@ mod tests {
                 }
             );
             assert_eq!(request.terms.provenance_digest, digest(60));
+            assert_eq!(request.terms.key_ref, root_key_ref);
             assert_eq!(request.terms.limits.max_operations.get(), 1);
             assert_eq!(request.terms.limits.max_signatures.get(), 1);
         }
@@ -2578,8 +2784,8 @@ mod tests {
         };
         assert_eq!(signed.signatures[0].bytes.decode(), vec![7; 65]);
         let requests = broker.requests.lock().unwrap();
-        let MachineBrokerRequest::SigningSign(request) = &requests[3] else {
-            panic!("fourth call must be signing.sign");
+        let MachineBrokerRequest::SigningSign(request) = &requests[5] else {
+            panic!("sixth call must be signing.sign");
         };
         assert_eq!(
             request.payloads,
@@ -2597,6 +2803,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
+                root_key_ref: key_ref(),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(7),
                 policy_digest: digest(7),
@@ -2620,8 +2827,8 @@ mod tests {
 
         {
             let requests = broker.requests.lock().unwrap();
-            let MachineBrokerRequest::SealedApprovalPrepare(request) = &requests[1] else {
-                panic!("second call must be sealed_approval.prepare");
+            let MachineBrokerRequest::SealedApprovalPrepare(request) = &requests[2] else {
+                panic!("third call must be sealed_approval.prepare");
             };
             assert_eq!(request.terms.limits.max_operations.get(), 1);
             assert_eq!(request.terms.limits.max_signatures.get(), 2);
@@ -2655,8 +2862,8 @@ mod tests {
         assert_eq!(signed.broker_receipt_digest, digest(91));
 
         let requests = broker.requests.lock().unwrap();
-        let MachineBrokerRequest::SigningSignBatch(request) = &requests[3] else {
-            panic!("fourth call must be signing.sign_batch");
+        let MachineBrokerRequest::SigningSignBatch(request) = &requests[5] else {
+            panic!("sixth call must be signing.sign_batch");
         };
         assert_eq!(
             request.payloads,
@@ -2677,6 +2884,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
+                root_key_ref: key_ref(),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -2701,6 +2909,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
+                root_key_ref: key_ref(),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -2725,6 +2934,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
+                root_key_ref: key_ref(),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -2875,6 +3085,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
+                root_key_ref: key_ref(),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -2908,11 +3119,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operation_cancel_uses_broker_pre_acceptance_surface() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: key_ref(),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(1),
+                policy_digest: digest(1),
+                wallet_revocation_epoch: DecimalU64::new(0),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let operation_id = OperationId::from_bytes([84; 32]);
+        let client = MachineBrokerClient::new(broker.clone());
+        let status = client.operation_status(operation_id.clone()).await.unwrap();
+        assert_eq!(status.operation_id, operation_id);
+        assert_eq!(status.state, bloom_broker_api::OperationState::Validated);
+        let cancelled = client.cancel_operation(operation_id.clone()).await.unwrap();
+        assert_eq!(cancelled.operation_id, operation_id);
+        assert_eq!(cancelled.state, bloom_broker_api::OperationState::Cancelled);
+        let requests = broker.requests.lock().unwrap();
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                MachineBrokerRequest::OperationStatus(_),
+                MachineBrokerRequest::OperationCancel(_)
+            ]
+        ));
+    }
+
+    #[tokio::test]
     async fn cross_operation_signing_response_fails_closed() {
         let broker = Arc::new(MockBroker {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
+                root_key_ref: key_ref(),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: digest(1),
@@ -3001,6 +3246,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
                 wallet_kind: token("local"),
+                root_key_ref: key_ref(),
                 key_refs: vec![key_ref()],
                 policy_version: DecimalU64::new(2),
                 policy_digest: digest(82),

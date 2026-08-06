@@ -81,6 +81,7 @@ impl BrokerFixture {
         WalletPublic {
             wallet_id: Token::new("alice").unwrap(),
             wallet_kind: Token::new("passkey").unwrap(),
+            root_key_ref: self.key_ref(),
             key_refs: vec![self.key_ref()],
             policy_version: policy.version,
             policy_digest: policy.policy_digest,
@@ -91,6 +92,7 @@ impl BrokerFixture {
     fn key_public(&self) -> KeyPublic {
         KeyPublic {
             key_ref: self.key_ref(),
+            role: bloom_broker_api::KeyRole::WalletRoot,
             canonical_public_key: Base64UrlBytes::from_bytes(&[13; 33]),
             addresses: vec!["0x0000000000000000000000000000000000000001".into()],
             supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],

@@ -147,8 +147,9 @@ A fresh Bloom VFS root exposes these default entries:
 - `addressbook/<alias>` — local petname directory.
 - `ens/<name>.eth` — ENS forward resolution as a read surface.
 - `petals/` — installed local Petal app surfaces. `bloom init` provisions the
-  pinned Polymarket, Near Intents, and
-  [Enso](https://github.com/bloom-directory/bloom-petal-enso) packages.
+  pinned Near Intents and
+  [Enso](https://github.com/bloom-directory/bloom-petal-enso) packages;
+  unreleased migrated venue Petals are installed explicitly.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are

@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes,
     CanonicalWalletPolicy, CredentialPublic, CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef,
-    KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
+    KeyRole, KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
     NormalizedSignature, PolicyDestination, ProvenanceCatalog, ProvenanceFeeAsset,
     ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, ServiceFuture,
     SignedPolicySnapshot, SigningPayloads, SigningResult, Token, WalletPublic, WalletRequest,
@@ -73,6 +73,7 @@ impl ExactSigningBrokerFixture {
         WalletPublic {
             wallet_id,
             wallet_kind: Token::new("local").unwrap(),
+            root_key_ref: self.key_ref.clone(),
             key_refs: vec![self.key_ref.clone()],
             policy_version: DecimalU64::new(1),
             policy_digest: policy.policy_digest,
@@ -83,6 +84,7 @@ impl ExactSigningBrokerFixture {
     fn key_public(&self) -> KeyPublic {
         KeyPublic {
             key_ref: self.key_ref.clone(),
+            role: KeyRole::WalletRoot,
             canonical_public_key: Base64UrlBytes::from_bytes(self.signer.public_key().as_slice()),
             addresses: vec![format!("{:#x}", self.signer.address())],
             supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
@@ -120,6 +122,9 @@ impl MachineBrokerService for ExactSigningBrokerFixture {
                     Ok(MachineBrokerResponse::KeyListPublic(vec![
                         self.key_public(),
                     ]))
+                }
+                MachineBrokerRequest::KeyGetPublic(request) if request.key_ref == self.key_ref => {
+                    Ok(MachineBrokerResponse::KeyGetPublic(self.key_public()))
                 }
                 MachineBrokerRequest::CredentialListPublic(WalletRequest { wallet_id })
                     if wallet_id.as_str() == "alice" =>

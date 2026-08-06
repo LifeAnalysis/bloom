@@ -33,7 +33,7 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     let compatibility = fs::read_to_string(release.join("compatibility-v1.toml")).unwrap();
     for exact_authority in ["machine_broker", "broker_signer"] {
         let block =
-            format!("[protocols.{exact_authority}]\nmajor = 1\nminor_min = 1\nminor_max = 1");
+            format!("[protocols.{exact_authority}]\nmajor = 1\nminor_min = 2\nminor_max = 2");
         assert!(compatibility.contains(&block));
     }
     for compatible_support in ["signer_control", "session"] {

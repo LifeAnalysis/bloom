@@ -11,10 +11,11 @@ readonly MAX_USD="25"
 readonly FIXTURE_PACKAGE_HASH="2e2344e74b7ed11d4bb4c939671be9da72e13147dd16c3f6b6c347ae2c84d1ad"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Test harnesses may redirect state so they never touch a developer's real home.
-# Interactive/manual runs always use the canonical ~/.bloom Machine home.
-home_dir="${BLOOM_INTEGRATION_TEST_HOME:-${HOME}/.bloom}"
-developer_root="${BLOOM_TRIAD_DEV_ROOT:-${home_dir}/triad-dev}"
+# Broker/Signer developer state remains persistent so existing passkey wallets
+# stay available. Machine runs from a disposable overlay and only receives a
+# copy of the canonical public wallet projection.
+canonical_home="${BLOOM_INTEGRATION_TEST_HOME:-${HOME}/.bloom}"
+developer_root="${BLOOM_TRIAD_DEV_ROOT:-${canonical_home}/triad-dev}"
 wallet=""
 execute_pm=0
 pm_slug=""
@@ -52,6 +53,10 @@ Environment:
   BLOOM_INTEGRATION_OPEN  Browser opener (default: open)
   BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS
                           Server/Petal startup deadline (default: 300)
+  BLOOM_INTEGRATION_POLYMARKET_PACKAGE
+                          Local migrated Polymarket package checkout
+  BLOOM_INTEGRATION_HYPERLIQUID_PACKAGE
+                          Local migrated Hyperliquid package checkout
 EOF
 }
 
@@ -133,12 +138,17 @@ if [ "$live" -eq 1 ]; then
 fi
 
 run_dir="$(mktemp -d "${TMPDIR:-/tmp}/bloom-mainnet-integration.XXXXXX")"
+machine_home="${run_dir}/machine-home"
 socket="${run_dir}/bloom.sock"
 mount_dir="${run_dir}/mount"
 server_log="${run_dir}/serve.log"
 ready_file="${run_dir}/triad.ready"
 server_pid=""
-mkdir "$mount_dir"
+mkdir -p "$mount_dir" "${machine_home}/cache"
+canonical_wallet_projection="${canonical_home}/cache/wallet-projections.json"
+if [ -f "$canonical_wallet_projection" ] && [ ! -L "$canonical_wallet_projection" ]; then
+  cp "$canonical_wallet_projection" "${machine_home}/cache/wallet-projections.json"
+fi
 
 mounted_path() {
   case "$1" in
@@ -260,9 +270,20 @@ trap cleanup EXIT INT TERM
 
 triad_launcher="${BLOOM_TRIAD_DEV_LAUNCHER:-${repo_root}/scripts/triad-dev-launch.sh}"
 [ -x "$triad_launcher" ] || die "triad developer launcher is not executable: $triad_launcher"
+if [ -z "${BLOOM_TRIAD_DEV_LAUNCHER:-}" ]; then
+  polymarket_package="${BLOOM_INTEGRATION_POLYMARKET_PACKAGE:-$(dirname "$repo_root")/bloom-petal-polymarket}"
+  hyperliquid_package="${BLOOM_INTEGRATION_HYPERLIQUID_PACKAGE:-$(dirname "$repo_root")/bloom-petal-hyperliquid}"
+  [ -d "$polymarket_package" ] || die "migrated Polymarket checkout is missing: $polymarket_package"
+  [ -d "$hyperliquid_package" ] || die "migrated Hyperliquid checkout is missing: $hyperliquid_package"
+else
+  polymarket_package="${BLOOM_INTEGRATION_POLYMARKET_PACKAGE:-}"
+  hyperliquid_package="${BLOOM_INTEGRATION_HYPERLIQUID_PACKAGE:-}"
+fi
+BLOOM_TRIAD_DEV_POLYMARKET_PACKAGE="$polymarket_package" \
+BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE="$hyperliquid_package" \
 "$triad_launcher" \
   --developer-root "$developer_root" \
-  --machine-home "$home_dir" \
+  --machine-home "$machine_home" \
   --mount "$mount_dir" \
   --machine-socket "$socket" \
   --log-dir "$run_dir" \
@@ -310,7 +331,8 @@ open_approval() {
 }
 
 printf '\nBloom local mainnet integration preflight\n'
-printf '  home:   %s\n  wallet: %s\n' "$home_dir" "$wallet"
+printf '  authority home: %s\n  Machine overlay: %s\n  wallet:          %s\n' \
+  "$developer_root" "$machine_home" "$wallet"
 printf '  mode:   %s\n\n' "$([ "$live" -eq 1 ] && printf LIVE || printf NON-SPENDING)"
 
 wallet_kind="$(vcat "/wallets/${wallet}/kind" | tr -d '[:space:]')"
@@ -475,10 +497,10 @@ if [ "$live" -eq 0 ] || [ "$execute_pm" -eq 1 ]; then
   vls_names "/petals/polymarket/trade" >/dev/null
   printf 'Polymarket Petal: mounted and route contract loaded\n'
   pm_triad_compatible="$(printf '%s' "$route_contract" | jq -r '
-    [.. | strings] | any(contains("bloom:sign/signing@0.3.0"))
+    [.. | strings] | any(contains("bloom:sign/signing@0.4.0"))
   ')"
   if [ "$pm_triad_compatible" != "true" ]; then
-    printf 'Polymarket Petal: read-only preflight only; pinned release lacks production triad payload signing\n'
+    printf 'Polymarket Petal: read-only preflight only; local package lacks production triad payload signing\n'
   fi
   if [ -n "$pm_slug" ]; then
     case "$pm_slug" in *[!A-Za-z0-9._-]*|'') die "Polymarket slug contains unsafe characters" ;; esac
@@ -497,7 +519,7 @@ fi
 [ "$preflight_blockers" -eq 0 ] ||
   die "live preflight found an external prerequisite blocker; no order was staged"
 [ "$pm_triad_compatible" = "true" ] ||
-  die "pinned Polymarket Petal is not production-triad signing compatible; no draft was staged"
+  die "local Polymarket Petal is not production-triad signing compatible; no draft was staged"
 
 if [ "$execute_pm" -eq 1 ]; then
   if [ "$pm_side" = "buy" ]; then

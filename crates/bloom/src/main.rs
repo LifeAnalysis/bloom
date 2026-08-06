@@ -1137,6 +1137,38 @@ async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<()> {
     Ok(())
 }
 
+async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<()> {
+    let (raw_operation_id, cancel) = match command {
+        OperationCmd::Status { operation_id } => (operation_id, false),
+        OperationCmd::Cancel { operation_id } => (operation_id, true),
+    };
+    let operation_id = bloom_broker_api::OperationId::new(raw_operation_id)
+        .context("operation ID must be 64 lowercase hexadecimal characters")?;
+    let client = configured_broker_client(home)
+        .context("operation lifecycle requires the authenticated Machine-to-Broker edge")?;
+    let status = if cancel {
+        client
+            .cancel_operation(operation_id.clone())
+            .await
+            .map_err(anyhow::Error::new)
+            .context("cancel Broker operation before downstream acceptance")?
+    } else {
+        client
+            .operation_status(operation_id.clone())
+            .await
+            .map_err(anyhow::Error::new)
+            .context("read Broker operation status")?
+    };
+    anyhow::ensure!(
+        status.operation_id == operation_id,
+        "Broker operation status identity mismatch"
+    );
+    serde_json::to_writer_pretty(std::io::stdout().lock(), &status)
+        .context("encode Broker operation status")?;
+    println!();
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "bloom",
@@ -1186,6 +1218,9 @@ enum Cmd {
     /// Inspect or cancel a Broker-owned custody ceremony by operation ID.
     #[command(subcommand)]
     Ceremony(CeremonyCmd),
+    /// Inspect or cancel a Broker operation before downstream acceptance.
+    #[command(subcommand)]
+    Operation(OperationCmd),
     /// Paid/free HTTP requests via the `/requests` VFS surface.
     #[command(subcommand)]
     Request(RequestCmd),
@@ -1261,6 +1296,14 @@ enum CeremonyCmd {
     /// Retrieve the signed public custody result. Encrypted Browser output is
     /// never printed by Machine.
     Result { operation_id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum OperationCmd {
+    /// Read the Broker's durable public operation state.
+    Status { operation_id: String },
+    /// Cancel only if Broker proves no downstream/backend acceptance occurred.
+    Cancel { operation_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2383,6 +2426,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Ceremony(command) => handle_ceremony(&home, command).await,
+        Cmd::Operation(command) => handle_operation(&home, command).await,
         Cmd::Serve { endpoint, mount } => {
             eprintln!("{ALPHA_DISCLOSURE}");
             let (_home_permit, d) = build_write_daemon(home.clone())?;

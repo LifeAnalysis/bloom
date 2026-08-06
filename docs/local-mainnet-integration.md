@@ -12,9 +12,10 @@ to Machine. Signer keeps custody, Broker owns the ceremony origin, and normal
 release bundles reject this feature.
 
 The developer enrollment and Broker/Signer databases persist at
-`$BLOOM_TRIAD_DEV_ROOT` (default `~/.bloom/triad-dev`). Machine state always
-uses `~/.bloom`. Process sockets,
-the kernel mount, and logs are new for every run. This is intentional: Signer
+`$BLOOM_TRIAD_DEV_ROOT` (default `~/.bloom/triad-dev`). Machine state uses a
+fresh temporary overlay for every run; only the canonical public wallet
+projection cache is copied into it. Process sockets, the kernel mount, and logs
+are also new for every run. This is intentional: Signer
 must retain the passkey credential, encrypted root, and backend state across
 runs. A fresh Signer database cannot use a legacy wallet merely because an
 encrypted record exists under `~/.bloom/keystore`; neither Machine nor these
@@ -55,7 +56,8 @@ to trade at.
 - Rust/Cargo and `jq` (`brew install jq`);
 - a wallet enrolled through a real Broker registration or import ceremony in
   the persistent developer triad root;
-- the pinned Polymarket Petal enabled in Bloom's preinstalled Petal config;
+- the migrated local Polymarket and Hyperliquid package checkouts, installed
+  only into the disposable Machine overlay;
 - Polymarket onboarding/funding sufficient for the chosen order;
 - no other local process listening on `127.0.0.1:18734`.
 
@@ -82,10 +84,10 @@ the local process does not connect to it.
 On first use, start the launcher in one terminal (replace the paths if needed):
 
 ```bash
-mkdir -p ~/.bloom ~/.bloom/triad-dev /tmp/bloom-triad-mount /tmp/bloom-triad-logs
+mkdir -p ~/.bloom/triad-dev/machine-home /tmp/bloom-triad-mount /tmp/bloom-triad-logs
 scripts/triad-dev-launch.sh \
   --developer-root ~/.bloom/triad-dev \
-  --machine-home ~/.bloom \
+  --machine-home ~/.bloom/triad-dev/machine-home \
   --mount /tmp/bloom-triad-mount \
   --machine-socket /tmp/bloom-triad-machine.sock \
   --log-dir /tmp/bloom-triad-logs \
@@ -121,8 +123,9 @@ and the final ceremony activates a canonical Petal-scoped Sealed Approval
 prepared through `/wallets/<wallet>/sealed-approvals/new.json`. A wallet whose
 policy already allows the fixture skips only the policy-update ceremony. The
 Petal receives only its public `KeyRef`, approval ID, and signature; it never
-receives private key material. Serving may
-install/update the pinned Polymarket Petal, but venue positions are not changed.
+receives private key material. The harness installs the migrated local
+Polymarket package only into its disposable Machine overlay; venue positions
+are not changed.
 Preflight verifies:
 
 - the mounted wallet exists, reports passkey kind, and exposes its address;
@@ -132,7 +135,8 @@ Preflight verifies:
 - the mounted fixture can derive and use a generic Petal sub-key through Broker
   and Signer using exact mounted retries, with missing approval failing closed
   before the runner prepares the canonical mounted Sealed Approval;
-- the pinned Polymarket Petal loads;
+- the migrated local Polymarket Petal package loads from its sibling checkout
+  (or `BLOOM_INTEGRATION_POLYMARKET_PACKAGE` override);
 - the Polymarket route contract and onboarding, account, and trade directories
   are reachable through the kernel-mounted filesystem.
 
@@ -153,11 +157,9 @@ This echoes the explicitly selected Polymarket slug. Live mounted draft creation
 refuses unavailable markets, incomplete onboarding, insufficient funding, or
 policy failures before its order-specific passkey ceremony or submission.
 
-The currently pinned Polymarket v0.1.3 Petal imports the retired
-`bloom:sign/signing@0.1.0` hash-signing interface. Read-only preflight still
-works, but live mode fails before creating a draft unless the pinned Petal has
-upgraded to production payload signing `bloom:sign/signing@0.3.0`. The harness
-does not patch or special-case the Petal.
+The harness installs the migrated local package into its disposable Machine
+overlay and requires production payload signing `bloom:sign/signing@0.4.0`.
+It does not install, patch, or advertise the old hash-signing release.
 
 ## 2. Run bounded mainnet submissions
 

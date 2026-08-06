@@ -12,8 +12,8 @@ use std::{
 
 use async_trait::async_trait;
 use bloom_broker_api::{
-    CredentialPublic, Digest32, KeyPublic, ProtocolError, ProtocolErrorCode, SignedPolicySnapshot,
-    Token, WalletPublic,
+    CredentialPublic, Digest32, KeyPublic, KeyRole, ProtocolError, ProtocolErrorCode,
+    SignedPolicySnapshot, Token, WalletPublic,
 };
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -63,15 +63,10 @@ impl WalletProjection {
     }
 
     pub fn primary_key(&self) -> Result<&KeyPublic, ProtocolError> {
-        let key_ref = self.wallet.key_refs.first().ok_or_else(|| {
-            invalid_projection(format!(
-                "wallet {} has no public key reference",
-                self.wallet.wallet_id.as_str()
-            ))
-        })?;
+        let key_ref = &self.wallet.root_key_ref;
         self.keys
             .iter()
-            .find(|key| &key.key_ref == key_ref)
+            .find(|key| &key.key_ref == key_ref && key.role == KeyRole::WalletRoot)
             .ok_or_else(|| {
                 invalid_projection(format!(
                     "wallet {} primary key is absent from projection",
@@ -569,6 +564,26 @@ fn validate_projection(projection: &WalletProjection) -> Result<(), ProtocolErro
         .map(|key| serde_json::to_string(&key.key_ref))
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(|error| invalid_projection(format!("encode public key reference: {error}")))?;
+    let encoded_root = serde_json::to_string(&projection.wallet.root_key_ref).map_err(|error| {
+        invalid_projection(format!("encode wallet root key reference: {error}"))
+    })?;
+    if !projection
+        .wallet
+        .key_refs
+        .contains(&projection.wallet.root_key_ref)
+        || !projection.keys.iter().any(|key| {
+            key.key_ref == projection.wallet.root_key_ref && key.role == KeyRole::WalletRoot
+        })
+        || projection.keys.iter().any(|key| {
+            key.role == KeyRole::WalletRoot && key.key_ref != projection.wallet.root_key_ref
+        })
+        || !key_refs.contains(&encoded_root)
+    {
+        return Err(invalid_projection(format!(
+            "wallet {} root key projection is inconsistent",
+            wallet_id.as_str()
+        )));
+    }
     for key_ref in &projection.wallet.key_refs {
         let encoded = serde_json::to_string(key_ref)
             .map_err(|error| invalid_projection(format!("encode wallet key reference: {error}")))?;
@@ -766,6 +781,26 @@ mod tests {
         let stale = restarted.get_wallet(&token("alice")).await.unwrap();
         assert_eq!(stale.freshness, ProjectionFreshness::Stale);
         assert_eq!(stale.policy.version.get(), 2);
+    }
+
+    #[test]
+    fn primary_key_uses_the_declared_root_not_key_list_order() {
+        let mut fixture = fixture(1);
+        let mut derived = fixture.keys[0].clone();
+        derived.key_ref.locator = "alice/derived/same-suite".into();
+        derived.role = KeyRole::Derived;
+        fixture.wallet.key_refs.insert(0, derived.key_ref.clone());
+        fixture.keys.insert(0, derived);
+        let expected_root = fixture.wallet.root_key_ref.clone();
+        let projection = build_projection(
+            fixture.wallet,
+            fixture.keys,
+            fixture.credentials,
+            fixture.policy,
+            1,
+        )
+        .unwrap();
+        assert_eq!(projection.primary_key().unwrap().key_ref, expected_root);
     }
 
     #[tokio::test]
@@ -970,6 +1005,7 @@ mod tests {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: token("passkey"),
+                root_key_ref: key_ref.clone(),
                 key_refs: vec![key_ref.clone()],
                 policy_version: DecimalU64::new(version),
                 policy_digest: policy_digest.clone(),
@@ -977,6 +1013,7 @@ mod tests {
             },
             keys: vec![KeyPublic {
                 key_ref,
+                role: KeyRole::WalletRoot,
                 canonical_public_key: Base64UrlBytes::from_bytes(&[4; 33]),
                 addresses: vec!["0x0000000000000000000000000000000000000001".into()],
                 supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],

@@ -14,8 +14,6 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
-const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
-const HYPERLIQUID_RELEASE_COMMIT: &str = "fa722a986c2a0a23977e9e00df54ebd291a686db";
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
 
@@ -28,24 +26,6 @@ pub(crate) struct PreinstalledPetal {
     pub archive: &'static str,
     pub expected_hash: Option<&'static str>,
 }
-
-const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
-    name: "polymarket",
-    repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
-    commit: POLYMARKET_PARITY_COMMIT,
-    release_tag: "v0.1.3",
-    archive: "polymarket-v0.1.3.petal.tar.gz",
-    expected_hash: Some("02d6d18d773147013c3b1e7129c4694d2db3c93f1e885e755bdb4aa390bf6a5c"),
-};
-
-const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
-    name: "hyperliquid",
-    repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
-    commit: HYPERLIQUID_RELEASE_COMMIT,
-    release_tag: "v0.1.4",
-    archive: "hyperliquid-v0.1.4.petal.tar.gz",
-    expected_hash: Some("1de2eb50b7ce0f0da03d3ef1ae6554c6f1b89393096d50183fe4f2dbca6b2af7"),
-};
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     name: "near-intents",
@@ -578,8 +558,6 @@ fn install_prebuilt_petal_archive(
 
 fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
     match name {
-        "polymarket" => Some(&PREINSTALLED_POLYMARKET),
-        "hyperliquid" => Some(&PREINSTALLED_HYPERLIQUID),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "enso" => Some(&PREINSTALLED_ENSO),
         _ => None,
@@ -1026,18 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_polymarket_entry_is_immutable_and_catalogued() {
-        let entry = preinstalled_petal("polymarket").unwrap();
-        assert_eq!(entry.name, "polymarket");
-        assert_eq!(entry.commit.len(), 40);
-        assert!(entry.commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert!(entry.repository.ends_with("/bloom-petal-polymarket"));
-        assert!(entry.archive.starts_with("polymarket-"));
-        assert!(entry.archive.ends_with(".petal.tar.gz"));
-        assert_eq!(
-            entry.archive,
-            format!("polymarket-{}.petal.tar.gz", entry.release_tag)
-        );
+    fn built_in_entries_are_immutable_and_incompatible_petals_are_absent() {
         let near = preinstalled_petal("near-intents").unwrap();
         assert_eq!(near.release_tag, "v0.1.1");
         assert_eq!(near.commit.len(), 40);
@@ -1048,35 +1015,32 @@ mod tests {
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
         assert_eq!(enso.archive, "enso-v0.1.2.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
-        let hyperliquid = preinstalled_petal("hyperliquid").unwrap();
-        assert_eq!(hyperliquid.release_tag, "v0.1.4");
-        assert_eq!(hyperliquid.commit, HYPERLIQUID_RELEASE_COMMIT);
-        assert_eq!(hyperliquid.archive, "hyperliquid-v0.1.4.petal.tar.gz");
-        assert!(hyperliquid.repository.ends_with("/bloom-petal-hyperliquid"));
+        assert!(preinstalled_petal("polymarket").is_none());
+        assert!(preinstalled_petal("hyperliquid").is_none());
         assert!(preinstalled_petal("unknown").is_none());
     }
 
     #[test]
     fn existing_preinstalled_package_must_match_source_commit_and_hash() {
-        let entry = preinstalled_petal("polymarket").unwrap();
+        let entry = preinstalled_petal("near-intents").unwrap();
         let hash = entry.expected_hash.unwrap().to_string();
         let mut meta = PetalMeta {
             hash: hash.clone(),
             size: 1,
             installed_at_ms: 1,
-            name: Some("polymarket".into()),
+            name: Some("near-intents".into()),
             caps: Default::default(),
             mode: PetalMode::Local,
             petal: Some(PetalPackageMeta {
-                name: "polymarket".into(),
-                petal_root: "polymarket".into(),
+                name: "near-intents".into(),
+                petal_root: "near-intents".into(),
                 route_index_schema: "test".into(),
             }),
             source: Some(PetalSourceProvenance {
                 source_kind: "github".into(),
                 url: entry.repository.into(),
                 owner: "bloom-directory".into(),
-                repo: "bloom-petal-polymarket".into(),
+                repo: "bloom-petal-near".into(),
                 requested_ref: entry.commit.into(),
                 resolved_commit: entry.commit.into(),
                 selected_tag: None,
@@ -1105,7 +1069,7 @@ mod tests {
             .to_string();
         assert!(err.contains("will not overwrite it automatically"), "{err}");
 
-        meta.source.as_mut().unwrap().repo = "bloom-petal-polymarket".into();
+        meta.source.as_mut().unwrap().repo = "bloom-petal-near".into();
         meta.source.as_mut().unwrap().resolved_commit = entry.commit.into();
         meta.source.as_mut().unwrap().package_hash = "c".repeat(64);
         let err = classify_existing_preinstalled(entry, &meta)
@@ -1563,7 +1527,7 @@ mod tests {
 
     #[test]
     fn release_manifest_is_bound_to_catalog_source_and_artifact() {
-        let entry = preinstalled_petal("polymarket").unwrap();
+        let entry = preinstalled_petal("near-intents").unwrap();
         let repo = parse_github_install_url(entry.repository).unwrap().unwrap();
         let mut manifest = PetalReleaseManifest {
             schema: "bloom.petal.release.v1".into(),

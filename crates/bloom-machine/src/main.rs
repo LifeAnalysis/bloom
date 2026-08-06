@@ -71,6 +71,9 @@ enum Command {
     /// Inspect, cancel, or retrieve a shared custody ceremony.
     #[command(subcommand)]
     Ceremony(CeremonyCommand),
+    /// Inspect or cancel a Broker operation before downstream acceptance.
+    #[command(subcommand)]
+    Operation(OperationCommand),
     /// Prepare or commit a canonical wallet-policy update.
     #[command(subcommand)]
     Policy(PolicyCommand),
@@ -89,6 +92,12 @@ enum CeremonyCommand {
     Result {
         operation_id: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum OperationCommand {
+    Status { operation_id: String },
+    Cancel { operation_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -140,6 +149,7 @@ async fn main() -> Result<()> {
             dispatch_and_print(&broker, &cli.state_dir, request).await
         }
         Command::Ceremony(command) => handle_ceremony(&broker, &cli.state_dir, command).await,
+        Command::Operation(command) => handle_operation(&broker, command).await,
         Command::Policy(command) => handle_policy(&broker, &cli.state_dir, command).await,
     };
     if let Err(error) = &result
@@ -151,6 +161,33 @@ async fn main() -> Result<()> {
         report_ceremony_listener_owner().await;
     }
     result
+}
+
+async fn handle_operation(broker: &MachineBrokerClient, command: OperationCommand) -> Result<()> {
+    let (raw_operation_id, cancel) = match command {
+        OperationCommand::Status { operation_id } => (operation_id, false),
+        OperationCommand::Cancel { operation_id } => (operation_id, true),
+    };
+    let operation_id = parse_operation_id(raw_operation_id)?;
+    let status = if cancel {
+        broker
+            .cancel_operation(operation_id.clone())
+            .await
+            .context("cancel Broker operation before downstream acceptance")?
+    } else {
+        broker
+            .operation_status(operation_id.clone())
+            .await
+            .context("read Broker operation status")?
+    };
+    anyhow::ensure!(
+        status.operation_id == operation_id,
+        "Broker operation status identity mismatch"
+    );
+    serde_json::to_writer_pretty(std::io::stdout().lock(), &status)
+        .context("encode Broker operation status")?;
+    println!();
+    Ok(())
 }
 
 fn is_broker_connect_failure(error: &ProtocolError) -> bool {

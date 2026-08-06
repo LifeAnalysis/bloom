@@ -75,8 +75,8 @@ require_compat_value() {
 }
 for authority_edge in machine_broker broker_signer; do
   require_compat_value "protocols.$authority_edge" major 1
-  require_compat_value "protocols.$authority_edge" minor_min 1
-  require_compat_value "protocols.$authority_edge" minor_max 1
+  require_compat_value "protocols.$authority_edge" minor_min 2
+  require_compat_value "protocols.$authority_edge" minor_max 2
 done
 for support_edge in signer_control session; do
   require_compat_value "protocols.$support_edge" major 1

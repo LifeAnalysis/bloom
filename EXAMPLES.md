@@ -191,11 +191,12 @@ Hyperliquid Petal and discover its mounted contract under `/bloom/petals/`.
 ## Polymarket (external Petal)
 
 Bloom no longer includes a native `bloom polymarket` command or `/polymarket/`
-VFS handler. `bloom init` provisions the pinned default Polymarket Petal, which
-is available at `/petals/polymarket/`:
+VFS handler. Polymarket is not provisioned by default while its migrated Petal
+is unreleased. Install a compatible package explicitly; it is then available at
+`/petals/polymarket/`:
 
 ```sh
-bloom init
+bloom petals install ../bloom-petal-polymarket
 bloom vfs cat /petals/polymarket/meta/route-contract.json
 ```
 

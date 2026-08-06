@@ -71,12 +71,12 @@ The supported passkey and signing workflow starts real Machine, Broker, and
 Signer protocol implementations as separate processes:
 
 ```sh
-mkdir -p ~/.bloom ~/.bloom/triad-dev \
+mkdir -p ~/.bloom/triad-dev/machine-home \
   /tmp/bloom-triad-mount /tmp/bloom-triad-logs
 
 scripts/triad-dev-launch.sh \
   --developer-root ~/.bloom/triad-dev \
-  --machine-home ~/.bloom \
+  --machine-home ~/.bloom/triad-dev/machine-home \
   --mount /tmp/bloom-triad-mount \
   --machine-socket /tmp/bloom-triad-machine.sock \
   --log-dir /tmp/bloom-triad-logs \

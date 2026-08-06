@@ -3328,6 +3328,8 @@ impl TxEngine {
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
             approval_id: state.approval_id.clone(),
+            petal_use_claim: None,
+            claim_assurance_evidence: None,
         };
         if state.approval_id.is_some() {
             state.expected_operation_digest = Some(
@@ -3979,6 +3981,8 @@ fn exact_evm_sign_request(
         expires_at_ms: state.expires_at_ms.clone(),
         canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
         approval_id: state.approval_id.clone(),
+        petal_use_claim: None,
+        claim_assurance_evidence: None,
     })
 }
 
@@ -4584,10 +4588,10 @@ mod tests {
 
     use super::*;
     use bloom_broker_api::{
-        ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes, KeyRef, KeySpec,
-        MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, NormalizedSignature,
-        OperationPublicStatus, ProvenanceCatalog, ProvenanceFeeAsset, ProvenanceOperationClass,
-        ServiceFuture, SigningPayloads, SigningResult, WalletPublic,
+        ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes, KeyPublic, KeyRef, KeyRole,
+        KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
+        NormalizedSignature, OperationPublicStatus, ProvenanceCatalog, ProvenanceFeeAsset,
+        ProvenanceOperationClass, ServiceFuture, SigningPayloads, SigningResult, WalletPublic,
     };
     use bloom_proto::TxStatus;
 
@@ -4614,10 +4618,24 @@ mod tests {
                         Ok(MachineBrokerResponse::WalletGetPublic(WalletPublic {
                             wallet_id: request.wallet_id,
                             wallet_kind: Token::new("local").unwrap(),
+                            root_key_ref: self.key_ref.clone(),
                             key_refs: vec![self.key_ref.clone()],
                             policy_version: DecimalU64::new(1),
                             policy_digest: Digest32::from_bytes([7; 32]),
                             wallet_revocation_epoch: DecimalU64::new(0),
+                        }))
+                    }
+                    MachineBrokerRequest::KeyGetPublic(request)
+                        if request.key_ref == self.key_ref =>
+                    {
+                        Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
+                            key_ref: request.key_ref,
+                            role: KeyRole::WalletRoot,
+                            canonical_public_key: Base64UrlBytes::from_bytes(&[3; 33]),
+                            addresses: Vec::new(),
+                            supported_crypto_suites: vec![
+                                CryptoSuite::Secp256k1Keccak256Recoverable,
+                            ],
                         }))
                     }
                     MachineBrokerRequest::SealedApprovalPrepare(request) => {
@@ -5571,17 +5589,22 @@ mod tests {
         assert!(terminal.expected_operation_digest.is_some());
 
         let requests = fixture.requests.lock();
-        assert!(matches!(
-            requests.as_slice(),
-            [
-                MachineBrokerRequest::WalletGetPublic(_),
-                MachineBrokerRequest::SealedApprovalPrepare(_),
-                MachineBrokerRequest::SealedApprovalStatus(_),
-                MachineBrokerRequest::WalletGetPublic(_),
-                MachineBrokerRequest::WalletGetPublic(_),
-                MachineBrokerRequest::SigningSign(_)
-            ]
-        ));
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [
+                    MachineBrokerRequest::WalletGetPublic(_),
+                    MachineBrokerRequest::KeyGetPublic(_),
+                    MachineBrokerRequest::SealedApprovalPrepare(_),
+                    MachineBrokerRequest::SealedApprovalStatus(_),
+                    MachineBrokerRequest::WalletGetPublic(_),
+                    MachineBrokerRequest::WalletGetPublic(_),
+                    MachineBrokerRequest::KeyGetPublic(_),
+                    MachineBrokerRequest::SigningSign(_)
+                ]
+            ),
+            "unexpected exact signing request sequence: {requests:#?}"
+        );
     }
 
     fn triad_batch_fixture(

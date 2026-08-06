@@ -49,6 +49,17 @@ impl MachineBrokerService for ExactBroker {
                 MachineBrokerRequest::WalletGetPublic(_) => {
                     Ok(MachineBrokerResponse::WalletGetPublic(self.wallet.clone()))
                 }
+                MachineBrokerRequest::KeyGetPublic(request)
+                    if request.key_ref == self.wallet.root_key_ref =>
+                {
+                    Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
+                        key_ref: request.key_ref,
+                        role: bloom_broker_api::KeyRole::WalletRoot,
+                        canonical_public_key: Base64UrlBytes::from_bytes(&[3; 33]),
+                        addresses: Vec::new(),
+                        supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+                    }))
+                }
                 MachineBrokerRequest::SealedApprovalPrepare(request) => Ok(
                     MachineBrokerResponse::SealedApprovalPrepare(SealedApprovalPrepareResponse {
                         approval_id: request.terms.approval_id()?,
@@ -129,6 +140,7 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
     let wallet = WalletPublic {
         wallet_id: token("alice"),
         wallet_kind: token("local"),
+        root_key_ref: key_ref.clone(),
         key_refs: vec![key_ref.clone()],
         policy_version: DecimalU64::new(1),
         policy_digest: policy_digest.clone(),
@@ -138,6 +150,7 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
         wallet: wallet.clone(),
         keys: vec![KeyPublic {
             key_ref,
+            role: bloom_broker_api::KeyRole::WalletRoot,
             canonical_public_key: Base64UrlBytes::from_bytes(&[3; 33]),
             addresses: vec![address],
             supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],

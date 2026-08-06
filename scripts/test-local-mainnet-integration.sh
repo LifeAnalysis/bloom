@@ -15,6 +15,24 @@ cleanup_test() {
 }
 trap cleanup_test EXIT
 
+canonical_home="${test_root}/home"
+mkdir -p "${canonical_home}/cache" \
+  "${canonical_home}/petals/store/packages/fixture" \
+  "${canonical_home}/petals/store/owners"
+printf '%s\n' \
+  '[petals]' \
+  'preinstalled = ["enso", "near-intents"]' \
+  > "${canonical_home}/config.toml"
+printf '%s\n' '{"schema":"fixture-projection","wallets":{"test-passkey":{}}}' \
+  > "${canonical_home}/cache/wallet-projections.json"
+printf '%s\n' 'persistent package bytes' \
+  > "${canonical_home}/petals/store/packages/fixture/package.bin"
+printf '%s\n' 'fixture-package-hash' \
+  > "${canonical_home}/petals/store/owners/user-choice"
+mkdir "${test_root}/before"
+cp "${canonical_home}/config.toml" "${test_root}/before/config.toml"
+cp -R "${canonical_home}/petals" "${test_root}/before/petals"
+
 output="$(
   printf '\n\n\n\n' | env \
     BLOOM_INTEGRATION_TEST_HOME="${test_root}/home" \
@@ -32,6 +50,30 @@ test -f "${test_root}/preflight-state/approval-prepared"
 test -f "${test_root}/preflight-state/approval-active"
 test ! -e "${test_root}/preflight-state/approval-invalid"
 test -f "${test_root}/preflight-state/fixture-signed"
+cmp "${test_root}/before/config.toml" "${canonical_home}/config.toml"
+diff -r "${test_root}/before/petals" "${canonical_home}/petals"
+cmp "${canonical_home}/cache/wallet-projections.json" \
+  "${test_root}/preflight-state/wallet-projection-copy"
+test "$(cat "${test_root}/preflight-state/machine-home")" != "$canonical_home"
+
+# The real launcher refuses the persistent canonical home before it builds or
+# starts any service, preventing direct callers from restoring this regression.
+guard_home="${test_root}/guard-user"
+mkdir -p "$guard_home" "${test_root}/guard-canonical"
+ln -s "${test_root}/guard-canonical" "${guard_home}/.bloom"
+if HOME="$guard_home" "$repo_root/scripts/triad-dev-launch.sh" \
+  --developer-root "${test_root}/developer" \
+  --machine-home "${guard_home}/.bloom" \
+  --mount "${test_root}/guard-mount" \
+  --machine-socket "${test_root}/guard.sock" \
+  --log-dir "${test_root}/guard-logs" \
+  --ready-file "${test_root}/guard.ready" \
+  >"${test_root}/canonical-guard.out" 2>&1
+then
+  printf 'developer launcher unexpectedly accepted canonical ~/.bloom\n' >&2
+  exit 1
+fi
+grep -q 'refusing to use canonical ~/.bloom' "${test_root}/canonical-guard.out"
 
 # Substituting a policy digest in the mounted public projection must not fool
 # the authority double into activating an approval. This proves the fake binds
@@ -142,7 +184,7 @@ if command -v expect >/dev/null 2>&1; then
     exit 1
   fi
   tr -d '\r' <"$legacy_pm_output" | grep -Fxq \
-    'error: pinned Polymarket Petal is not production-triad signing compatible; no draft was staged'
+    'error: local Polymarket Petal is not production-triad signing compatible; no draft was staged'
   test ! -e "${test_root}/legacy-pm-state/pm-draft-staged"
   test ! -e "${test_root}/legacy-pm-state/pm-posted"
 

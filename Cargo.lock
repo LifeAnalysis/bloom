@@ -2188,7 +2188,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=2c11393a83ca0ebaf557aa11582f8e4b39caba4b#2c11393a83ca0ebaf557aa11582f8e4b39caba4b"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=9ed50362bb08681270961029aceac1269167e18b#9ed50362bb08681270961029aceac1269167e18b"
 dependencies = [
  "bloom-rpc-wire",
  "serde",
@@ -2230,6 +2230,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

@@ -36,6 +36,13 @@ developer_root="$(cd "$developer_root" && pwd -P)"
 mkdir -p "$machine_home" "$mount_dir" "$log_dir" \
   "$(dirname "$machine_socket")" "$(dirname "$ready_file")"
 machine_home="$(cd "$machine_home" && pwd -P)"
+if [ -d "${HOME}/.bloom" ]; then
+  canonical_machine_home="$(cd "${HOME}/.bloom" && pwd -P)"
+else
+  canonical_machine_home="$(cd "$HOME" && pwd -P)/.bloom"
+fi
+[ "$machine_home" != "$canonical_machine_home" ] ||
+  die "refusing to use canonical ~/.bloom as the mutable developer Machine home"
 mount_dir="$(cd "$mount_dir" && pwd -P)"
 log_dir="$(cd "$log_dir" && pwd -P)"
 machine_socket="$(cd "$(dirname "$machine_socket")" && pwd -P)/$(basename "$machine_socket")"
@@ -250,16 +257,31 @@ BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
   "$bloom_bin" --home "$machine_home" petals install "$fixture_root" \
   >"${log_dir}/fixture-install.log" 2>&1
 
-# This harness exercises Polymarket plus the local authority fixture.  Keep the
-# production Machine's ordinary provisioning path, but do not make readiness
-# depend on downloading unrelated preinstalled Petals.
+for integration_petal in \
+  "${BLOOM_TRIAD_DEV_POLYMARKET_PACKAGE:-}" \
+  "${BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE:-}"
+do
+  [ -n "$integration_petal" ] || continue
+  [ -d "$integration_petal" ] || die "integration Petal package is missing: $integration_petal"
+  package_name="$(basename "$integration_petal")"
+  BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
+  BLOOM_BROKER_SOCKET="$broker_socket" \
+  BLOOM_MACHINE_IDENTITY="${config_dir}/machine-identity.json" \
+  BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
+  BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
+    "$bloom_bin" --home "$machine_home" petals install "$integration_petal" \
+    >"${log_dir}/${package_name}-install.log" 2>&1
+done
+
+# Developer Petals are installed explicitly above. Do not download or advertise
+# a stale production release merely to make this isolated harness ready.
 machine_config="${machine_home}/config.toml"
 [ -f "$machine_config" ] || die "Machine did not create its configuration"
 machine_config_new="${machine_config}.new.$$"
 awk '
   $0 == "[petals]" { in_petals = 1; print; next }
   in_petals && $0 ~ /^preinstalled = \[/ {
-    print "preinstalled = [\"polymarket\"]"
+    print "preinstalled = []"
     skipping = 1
     next
   }
