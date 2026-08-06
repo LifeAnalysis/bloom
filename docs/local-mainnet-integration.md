@@ -12,8 +12,8 @@ to Machine. Signer keeps custody, Broker owns the ceremony origin, and normal
 release bundles reject this feature.
 
 The developer enrollment and Broker/Signer databases persist at
-`$BLOOM_TRIAD_DEV_ROOT` (default `~/.bloom-triad-dev`). Machine state defaults
-to `$BLOOM_TRIAD_DEV_ROOT/machine-home`. Process sockets,
+`$BLOOM_TRIAD_DEV_ROOT` (default `~/.bloom/triad-dev`). Machine state always
+uses `~/.bloom`. Process sockets,
 the kernel mount, and logs are new for every run. This is intentional: Signer
 must retain the passkey credential, encrypted root, and backend state across
 runs. A fresh Signer database cannot use a legacy wallet merely because an
@@ -82,10 +82,10 @@ the local process does not connect to it.
 On first use, start the launcher in one terminal (replace the paths if needed):
 
 ```bash
-mkdir -p ~/.bloom-triad-dev/machine-home /tmp/bloom-triad-mount /tmp/bloom-triad-logs
+mkdir -p ~/.bloom ~/.bloom/triad-dev /tmp/bloom-triad-mount /tmp/bloom-triad-logs
 scripts/triad-dev-launch.sh \
-  --developer-root ~/.bloom-triad-dev \
-  --machine-home ~/.bloom-triad-dev/machine-home \
+  --developer-root ~/.bloom/triad-dev \
+  --machine-home ~/.bloom \
   --mount /tmp/bloom-triad-mount \
   --machine-socket /tmp/bloom-triad-machine.sock \
   --log-dir /tmp/bloom-triad-logs \

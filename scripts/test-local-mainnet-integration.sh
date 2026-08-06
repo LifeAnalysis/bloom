@@ -17,7 +17,7 @@ trap cleanup_test EXIT
 
 output="$(
   printf '\n\n\n\n' | env \
-    BLOOM_HOME="${test_root}/home" \
+    BLOOM_INTEGRATION_TEST_HOME="${test_root}/home" \
     BLOOM_FAKE_STATE="${test_root}/preflight-state" \
     BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" \
     BLOOM_INTEGRATION_OPEN=true \
@@ -37,7 +37,7 @@ test -f "${test_root}/preflight-state/fixture-signed"
 # the authority double into activating an approval. This proves the fake binds
 # the complete request to its independently retained committed policy state.
 if printf '\n\n\n\n' | env \
-  BLOOM_HOME="${test_root}/mutated-home" \
+  BLOOM_INTEGRATION_TEST_HOME="${test_root}/mutated-home" \
   BLOOM_FAKE_STATE="${test_root}/mutated-approval-state" \
   BLOOM_FAKE_MUTATE_APPROVAL_POLICY_DIGEST=1 \
   BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" \
@@ -59,7 +59,7 @@ test ! -e "${test_root}/mutated-approval-state/fixture-signed"
 # configured Petals before the server creates its IPC socket.
 delayed_output="$(
   printf '\n\n\n\n' | env \
-    BLOOM_HOME="${test_root}/home" \
+    BLOOM_INTEGRATION_TEST_HOME="${test_root}/home" \
     BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" \
     BLOOM_INTEGRATION_OPEN=true \
     BLOOM_FAKE_STARTUP_DELAY_SECS=11 \
@@ -68,7 +68,7 @@ delayed_output="$(
 grep -q 'Preflight passed' <<<"$delayed_output"
 grep -q 'Still starting Bloom' "${test_root}/delayed.err"
 
-if BLOOM_HOME="${test_root}/home" \
+if BLOOM_INTEGRATION_TEST_HOME="${test_root}/home" \
   BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" \
   BLOOM_INTEGRATION_OPEN=true \
     "$runner" --wallet test-passkey --execute-hyperliquid \
@@ -79,7 +79,7 @@ then
 fi
 grep -q 'unknown argument: --execute-hyperliquid' "${test_root}/removed-hyperliquid.out"
 
-if BLOOM_HOME="${test_root}/home" BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" \
+if BLOOM_INTEGRATION_TEST_HOME="${test_root}/home" BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" \
   BLOOM_INTEGRATION_OPEN=true "$runner" --wallet test-passkey \
     --execute-polymarket --pm-slug fixture --pm-outcome Yes --pm-side buy \
     --pm-amount 26 --pm-price-bound 0.5 --pm-order-type FAK \
@@ -90,7 +90,7 @@ then
 fi
 grep -q 'maximum consideration exceeds' "${test_root}/pm-cap.out"
 
-if BLOOM_HOME="${test_root}/home" BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" \
+if BLOOM_INTEGRATION_TEST_HOME="${test_root}/home" BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" \
   BLOOM_INTEGRATION_OPEN=true "$runner" --wallet test-passkey \
     --execute-polymarket --pm-slug fixture --pm-outcome Yes --pm-side buy \
     --pm-amount 1 --pm-price-bound 0.5 --pm-order-type GTC \
@@ -101,7 +101,7 @@ then
 fi
 grep -q 'must be FAK or FOK' "${test_root}/pm-order-type.out"
 
-if BLOOM_HOME="${test_root}/home" BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" \
+if BLOOM_INTEGRATION_TEST_HOME="${test_root}/home" BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" \
   BLOOM_INTEGRATION_OPEN=true "$runner" --wallet test-passkey \
     --execute-polymarket --pm-slug fixture --pm-outcome Yes --pm-side buy \
     --pm-amount 1 --pm-price-bound 1.1 --pm-order-type FAK \
@@ -117,7 +117,7 @@ if command -v expect >/dev/null 2>&1; then
   # A legacy hash-only route contract must be rejected after the generic
   # fixture proof but before the venue Petal receives a draft write.
   # shellcheck disable=SC2016
-  if RUNNER="$runner" BLOOM_HOME="${test_root}/home" \
+  if RUNNER="$runner" BLOOM_INTEGRATION_TEST_HOME="${test_root}/home" \
     BLOOM_FAKE_STATE="${test_root}/legacy-pm-state" \
     BLOOM_FAKE_PM_SIGNING_ABI="0.1.0" \
     BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" BLOOM_INTEGRATION_OPEN=true \
@@ -150,7 +150,7 @@ if command -v expect >/dev/null 2>&1; then
   # Expect expands its own $env(RUNNER).
   # shellcheck disable=SC2016
   RUNNER="$runner" \
-  BLOOM_HOME="${test_root}/home" \
+  BLOOM_INTEGRATION_TEST_HOME="${test_root}/home" \
     BLOOM_FAKE_STATE="${test_root}/fake-state" \
     BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" \
     BLOOM_INTEGRATION_OPEN=true \
@@ -183,7 +183,7 @@ if command -v expect >/dev/null 2>&1; then
 
   wrong_ack_output="${test_root}/wrong-ack.out"
   # shellcheck disable=SC2016
-  if RUNNER="$runner" BLOOM_HOME="${test_root}/home" \
+  if RUNNER="$runner" BLOOM_INTEGRATION_TEST_HOME="${test_root}/home" \
     BLOOM_FAKE_STATE="${test_root}/wrong-ack-state" \
     BLOOM_TRIAD_DEV_LAUNCHER="$fixture_bin" BLOOM_INTEGRATION_OPEN=true \
     expect -c '

@@ -15,6 +15,7 @@ use url::Url;
 
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
+const HYPERLIQUID_RELEASE_COMMIT: &str = "fa722a986c2a0a23977e9e00df54ebd291a686db";
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
 
@@ -35,6 +36,15 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.3",
     archive: "polymarket-v0.1.3.petal.tar.gz",
     expected_hash: Some("02d6d18d773147013c3b1e7129c4694d2db3c93f1e885e755bdb4aa390bf6a5c"),
+};
+
+const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
+    name: "hyperliquid",
+    repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
+    commit: HYPERLIQUID_RELEASE_COMMIT,
+    release_tag: "v0.1.4",
+    archive: "hyperliquid-v0.1.4.petal.tar.gz",
+    expected_hash: Some("1de2eb50b7ce0f0da03d3ef1ae6554c6f1b89393096d50183fe4f2dbca6b2af7"),
 };
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
@@ -569,6 +579,7 @@ fn install_prebuilt_petal_archive(
 fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
     match name {
         "polymarket" => Some(&PREINSTALLED_POLYMARKET),
+        "hyperliquid" => Some(&PREINSTALLED_HYPERLIQUID),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "enso" => Some(&PREINSTALLED_ENSO),
         _ => None,
@@ -1037,6 +1048,11 @@ mod tests {
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
         assert_eq!(enso.archive, "enso-v0.1.2.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
+        let hyperliquid = preinstalled_petal("hyperliquid").unwrap();
+        assert_eq!(hyperliquid.release_tag, "v0.1.4");
+        assert_eq!(hyperliquid.commit, HYPERLIQUID_RELEASE_COMMIT);
+        assert_eq!(hyperliquid.archive, "hyperliquid-v0.1.4.petal.tar.gz");
+        assert!(hyperliquid.repository.ends_with("/bloom-petal-hyperliquid"));
         assert!(preinstalled_petal("unknown").is_none());
     }
 

@@ -22,12 +22,12 @@ It does not claim production UID isolation, but it preserves the authority
 boundaries and genuine passkey flow.
 
 ```sh
-mkdir -p ~/.bloom-triad-dev/machine-home \
+mkdir -p ~/.bloom ~/.bloom/triad-dev \
   /tmp/bloom-triad-mount /tmp/bloom-triad-logs
 
 scripts/triad-dev-launch.sh \
-  --developer-root ~/.bloom-triad-dev \
-  --machine-home ~/.bloom-triad-dev/machine-home \
+  --developer-root ~/.bloom/triad-dev \
+  --machine-home ~/.bloom \
   --mount /tmp/bloom-triad-mount \
   --machine-socket /tmp/bloom-triad-machine.sock \
   --log-dir /tmp/bloom-triad-logs \

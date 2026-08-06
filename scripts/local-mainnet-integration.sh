@@ -11,8 +11,10 @@ readonly MAX_USD="25"
 readonly FIXTURE_PACKAGE_HASH="2e2344e74b7ed11d4bb4c939671be9da72e13147dd16c3f6b6c347ae2c84d1ad"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-developer_root="${BLOOM_TRIAD_DEV_ROOT:-${HOME}/.bloom-triad-dev}"
-home_dir="${BLOOM_HOME:-${developer_root}/machine-home}"
+# Test harnesses may redirect state so they never touch a developer's real home.
+# Interactive/manual runs always use the canonical ~/.bloom Machine home.
+home_dir="${BLOOM_INTEGRATION_TEST_HOME:-${HOME}/.bloom}"
+developer_root="${BLOOM_TRIAD_DEV_ROOT:-${home_dir}/triad-dev}"
 wallet=""
 execute_pm=0
 pm_slug=""
@@ -43,9 +45,8 @@ Safety properties:
   * Machine is built without embedded custody or signing features.
 
 Environment:
-  BLOOM_HOME              Isolated Machine home (default: $BLOOM_TRIAD_DEV_ROOT/machine-home)
   BLOOM_TRIAD_DEV_ROOT    Persistent Broker/Signer developer state and enrollment
-                          (default: ~/.bloom-triad-dev)
+                          (default: ~/.bloom/triad-dev)
   BLOOM_TRIAD_DEV_LAUNCHER
                           Deterministic shell-test launcher override
   BLOOM_INTEGRATION_OPEN  Browser opener (default: open)

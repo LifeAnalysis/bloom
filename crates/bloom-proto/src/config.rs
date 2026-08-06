@@ -85,6 +85,7 @@ impl Default for PetalsConfig {
 fn default_preinstalled_petals() -> Vec<String> {
     vec![
         "polymarket".to_string(),
+        "hyperliquid".to_string(),
         "near-intents".to_string(),
         "enso".to_string(),
     ]
@@ -550,7 +551,10 @@ impl Config {
         let mut seen_preinstalled = std::collections::BTreeSet::new();
         for name in &self.petals.preinstalled {
             validate_petal_runtime_name("preinstalled entry", name)?;
-            if !matches!(name.as_str(), "polymarket" | "near-intents" | "enso") {
+            if !matches!(
+                name.as_str(),
+                "polymarket" | "hyperliquid" | "near-intents" | "enso"
+            ) {
                 return Err(ConfigError::Invalid(format!(
                     "unknown preinstalled Petal {name:?}"
                 )));
@@ -631,7 +635,7 @@ mod tests {
         assert!(cfg.enso.is_none());
         assert_eq!(
             cfg.petals.preinstalled,
-            ["polymarket", "near-intents", "enso"]
+            ["polymarket", "hyperliquid", "near-intents", "enso"]
         );
         assert_eq!(cfg.chains.len(), 13);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
@@ -844,13 +848,16 @@ allow_broadcast = false
         std::fs::write(&path, format!("{legacy}\n[polymarket]\nenabled = false\n")).unwrap();
 
         let migrated = Config::load(&path).unwrap();
-        assert_eq!(migrated.petals.preinstalled, vec!["near-intents", "enso"]);
+        assert_eq!(
+            migrated.petals.preinstalled,
+            vec!["hyperliquid", "near-intents", "enso"]
+        );
 
         std::fs::write(&path, format!("{default}\n[polymarket]\nenabled = false\n")).unwrap();
         let explicitly_enabled = Config::load(&path).unwrap();
         assert_eq!(
             explicitly_enabled.petals.preinstalled,
-            vec!["polymarket", "near-intents", "enso"]
+            vec!["polymarket", "hyperliquid", "near-intents", "enso"]
         );
     }
 
