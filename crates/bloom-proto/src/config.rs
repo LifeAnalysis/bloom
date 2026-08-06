@@ -91,6 +91,7 @@ fn default_preinstalled_petals() -> Vec<String> {
         "polymarket".to_string(),
         "near-intents".to_string(),
         "enso".to_string(),
+        "venice-x402".to_string(),
     ]
 }
 

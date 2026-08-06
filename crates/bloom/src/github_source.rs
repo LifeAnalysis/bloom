@@ -17,6 +17,7 @@ const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
+const VENICE_X402_RELEASE_COMMIT: &str = "f8d6a1b287397b2c66fa11ca777fe2b762640964";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
@@ -53,6 +54,15 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.2",
     archive: "enso-v0.1.2.petal.tar.gz",
     expected_hash: Some("82e541b237cd8dde0a566dfca7f3d20d6e688aacd23f62b1d0f1306f9c76ecb7"),
+};
+
+const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
+    name: "venice-x402",
+    repository: "https://github.com/bloom-directory/bloom-petal-venice-x402",
+    commit: VENICE_X402_RELEASE_COMMIT,
+    release_tag: "v0.1.0",
+    archive: "venice-x402-v0.1.0.petal.tar.gz",
+    expected_hash: Some("473df7e6a3f948480684d4485f07836918f0e36042d1b2105dc82fdb0370bf18"),
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,6 +581,7 @@ fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
         "polymarket" => Some(&PREINSTALLED_POLYMARKET),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "enso" => Some(&PREINSTALLED_ENSO),
+        "venice-x402" => Some(&PREINSTALLED_VENICE_X402),
         _ => None,
     }
 }
