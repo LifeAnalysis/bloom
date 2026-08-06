@@ -281,6 +281,7 @@ else
 fi
 BLOOM_TRIAD_DEV_POLYMARKET_PACKAGE="$polymarket_package" \
 BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE="$hyperliquid_package" \
+BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE=1 \
 "$triad_launcher" \
   --developer-root "$developer_root" \
   --machine-home "$machine_home" \

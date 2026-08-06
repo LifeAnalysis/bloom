@@ -30,11 +30,12 @@
 //! Both calls fail with [`HostError::Denied`] (`-2`) unless the petal's
 //! metadata declared the corresponding capability.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use wasmtime::component::{Component, Linker as ComponentLinker, Val as ComponentVal};
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, StoreContextMut};
 use wasmtime_wasi::WasiCtxBuilder;
@@ -165,6 +166,7 @@ pub struct DispatchOutput {
 #[derive(Clone)]
 pub struct PetalVm {
     engine: Engine,
+    components: Arc<Mutex<HashMap<[u8; 32], Component>>>,
 }
 
 impl PetalVm {
@@ -195,7 +197,21 @@ impl PetalVm {
         config.wasm_relaxed_simd(true);
         config.relaxed_simd_deterministic(true);
         let engine = Engine::new(&config).map_err(|e| PetalError::vm(e.to_string()))?;
-        Ok(Self { engine })
+        Ok(Self {
+            engine,
+            components: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    fn component(&self, wasm: &[u8]) -> Result<Component, PetalError> {
+        let key = *blake3::hash(wasm).as_bytes();
+        if let Some(component) = self.components.lock().get(&key).cloned() {
+            return Ok(component);
+        }
+        let component = Component::from_binary(&self.engine, wasm)
+            .map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+        self.components.lock().insert(key, component.clone());
+        Ok(component)
     }
 
     /// Run a petal end-to-end: instantiate, call `_start`, collect
@@ -281,8 +297,7 @@ impl PetalVm {
         route_params: Vec<(String, String)>,
         opts: RunOptions,
     ) -> Result<DispatchOutput, PetalError> {
-        let component = Component::from_binary(&self.engine, wasm)
-            .map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+        let component = self.component(wasm)?;
         let wasi_ctx = WasiCtxBuilder::new().build_p1();
         let mut store = Store::new(
             &self.engine,
@@ -370,8 +385,7 @@ impl PetalVm {
         route_params: Vec<(String, String)>,
         opts: RunOptions,
     ) -> Result<ComponentRouteMetadata, PetalError> {
-        let component = Component::from_binary(&self.engine, wasm)
-            .map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+        let component = self.component(wasm)?;
         let wasi_ctx = WasiCtxBuilder::new().build_p1();
         let mut store = Store::new(
             &self.engine,
@@ -959,7 +973,8 @@ async fn component_store_get(
     if let Err(e) = store_namespace_allowed(store.data(), &namespace) {
         return set_component_result(results, component_host_err(e));
     }
-    let key = match namespaced_store_key(&namespace, &key) {
+    let logical_key = key;
+    let key = match namespaced_store_key(&namespace, &logical_key) {
         Ok(key) => key,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
@@ -970,7 +985,27 @@ async fn component_store_get(
         );
     };
     let petal_hash = store.data().petal_hash.clone();
-    match private_store.get(&petal_hash, &key) {
+    let value = match private_store.get(&petal_hash, &key) {
+        Err(HostError::NotFound(_))
+            if namespace == "state"
+                && (logical_key == "creds" || logical_key.starts_with("creds/")) =>
+        {
+            // SDK releases through 0.1.0 routed secret writes to `secrets`
+            // but routed every read to `state`, despite documenting `creds/`
+            // as key-routed. Preserve compatibility with already-built Petals
+            // while the corrected SDK propagates through pinned packages.
+            if let Err(e) = store_namespace_allowed(store.data(), "secrets") {
+                return set_component_result(results, component_host_err(e));
+            }
+            let secret_key = match namespaced_store_key("secrets", &logical_key) {
+                Ok(key) => key,
+                Err(e) => return set_component_result(results, component_host_err(e)),
+            };
+            private_store.get(&petal_hash, &secret_key)
+        }
+        result => result,
+    };
+    match value {
         Ok(bytes) => set_component_result(
             results,
             component_ok(Some(ComponentVal::Option(Some(Box::new(component_bytes(
@@ -3278,6 +3313,14 @@ mod tests {
                 ComponentVal::String("alice".into())
             ])]
         );
+        assert!(
+            !bound_params.iter().any(|value| matches!(
+                value,
+                ComponentVal::Tuple(fields)
+                    if fields.first() == Some(&ComponentVal::String("bloom.route_id".into()))
+            )),
+            "route identity must come from the trusted route match, not request.ctx"
+        );
 
         let read = route_component_response(
             DispatchOp::Read,
@@ -3584,6 +3627,41 @@ mod tests {
         .await
         .unwrap();
         assert_component_ok_optional_bytes(&missing[0], None);
+    }
+
+    #[tokio::test]
+    async fn component_store_get_reads_legacy_sdk_credential_keys_from_secrets() {
+        let tmp = TempDir::new().unwrap();
+        let private_store = PrivateStore::open(tmp.path()).unwrap();
+        private_store
+            .put(
+                VALID_HASH,
+                "secrets/creds/wallet/clob.json",
+                b"credential",
+                true,
+            )
+            .unwrap();
+
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Store);
+        let mut store = component_test_store(caps, Some(private_store), Arc::new(DenyHost));
+        store.data_mut().store_namespaces = Some(StoreNamespacePolicy::from_namespaces(
+            ["state".to_string()],
+            ["secrets".to_string()],
+        ));
+
+        let mut result = vec![ComponentVal::Bool(false)];
+        component_store_get(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("state".into()),
+                ComponentVal::String("creds/wallet/clob.json".into()),
+            ],
+            &mut result,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_optional_bytes(&result[0], Some(b"credential"));
     }
 
     #[tokio::test]

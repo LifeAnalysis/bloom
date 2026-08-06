@@ -883,6 +883,152 @@ impl MachineBrokerClient {
         .map(ExactPayloadSignOutcome::ApprovalRequired)
     }
 
+    /// Prepare or execute one Petal-scoped payload batch. Unlike the exact
+    /// selector, the approval binds the installer-authenticated package,
+    /// route, operation class, wallet and assurance level, so a short-lived
+    /// venue timestamp may be refreshed after the owner completes ceremony.
+    /// The one-operation/signature-count limits still make the approval
+    /// single-use and bounded to this batch.
+    pub async fn sign_reusable_petal_payload_batch(
+        &self,
+        request: ExactPayloadBatchSignRequest,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        request.validate()?;
+        let claim = request.petal_use_claim.as_ref().ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "reusable Petal batch signing requires a PetalUseClaim",
+            )
+        })?;
+        let ProvenanceSubject::Petal {
+            package_hash,
+            route,
+        } = &request.provenance
+        else {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ProvenanceMismatch,
+                "reusable Petal batch signing requires trusted Petal provenance",
+            ));
+        };
+        let ordered_payload_digests = request
+            .preimages
+            .iter()
+            .map(|payload| Digest32::from_bytes(Sha256::digest(payload).into()))
+            .collect::<Vec<_>>();
+        let ordered_hashes = request
+            .preimages
+            .iter()
+            .map(|payload| suite_hash(request.crypto_suite, payload))
+            .collect::<Vec<_>>();
+        if request.claimed_hashes != ordered_hashes
+            || &claim.package_hash != package_hash
+            || &claim.route != route
+            || claim.operation_class.as_str() == ""
+            || claim.crypto_suite != request.crypto_suite
+            || claim.payload_digest != petal_batch_payload_digest(&request.preimages)
+            || claim.ordered_hashes != ordered_hashes
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "reusable Petal batch claim does not match provenance or payloads",
+            ));
+        }
+        let wallet = self.wallet(request.wallet_id.clone()).await?;
+        let key_ref = self
+            .verified_wallet_root(&wallet, request.crypto_suite)
+            .await?;
+        let activation_mode = request
+            .activation_mode
+            .clone()
+            .unwrap_or_else(|| default_activation_mode(&key_ref));
+        let claim_digest = Some(jcs_digest(claim)?);
+        let assurance_digest = Some(jcs_digest(&claim.claim_assurance)?);
+
+        if let Some(approval_id) = request.approval_id {
+            let operation_digest = SignOperationIdentity {
+                operation_id: request.signing_operation_id.clone(),
+                approval_id: approval_id.clone(),
+                key_ref: key_ref.clone(),
+                crypto_suite: request.crypto_suite,
+                ordered_payload_digests,
+                ordered_hashes,
+                petal_use_claim_digest: claim_digest,
+                claim_assurance_digest: assurance_digest,
+                policy_version: wallet.policy_version,
+                policy_digest: wallet.policy_digest,
+            }
+            .digest()?;
+            return self
+                .sign_batch(MachineSignRequest {
+                    operation_id: request.signing_operation_id,
+                    operation_digest,
+                    approval_id,
+                    key_ref,
+                    crypto_suite: request.crypto_suite,
+                    payloads: SigningPayloads::Batch {
+                        children: request
+                            .preimages
+                            .iter()
+                            .map(|payload| Base64UrlBytes::from_bytes(payload))
+                            .collect(),
+                    },
+                    petal_use_claim: Some(claim.clone()),
+                    claim_assurance_evidence: request
+                        .claim_assurance_evidence
+                        .as_deref()
+                        .map(Base64UrlBytes::from_bytes),
+                    provenance: request.provenance,
+                })
+                .await
+                .map(ExactPayloadSignOutcome::Signed);
+        }
+
+        let signature_count = u64::try_from(request.preimages.len()).map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::LimitExceededSignatures,
+                "reusable batch signature count exceeds protocol limits",
+            )
+        })?;
+        let operation_class = claim.operation_class.clone();
+        let terms = SealedApprovalTerms {
+            subject: approval_subject(&request.provenance),
+            wallet_id: request.wallet_id,
+            key_ref,
+            allowed_crypto_suites: vec![request.crypto_suite],
+            selector: ApprovalSelector::Petal {
+                package_hash: package_hash.clone(),
+                route: route.clone(),
+                allowed_operation_classes: vec![operation_class],
+                required_claim_assurance: claim.claim_assurance.level(),
+            },
+            limits: ApprovalLimits {
+                max_operations: DecimalU64::new(1),
+                max_signatures: DecimalU64::new(signature_count),
+                operation_rate_limits: Vec::new(),
+                signature_rate_limits: Vec::new(),
+                value_limits: Vec::new(),
+            },
+            activation_mode,
+            wallet_revocation_epoch: wallet.wallet_revocation_epoch,
+            policy_version: wallet.policy_version,
+            policy_digest: wallet.policy_digest,
+            provenance_digest: request.provenance_digest,
+            request_nonce: request.request_nonce,
+            issued_at_ms: request.issued_at_ms.clone(),
+            not_before_ms: request.issued_at_ms,
+            expires_at_ms: request.expires_at_ms,
+            renewal_of: None,
+        };
+        terms.validate()?;
+        self.prepare_approval(ApprovalPrepareRequest {
+            operation_id: request.approval_operation_id,
+            terms,
+            canonical_plan_facts_digest: request.canonical_plan_facts_digest,
+        })
+        .await
+        .map(ExactPayloadSignOutcome::ApprovalRequired)
+    }
+
     pub async fn prepare_approval(
         &self,
         request: ApprovalPrepareRequest,

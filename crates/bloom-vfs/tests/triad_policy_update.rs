@@ -425,7 +425,7 @@ async fn vfs_policy_prepare_response_loss_reconciles_the_persisted_operation_id(
         [
             MachineBrokerRequest::PolicyRead(_),
             MachineBrokerRequest::PolicyValidateUpdate(_),
-            MachineBrokerRequest::CeremonyStatus(_)
+            MachineBrokerRequest::PolicyValidateUpdate(_)
         ]
     ));
 }

@@ -1058,24 +1058,16 @@ impl WalletsHandler {
                 ));
             }
             let status = if projection.review_manifest_digest.is_none() {
-                match broker
-                    .ceremony_status(projection.operation_id.clone())
+                // The pre-prepare journal can survive a lost Broker response.
+                // Repeat the exact idempotent prepare so Machine recovers the
+                // review digest and URL that ceremony.status does not expose.
+                let prepared = broker
+                    .validate_policy_update(projection.request(&proposed_bytes))
                     .await
-                {
-                    Ok(status) => status,
-                    Err(error)
-                        if error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound =>
-                    {
-                        let prepared = broker
-                            .validate_policy_update(projection.request(&proposed_bytes))
-                            .await
-                            .map_err(|error| HandlerError::backend(error.to_string()))?;
-                        projection.adopt_prepare(prepared)?;
-                        write_atomic_json(&projection_path, &projection)?;
-                        return Err(HandlerError::PermissionDenied);
-                    }
-                    Err(error) => return Err(HandlerError::backend(error.to_string())),
-                }
+                    .map_err(|error| HandlerError::backend(error.to_string()))?;
+                projection.adopt_prepare(prepared)?;
+                write_atomic_json(&projection_path, &projection)?;
+                return Err(HandlerError::PermissionDenied);
             } else {
                 broker
                     .ceremony_status(projection.operation_id.clone())
@@ -1736,6 +1728,11 @@ impl Handler for WalletsHandler {
             );
         }
         r
+    }
+
+    fn is_async_write_command(&self, path: &VfsPath) -> bool {
+        let segs = path.segments();
+        matches!(segs, [_, leaf] if leaf == "policy.json")
     }
 
     async fn prepare_write_open(&self, path: &VfsPath) -> Result<(), HandlerError> {

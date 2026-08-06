@@ -268,6 +268,15 @@ pub trait Handler: Send + Sync {
         let _ = path;
         false
     }
+
+    /// Whether `path` is a small asynchronous command sink whose payload is
+    /// submitted as one complete write. The mount adapter accepts the NFS write
+    /// immediately and runs the command away from the request path; callers
+    /// observe its outcome through status projections.
+    fn is_async_write_command(&self, path: &VfsPath) -> bool {
+        let _ = path;
+        false
+    }
 }
 
 #[cfg(test)]

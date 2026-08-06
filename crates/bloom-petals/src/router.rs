@@ -118,7 +118,25 @@ impl PetalRouter {
         path: String,
         body: Vec<u8>,
     ) -> Result<DispatchResponse, HandlerError> {
-        let _audit_guard = self.audit_effect_lock.lock().await;
+        // Lookup, list, and ordinary reads are filesystem observations, not
+        // security effects. Auditing them both misstates the event stream and
+        // makes a single mounted path traversal append (and authenticate) many
+        // journal records before NFS reaches the command WRITE. A read is an
+        // effect only when its route explicitly declares that property.
+        let audit_effect = match op {
+            DispatchOp::Write => true,
+            DispatchOp::Read => self
+                .runner
+                .petal_route_effective_metadata(mount, op, &path)
+                .map(|(_, metadata)| metadata.side_effecting_read)
+                .unwrap_or(true),
+            DispatchOp::Lookup | DispatchOp::List => false,
+        };
+        let _audit_guard = if audit_effect {
+            Some(self.audit_effect_lock.lock().await)
+        } else {
+            None
+        };
         let operation = format!("petal.execute.{op:?}").to_ascii_lowercase();
         let payload_digest = blake3::hash(&body).to_hex().to_string();
         let operation_id = blake3::hash(
@@ -130,10 +148,13 @@ impl PetalRouter {
         )
         .to_hex()
         .to_string();
-        let correlation_id = self
-            .audit
-            .as_ref()
-            .map(|audit| format!("{operation_id}:{}", audit.sequence() + 1));
+        let correlation_id = audit_effect
+            .then(|| {
+                self.audit
+                    .as_ref()
+                    .map(|audit| format!("{operation_id}:{}", audit.sequence() + 1))
+            })
+            .flatten();
         if let (Some(audit), Some(correlation_id)) = (&self.audit, &correlation_id) {
             audit
                 .append(AuditRecord {
@@ -307,6 +328,12 @@ impl Handler for PetalRouter {
         {
             DispatchResponse::Write => Ok(()),
             DispatchResponse::Error { code, message } => {
+                tracing::debug!(
+                    path = %path.to_string_path(),
+                    code,
+                    message = %message,
+                    "petal.write_rejected"
+                );
                 Err(dispatch_error(code, message, path.to_string_path()))
             }
             other => Err(unexpected_response("write", other)),
@@ -405,6 +432,20 @@ impl Handler for PetalRouter {
                 .petal_route_effective_metadata(mount, DispatchOp::Read, &rest)
                 .ok()
                 .map(|(_, metadata)| metadata.side_effecting_read)
+                .unwrap_or(false);
+        }
+        false
+    }
+
+    fn is_async_write_command(&self, path: &VfsPath) -> bool {
+        if let Ok((mount, rest)) = Self::mount_path(path)
+            && self.is_petal(mount)
+        {
+            return self
+                .runner
+                .petal_route_effective_metadata(mount, DispatchOp::Write, &rest)
+                .ok()
+                .map(|(_, metadata)| metadata.write_async)
                 .unwrap_or(false);
         }
         false

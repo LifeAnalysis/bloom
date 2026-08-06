@@ -10,6 +10,7 @@ mount_dir=""
 machine_socket=""
 log_dir=""
 ready_file=""
+install_authority_fixture="${BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE:-0}"
 
 die() { printf 'triad developer launcher: %s\n' "$*" >&2; exit 1; }
 need_value() { [ "$#" -ge 2 ] || die "$1 requires a value"; }
@@ -27,6 +28,10 @@ done
 for value in "$developer_root" "$machine_home" "$mount_dir" "$machine_socket" "$log_dir" "$ready_file"; do
   [ -n "$value" ] || die "all launcher paths are required"
 done
+case "$install_authority_fixture" in
+  0|1) ;;
+  *) die "BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE must be 0 or 1" ;;
+esac
 
 command -v jq >/dev/null 2>&1 || die "jq is required"
 umask 077
@@ -36,13 +41,6 @@ developer_root="$(cd "$developer_root" && pwd -P)"
 mkdir -p "$machine_home" "$mount_dir" "$log_dir" \
   "$(dirname "$machine_socket")" "$(dirname "$ready_file")"
 machine_home="$(cd "$machine_home" && pwd -P)"
-if [ -d "${HOME}/.bloom" ]; then
-  canonical_machine_home="$(cd "${HOME}/.bloom" && pwd -P)"
-else
-  canonical_machine_home="$(cd "$HOME" && pwd -P)/.bloom"
-fi
-[ "$machine_home" != "$canonical_machine_home" ] ||
-  die "refusing to use canonical ~/.bloom as the mutable developer Machine home"
 mount_dir="$(cd "$mount_dir" && pwd -P)"
 log_dir="$(cd "$log_dir" && pwd -P)"
 machine_socket="$(cd "$(dirname "$machine_socket")" && pwd -P)/$(basename "$machine_socket")"
@@ -71,12 +69,15 @@ release_digest="$(
 )"
 config_dir="${developer_root}/config"
 fixture_root="${repo_root}/tests/fixtures/triad-authority-petal"
-fixture_hash="$($bloom_bin --home "${developer_root}/package-scan" petals build "$fixture_root" |
-  sed -n 's/^hash: //p')"
-case "$fixture_hash" in
-  [0-9a-f][0-9a-f]*) [ "${#fixture_hash}" -eq 64 ] || die "fixture package hash is malformed" ;;
-  *) die "could not determine fixture package hash" ;;
-esac
+fixture_hash=""
+if [ "$install_authority_fixture" -eq 1 ]; then
+  fixture_hash="$($bloom_bin --home "${developer_root}/package-scan" petals build "$fixture_root" |
+    sed -n 's/^hash: //p')"
+  case "$fixture_hash" in
+    [0-9a-f][0-9a-f]*) [ "${#fixture_hash}" -eq 64 ] || die "fixture package hash is malformed" ;;
+    *) die "could not determine fixture package hash" ;;
+  esac
+fi
 if [ ! -f "${config_dir}/edge-manifest.json" ]; then
   [ ! -e "$config_dir" ] || die "incomplete developer config already exists: $config_dir"
   template_dir="$(mktemp -d "${developer_root}/templates.XXXXXX")"
@@ -85,17 +86,19 @@ if [ ! -f "${config_dir}/edge-manifest.json" ]; then
     cp "${repo_root}/packaging/triad/macos/config/${name}" "${template_dir}/${name}"
     chmod 0600 "${template_dir}/${name}"
   done
-  catalog="${template_dir}/provenance-catalog.unsigned.json"
-  catalog_new="${catalog}.new"
-  jq --arg package_hash "$fixture_hash" '.records += [{
-    subject: {kind:"petal", package_hash:$package_hash, route:"r000001"},
-    publisher:"bloom-developer-fixture",
-    operation_classes:[{operation_class:"fixture.payload", fee_asset:null}],
-    installer_key_id:"unsigned-template",
-    installer_signature:""
-  }]' "$catalog" > "$catalog_new"
-  chmod 0600 "$catalog_new"
-  mv -f "$catalog_new" "$catalog"
+  if [ "$install_authority_fixture" -eq 1 ]; then
+    catalog="${template_dir}/provenance-catalog.unsigned.json"
+    catalog_new="${catalog}.new"
+    jq --arg package_hash "$fixture_hash" '.records += [{
+      subject: {kind:"petal", package_hash:$package_hash, route:"r000001"},
+      publisher:"bloom-developer-fixture",
+      operation_classes:[{operation_class:"fixture.payload", fee_asset:null}],
+      installer_key_id:"unsigned-template",
+      installer_signature:""
+    }]' "$catalog" > "$catalog_new"
+    chmod 0600 "$catalog_new"
+    mv -f "$catalog_new" "$catalog"
+  fi
   mkdir "$config_dir"
   chmod 0700 "$config_dir"
   "$bloom_bin" --triad-render-developer-enrollment \
@@ -123,11 +126,13 @@ do
   [ ! -L "${config_dir}/${name}" ] || die "developer config contains a symlink: ${name}"
   chmod 0600 "${config_dir}/${name}"
 done
-jq -e --arg package_hash "$fixture_hash" '
-  any(.records[]; .subject.kind == "petal" and
-      .subject.package_hash == $package_hash and .subject.route == "r000001")
-' "${config_dir}/provenance-catalog.json" >/dev/null ||
-  die "developer enrollment predates the current fixture; create a fresh developer root"
+if [ "$install_authority_fixture" -eq 1 ]; then
+  jq -e --arg package_hash "$fixture_hash" '
+    any(.records[]; .subject.kind == "petal" and
+        .subject.package_hash == $package_hash and .subject.route == "r000001")
+  ' "${config_dir}/provenance-catalog.json" >/dev/null ||
+    die "developer enrollment predates the current fixture; create a fresh developer root"
+fi
 mkdir -p "${developer_root}/state/broker" "${developer_root}/state/signer"
 chmod 0700 "${developer_root}/state" \
   "${developer_root}/state/broker" "${developer_root}/state/signer"
@@ -147,7 +152,7 @@ broker_socket="${runtime_dir}/broker/broker.sock"
 broker_control_socket="${runtime_dir}/broker/control.sock"
 broker_checkpoint_dir="${developer_root}/audit-checkpoints/broker"
 signer_checkpoint_dir="${developer_root}/audit-checkpoints/signer"
-machine_checkpoint_dir="${developer_root}/audit-checkpoints/machine"
+machine_checkpoint_dir="${machine_home}/audit-checkpoints/machine"
 mkdir -p "$broker_checkpoint_dir" "$signer_checkpoint_dir" "$machine_checkpoint_dir"
 chmod 0700 "$broker_checkpoint_dir" "$signer_checkpoint_dir" "$machine_checkpoint_dir"
 export BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR="$machine_checkpoint_dir"
@@ -225,7 +230,14 @@ BLOOM_TRIAD_DEVELOPER_RUNTIME="$runtime_dir" \
 session_pid=$!
 wait_for_socket "$session_socket" "$session_pid" session
 
-BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
+signer_clock_env=(env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS -u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST)
+if [ -n "${BLOOM_TRIAD_DEV_SIGNER_CLOCK_REPAIR_MS:-}" ]; then
+  signer_clock_env+=("BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS=${BLOOM_TRIAD_DEV_SIGNER_CLOCK_REPAIR_MS}")
+fi
+if [ -n "${BLOOM_TRIAD_DEV_SIGNER_CLOCK_REPAIR_CONFIRM:-}" ]; then
+  signer_clock_env+=("BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST=${BLOOM_TRIAD_DEV_SIGNER_CLOCK_REPAIR_CONFIRM}")
+fi
+"${signer_clock_env[@]}" BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
 BLOOM_SIGNER_IDENTITY="${config_dir}/signer-identity.json" \
 BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
 BLOOM_SIGNER_CONFIG="${config_dir}/signer.json" \
@@ -237,7 +249,14 @@ BLOOM_SESSION_SOCKET="$session_socket" \
 signer_pid=$!
 wait_for_socket "$signer_socket" "$signer_pid" signer
 
-BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
+broker_clock_env=(env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS -u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST)
+if [ -n "${BLOOM_TRIAD_DEV_BROKER_CLOCK_REPAIR_MS:-}" ]; then
+  broker_clock_env+=("BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS=${BLOOM_TRIAD_DEV_BROKER_CLOCK_REPAIR_MS}")
+fi
+if [ -n "${BLOOM_TRIAD_DEV_BROKER_CLOCK_REPAIR_CONFIRM:-}" ]; then
+  broker_clock_env+=("BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST=${BLOOM_TRIAD_DEV_BROKER_CLOCK_REPAIR_CONFIRM}")
+fi
+"${broker_clock_env[@]}" BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
 BLOOM_BROKER_IDENTITY="${config_dir}/broker-identity.json" \
 BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
 BLOOM_BROKER_CONFIG="${config_dir}/broker.json" \
@@ -249,13 +268,24 @@ BLOOM_SESSION_SOCKET="$session_socket" \
 broker_pid=$!
 wait_for_socket "$broker_socket" "$broker_pid" broker
 
-BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
-BLOOM_BROKER_SOCKET="$broker_socket" \
-BLOOM_MACHINE_IDENTITY="${config_dir}/machine-identity.json" \
-BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
-BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
-  "$bloom_bin" --home "$machine_home" petals install "$fixture_root" \
-  >"${log_dir}/fixture-install.log" 2>&1
+machine_config="${machine_home}/config.toml"
+if [ ! -e "$machine_config" ]; then
+  canonical_machine_config="${BLOOM_TRIAD_DEV_MACHINE_CONFIG:-${HOME}/.bloom/config.toml}"
+  [ -f "$canonical_machine_config" ] && [ ! -L "$canonical_machine_config" ] ||
+    die "canonical Machine config is not a regular file: $canonical_machine_config"
+  cp "$canonical_machine_config" "$machine_config"
+  chmod 0600 "$machine_config"
+fi
+
+if [ "$install_authority_fixture" -eq 1 ]; then
+  BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
+  BLOOM_BROKER_SOCKET="$broker_socket" \
+  BLOOM_MACHINE_IDENTITY="${config_dir}/machine-identity.json" \
+  BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
+  BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
+    "$bloom_bin" --home "$machine_home" petals install "$fixture_root" \
+    >"${log_dir}/fixture-install.log" 2>&1
+fi
 
 for integration_petal in \
   "${BLOOM_TRIAD_DEV_POLYMARKET_PACKAGE:-}" \
@@ -275,21 +305,38 @@ done
 
 # Developer Petals are installed explicitly above. Do not download or advertise
 # a stale production release merely to make this isolated harness ready.
-machine_config="${machine_home}/config.toml"
 [ -f "$machine_config" ] || die "Machine did not create its configuration"
 machine_config_new="${machine_config}.new.$$"
 awk '
-  $0 == "[petals]" { in_petals = 1; print; next }
+  $0 == "[petals]" {
+    saw_petals = 1
+    in_petals = 1
+    print
+    next
+  }
   in_petals && $0 ~ /^preinstalled = \[/ {
     print "preinstalled = []"
-    skipping = 1
+    replaced_preinstalled = 1
+    if ($0 !~ /\]/) skipping = 1
     next
   }
   skipping {
     if ($0 == "]") skipping = 0
     next
   }
+  in_petals && $0 ~ /^\[/ {
+    if (!replaced_preinstalled) print "preinstalled = []"
+    in_petals = 0
+  }
   { print }
+  END {
+    if (in_petals && !replaced_preinstalled) print "preinstalled = []"
+    if (!saw_petals) {
+      print ""
+      print "[petals]"
+      print "preinstalled = []"
+    }
+  }
 ' "$machine_config" > "$machine_config_new"
 chmod 0600 "$machine_config_new"
 mv -f "$machine_config_new" "$machine_config"

@@ -484,6 +484,38 @@ impl DaemonPetalHost {
         ))
     }
 
+    fn petal_reusable_signing_paths(
+        &self,
+        context: &PetalRouteContext,
+        wallet: &str,
+        operation_class: &str,
+        signature_count: usize,
+    ) -> Result<(String, PathBuf, PathBuf), HostError> {
+        let root = self
+            .petal_signing_state_root
+            .as_ref()
+            .ok_or_else(|| HostError::Backend("Petal signing state is not configured".into()))?;
+        let mut identity = blake3::Hasher::new();
+        identity.update(b"bloom-petal-reusable-batch-signing/v1\0");
+        let signature_count = (signature_count as u64).to_be_bytes();
+        for part in [
+            context.package_hash.as_bytes(),
+            context.route_id.as_bytes(),
+            wallet.as_bytes(),
+            operation_class.as_bytes(),
+            signature_count.as_slice(),
+        ] {
+            identity.update(&(part.len() as u64).to_be_bytes());
+            identity.update(part);
+        }
+        let request_id = identity.finalize().to_hex().to_string();
+        Ok((
+            request_id.clone(),
+            root.join(".state").join(format!("{request_id}.json")),
+            root.join(format!("{request_id}.json")),
+        ))
+    }
+
     fn write_petal_signing_projection(
         path: &Path,
         state: &PetalSigningRequestProjection,
@@ -1319,10 +1351,9 @@ impl PetalHost for DaemonPetalHost {
         &self,
         req: PayloadBatchSignRequest,
     ) -> Result<PayloadBatchSignOutcome, HostError> {
-        if req.selector != bloom_broker_api::PetalSignSelector::Exact || req.key_ref.is_some() {
+        if req.key_ref.is_some() {
             return Err(HostError::Denied(
-                "Petal payload batches require Machine-owned exact approval and root selection"
-                    .into(),
+                "Petal payload batches require Machine-owned approval and root selection".into(),
             ));
         }
         let broker = self.broker.as_ref().ok_or_else(|| {
@@ -1411,20 +1442,28 @@ impl PetalHost for DaemonPetalHost {
             package_hash: trusted_package_hash,
             route: context.route_id.clone(),
         };
-        let (request_id, exact_state_path, owner_projection_path) = self.petal_signing_paths(
-            context,
-            &req.wallet,
-            &req.operation_class,
-            &batch_digest_bytes,
-            &canonical_claim,
-        )?;
+        let (request_id, exact_state_path, owner_projection_path) = match req.selector {
+            bloom_broker_api::PetalSignSelector::Exact => self.petal_signing_paths(
+                context,
+                &req.wallet,
+                &req.operation_class,
+                &batch_digest_bytes,
+                &canonical_claim,
+            )?,
+            bloom_broker_api::PetalSignSelector::Reusable => self.petal_reusable_signing_paths(
+                context,
+                &req.wallet,
+                &req.operation_class,
+                preimages.len(),
+            )?,
+        };
         if req
             .approval_hint
             .as_deref()
             .is_some_and(|hint| hint != request_id)
         {
             return Err(HostError::Denied(
-                "approval artifact does not match the exact Petal batch operation".into(),
+                "approval artifact does not match the Petal batch authorization".into(),
             ));
         }
         let payload_digests = preimages
@@ -1433,46 +1472,78 @@ impl PetalHost for DaemonPetalHost {
                 bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(payload).into())
             })
             .collect::<Vec<_>>();
-        let canonical_facts = serde_json::json!({
-            "schema": "bloom.machine.petal-exact-batch-facts.v1",
-            "request_id": request_id,
-            "package_hash": context.package_hash,
-            "route": context.route_id,
-            "wallet": req.wallet,
-            "operation_class": req.operation_class,
-            "crypto_suite": crypto_suite,
-            "batch_payload_digest": batch_digest,
-            "ordered_payload_digests": payload_digests,
-            "ordered_hashes": recomputed_hashes,
-            "petal_use_claim_digest": bloom_broker_api::Digest32::from_bytes(
-                sha2::Sha256::digest(&canonical_claim).into()
-            ),
-            "claim_assurance_evidence_digest": req.claim_assurance_evidence.as_ref()
-                .map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
-            "action_digest": req.action.as_ref().map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
-            "advisory_digest": req.advisory.as_ref().map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
-        });
+        let canonical_facts = match req.selector {
+            bloom_broker_api::PetalSignSelector::Exact => serde_json::json!({
+                "schema": "bloom.machine.petal-exact-batch-facts.v1",
+                "request_id": request_id,
+                "package_hash": context.package_hash,
+                "route": context.route_id,
+                "wallet": req.wallet,
+                "operation_class": req.operation_class,
+                "crypto_suite": crypto_suite,
+                "batch_payload_digest": batch_digest,
+                "ordered_payload_digests": payload_digests,
+                "ordered_hashes": recomputed_hashes,
+                "petal_use_claim_digest": bloom_broker_api::Digest32::from_bytes(
+                    sha2::Sha256::digest(&canonical_claim).into()
+                ),
+                "claim_assurance_evidence_digest": req.claim_assurance_evidence.as_ref()
+                    .map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
+                "action_digest": req.action.as_ref().map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
+                "advisory_digest": req.advisory.as_ref().map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
+            }),
+            bloom_broker_api::PetalSignSelector::Reusable => serde_json::json!({
+                "schema": "bloom.machine.petal-reusable-batch-facts.v1",
+                "request_id": request_id,
+                "package_hash": context.package_hash,
+                "route": context.route_id,
+                "wallet": req.wallet,
+                "operation_class": req.operation_class,
+                "crypto_suite": crypto_suite,
+                "max_operations": 1,
+                "max_signatures": preimages.len(),
+                "required_claim_assurance": claim.claim_assurance.level(),
+            }),
+        };
         let catalog = self.provenance_catalog.clone().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
         let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog);
         let _guard = self.petal_signing_lock.lock().await;
-        let outcome = signer
-            .sign_or_prepare_petal_batch(
-                &exact_state_path,
-                &request_id,
-                &req.wallet,
-                &req.operation_class,
-                &preimages,
-                &claimed_hashes,
-                crypto_suite,
-                &canonical_facts,
-                &trusted_subject,
-                &claim,
-                req.claim_assurance_evidence.as_deref(),
-            )
-            .await
-            .map_err(HostError::Denied)?;
+        let outcome = if req.selector == bloom_broker_api::PetalSignSelector::Reusable {
+            signer
+                .sign_or_prepare_reusable_petal_batch(
+                    &exact_state_path,
+                    &request_id,
+                    &req.wallet,
+                    &req.operation_class,
+                    &preimages,
+                    &claimed_hashes,
+                    crypto_suite,
+                    &canonical_facts,
+                    &trusted_subject,
+                    &claim,
+                    req.claim_assurance_evidence.as_deref(),
+                )
+                .await
+        } else {
+            signer
+                .sign_or_prepare_petal_batch(
+                    &exact_state_path,
+                    &request_id,
+                    &req.wallet,
+                    &req.operation_class,
+                    &preimages,
+                    &claimed_hashes,
+                    crypto_suite,
+                    &canonical_facts,
+                    &trusted_subject,
+                    &claim,
+                    req.claim_assurance_evidence.as_deref(),
+                )
+                .await
+        }
+        .map_err(HostError::Denied)?;
         match outcome {
             bloom_vfs::ExactPayloadBatchOutcome::ApprovalRequired {
                 approval_id,

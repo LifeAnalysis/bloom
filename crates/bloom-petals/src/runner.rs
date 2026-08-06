@@ -462,11 +462,13 @@ impl PetalRunner {
         opts: RunOptions,
     ) -> Result<DispatchOutput, PetalError> {
         let matched = self.petal_route(mount, request.op, &request.path)?;
-        let route_params = matched.params.clone();
+        let mut route_params = matched.params.clone();
+        // Components need the host-selected route identity to construct
+        // claims that the signing host binds back to this exact route. Keep
+        // it in the trusted match output rather than accepting it from the
+        // caller-supplied request context.
+        route_params.push(("bloom.route_id".into(), matched.route.route_id.clone()));
         request.ctx.extend(route_params.clone());
-        request
-            .ctx
-            .push(("bloom.route_id".into(), matched.route.route_id.clone()));
 
         let wasm = self
             .store

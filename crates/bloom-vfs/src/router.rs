@@ -104,6 +104,18 @@ impl Vfs {
         h.is_read_side_effecting(&rest)
     }
 
+    /// Whether `path` is a small asynchronous command sink. Returns false for
+    /// unknown paths and ordinary writable files.
+    pub fn is_async_write_command(&self, path: &VfsPath) -> bool {
+        let Some(head) = path.first() else {
+            return false;
+        };
+        let Some(h) = self.handlers.get(head) else {
+            return false;
+        };
+        h.is_async_write_command(&path.shift())
+    }
+
     fn audit_record(
         &self,
         kind: &str,

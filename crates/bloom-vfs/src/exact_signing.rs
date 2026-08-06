@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bloom_broker_api::{
-    CryptoSuite, DecimalU64, Digest32, OperationId, PetalUseClaim, ProvenanceCatalog,
-    ProvenanceSubject, RequestNonce, Token,
+    CryptoSuite, DecimalU64, Digest32, OperationId, PetalUseClaim, ProtocolErrorCode,
+    ProvenanceCatalog, ProvenanceSubject, RequestNonce, Token,
 };
 use bloom_machine_client::{
     ExactPayloadBatchSignRequest, ExactPayloadSignOutcome, ExactPayloadSignRequest,
@@ -79,6 +79,25 @@ struct ExactBatchSigningState {
     crypto_suite: CryptoSuite,
     payload_digests: Vec<Digest32>,
     claimed_hashes: Vec<Digest32>,
+    provenance_digest: Digest32,
+    approval_operation_id: OperationId,
+    signing_operation_id: OperationId,
+    request_nonce: RequestNonce,
+    issued_at_ms: DecimalU64,
+    expires_at_ms: DecimalU64,
+    canonical_plan_facts_digest: Digest32,
+    approval_id: Option<Digest32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReusablePetalBatchSigningState {
+    schema: String,
+    action_id: String,
+    wallet_id: Token,
+    operation_class: Token,
+    crypto_suite: CryptoSuite,
+    signature_count: u64,
     provenance_digest: Digest32,
     approval_operation_id: OperationId,
     signing_operation_id: OperationId,
@@ -280,8 +299,14 @@ impl BrokerExactPayloadSigner {
         {
             return Err("exact signing retry differs from its persisted operation identity".into());
         }
-        if state.expires_at_ms.get() <= now_ms()? {
-            return Err("exact signing approval operation expired; stage a new action".into());
+        let now = now_ms()?;
+        if state.expires_at_ms.get() <= now {
+            state.approval_operation_id = random_operation_id();
+            state.signing_operation_id = random_operation_id();
+            state.request_nonce = random_request_nonce();
+            state.issued_at_ms = DecimalU64::new(now);
+            state.expires_at_ms = DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS));
+            state.approval_id = None;
         }
         write_state(state_path, &state)?;
         let request = ExactPayloadSignRequest {
@@ -323,7 +348,10 @@ impl BrokerExactPayloadSigner {
                 }
                 Ok(ExactPayloadOutcome::Signed(signature.bytes.decode()))
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => {
+                tracing::error!(code = ?error.code, message = %error.message, action_id, "petal exact signing failed");
+                Err(error.to_string())
+            }
         }
     }
 
@@ -379,6 +407,196 @@ impl BrokerExactPayloadSigner {
             .await;
         let _ = lock.unlock();
         result
+    }
+
+    /// Single-use Petal-scoped batch approval for payloads containing short-
+    /// lived venue fields. Durable identity intentionally excludes payload
+    /// bytes while retaining package, route, operation class, wallet, suite,
+    /// assurance, operation count and signature count in Broker terms.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sign_or_prepare_reusable_petal_batch(
+        &self,
+        state_path: &Path,
+        action_id: &str,
+        wallet: &str,
+        operation_class: &str,
+        preimages: &[Vec<u8>],
+        claimed_hashes: &[Digest32],
+        crypto_suite: CryptoSuite,
+        canonical_plan_facts: &serde_json::Value,
+        trusted_subject: &ProvenanceSubject,
+        claim: &PetalUseClaim,
+        claim_assurance_evidence: Option<&[u8]>,
+    ) -> Result<ExactPayloadBatchOutcome, String> {
+        let parent = state_path
+            .parent()
+            .ok_or_else(|| "reusable batch signing state path has no parent".to_owned())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create reusable batch signing state directory: {error}"))?;
+        let lock_path = state_path.with_extension("lock");
+        let lock = tokio::task::spawn_blocking(move || {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(lock_path)
+                .map_err(|error| format!("open reusable batch signing lock: {error}"))?;
+            file.lock_exclusive()
+                .map_err(|error| format!("lock reusable batch signing state: {error}"))?;
+            Ok::<_, String>(file)
+        })
+        .await
+        .map_err(|error| format!("join reusable batch signing lock task: {error}"))??;
+        let result = self
+            .sign_or_prepare_reusable_petal_batch_locked(
+                state_path,
+                action_id,
+                wallet,
+                operation_class,
+                preimages,
+                claimed_hashes,
+                crypto_suite,
+                canonical_plan_facts,
+                trusted_subject,
+                claim,
+                claim_assurance_evidence,
+            )
+            .await;
+        let _ = lock.unlock();
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sign_or_prepare_reusable_petal_batch_locked(
+        &self,
+        state_path: &Path,
+        action_id: &str,
+        wallet: &str,
+        operation_class: &str,
+        preimages: &[Vec<u8>],
+        claimed_hashes: &[Digest32],
+        crypto_suite: CryptoSuite,
+        canonical_plan_facts: &serde_json::Value,
+        trusted_subject: &ProvenanceSubject,
+        claim: &PetalUseClaim,
+        claim_assurance_evidence: Option<&[u8]>,
+    ) -> Result<ExactPayloadBatchOutcome, String> {
+        let operation_class_token = Token::new(operation_class.to_owned())
+            .map_err(|error| format!("operation class: {error}"))?;
+        let provenance = self
+            .provenance_catalog
+            .records
+            .iter()
+            .find(|record| {
+                &record.subject == trusted_subject
+                    && record
+                        .operation_classes
+                        .iter()
+                        .any(|entry| entry.operation_class == operation_class_token)
+            })
+            .ok_or_else(|| format!("installer provenance does not authorize {operation_class}"))?;
+        let provenance_digest = provenance
+            .digest()
+            .map_err(|error| format!("digest installer provenance: {error}"))?;
+        let plan_bytes = serde_jcs::to_vec(canonical_plan_facts)
+            .map_err(|error| format!("canonicalize reusable batch signing facts: {error}"))?;
+        let canonical_plan_facts_digest = Digest32::from_bytes(Sha256::digest(plan_bytes).into());
+        let wallet_id = Token::new(wallet.to_owned()).map_err(|error| error.to_string())?;
+        let signature_count = u64::try_from(preimages.len())
+            .map_err(|_| "reusable batch signature count overflow".to_owned())?;
+
+        let mut state = match fs::read(state_path) {
+            Ok(bytes) => serde_json::from_slice::<ReusablePetalBatchSigningState>(&bytes)
+                .map_err(|error| format!("read reusable batch signing state: {error}"))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let now = now_ms()?;
+                ReusablePetalBatchSigningState {
+                    schema: STATE_SCHEMA.into(),
+                    action_id: action_id.to_owned(),
+                    wallet_id: wallet_id.clone(),
+                    operation_class: operation_class_token.clone(),
+                    crypto_suite,
+                    signature_count,
+                    provenance_digest: provenance_digest.clone(),
+                    approval_operation_id: random_operation_id(),
+                    signing_operation_id: random_operation_id(),
+                    request_nonce: random_request_nonce(),
+                    issued_at_ms: DecimalU64::new(now),
+                    expires_at_ms: DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS)),
+                    canonical_plan_facts_digest: canonical_plan_facts_digest.clone(),
+                    approval_id: None,
+                }
+            }
+            Err(error) => return Err(format!("read reusable batch signing state: {error}")),
+        };
+        if state.schema != STATE_SCHEMA
+            || state.action_id != action_id
+            || state.wallet_id != wallet_id
+            || state.operation_class != operation_class_token
+            || state.crypto_suite != crypto_suite
+            || state.signature_count != signature_count
+            || state.provenance_digest != provenance_digest
+            || state.canonical_plan_facts_digest != canonical_plan_facts_digest
+        {
+            return Err(
+                "reusable batch retry differs from its persisted authorization scope".into(),
+            );
+        }
+        let now = now_ms()?;
+        if state.expires_at_ms.get() <= now {
+            state.approval_operation_id = random_operation_id();
+            state.signing_operation_id = random_operation_id();
+            state.request_nonce = random_request_nonce();
+            state.issued_at_ms = DecimalU64::new(now);
+            state.expires_at_ms = DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS));
+            state.approval_id = None;
+        }
+        write_state(state_path, &state)?;
+        let request = ExactPayloadBatchSignRequest {
+            wallet_id,
+            preimages: preimages.to_vec(),
+            claimed_hashes: claimed_hashes.to_vec(),
+            crypto_suite,
+            provenance: provenance.subject.clone(),
+            provenance_digest,
+            activation_mode: None,
+            approval_operation_id: state.approval_operation_id.clone(),
+            signing_operation_id: state.signing_operation_id.clone(),
+            request_nonce: state.request_nonce.clone(),
+            issued_at_ms: state.issued_at_ms.clone(),
+            expires_at_ms: state.expires_at_ms.clone(),
+            canonical_plan_facts_digest,
+            approval_id: state.approval_id.clone(),
+            petal_use_claim: Some(claim.clone()),
+            claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
+        };
+        match self.broker.sign_reusable_petal_payload_batch(request).await {
+            Ok(ExactPayloadSignOutcome::ApprovalRequired(prepared)) => {
+                state.approval_id = Some(prepared.approval_id.clone());
+                write_state(state_path, &state)?;
+                Ok(ExactPayloadBatchOutcome::ApprovalRequired {
+                    approval_id: prepared.approval_id,
+                    ceremony_url: prepared.ceremony_url,
+                    ceremony_expires_at_ms: prepared.ceremony_expires_at_ms.get(),
+                })
+            }
+            Ok(ExactPayloadSignOutcome::Signed(result)) => {
+                if result.signatures.len() != preimages.len() {
+                    return Err(
+                        "Broker returned an unexpected reusable batch signature count".into(),
+                    );
+                }
+                Ok(ExactPayloadBatchOutcome::Signed(
+                    result
+                        .signatures
+                        .iter()
+                        .map(|signature| signature.bytes.decode())
+                        .collect(),
+                ))
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -461,13 +679,17 @@ impl BrokerExactPayloadSigner {
                 "exact batch signing retry differs from its persisted operation identity".into(),
             );
         }
-        if state.expires_at_ms.get() <= now_ms()? {
-            return Err(
-                "exact batch signing approval operation expired; stage a new action".into(),
-            );
+        let now = now_ms()?;
+        if state.expires_at_ms.get() <= now {
+            state.approval_operation_id = random_operation_id();
+            state.signing_operation_id = random_operation_id();
+            state.request_nonce = random_request_nonce();
+            state.issued_at_ms = DecimalU64::new(now);
+            state.expires_at_ms = DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS));
+            state.approval_id = None;
         }
         write_state(state_path, &state)?;
-        let request = ExactPayloadBatchSignRequest {
+        let mut request = ExactPayloadBatchSignRequest {
             wallet_id,
             preimages: preimages.to_vec(),
             claimed_hashes: claimed_hashes.to_vec(),
@@ -485,7 +707,22 @@ impl BrokerExactPayloadSigner {
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
-        match self.broker.sign_exact_payload_batch(request).await {
+        let mut response = self.broker.sign_exact_payload_batch(request.clone()).await;
+        if response
+            .as_ref()
+            .is_err_and(|error| error.code == ProtocolErrorCode::OperationIdConflict)
+            && state.approval_id.is_some()
+        {
+            // A prior sign attempt may have durably finalized its reservation
+            // before returning a retryable error. Preserve the completed
+            // approval and exact payload identity, but never reuse that
+            // finalized signing operation ID.
+            state.signing_operation_id = random_operation_id();
+            request.signing_operation_id = state.signing_operation_id.clone();
+            write_state(state_path, &state)?;
+            response = self.broker.sign_exact_payload_batch(request).await;
+        }
+        match response {
             Ok(ExactPayloadSignOutcome::ApprovalRequired(prepared)) => {
                 state.approval_id = Some(prepared.approval_id.clone());
                 write_state(state_path, &state)?;
@@ -507,7 +744,10 @@ impl BrokerExactPayloadSigner {
                         .collect(),
                 ))
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => {
+                tracing::error!(code = ?error.code, message = %error.message, action_id, "petal exact batch signing failed");
+                Err(error.to_string())
+            }
         }
     }
 }

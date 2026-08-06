@@ -1311,16 +1311,20 @@ impl FileSystem for BloomFs {
         //
         // Strategy:
         // - Flush eagerly when the request is sync-stable and the buffer is
-        //   contiguous, or for a narrowly-classified atomic command sink at
-        //   offset zero. NFS WRITE does not otherwise carry an EOF/final chunk
-        //   marker, so an ordinary UNSTABLE offset-0 prefix that may grow must
-        //   wait for COMMIT even if it could also be a whole single-RPC write.
+        //   contiguous. For a narrowly-classified asynchronous command sink,
+        //   accept a complete offset-zero write and dispatch it away from the
+        //   NFS request path. Stability for these virtual files means Bloom
+        //   accepted the command; completion is represented by the command's
+        //   durable status/challenge/receipt projection. NFS WRITE does not
+        //   otherwise carry an EOF/final-chunk marker, so ordinary offset-zero
+        //   prefixes wait for COMMIT even when they fit in one RPC.
         // - DATA_SYNC / FILE_SYNC requested but buffer is incomplete
         //   (mid-stream chunk): reject explicitly. Returning a weaker
         //   stability than requested violates embednfs' contract and
         //   surfaces as SERVERFAULT/EREMOTEIO.
         // - UNSTABLE requested: buffer and reply UNSTABLE; a later
         //   COMMIT or read will trigger `flush_path`.
+        let async_command = self.vfs.is_async_write_command(&path);
         let (complete_payload, accepted) = {
             let mut map = self.write_buffers.lock();
             let buf = map.entry(path.clone()).or_insert_with(WriteBuffer::new);
@@ -1332,7 +1336,9 @@ impl FileSystem for BloomFs {
                 return Err(FsError::FileTooLarge);
             }
             buf.apply(offset, &data)?;
-            let payload = if buf.should_flush_after_write(requested) {
+            let payload = if buf.should_flush_after_write(requested)
+                || (offset == 0 && async_command && buf.is_complete())
+            {
                 Some(map.remove(&path).expect("just observed").bytes)
             } else {
                 None
@@ -1351,8 +1357,10 @@ impl FileSystem for BloomFs {
         }
 
         let actual_stability = if complete_payload.is_some() {
-            // We persisted the buffer through to the VFS, so we can
-            // honour whatever sync level the kernel asked for.
+            // A normal write is persisted below before this result returns. An
+            // asynchronous command is accepted for dispatch; its virtual file
+            // never represents persisted content, and its outcome is projected
+            // separately by the command handler.
             requested
         } else {
             // Still buffering: only safe to advertise UNSTABLE so the
@@ -1364,12 +1372,32 @@ impl FileSystem for BloomFs {
             if mount_write_path_uses_wallet_signer(&path) {
                 return Err(FsError::PermissionDenied);
             }
-            match self.vfs.write(&path, &payload).await {
-                Ok(()) => {
-                    // Persisted new bytes — invalidate any stale rendered view.
-                    self.invalidate_after_write(&path);
+            if async_command {
+                let vfs = self.vfs.clone();
+                let command_path = path.clone();
+                let runtime = tokio::runtime::Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = runtime.block_on(vfs.write(&command_path, &payload)) {
+                        warn!(
+                            path = %command_path.to_string_path(),
+                            error = %error,
+                            "mount.adapter.async_command_outcome_deferred"
+                        );
+                    }
+                });
+                // The command owns its durable status/challenge/receipt
+                // projection. Invalidate speculative mount views immediately;
+                // subsequent reads will either observe the old status briefly
+                // or the command's published outcome.
+                self.invalidate_after_write(&path);
+            } else {
+                match self.vfs.write(&path, &payload).await {
+                    Ok(()) => {
+                        // Persisted new bytes — invalidate stale rendered views.
+                        self.invalidate_after_write(&path);
+                    }
+                    Err(error) => return Err(map_err(error)),
                 }
-                Err(error) => return Err(map_err(error)),
             }
         }
 
@@ -1672,7 +1700,9 @@ mod tests {
                 return Ok(Entry::dir(""));
             }
             match p.first() {
-                Some("inbox") => Ok(Entry::writable_file("inbox")),
+                Some("inbox" | "command") => Ok(Entry::writable_file(
+                    p.first().expect("matched path segment"),
+                )),
                 Some("readme") => Ok(Entry::file("readme")),
                 Some("run") => Ok(Entry::executable_file("run")),
                 _ => Err(HandlerError::NotFound(p.to_string_path())),
@@ -1688,9 +1718,16 @@ mod tests {
         }
         async fn write(&self, p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
             match p.first() {
-                Some("inbox" | "mainnet") => {
+                Some("inbox" | "command" | "mainnet") => {
+                    if data == b"slow\n" {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                     self.writes.lock().push(data.to_vec());
-                    Ok(())
+                    if data == b"deny\n" {
+                        Err(HandlerError::PermissionDenied)
+                    } else {
+                        Ok(())
+                    }
                 }
                 _ => Err(HandlerError::PermissionDenied),
             }
@@ -1699,12 +1736,17 @@ mod tests {
             if p.is_root() {
                 Ok(vec![
                     Entry::writable_file("inbox"),
+                    Entry::writable_file("command"),
                     Entry::file("readme"),
                     Entry::executable_file("run"),
                 ])
             } else {
                 Err(HandlerError::NotADir(p.to_string_path()))
             }
+        }
+
+        fn is_async_write_command(&self, p: &VfsPath) -> bool {
+            p.first() == Some("command")
         }
     }
 
@@ -1713,6 +1755,102 @@ mod tests {
         // use; for adapter unit tests we only ever read it via
         // `_ctx`-prefixed args, so an anonymous one is fine.
         RequestContext::anonymous()
+    }
+
+    #[tokio::test]
+    async fn unstable_async_command_dispatches_without_commit() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let command = fs.lookup(&ctx, &dir, "command").await.unwrap();
+
+        let result = fs
+            .write(
+                &ctx,
+                &command,
+                0,
+                Bytes::from_static(b"post\n"),
+                WriteStability::Unstable,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.stability, WriteStability::Unstable);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recorder.write_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("asynchronous command dispatch completes");
+        assert_eq!(recorder.last_write().as_deref(), Some(&b"post\n"[..]));
+    }
+
+    #[tokio::test]
+    async fn async_command_does_not_block_a_sync_nfs_write() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let command = fs.lookup(&ctx, &dir, "command").await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            fs.write(
+                &ctx,
+                &command,
+                0,
+                Bytes::from_static(b"slow\n"),
+                WriteStability::FileSync,
+            ),
+        )
+        .await
+        .expect("NFS write must acknowledge before the command completes")
+        .unwrap();
+        assert_eq!(recorder.write_count(), 0);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recorder.write_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("asynchronous command dispatch completes");
+        assert_eq!(recorder.last_write().as_deref(), Some(&b"slow\n"[..]));
+    }
+
+    #[tokio::test]
+    async fn unstable_async_command_defers_handler_error_to_status_projection() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let command = fs.lookup(&ctx, &dir, "command").await.unwrap();
+
+        let result = fs
+            .write(
+                &ctx,
+                &command,
+                0,
+                Bytes::from_static(b"deny\n"),
+                WriteStability::Unstable,
+            )
+            .await
+            .expect("the NFS transport must not reject a staged command");
+
+        assert_eq!(result.stability, WriteStability::Unstable);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recorder.write_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("asynchronous command dispatch completes");
+        assert_eq!(recorder.last_write().as_deref(), Some(&b"deny\n"[..]));
     }
 
     #[tokio::test]
