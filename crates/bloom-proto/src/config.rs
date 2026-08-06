@@ -597,7 +597,7 @@ impl Config {
         let mut seen_preinstalled = std::collections::BTreeSet::new();
         for name in &self.petals.preinstalled {
             validate_petal_runtime_name("preinstalled entry", name)?;
-if !matches!(name.as_str(), "polymarket" | "near-intents" | "enso" | "gasless") {
+            if !matches!(name.as_str(), "polymarket" | "near-intents" | "enso" | "gasless") {
                 return Err(ConfigError::Invalid(format!(
                     "unknown preinstalled Petal {name:?}"
                 )));
@@ -676,7 +676,7 @@ mod tests {
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-assert_eq!(
+        assert_eq!(
             cfg.petals.preinstalled,
             ["polymarket", "near-intents", "enso", "gasless"]
         );
@@ -912,13 +912,13 @@ allow_broadcast = false
         std::fs::write(&path, format!("{legacy}\n[polymarket]\nenabled = false\n")).unwrap();
 
         let migrated = Config::load(&path).unwrap();
-assert_eq!(migrated.petals.preinstalled, vec!["near-intents", "enso", "gasless"]);
+        assert_eq!(migrated.petals.preinstalled, vec!["near-intents", "enso", "gasless"]);
 
         std::fs::write(&path, format!("{default}\n[polymarket]\nenabled = false\n")).unwrap();
         let explicitly_enabled = Config::load(&path).unwrap();
         assert_eq!(
             explicitly_enabled.petals.preinstalled,
-vec!["polymarket", "near-intents", "enso", "gasless"]
+            vec!["polymarket", "near-intents", "enso", "gasless"]
         );
     }
 
