@@ -19,6 +19,7 @@ const HYPERLIQUID_RELEASE_COMMIT: &str = "fa722a986c2a0a23977e9e00df54ebd291a686
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
 const GASLESS_RELEASE_COMMIT: &str = "73ccf05b4f10d7993fbc8fa453e8f91987564aab";
+const PRIVACY_POOLS_RELEASE_COMMIT: &str = "ae01a7d398416af4fa38a985b684ac973e128208";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
@@ -87,6 +88,15 @@ const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.1",
     archive: "gasless-v0.1.1.petal.tar.gz",
     expected_hash: Some("26c75bd577e6c24c648dd99bd86c124ff602d9134bd5825649b5906851d2724a"),
+};
+
+const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
+    name: "privacy-pools",
+    repository: "https://github.com/bloom-directory/bloom-petal-privacy-pools",
+    commit: PRIVACY_POOLS_RELEASE_COMMIT,
+    release_tag: "v0.1.2",
+    archive: "privacy-pools-v0.1.2.petal.tar.gz",
+    expected_hash: Some("f86cf4fac3dcd5dc86fa6d60daadeb2377b7d3a655774f64a109a7f5aca446b4"),
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -615,6 +625,7 @@ fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "enso" => Some(&PREINSTALLED_ENSO),
         "gasless" => Some(&PREINSTALLED_GASLESS),
+        "privacy-pools" => Some(&PREINSTALLED_PRIVACY_POOLS),
         _ => None,
     }
 }
