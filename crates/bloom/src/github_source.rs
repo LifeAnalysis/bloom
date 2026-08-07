@@ -18,6 +18,7 @@ const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542
 const HYPERLIQUID_RELEASE_COMMIT: &str = "fa722a986c2a0a23977e9e00df54ebd291a686db";
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
+const GASLESS_RELEASE_COMMIT: &str = "73ccf05b4f10d7993fbc8fa453e8f91987564aab";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
@@ -77,6 +78,15 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     archive: "enso-v0.1.2.petal.tar.gz",
     expected_hash: Some("82e541b237cd8dde0a566dfca7f3d20d6e688aacd23f62b1d0f1306f9c76ecb7"),
     upgrade_policy: PreinstalledUpgradePolicy::Automatic,
+};
+
+const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
+    name: "gasless",
+    repository: "https://github.com/bloom-directory/bloom-petal-gasless",
+    commit: GASLESS_RELEASE_COMMIT,
+    release_tag: "v0.1.1",
+    archive: "gasless-v0.1.1.petal.tar.gz",
+    expected_hash: Some("26c75bd577e6c24c648dd99bd86c124ff602d9134bd5825649b5906851d2724a"),
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -604,6 +614,7 @@ fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
         "hyperliquid" => Some(&PREINSTALLED_HYPERLIQUID),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "enso" => Some(&PREINSTALLED_ENSO),
+        "gasless" => Some(&PREINSTALLED_GASLESS),
         _ => None,
     }
 }

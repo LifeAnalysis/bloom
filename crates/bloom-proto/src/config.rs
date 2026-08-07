@@ -93,6 +93,9 @@ fn default_preinstalled_petals() -> Vec<String> {
         "near-intents".to_string(),
         "enso".to_string(),
         "hyperliquid".to_string(),
+        "gasless".to_string(),
+        "privacy-pools".to_string(),
+        "venice-x402".to_string(),
     ]
 }
 
@@ -642,7 +645,8 @@ impl Config {
             validate_petal_runtime_name("preinstalled entry", name)?;
             if !matches!(
                 name.as_str(),
-                "polymarket" | "hyperliquid" | "near-intents" | "enso"
+                "polymarket" | "hyperliquid" | "near-intents" | "enso" | "gasless"
+                    | "privacy-pools" | "venice-x402"
             ) {
                 return Err(ConfigError::Invalid(format!(
                     "unknown preinstalled Petal {name:?}"
@@ -735,7 +739,15 @@ mod tests {
         assert!(cfg.enso.is_none());
         assert_eq!(
             cfg.petals.preinstalled,
-            ["polymarket", "near-intents", "enso", "hyperliquid"]
+            [
+                "polymarket",
+                "near-intents",
+                "enso",
+                "hyperliquid",
+                "gasless",
+                "privacy-pools",
+                "venice-x402"
+            ]
         );
         let hyperliquid_deposit = cfg
             .hyperliquid
@@ -1089,14 +1101,29 @@ allow_broadcast = false
         let migrated = Config::load(&path).unwrap();
         assert_eq!(
             migrated.petals.preinstalled,
-            vec!["near-intents", "enso", "hyperliquid"]
+            vec![
+                "near-intents",
+                "enso",
+                "hyperliquid",
+                "gasless",
+                "privacy-pools",
+                "venice-x402"
+            ]
         );
 
         std::fs::write(&path, format!("{default}\n[polymarket]\nenabled = false\n")).unwrap();
         let explicitly_enabled = Config::load(&path).unwrap();
         assert_eq!(
             explicitly_enabled.petals.preinstalled,
-            vec!["polymarket", "near-intents", "enso", "hyperliquid"]
+            vec![
+                "polymarket",
+                "near-intents",
+                "enso",
+                "hyperliquid",
+                "gasless",
+                "privacy-pools",
+                "venice-x402"
+            ]
         );
     }
 
