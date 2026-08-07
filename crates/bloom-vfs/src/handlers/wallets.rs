@@ -84,8 +84,6 @@ pub struct WalletsHandler {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub mempool_indexes:
         Arc<std::collections::BTreeMap<String, Arc<bloom_mempool::PendingTxIndex>>>,
-    /// Optional Hyperliquid handler for capability roll-up aggregation.
-    pub hyperliquid_handler: Option<Arc<crate::handlers::hyperliquid::HyperliquidHandler>>,
     /// Optional Layer-B auth services. Migrated signer paths must use this
     /// instead of marker files; absent means legacy behavior remains explicit.
     pub auth_services: AuthServices,
@@ -105,7 +103,6 @@ impl WalletsHandler {
             address_book: Arc::new(address_book),
             home_write_permit: None,
             mempool_indexes: Arc::new(std::collections::BTreeMap::new()),
-            hyperliquid_handler: None,
             auth_services: AuthServices::default(),
         }
     }
@@ -122,14 +119,6 @@ impl WalletsHandler {
 
     pub fn with_home_write_permit_opt(mut self, permit: Option<Arc<HomeWritePermit>>) -> Self {
         self.home_write_permit = permit;
-        self
-    }
-
-    pub fn with_hyperliquid_handler(
-        mut self,
-        hl: Option<Arc<crate::handlers::hyperliquid::HyperliquidHandler>>,
-    ) -> Self {
-        self.hyperliquid_handler = hl;
         self
     }
 
@@ -271,10 +260,6 @@ impl WalletsHandler {
 
     fn all_capability_views_for(&self, wallet: &str) -> Vec<CapabilityViewEntry> {
         let mut all = self.evm_capability_views_for(wallet);
-        if let Some(ref hl) = self.hyperliquid_handler {
-            let hl_views = hl.capability_views_for(wallet);
-            all.extend(hl_views);
-        }
         all.sort_by(|a, b| {
             a.created_ms
                 .cmp(&b.created_ms)
@@ -296,15 +281,15 @@ impl WalletsHandler {
         md.push_str(&format!("# Capabilities for `{wallet}`\n\n"));
         if entries.is_empty() {
             md.push_str("No active capabilities.\n\n");
-            md.push_str("Create a Hyperliquid session at `/hyperliquid/<net>/agent_sessions/{wallet}/new.json`");
-            md.push_str(" or an EVM policy session at `/wallets/{wallet}/policy-session/new`.\n");
+            md.push_str(
+                "Create an EVM policy session at `/wallets/{wallet}/policy-session/new`.\n",
+            );
         } else {
             for c in &entries {
                 md.push_str(&format!(
                     "## {} ({})\n\n",
                     c.id,
                     match c.venue {
-                        Venue::Hyperliquid => "Hyperliquid",
                         Venue::EvmOutbox => "EVM outbox",
                         Venue::Defi => "DeFi",
                     }

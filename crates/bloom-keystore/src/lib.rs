@@ -28,7 +28,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod ephemeral;
 pub(crate) mod passkey;
 pub use passkey::{
     FinalizedPasskeyWallet, PreparedPasskeyWallet, SealedCeremonyChallenge, bind_local,

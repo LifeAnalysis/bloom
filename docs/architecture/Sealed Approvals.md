@@ -36,7 +36,7 @@ Bloom Machine records audit/result
 ```
 
 The model is intentionally Petal-neutral. EVM transactions, paid HTTP
-credentials, installed-Petal onboarding, Hyperliquid owner actions, wallet
+credentials, installed-Petal onboarding (Polymarket, Hyperliquid), wallet
 policy updates, and future WASM Petals all use the same authorization spine.
 
 ## Core Objects
@@ -44,7 +44,7 @@ policy updates, and future WASM Petals all use the same authorization spine.
 **Action**
 
 A user-meaningful unit of work such as an EVM transfer, paid HTTP payment,
-an installed Petal's onboarding batch, Hyperliquid `approveAgent`, DeFi route,
+an installed Petal's onboarding batch (Polymarket, Hyperliquid), DeFi route,
 or wallet policy update.
 
 **Central outbox**
@@ -150,7 +150,7 @@ delegated to a verifier Petal (see
 [`Bloom Machine + Petals.md`](./Bloom%20Machine%20+%20Petals.md)).
 
 Examples of attested facts include amount, token, destination, chain, method,
-order side, market, Hyperliquid action type, session id, route steps, or policy
+order side, market, Petal action type, session id, route steps, or policy
 hash.
 
 ## Ceremony
@@ -382,10 +382,12 @@ local-app signing and outbox contracts.
 
 **Hyperliquid**
 
-The sealed subject may be `approveAgent`, `usdSend`, owner recovery, or other
-owner-signed actions. Once a bounded agent session exists, later trades may use
-the session capability without a fresh owner-key ceremony if policy and session
-limits allow it.
+Owner-signed actions (`approveAgent`, `usdSend`, recovery) and optionally
+bounded agent-session trading are provided by the standalone
+`bloom-petal-hyperliquid` package. Session enforcement and cleanup are
+version-specific Petal behavior, not a Bloom-core guarantee. The Petal uses the
+generic local-app signing and outbox contracts; Bloom does not mount a native
+Hyperliquid VFS subtree or CLI.
 
 **DeFi**
 

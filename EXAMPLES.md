@@ -1408,78 +1408,148 @@ just by `cat`ing them again.
 
 ## 16. Hyperliquid trading
 
-Hyperliquid perp and spot trading surface. Mounted when the `[hyperliquid]`
-block is present in `config.toml`. Reads are always safe; writes require either
-an agent session (RECOMMENDED) or an unlocked wallet for direct exchange
-writes (ADVANCED). Read `/hyperliquid/README.md` for the full safety
-model and agent guidance.
+Hyperliquid perp and spot trading are provided by the default-installed
+standalone Petal. Initialize Bloom, then read its mounted documentation before
+using signed routes. Paths below use `/bloom/` as the mount root; replace with
+the VFS root (`/petals/...`) when running under `bloom vfs`.
+
+```sh
+bloom init
+bloom vfs cat /petals/hyperliquid/README.md
+```
+
+Petal developers can replace the pinned package through the explicit
+uninstall/install workflow documented by `bloom petals --help`; initialization
+never overwrites a differently sourced installation.
 
 ### Discovery
 
 ```sh
-ls /bloom/hyperliquid/mainnet/
+ls /bloom/petals/hyperliquid/mainnet/
 # mids.json  perp_meta.json  spot_meta.json  books/  candles/
 # exchange/  agent_sessions/  users/  README.md  ASSET_IDS.md
-cat /bloom/hyperliquid/mainnet/README.md
+cat /bloom/petals/hyperliquid/README.md
 ```
 
 ### Market data (reads, no wallet)
 
 ```sh
 # All prices
-cat /bloom/hyperliquid/mainnet/mids.json | jq '.[0:3]'
+cat /bloom/petals/hyperliquid/mainnet/mids.json | jq '.[0:3]'
 
 # Order book
-cat /bloom/hyperliquid/mainnet/books/BTC.json
+cat /bloom/petals/hyperliquid/mainnet/books/BTC.json
 
 # Perp metadata
-cat /bloom/hyperliquid/mainnet/perp_meta.json
+cat /bloom/petals/hyperliquid/mainnet/perp_meta.json
 
 # Candles (coin, interval in ["15m","1h","4h","1d"])
-cat /bloom/hyperliquid/mainnet/candles/ETH.json
+cat /bloom/petals/hyperliquid/mainnet/candles/ETH.json
 # {"interval":"1h","candles":[{"t":...,"o":"...","h":"...","l":"...","c":"..."}]}
 
 # User account state
-cat /bloom/hyperliquid/mainnet/users/0xYourAddress/clearinghouse.json
-cat /bloom/hyperliquid/mainnet/users/0xYourAddress/open_orders.json
-cat /bloom/hyperliquid/mainnet/users/0xYourAddress/fills.json
+cat /bloom/petals/hyperliquid/mainnet/users/0xYourAddress/clearinghouse.json
+cat /bloom/petals/hyperliquid/mainnet/users/0xYourAddress/open_orders.json
+cat /bloom/petals/hyperliquid/mainnet/users/0xYourAddress/fills.json
 ```
 
-### Automated trading via agent session (RECOMMENDED)
+### Agent sessions (advanced)
 
-One `approveAgent` ceremony creates an ephemeral trading key. The agent
-trades inside policy bounds without further prompts. Sessions auto-expire
-and auto-flatten on risk breach.
+One `approveAgent` ceremony creates an ephemeral trading key. In the pinned
+v0.1.4 Petal, `assets`, `max_notional_usd`, and `max_leverage` are optional, so
+set all three explicitly. These are per-write checks: `max_notional_usd` caps
+the non-reduce-only notional in one submitted order action, and the leverage
+cap is enforced on `updateLeverage` writes.
+
+There is no background position/loss monitor or automatic flattening. Expiry
+and `stop` reject later session writes but do not cancel open orders, close
+positions, or revoke the agent at Hyperliquid. Perform those actions explicitly
+before treating a session as quiesced.
+
+Save this bounded session request as `hyperliquid-session.json`:
+
+<!-- docs-test:hyperliquid-session -->
+
+```json
+{
+  "id": "bounded-session",
+  "duration_ms": 3600000,
+  "max_notional_usd": "1000",
+  "max_leverage": 3,
+  "assets": ["0"]
+}
+```
+
+Hyperliquid exchange writes use a tagged `action` and numeric asset IDs. Read
+`/petals/hyperliquid/ASSET_IDS.md` before constructing a request. Save this
+example as `hyperliquid-order.json`:
+
+<!-- docs-test:hyperliquid-order -->
+
+```json
+{
+  "action": {
+    "type": "order",
+    "orders": [
+      {
+        "a": 0,
+        "b": true,
+        "p": "30000",
+        "s": "0.001",
+        "r": false,
+        "t": { "limit": { "tif": "Gtc" } }
+      }
+    ],
+    "grouping": "na"
+  }
+}
+```
 
 ```sh
 # 1) Owner unlocks (one time)
-bloom wallet unlock <wallet>
+bloom wallet unlock <wallet-name>
+bloom wallet address <wallet-name> # use this as <wallet-address> below
 
 # 2) Create the session (one approveAgent signature)
-echo '{}' > /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/new.json
+bloom vfs write /petals/hyperliquid/testnet/agent_sessions/<wallet-address>/new.json \
+  --data "$(cat hyperliquid-session.json)"
 # 3) Trade through the session
-echo '{"asset":"ETH","is_buy":true,"order_type":"Limit",
-  "price":"3000","sz":"0.01","reduce_only":false}' \
-  > /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json
+bloom vfs write /petals/hyperliquid/testnet/agent_sessions/<wallet-address>/<session>/order.json \
+  --data "$(cat hyperliquid-order.json)"
 
 # 4) Inspect session status
-cat /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/status.json
+bloom vfs cat /petals/hyperliquid/testnet/agent_sessions/<wallet-address>/<session>/status.json
 
 # 5) Stop the session early
-echo stop > /bloom/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/stop
+bloom vfs write /petals/hyperliquid/testnet/agent_sessions/<wallet-address>/<session>/stop \
+  --data stop
 ```
 
 ### Direct exchange writes (ADVANCED)
 
-Owner-signed one-off actions. Requires the wallet to stay unlocked.
+Owner-signed one-off actions require the wallet to stay unlocked. Reuse
+`hyperliquid-order.json` for an order. Save this leverage request as
+`hyperliquid-update-leverage.json`:
+
+<!-- docs-test:hyperliquid-update-leverage -->
+
+```json
+{
+  "action": {
+    "type": "updateLeverage",
+    "asset": 0,
+    "isCross": false,
+    "leverage": 3
+  }
+}
+```
 
 ```sh
-echo '{"asset":"ETH","is_buy":true,"order_type":"Limit",
-  "price":"3000","sz":"0.01","reduce_only":false}' \
-  > /bloom/hyperliquid/mainnet/exchange/<wallet>/order.json
+bloom vfs write /petals/hyperliquid/testnet/exchange/<wallet-address>/order.json \
+  --data "$(cat hyperliquid-order.json)"
 
-echo '{"asset":"ETH","is_cross":false,"leverage":5}' \
-  > /bloom/hyperliquid/mainnet/exchange/<wallet>/update_leverage.json
+bloom vfs write /petals/hyperliquid/testnet/exchange/<wallet-address>/update_leverage.json \
+  --data "$(cat hyperliquid-update-leverage.json)"
 ```
 
 ---
@@ -1487,8 +1557,8 @@ echo '{"asset":"ETH","is_cross":false,"leverage":5}' \
 ## 17. Polymarket (external Petal)
 
 Bloom no longer includes a native `bloom polymarket` command or `/polymarket/`
-VFS handler. `bloom init` provisions the pinned default Polymarket Petal, which
-is available at `/petals/polymarket/`:
+VFS handler. `bloom init` provisions the pinned default Polymarket Petal
+alongside Hyperliquid. Polymarket is available at `/petals/polymarket/`:
 
 ```sh
 bloom init

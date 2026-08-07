@@ -14,11 +14,12 @@ All paths below are relative to the Bloom VFS root.
 - `wallets/<name>/` — managed wallets, outbox write surface, history,
   allowances, ENS reverse, sign / EIP-712 surfaces.
 - `defi/intents/` — Enso-mediated DeFi intents (write `quote` / `execute`).
-- `hyperliquid/` — HyperCore reads plus signed exchange and agent-session
-  writes; read `hyperliquid/README.md` for the mounted workflow documentation.
 - `petals/<name>/` — installed wallet extensions. Read `docs/petals.md` for
   the exact installed names, mount directories, consent summaries, and
   declared capabilities.
+- `petals/hyperliquid/` — HyperCore reads plus signed exchange and
+  agent-session writes from the default-installed Hyperliquid Petal; read
+  `petals/hyperliquid/README.md` for its workflow documentation.
 - `watch/` — long-running subscriptions (head, addr, log) executed by the
   daemon and persisted to JSONL.
 - `simulate/` — out-of-band tx simulation with state overrides

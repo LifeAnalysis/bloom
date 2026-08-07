@@ -37,7 +37,6 @@ use bloom_evm::{ChainClient, ChainRegistry};
 
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
-use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
 use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
 use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::abi::{
@@ -65,9 +64,9 @@ use bloom_tx::tx_engine::{Eip1559FeeOverrides, TxEngine};
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
-    AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, HyperliquidHandler,
-    OutboxHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler, ToolsHandler,
-    WalletsHandler, WatchHandler,
+    AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, OutboxHandler,
+    PricesHandler, RequestsHandler, SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler,
+    WatchHandler,
 };
 use bloom_vfs::{AuthServices, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
@@ -1759,6 +1758,17 @@ impl Daemon {
             debug!(path = %config_path.display(), "config.initialised_default");
         }
 
+        let legacy_hl_secrets = home.root().join("hyperliquid").join(".agent_key_kek");
+        if legacy_hl_secrets.exists() {
+            warn!(
+                path = %legacy_hl_secrets.parent().unwrap().display(),
+                "bloom no longer manages native Hyperliquid agent sessions. \
+                 Sealed agent keys remain on disk under this directory. \
+                 Verify that any active sessions have been stopped or revoked \
+                 at the venue, then remove this directory."
+            );
+        }
+
         let mut clients: Vec<ChainClient> = Vec::new();
         for spec in config.chains.values() {
             match ChainClient::new(spec.clone()) {
@@ -2297,41 +2307,6 @@ impl Daemon {
                 ) as _,
             );
 
-        let hyperliquid_handler: Option<Arc<HyperliquidHandler>> = if let Some(hl_cfg) =
-            &config.hyperliquid
-        {
-            let hl_url = |raw: &str| match url::Url::parse(raw) {
-                Ok(u) => Some(u),
-                Err(e) => {
-                    warn!(url = %raw, error = %e, "daemon.hyperliquid_url_invalid_using_default");
-                    None
-                }
-            };
-            let mut mainnet = HyperliquidClient::new(HyperliquidNetwork::Mainnet);
-            if let Some(u) = hl_url(&hl_cfg.mainnet_url) {
-                mainnet = mainnet.with_base_url(u);
-            }
-            let mut testnet = HyperliquidClient::new(HyperliquidNetwork::Testnet);
-            if let Some(u) = hl_url(&hl_cfg.testnet_url) {
-                testnet = testnet.with_base_url(u);
-            }
-            debug!("daemon.hyperliquid_mounted");
-            let handler = Arc::new(
-                HyperliquidHandler::new(mainnet, testnet, keystore.clone())
-                    .with_auth_services(auth_services.clone())
-                    .with_store_root(home.root().join("hyperliquid")),
-            );
-            handler.clone().start_monitoring();
-            Some(handler)
-        } else {
-            debug!("daemon.hyperliquid_skipped: no [hyperliquid] config");
-            None
-        };
-
-        if let Some(ref hl) = hyperliquid_handler {
-            vfs_builder = vfs_builder.mount("hyperliquid", hl.clone() as _);
-        }
-
         vfs_builder = vfs_builder
             .mount(
                 "wallets",
@@ -2344,8 +2319,7 @@ impl Daemon {
                     )
                     .with_auth_services(auth_services.clone())
                     .with_home_write_permit_opt(home_write_permit.clone())
-                    .with_mempool_indexes(mempool_indexes.clone())
-                    .with_hyperliquid_handler(hyperliquid_handler.clone()),
+                    .with_mempool_indexes(mempool_indexes.clone()),
                 ) as _,
             )
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
@@ -2402,7 +2376,6 @@ impl Daemon {
         // what capabilities are active/expired/orphaned, what risk data is stale.
         let next_keystore = keystore.clone();
         let next_tx_engine = tx_engine.clone();
-        let next_hl = hyperliquid_handler.clone();
         let next_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> = Arc::new(move || {
             let mut md = String::from("# Next Actions\n\n");
             let now_ms = std::time::SystemTime::now()
@@ -2469,72 +2442,9 @@ impl Daemon {
                 md.push('\n');
             }
 
-            // 3. Capability status (HL sessions)
-            if let Some(ref hl) = next_hl {
-                let mut expired = Vec::new();
-                let mut orphaned = Vec::new();
-                let mut stale = Vec::new();
-                if let Ok(infos) = next_keystore.list() {
-                    for info in &infos {
-                        let views = hl.capability_views_for(&info.name);
-                        for v in &views {
-                            match v.status {
-                                bloom_proto::CapabilityStatus::Expired => {
-                                    expired.push(format!(
-                                        "- `{}` session `{}`: **expired** — no new orders accepted",
-                                        info.name, v.id
-                                    ));
-                                }
-                                bloom_proto::CapabilityStatus::Orphaned => {
-                                    orphaned.push(format!(
-                                        "- `{}` session `{}`: **orphaned** — daemon lost the agent key after restart. Owner must recover via `orphan_cancel_all` or `orphan_close_all` at `{}`",
-                                        info.name, v.id, v.revoke_path
-                                    ));
-                                }
-                                bloom_proto::CapabilityStatus::Active => {
-                                    if let Some(secs) = v.expires_in_secs
-                                        && secs < 300
-                                    {
-                                        stale.push(format!(
-                                            "- `{}` session `{}`: expiring in {}s",
-                                            info.name, v.id, secs
-                                        ));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                if !expired.is_empty() {
-                    md.push_str("## Expired Sessions\n\n");
-                    for e in &expired {
-                        md.push_str(e);
-                        md.push('\n');
-                    }
-                    md.push('\n');
-                }
-                if !orphaned.is_empty() {
-                    md.push_str("## Orphaned Sessions (Needs Owner)\n\n");
-                    for o in &orphaned {
-                        md.push_str(o);
-                        md.push('\n');
-                    }
-                    md.push('\n');
-                }
-                if !stale.is_empty() {
-                    md.push_str("## Expiring Soon\n\n");
-                    for s in &stale {
-                        md.push_str(s);
-                        md.push('\n');
-                    }
-                    md.push('\n');
-                }
-            }
-
-            if unsigned.is_empty() && pending_confirms.is_empty() && next_hl.is_none() {
+            if unsigned.is_empty() && pending_confirms.is_empty() {
                 md.push_str("No wallets with pending actions.\n\n");
-                md.push_str("All policies are signed, no outbox confirms await review, and no Hyperliquid sessions are active.\n");
+                md.push_str("All policies are signed and no outbox confirms await review.\n");
             }
             md.into_bytes()
         });
@@ -3073,8 +2983,8 @@ mod tests {
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("petals").is_some());
         assert!(
-            d.vfs.handler("hyperliquid").is_some(),
-            "fresh homes should mount Hyperliquid with public defaults"
+            d.vfs.handler("hyperliquid").is_none(),
+            "native Hyperliquid must not be mounted; use petals/hyperliquid"
         );
         assert!(
             d.vfs.handler("polymarket").is_none(),
@@ -3642,12 +3552,15 @@ mod tests {
     }
 
     #[test]
-    fn config_without_hyperliquid_keeps_surface_disabled() {
+    fn legacy_hyperliquid_config_does_not_restore_native_surface() {
         let dir = tempfile::tempdir().unwrap();
         let home = HomeDir::at(dir.path());
         home.ensure().unwrap();
         let mut config = Config::local_default();
-        config.hyperliquid = None;
+        config.enso = Some(bloom_proto::EnsoConfig {
+            api_key: String::new(),
+            api_url: "https://api.enso.finance".to_string(),
+        });
         config.save(&home.config_path()).unwrap();
 
         let daemon = Daemon::from_home(home).unwrap();

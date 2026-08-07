@@ -25,7 +25,7 @@ cover. No external services, no filesystem, no network.
 
 - Run: `cargo test -p <crate>` (or `cargo test --lib`)
 - Examples: walletFS crates such as `bloom-tx`, `bloom-vfs`, `bloom-petals`,
-  and `bloom-hyperliquid`.
+  while standalone application routes are tested in their Petal repositories.
 
 ### integration
 

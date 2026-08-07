@@ -22,25 +22,32 @@ bloom gatekeeps every value-moving action through capabilities:
 
 - **Reads are always safe.** No signing, no ceremony, no wallet needed for chain
   state, balances, prices, books, candles, account state.
-- **Direct writes require owner approval.** The outbox stage-confirm flow,
-  one-off Hyperliquid exchange orders, and Polymarket trades each cross an
-  owner gate (passkey ceremony or local passphrase unlock).
+- **Direct writes require owner approval.** The outbox stage-confirm flow and
+  one-off actions through the default Hyperliquid and Polymarket Petals each
+  cross an owner gate (passkey ceremony or local passphrase unlock).
 - **Automated action uses a capability.** Create a bounded session/capability
   first — the human approves the bounds once, then the agent operates inside
-  them without re-prompting until expiry, breach, or revocation.
+  the checks implemented by that extension. Inspect the extension's lifecycle,
+  expiry, cleanup, and revocation semantics before relying on it.
 - **The owner key is never handed off.** For capabilities that depend on owner
   signing (EVM and installed Petals), the key will
   reside in daemon RAM for a bounded window and auto-lock on expiry.
-  Hyperliquid already uses an ephemeral agent key that does not need the
+  The Hyperliquid Petal uses an ephemeral agent key that does not need the
   owner key after session creation.
 
 To see what a wallet can do without a human, check its per-chain state and
-outbox, or its Hyperliquid sessions under `hyperliquid/<net>/agent_sessions/`.
-A read-only `wallets/<wallet>/capabilities/` roll-up and a VFS-root `next.md`
-aggregator expose the current capability and next-action view when the daemon
-has the relevant handlers mounted.
+outbox. A read-only `wallets/<wallet>/capabilities/` roll-up and a VFS-root
+`next.md` aggregator expose Bloom-native capability and next-action state.
+Installed Petals expose their own durable session and status files.
 
-Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
+For the default-installed Hyperliquid Petal, start with
+`cat petals/hyperliquid/README.md` and list its route tree before trading.
+Read `docs/petals.md` for every installed Petal's mount directory, consent
+summary, and declared capabilities.
+For the default-installed Polymarket Petal, start with
+`cat petals/polymarket/README.md`, read `petals/polymarket/AGENTS.md`, then
+inspect `petals/polymarket/meta/route-contract.json` and list its route tree
+before using its prediction-market routes.
 
 ## Wallets
 
@@ -264,22 +271,21 @@ REQUEST
 Prefer request-local USD caps. If `plan.md` says policy is denied, do not retry
 blindly; inspect the wallet policy or ask the human to change it.
 
-## Hyperliquid (session-first)
+## Hyperliquid
 
 Hyperliquid trading uses Sealed Approval for owner authority:
 
-- **Agent sessions (RECOMMENDED):** write an explicit session id to
-  `hyperliquid/mainnet/agent_sessions/<wallet>/new.json`. If the write returns
-  permission denied, read that session directory's `approval_challenge.json`,
-  open or forward its `ceremony_url`, complete the grant ceremony, then retry
-  the same write. The resulting ephemeral API wallet trades inside policy
-  bounds at `hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json`
-  without additional owner prompts until the session expires or is stopped.
-
-- **Owner actions:** `hyperliquid/<network>/exchange/<wallet>/send_asset.json`
-  follows the same challenge/grant/retry flow and requires `transfer_cap_usd`.
-  Generic owner-signed order/cancel/update-leverage writes are disabled; use
-  agent sessions.
+- **Read the installed contract first.** Inspect
+  `petals/hyperliquid/README.md`, `AGENTS.md`, and `ASSET_IDS.md`; request bodies
+  and supported cleanup routes are version-specific.
+- **Agent sessions are advanced delegated authority.** Set `assets`,
+  `max_notional_usd`, and `max_leverage` explicitly. In v0.1.4 those checks run
+  per route write; there is no background loss/position monitor or automatic
+  flattening. Expiry or `stop` blocks later writes but does not cancel orders,
+  close positions, or revoke venue authority.
+- **Owner actions:** use the exact tagged action schemas documented by the
+  installed Petal. An accepted write is not evidence of a fill; inspect its
+  durable response and error files.
 
 ## Petals
 

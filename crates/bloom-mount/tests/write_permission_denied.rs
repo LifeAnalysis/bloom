@@ -120,12 +120,21 @@ impl HyperliquidMountWorkflowHandler {
             .map(|(_, body)| body.clone())
             .collect()
     }
+
+    fn route(path: &VfsPath) -> String {
+        let rendered = path.to_string_path();
+        match rendered.strip_prefix("/hyperliquid") {
+            Some("") => "/".to_string(),
+            Some(route) => route.to_string(),
+            None => rendered,
+        }
+    }
 }
 
 #[async_trait]
 impl Handler for HyperliquidMountWorkflowHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
-        let rendered = path.to_string_path();
+        let rendered = Self::route(path);
         match rendered.as_str() {
             "/" => Ok(Entry::dir("")),
             "/mainnet" => Ok(Entry::dir("mainnet")),
@@ -155,7 +164,7 @@ impl Handler for HyperliquidMountWorkflowHandler {
     }
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
-        let rendered = path.to_string_path();
+        let rendered = Self::route(path);
         match rendered.as_str() {
             "/mainnet/agent_sessions/minnow/mount-session-1/approval_challenge.json"
                 if self.challenge_staged.load(Ordering::SeqCst) =>
@@ -190,7 +199,7 @@ impl Handler for HyperliquidMountWorkflowHandler {
         self.writes
             .lock()
             .push((path.to_string_path(), data.to_vec()));
-        let rendered = path.to_string_path();
+        let rendered = Self::route(path);
         match rendered.as_str() {
             "/mainnet/agent_sessions/minnow/new.json" => {
                 if !String::from_utf8_lossy(data).contains(HL_TEST_SESSION) {
@@ -216,7 +225,7 @@ impl Handler for HyperliquidMountWorkflowHandler {
     }
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
-        let rendered = path.to_string_path();
+        let rendered = Self::route(path);
         match rendered.as_str() {
             "/" => Ok(vec![Entry::dir("mainnet")]),
             "/mainnet" => Ok(vec![Entry::dir("agent_sessions")]),
@@ -542,7 +551,7 @@ async fn mounted_hyperliquid_session_flow_reaches_handler() {
     let mount_dir = unique_mount_dir();
     std::fs::create_dir_all(&mount_dir).expect("create Hyperliquid mount test directory");
     let handler = Arc::new(HyperliquidMountWorkflowHandler::default());
-    let vfs = Vfs::builder().mount("hyperliquid", handler.clone()).build();
+    let vfs = Vfs::builder().mount("petals", handler.clone()).build();
     let mount = match serve_test_mount(vfs, &mount_dir).await {
         Ok(mount) => mount,
         Err(err) => {
@@ -555,7 +564,7 @@ async fn mounted_hyperliquid_session_flow_reaches_handler() {
         }
     };
 
-    let wallet_root = mount_dir.join("hyperliquid/mainnet/agent_sessions/minnow");
+    let wallet_root = mount_dir.join("petals/hyperliquid/mainnet/agent_sessions/minnow");
     let new_path = wallet_root.join("new.json");
     let session_root = wallet_root.join(HL_TEST_SESSION);
     let payload = format!(r#"{{"id":"{HL_TEST_SESSION}","agent_name":"mounted-test"}}"#);

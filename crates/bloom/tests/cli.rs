@@ -23,6 +23,22 @@ use bloom_vfs::{Entry, Handler, HandlerError, VfsPath};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+const DOCUMENTED_EXAMPLES: &str = include_str!("../../../EXAMPLES.md");
+
+fn marked_example_json(name: &str) -> &'static str {
+    let marker = format!("<!-- docs-test:{name} -->");
+    let (_, after_marker) = DOCUMENTED_EXAMPLES
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("missing documentation marker {marker}"));
+    let (_, after_fence) = after_marker
+        .split_once("```json")
+        .unwrap_or_else(|| panic!("missing JSON fence after {marker}"));
+    let (body, _) = after_fence
+        .split_once("```")
+        .unwrap_or_else(|| panic!("unterminated JSON fence after {marker}"));
+    body.trim()
+}
+
 /// Build a Command for the `bloom` binary that always runs against a
 /// hermetic temp home. Returns the tempdir handle so callers can keep it
 /// alive (and pass it back into the same process for follow-up calls).
@@ -240,6 +256,7 @@ fn help_lists_all_subcommands() {
         .stdout(predicate::str::contains("ipc"))
         .stdout(predicate::str::contains("petals"))
         .stdout(predicate::str::contains("init"))
+        .stdout(predicate::str::contains("hyperliquid").not())
         .stdout(predicate::str::contains("polymarket").not());
 }
 
@@ -301,7 +318,8 @@ fn status_prints_version_and_chain_summary() {
         // Version line uses the package version; just assert the prefix.
         .stdout(predicate::str::contains("version: "))
         .stdout(predicate::str::contains("home: "))
-        .stdout(predicate::str::contains("chains: "));
+        .stdout(predicate::str::contains("chains: "))
+        .stdout(predicate::str::contains("hyperliquid_vfs").not());
 }
 
 #[test]
@@ -332,6 +350,10 @@ fn vfs_ls_root_lists_top_level_handlers() {
     assert!(
         !out.lines().any(|line| line.starts_with("polymarket\t")),
         "native polymarket handler must not be mounted:\n{out}"
+    );
+    assert!(
+        !out.lines().any(|line| line.starts_with("hyperliquid\t")),
+        "native Hyperliquid handler must not be mounted:\n{out}"
     );
 }
 
@@ -1427,6 +1449,63 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .assert()
         .success()
         .stdout(predicate::str::contains("# Polymarket Petal"));
+}
+
+#[test]
+#[ignore = "downloads and dispatches the pinned Hyperliquid v0.1.4 release"]
+fn preinstalled_hyperliquid_accepts_documented_request_shapes() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    let mut config = bloom_proto::Config::local_default();
+    config.petals.preinstalled = vec!["hyperliquid".into()];
+    config.save(&home_dir.config_path()).unwrap();
+
+    bloom_cmd(home.path())
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "preinstalled_petals: [\"hyperliquid\"]",
+        ));
+
+    for (name, path, parse_error) in [
+        (
+            "hyperliquid-session",
+            "/petals/hyperliquid/testnet/agent_sessions/0x0000000000000000000000000000000000000001/new.json",
+            "invalid new session body",
+        ),
+        (
+            "hyperliquid-order",
+            "/petals/hyperliquid/testnet/exchange/0x0000000000000000000000000000000000000001/order.json",
+            "invalid exchange body",
+        ),
+        (
+            "hyperliquid-update-leverage",
+            "/petals/hyperliquid/testnet/exchange/0x0000000000000000000000000000000000000001/update_leverage.json",
+            "invalid exchange body",
+        ),
+    ] {
+        let assert = bloom_cmd(home.path())
+            .args(["vfs", "write", path, "--data", marked_example_json(name)])
+            .assert()
+            .failure();
+        let output = assert.get_output();
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !rendered.contains(parse_error),
+            "{name} was rejected by pinned v0.1.4: {rendered}"
+        );
+        assert!(
+            ["wallet", "sign", "store", "approval", "denied"]
+                .iter()
+                .any(|needle| rendered.contains(needle)),
+            "{name} did not reach a downstream host boundary: {rendered}"
+        );
+    }
 }
 
 #[test]

@@ -46,7 +46,7 @@ from the release it ships with.
 - the mounted Sealed Approval lifecycle for the EVM slice: permission-denied
   confirm writes, `approval_challenge.json`, `ceremony_url`, grant / grant +
   execute, and retrying after a grant-only approval;
-- Hyperliquid session-first trading and discovery of installed Petal docs;
+- Hyperliquid trading and discovery of the installed Petal's versioned docs;
 - passkey policy signing and `under_policy` semantics.
 
 As additional Petals adopt the mounted Sealed Approval flow described in
@@ -61,8 +61,9 @@ hint file and no per-directory README duplication of global contracts.
 
 Built-in handlers embed read-only, handler-local documentation, while external
 Petals expose package-defined route documentation under `/petals/<name>/`.
-For example, Hyperliquid exposes `/hyperliquid/README.md`, and the default
-installed Polymarket Petal exposes `/petals/polymarket/README.md`,
+For example, the default-installed Hyperliquid Petal exposes
+`/petals/hyperliquid/README.md`, and the default-installed Polymarket Petal
+exposes `/petals/polymarket/README.md`,
 `/petals/polymarket/AGENTS.md`, and
 `/petals/polymarket/meta/route-contract.json`. Per-request `plan.md` files under
 `/requests` are per-instance previews rather than static docs.
@@ -95,8 +96,8 @@ Two mechanisms keep the served documentation truthful:
 byte-identical to the vendored source file, and that the content passes
 sanity checks. Petal router tests assert that package `README.md` and
 `AGENTS.md` files are listed, readable, and immutable. Built-in handlers carry
-similar tests for their READMEs (for example, that the Hyperliquid README
-documents safe reads and API-wallet risk).
+similar tests for their READMEs (for example, that the installed Hyperliquid
+Petal's README documents safe reads and API-wallet risk).
 
 **The PR checklist enforces updates.** The repository's pull request
 template includes a mandatory "Agent Documentation updated" item, enforced

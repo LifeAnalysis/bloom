@@ -15,6 +15,7 @@ use url::Url;
 
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
+const HYPERLIQUID_RELEASE_COMMIT: &str = "fa722a986c2a0a23977e9e00df54ebd291a686db";
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
 
@@ -26,6 +27,16 @@ pub(crate) struct PreinstalledPetal {
     pub release_tag: &'static str,
     pub archive: &'static str,
     pub expected_hash: Option<&'static str>,
+    upgrade_policy: PreinstalledUpgradePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreinstalledUpgradePolicy {
+    Automatic,
+    /// Package-private state is keyed by content hash, so replacing this
+    /// package requires an explicit domain-specific quiescence and migration
+    /// flow before Bloom may change its owner record.
+    ManualStateMigration,
 }
 
 const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
@@ -35,6 +46,17 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.3",
     archive: "polymarket-v0.1.3.petal.tar.gz",
     expected_hash: Some("02d6d18d773147013c3b1e7129c4694d2db3c93f1e885e755bdb4aa390bf6a5c"),
+    upgrade_policy: PreinstalledUpgradePolicy::Automatic,
+};
+
+const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
+    name: "hyperliquid",
+    repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
+    commit: HYPERLIQUID_RELEASE_COMMIT,
+    release_tag: "v0.1.4",
+    archive: "hyperliquid-v0.1.4.petal.tar.gz",
+    expected_hash: Some("1de2eb50b7ce0f0da03d3ef1ae6554c6f1b89393096d50183fe4f2dbca6b2af7"),
+    upgrade_policy: PreinstalledUpgradePolicy::ManualStateMigration,
 };
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
@@ -44,6 +66,7 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.1",
     archive: "near-intents-v0.1.1.petal.tar.gz",
     expected_hash: Some("c3f714c01e17f642b8add45b7501d6675c851a13210ce9e834fd16d23330f166"),
+    upgrade_policy: PreinstalledUpgradePolicy::Automatic,
 };
 
 const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
@@ -53,6 +76,7 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.2",
     archive: "enso-v0.1.2.petal.tar.gz",
     expected_hash: Some("82e541b237cd8dde0a566dfca7f3d20d6e688aacd23f62b1d0f1306f9c76ecb7"),
+    upgrade_policy: PreinstalledUpgradePolicy::Automatic,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +342,14 @@ fn ensure_preinstalled_petals_with(
                         continue;
                     }
                     PreinstalledState::Outdated { installed_commit } => {
+                        if entry.upgrade_policy == PreinstalledUpgradePolicy::ManualStateMigration {
+                            eprintln!(
+                                "preinstalled_petal: {} remains at {} instead of pinned {}; automatic replacement is disabled because its active sessions and secret state are package-version scoped. Quiesce the package, cancel or close live activity, revoke venue agent authority, then explicitly uninstall it and rerun `bloom init`",
+                                entry.name, installed_commit, entry.commit
+                            );
+                            ready.push(name.clone());
+                            continue;
+                        }
                         println!(
                             "preinstalled_petal: updating {} from {} to {}",
                             entry.name, installed_commit, entry.commit
@@ -569,6 +601,7 @@ fn install_prebuilt_petal_archive(
 fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
     match name {
         "polymarket" => Some(&PREINSTALLED_POLYMARKET),
+        "hyperliquid" => Some(&PREINSTALLED_HYPERLIQUID),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "enso" => Some(&PREINSTALLED_ENSO),
         _ => None,
@@ -1015,18 +1048,34 @@ mod tests {
     }
 
     #[test]
-    fn built_in_polymarket_entry_is_immutable_and_catalogued() {
-        let entry = preinstalled_petal("polymarket").unwrap();
-        assert_eq!(entry.name, "polymarket");
-        assert_eq!(entry.commit.len(), 40);
-        assert!(entry.commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert!(entry.repository.ends_with("/bloom-petal-polymarket"));
-        assert!(entry.archive.starts_with("polymarket-"));
-        assert!(entry.archive.ends_with(".petal.tar.gz"));
+    fn built_in_entries_are_immutable_and_catalogued() {
+        let defaults = bloom_proto::Config::local_default().petals.preinstalled;
         assert_eq!(
-            entry.archive,
-            format!("polymarket-{}.petal.tar.gz", entry.release_tag)
+            defaults,
+            ["polymarket", "near-intents", "enso", "hyperliquid"]
         );
+        for name in defaults {
+            let entry = preinstalled_petal(&name).unwrap();
+            assert_eq!(entry.name, name);
+            assert_eq!(entry.commit.len(), 40);
+            assert!(entry.commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            let repo_segment = match name.as_str() {
+                "near-intents" => "near",
+                other => other,
+            };
+            assert!(
+                entry
+                    .repository
+                    .ends_with(&format!("/bloom-petal-{repo_segment}"))
+            );
+            assert!(entry.archive.starts_with(&format!("{name}-")));
+            assert!(entry.archive.ends_with(".petal.tar.gz"));
+            assert_eq!(
+                entry.archive,
+                format!("{name}-{}.petal.tar.gz", entry.release_tag)
+            );
+            assert_eq!(entry.expected_hash.unwrap().len(), 64);
+        }
         let near = preinstalled_petal("near-intents").unwrap();
         assert_eq!(near.release_tag, "v0.1.1");
         assert_eq!(near.commit.len(), 40);
@@ -1037,6 +1086,16 @@ mod tests {
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
         assert_eq!(enso.archive, "enso-v0.1.2.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
+        assert_eq!(
+            preinstalled_petal("hyperliquid").unwrap().upgrade_policy,
+            PreinstalledUpgradePolicy::ManualStateMigration
+        );
+        for name in ["polymarket", "near-intents", "enso"] {
+            assert_eq!(
+                preinstalled_petal(name).unwrap().upgrade_policy,
+                PreinstalledUpgradePolicy::Automatic
+            );
+        }
         assert!(preinstalled_petal("unknown").is_none());
     }
 
@@ -1153,16 +1212,12 @@ mod tests {
     }
 
     fn build_near_release(version: &str) -> PetalRelease {
+        build_test_release(NEAR_REPO, "near-intents", version)
+    }
+
+    fn build_test_release(repo: &str, name: &str, version: &str) -> PetalRelease {
         let source = tempfile::tempdir().unwrap();
-        write_named_source_repo(
-            &source,
-            NEAR_REPO,
-            "near-intents",
-            true,
-            &BuildScript::Success,
-            version,
-        )
-        .unwrap();
+        write_named_source_repo(&source, repo, name, true, &BuildScript::Success, version).unwrap();
         run_source_build(source.path()).unwrap();
         let package = PreparedPetalPackage::from_dir(source.path()).unwrap();
         let archive = tempfile::NamedTempFile::new().unwrap();
@@ -1186,6 +1241,7 @@ mod tests {
             release_tag,
             archive,
             expected_hash,
+            upgrade_policy: PreinstalledUpgradePolicy::Automatic,
         }
     }
 
@@ -1348,6 +1404,89 @@ mod tests {
     }
 
     #[test]
+    fn stateful_hyperliquid_update_requires_manual_quiescence_and_preserves_session_state() {
+        const OLD_COMMIT: &str = "3333333333333333333333333333333333333333";
+        const NEW_COMMIT: &str = "4444444444444444444444444444444444444444";
+        const REPO: &str = "bloom-petal-hyperliquid";
+        const SESSION_KEY: &str = "state/sessions/mainnet/test-wallet/session-1/session.json";
+        const AGENT_KEY: &str = "secrets/sessions/mainnet/test-wallet/session-1/agent_key";
+
+        let old = build_test_release(REPO, "hyperliquid", "old");
+        let new = build_test_release(REPO, "hyperliquid", "new");
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        home_dir.ensure().unwrap();
+        let mut config = bloom_proto::Config::local_default();
+        config.petals.preinstalled = vec!["hyperliquid".into()];
+        config.save(&home_dir.config_path()).unwrap();
+        let daemon = Daemon::from_home(home_dir).unwrap();
+        let provenance = PetalSourceProvenance {
+            source_kind: "github".into(),
+            url: format!("https://github.com/bloom-directory/{REPO}"),
+            owner: "bloom-directory".into(),
+            repo: REPO.into(),
+            requested_ref: "v0.1.0".into(),
+            resolved_commit: OLD_COMMIT.into(),
+            selected_tag: Some("v0.1.0".into()),
+            package_hash: old.package.hash.clone(),
+        };
+        daemon
+            .petals
+            .store()
+            .install_prepared_petal_package_with_source(old.package.clone(), Some(provenance))
+            .unwrap();
+
+        let private_store =
+            bloom_petals::PrivateStore::open(daemon.petals.store().private_data_root()).unwrap();
+        let session = br#"{"id":"session-1","status":"active"}"#;
+        let agent_key = b"generic-test-agent-key";
+        private_store
+            .put(&old.package.hash, SESSION_KEY, session, false)
+            .unwrap();
+        private_store
+            .put(&old.package.hash, AGENT_KEY, agent_key, true)
+            .unwrap();
+
+        let new_hash: &'static str = Box::leak(new.package.hash.clone().into_boxed_str());
+        let entry = PreinstalledPetal {
+            name: "hyperliquid",
+            repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
+            commit: NEW_COMMIT,
+            release_tag: "v0.2.0",
+            archive: "hyperliquid-v0.2.0.petal.tar.gz",
+            expected_hash: Some(new_hash),
+            upgrade_policy: PreinstalledUpgradePolicy::ManualStateMigration,
+        };
+
+        let ready = ensure_preinstalled_petals_with(
+            &daemon,
+            |name| (name == "hyperliquid").then_some(entry),
+            |_, _| panic!("stateful Hyperliquid must not be replaced automatically"),
+        )
+        .unwrap();
+
+        assert_eq!(ready, ["hyperliquid"]);
+        assert_eq!(
+            daemon
+                .petals
+                .store()
+                .resolve_petal_owner("hyperliquid")
+                .unwrap()
+                .as_deref(),
+            Some(old.package.hash.as_str())
+        );
+        assert_eq!(
+            private_store.get(&old.package.hash, SESSION_KEY).unwrap(),
+            session
+        );
+        assert_eq!(
+            private_store.get(&old.package.hash, AGENT_KEY).unwrap(),
+            agent_key
+        );
+        assert!(!daemon.petals.store().contains_package(new_hash));
+    }
+
+    #[test]
     fn failed_replacement_verification_leaves_the_previous_owner_active() {
         let old = build_near_release("v0.1.0");
         let new = build_near_release("v0.1.1");
@@ -1487,6 +1626,7 @@ mod tests {
             release_tag: "v0.1.0",
             archive: "unused.petal.tar.gz",
             expected_hash: None,
+            upgrade_policy: PreinstalledUpgradePolicy::Automatic,
         };
         let release = PetalReleaseManifest {
             schema: "bloom.petal.release.v1".into(),
@@ -2077,7 +2217,7 @@ summary = "Demo app used by source install tests."
             BuildScript::Failure => "#!/usr/bin/env bash\nset -euo pipefail\nexit 42\n".to_string(),
         };
         let script_path = work.path().join("scripts/build.sh");
-        std::fs::write(&script_path, script)?;
+        write_and_sync(&script_path, script.as_bytes())?;
         make_executable(&script_path)?;
         Ok(())
     }
@@ -2093,6 +2233,17 @@ summary = "Demo app used by source install tests."
 
     #[cfg(not(unix))]
     fn make_executable(_path: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    fn write_and_sync(path: &Path, contents: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let mut file =
+            std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", path.display()))?;
         Ok(())
     }
 

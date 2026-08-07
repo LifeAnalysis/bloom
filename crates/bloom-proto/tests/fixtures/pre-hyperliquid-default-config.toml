@@ -1,0 +1,203 @@
+# Serialized by `Config::local_default()` at base commit f84f5f7, immediately
+# before Hyperliquid joined the default Petal list.
+mount_path = "/bloom"
+nfs_listen_addr = "127.0.0.1:12049"
+default_chain = "ethereum"
+stage_ttl = "1h"
+
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "Anvil (local)"
+native_symbol = "ETH"
+native_decimals = 18
+legacy_tx = false
+op_stack = false
+
+[chains.arbitrum]
+name = "arbitrum"
+chain_id = 42161
+rpc_urls = [
+    "https://arb1.arbitrum.io/rpc",
+    "https://arbitrum-one-rpc.publicnode.com",
+]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "Arbitrum One"
+native_symbol = "ETH"
+native_decimals = 18
+legacy_tx = false
+op_stack = false
+
+[chains.avalanche]
+name = "avalanche"
+chain_id = 43114
+rpc_urls = [
+    "https://api.avax.network/ext/bc/C/rpc",
+    "https://avalanche-c-chain-rpc.publicnode.com",
+]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "Avalanche C-Chain"
+native_symbol = "AVAX"
+native_decimals = 18
+legacy_tx = false
+op_stack = false
+
+[chains.base]
+name = "base"
+chain_id = 8453
+rpc_urls = [
+    "https://mainnet.base.org",
+    "https://base.llamarpc.com",
+]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "Base Mainnet"
+native_symbol = "ETH"
+native_decimals = 18
+legacy_tx = false
+op_stack = true
+
+[chains.bsc]
+name = "bsc"
+chain_id = 56
+rpc_urls = [
+    "https://bsc-dataseed.binance.org",
+    "https://bsc-rpc.publicnode.com",
+]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "BNB Smart Chain"
+native_symbol = "BNB"
+native_decimals = 18
+legacy_tx = false
+op_stack = false
+
+[chains.ethereum]
+name = "ethereum"
+chain_id = 1
+rpc_urls = [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.llamarpc.com",
+]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "Ethereum Mainnet"
+native_symbol = "ETH"
+native_decimals = 18
+legacy_tx = false
+op_stack = false
+
+[chains.gnosis]
+name = "gnosis"
+chain_id = 100
+rpc_urls = [
+    "https://rpc.gnosischain.com",
+    "https://gnosis-rpc.publicnode.com",
+]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "Gnosis Chain"
+native_symbol = "xDAI"
+native_decimals = 18
+legacy_tx = false
+op_stack = false
+
+[chains.hyperliquid]
+name = "hyperliquid"
+chain_id = 999
+rpc_urls = ["https://rpc.hyperliquid.xyz/evm"]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "HyperEVM"
+native_symbol = "HYPE"
+native_decimals = 18
+legacy_tx = false
+op_stack = false
+
+[chains.linea]
+name = "linea"
+chain_id = 59144
+rpc_urls = [
+    "https://rpc.linea.build",
+    "https://linea-rpc.publicnode.com",
+]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "Linea"
+native_symbol = "ETH"
+native_decimals = 18
+legacy_tx = false
+op_stack = false
+
+[chains.optimism]
+name = "optimism"
+chain_id = 10
+rpc_urls = [
+    "https://mainnet.optimism.io",
+    "https://optimism-rpc.publicnode.com",
+]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "OP Mainnet"
+native_symbol = "ETH"
+native_decimals = 18
+legacy_tx = false
+op_stack = true
+
+[chains.polygon]
+name = "polygon"
+chain_id = 137
+rpc_urls = [
+    "https://polygon-rpc.com",
+    "https://polygon-bor-rpc.publicnode.com",
+]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "Polygon PoS"
+native_symbol = "POL"
+native_decimals = 18
+legacy_tx = false
+op_stack = false
+
+[chains.tempo]
+name = "tempo"
+chain_id = 4217
+rpc_urls = ["https://rpc.tempo.xyz"]
+rpc_endpoints = []
+allow_broadcast = true
+display_name = "Tempo Mainnet"
+native_symbol = "ETH"
+native_decimals = 18
+legacy_tx = false
+op_stack = false
+
+[petals]
+preinstalled = [
+    "polymarket",
+    "near-intents",
+    "enso",
+]
+
+[petals.runtime]
+
+[hyperliquid]
+mainnet_url = "https://api.hyperliquid.xyz"
+testnet_url = "https://api.hyperliquid-testnet.xyz"
+bridge_address = "0x2df1c51e09aecf9cacb7bc98cb1742757f163df7"
+deposit_chain_id = 42161
+
+[mempool]
+
+[private_rpc]
+
+[backends]
+contract_metadata = "etherscan"
+address_history = "etherscan"
+event_logs = "rpc"
+storage_reads = "rpc"
+proxy_detection = "rpc"

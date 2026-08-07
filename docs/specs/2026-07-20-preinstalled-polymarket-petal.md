@@ -4,6 +4,10 @@
 **Date:** 2026-07-20
 **Primary PR:** bloom-directory/bloom#107
 
+> Historical note: this specification introduced Polymarket as the first
+> default Petal. The current default set also includes the pinned Hyperliquid
+> Petal.
+
 ## Summary
 
 Bloom will support a defined list of Petals that are provisioned as part of the

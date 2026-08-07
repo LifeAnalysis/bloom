@@ -161,27 +161,6 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        [root, _network, branch, _wallet, _session, leaf]
-            if root == "hyperliquid"
-                && branch == "agent_sessions"
-                && matches!(leaf.as_str(), "orphan_cancel_all" | "orphan_close_all") =>
-        {
-            true
-        }
-        [root, _network, branch, _wallet, leaf]
-            if root == "hyperliquid"
-                && branch == "exchange"
-                && matches!(
-                    leaf.as_str(),
-                    "order.json"
-                        | "cancel.json"
-                        | "schedule_cancel.json"
-                        | "update_leverage.json"
-                        | "send_asset.json"
-                ) =>
-        {
-            true
-        }
         // policy.toml and policy-session/new writes flow through to the VFS
         // wallets handler, which stages a first-party Sealed Approval for passkey
         // wallets (challenge + grant-gated install/mint) and writes local policy
@@ -200,19 +179,23 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
 ///
 /// Keep this list narrow. Ordinary files still need whole-file buffering
 /// because a first contiguous WRITE is not proof that more chunks will not
-/// follow. Hyperliquid agent-session commands are JSON/control messages well
-/// below the mount's 64 KiB `wsize`; applying their offset-zero WRITE inline is
-/// what makes the documented mount-only workflow usable on macOS.
+/// follow. Hyperliquid Petal agent-session commands are JSON/control messages
+/// well below the mount's 64 KiB `wsize`; applying their offset-zero WRITE
+/// inline is what makes the documented mount-only workflow usable on macOS.
 fn mount_write_path_is_atomic_command(path: &VfsPath) -> bool {
     let segs = path.segments();
     match segs {
-        [root, _network, branch, _wallet, leaf]
-            if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
+        [petals, app, _network, branch, _wallet, leaf]
+            if petals == "petals"
+                && app == "hyperliquid"
+                && branch == "agent_sessions"
+                && leaf == "new.json" =>
         {
             true
         }
-        [root, _network, branch, _wallet, _session, leaf]
-            if root == "hyperliquid"
+        [petals, app, _network, branch, _wallet, _session, leaf]
+            if petals == "petals"
+                && app == "hyperliquid"
                 && branch == "agent_sessions"
                 && matches!(
                     leaf.as_str(),
@@ -1785,7 +1768,7 @@ mod tests {
         }
         async fn write(&self, p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
             match p.first() {
-                Some("inbox" | "mainnet") => {
+                Some("inbox" | "mainnet" | "hyperliquid") => {
                     self.writes.lock().push(data.to_vec());
                     Ok(())
                 }
@@ -1828,8 +1811,8 @@ mod tests {
         let fs = BloomFs::new(Vfs::builder().build());
         let ctx = fake_ctx();
         let handle = BloomHandle::Path {
-            entry: Entry::file("order.json"),
-            path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow/order.json").unwrap(),
+            entry: Entry::file("hash"),
+            path: VfsPath::parse("/wallets/minnow/sign/hash").unwrap(),
         };
 
         let err = fs
@@ -1880,15 +1863,15 @@ mod tests {
         let fs = BloomFs::new(Vfs::builder().build());
         let ctx = fake_ctx();
         let parent = BloomHandle::Path {
-            entry: Entry::dir("minnow"),
-            path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow").unwrap(),
+            entry: Entry::dir("sign"),
+            path: VfsPath::parse("/wallets/minnow/sign").unwrap(),
         };
 
         let err = fs
             .create(
                 &ctx,
                 &parent,
-                "order.json",
+                "hash",
                 CreateRequest {
                     kind: CreateKind::File,
                     attrs: SetAttrs::default(),
@@ -1908,7 +1891,8 @@ mod tests {
             "/wallets/minnow/policy.toml",
             "/wallets/minnow/policy-session/new",
             "/requests/pending/req_1/confirm",
-            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/new.json",
+            "/petals/hyperliquid/mainnet/exchange/minnow/order.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!mount_write_path_uses_wallet_signer(&p), "{path}");
@@ -1920,7 +1904,6 @@ mod tests {
             "/wallets/minnow/sign/typed_data",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/cancel",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/replace",
-            "/hyperliquid/mainnet/exchange/minnow/order.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(mount_write_path_uses_wallet_signer(&p), "{path}");
@@ -1930,22 +1913,22 @@ mod tests {
     #[test]
     fn mount_classifier_flushes_hyperliquid_session_commands_inline() {
         for path in [
-            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/stop",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/close_all",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/new.json",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel.json",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/stop",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/close_all",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(mount_write_path_is_atomic_command(&p), "{path}");
         }
 
         for path in [
-            "/hyperliquid/mainnet/mids.json",
-            "/hyperliquid/mainnet/exchange/minnow/order.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/status.json",
+            "/petals/hyperliquid/mainnet/mids.json",
+            "/petals/hyperliquid/mainnet/exchange/minnow/order.json",
+            "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/status.json",
             "/wallets/minnow/policy.toml",
         ] {
             let p = VfsPath::parse(path).unwrap();
@@ -1956,15 +1939,15 @@ mod tests {
     #[tokio::test]
     async fn unstable_hyperliquid_session_command_flushes_inline() {
         let recorder = RecordingHandler::new();
-        let vfs = Vfs::builder()
-            .mount("hyperliquid", recorder.clone())
-            .build();
+        let vfs = Vfs::builder().mount("petals", recorder.clone()).build();
         let fs = BloomFs::new(vfs);
         let ctx = fake_ctx();
         let handle = BloomHandle::Path {
             entry: Entry::file("order.json"),
-            path: VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json")
-                .unwrap(),
+            path: VfsPath::parse(
+                "/petals/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
+            )
+            .unwrap(),
         };
         let body = Bytes::from_static(br#"{"action":{"type":"order"}}"#);
 
@@ -1981,12 +1964,13 @@ mod tests {
     #[tokio::test]
     async fn unstable_hyperliquid_command_defers_handler_error_to_status_files() {
         let handler = Arc::new(AtomicDenyHandler::default());
-        let vfs = Vfs::builder().mount("hyperliquid", handler.clone()).build();
+        let vfs = Vfs::builder().mount("petals", handler.clone()).build();
         let fs = BloomFs::new(vfs);
         let ctx = fake_ctx();
         let handle = BloomHandle::Path {
             entry: Entry::file("new.json"),
-            path: VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/new.json").unwrap(),
+            path: VfsPath::parse("/petals/hyperliquid/mainnet/agent_sessions/minnow/new.json")
+                .unwrap(),
         };
         let body = Bytes::from_static(br#"{"id":"session-1"}"#);
 
