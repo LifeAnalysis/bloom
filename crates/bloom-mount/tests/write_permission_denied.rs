@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -94,6 +95,45 @@ impl Handler for ChallengeStagingHandler {
             }
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
+    }
+}
+
+#[derive(Default)]
+struct AsyncCommandHandler {
+    writes: AtomicUsize,
+}
+
+#[async_trait]
+impl Handler for AsyncCommandHandler {
+    async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        if path.is_root() {
+            Ok(Entry::dir(""))
+        } else if path.first() == Some("command") {
+            Ok(Entry::writable_file("command"))
+        } else {
+            Err(HandlerError::NotFound(path.to_string_path()))
+        }
+    }
+
+    async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        if path.is_root() {
+            Ok(vec![Entry::writable_file("command")])
+        } else {
+            Err(HandlerError::NotADir(path.to_string_path()))
+        }
+    }
+
+    async fn write(&self, path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+        if path.first() != Some("command") {
+            return Err(HandlerError::PermissionDenied);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        Err(HandlerError::PermissionDenied)
+    }
+
+    fn is_async_write_command(&self, path: &VfsPath) -> bool {
+        path.first() == Some("command")
     }
 }
 
@@ -392,4 +432,57 @@ async fn mounted_printf_surfaces_permission_denied() {
         vec![Vec::<u8>::new()],
         "open-time denial must happen before the shell writes the payload"
     );
+}
+
+/// Regression coverage for macOS command sinks: handler rejection is projected
+/// out-of-band and must never invalidate the kernel mount or block WRITE.
+#[tokio::test]
+async fn mounted_async_command_rejections_keep_the_mount_live() {
+    if !require_real_mount_test() {
+        eprintln!("skip: BLOOM_MOUNT_TEST_REQUIRE_REAL is not set");
+        return;
+    }
+    let mount_dir = unique_mount_dir();
+    std::fs::create_dir(&mount_dir).expect("create temporary mount dir");
+    let handler = Arc::new(AsyncCommandHandler::default());
+    let vfs = Vfs::builder().mount("stage", handler.clone()).build();
+    let mount = serve_test_mount(vfs, &mount_dir)
+        .await
+        .expect("mount asynchronous command VFS");
+    let target = mount_dir.join("stage/command");
+
+    for sequence in 0..25 {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '%s' \"$1\" > \"$2\"")
+            .arg("bloom-mount-async-test")
+            .arg(format!("{{\"sequence\":{sequence}}}"))
+            .arg(&target);
+        let output = command_output_with_timeout(command, Duration::from_secs(2))
+            .await
+            .expect("run asynchronous mounted command")
+            .expect("asynchronous mounted command must not hang");
+        assert!(
+            output.status.success(),
+            "asynchronous command leaked handler failure through NFS: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            command_text("mount", &[], Duration::from_secs(2))
+                .await
+                .contains(&mount_dir.display().to_string()),
+            "kernel mount disappeared after asynchronous command {sequence}"
+        );
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while handler.writes.load(Ordering::SeqCst) < 25 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("every accepted command reaches its handler");
+    mount.unmount().await.expect("unmount test VFS");
+    let _ = std::fs::remove_dir(&mount_dir);
 }

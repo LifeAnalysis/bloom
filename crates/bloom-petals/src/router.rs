@@ -445,7 +445,9 @@ impl Handler for PetalRouter {
                 .runner
                 .petal_route_effective_metadata(mount, DispatchOp::Write, &rest)
                 .ok()
-                .map(|(_, metadata)| metadata.write_async)
+                .map(|(route, metadata)| {
+                    route.route.install_metadata.write_async || metadata.write_async
+                })
                 .unwrap_or(false);
         }
         false
@@ -815,14 +817,13 @@ name = "example"
         let router = PetalRouter::new(runner, Arc::new(DenyHost))
             .with_async_write_switch(Arc::new(AtomicBool::new(true)));
         let vfs = Vfs::builder().mount("petals", Arc::new(router)).build();
+        let path = VfsPath::parse("/petals/example/alice.txt").unwrap();
+        assert!(
+            vfs.is_async_write_command(&path),
+            "mounted component writes must not return handler failures through macOS NFS"
+        );
 
-        let error = vfs
-            .write(
-                &VfsPath::parse("/petals/example/alice.txt").unwrap(),
-                b"payload",
-            )
-            .await
-            .unwrap_err();
+        let error = vfs.write(&path, b"payload").await.unwrap_err();
         assert!(
             error.to_string().contains("component route write"),
             "unexpected write error: {error}"

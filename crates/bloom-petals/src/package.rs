@@ -644,8 +644,7 @@ fn install_metadata_for_route(
         side_effecting_read: validation.abi == RouteAbi::ComponentBloomRoute010
             && !route.params.is_empty(),
         write_async: validation.abi == RouteAbi::ComponentBloomRoute010
-            && validation.has_write_export
-            && !route.params.is_empty(),
+            && validation.has_write_export,
         executable: false,
         required_caps: validation.required_caps.clone(),
         sign_intent: None,
@@ -667,7 +666,7 @@ fn install_metadata_for_route(
     metadata.mode = component_metadata.mode;
     metadata.cache_ttl_ms = component_metadata.cache_ttl_ms;
     metadata.side_effecting_read = component_metadata.side_effecting_read;
-    metadata.write_async = component_metadata.write_async;
+    metadata.write_async |= component_metadata.write_async;
     metadata.executable = component_metadata.executable;
     metadata.required_caps = component_metadata
         .required_caps

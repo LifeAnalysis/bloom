@@ -610,7 +610,8 @@ impl MachineBrokerClient {
                 if &claim.package_hash != package_hash
                     || &claim.route != route
                     || claim.crypto_suite != request.crypto_suite
-                    || claim.payload_digest != payload_digest
+                    || claim.payload_digest
+                        != petal_batch_payload_digest(std::slice::from_ref(&request.preimage))
                     || claim.ordered_hashes.as_slice() != [ordered_hash.clone()]
                 {
                     return Err(ProtocolError::new(
@@ -2941,6 +2942,51 @@ mod tests {
         );
         assert!(request.petal_use_claim.is_none());
         assert!(request.claim_assurance_evidence.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_petal_payload_uses_the_canonical_batch_digest() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: key_ref(),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker);
+        let payload = b"hyperliquid approve-agent payload".to_vec();
+        let mut request = exact_request(payload.clone(), None);
+        let package_hash = digest(80);
+        let route = "r000021".to_owned();
+        request.provenance = ProvenanceSubject::Petal {
+            package_hash: package_hash.clone(),
+            route: route.clone(),
+        };
+        request.activation_mode = None;
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash,
+            route,
+            operation_class: token("hyperliquid.approve_agent"),
+            crypto_suite: request.crypto_suite,
+            payload_digest: petal_batch_payload_digest(std::slice::from_ref(&payload)),
+            ordered_hashes: vec![request.claimed_hash.clone()],
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([81; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        });
+
+        assert!(matches!(
+            client.sign_exact_payload(request).await.unwrap(),
+            ExactPayloadSignOutcome::ApprovalRequired(_)
+        ));
     }
 
     #[tokio::test]

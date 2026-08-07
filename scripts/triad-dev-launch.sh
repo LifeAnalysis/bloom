@@ -341,24 +341,45 @@ awk '
 chmod 0600 "$machine_config_new"
 mv -f "$machine_config_new" "$machine_config"
 
-BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
-BLOOM_BROKER_SOCKET="$broker_socket" \
-BLOOM_MACHINE_IDENTITY="${config_dir}/machine-identity.json" \
-BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
-BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
-  "$bloom_bin" --home "$machine_home" serve \
-    --endpoint "unix:${machine_socket}" --mount "$mount_dir" \
-    >"${log_dir}/machine.log" 2>&1 &
-machine_pid=$!
-printf '%s\n' "$machine_pid" > "${log_dir}/machine.pid"
-chmod 0600 "${log_dir}/machine.pid"
-wait_for_socket "$machine_socket" "$machine_pid" machine
-mount_attempts=0
-while ! mount | grep -F " on ${mount_dir} " >/dev/null 2>&1 || ! command ls "$mount_dir" >/dev/null 2>&1; do
-  kill -0 "$machine_pid" 2>/dev/null || die "Machine exited before its kernel mount became ready"
-  mount_attempts=$((mount_attempts + 1))
-  [ "$mount_attempts" -lt 300 ] || die "Machine socket became ready but its kernel mount did not"
-  sleep 0.1
-done
+mount_is_live() {
+  mount | grep -F " on ${mount_dir} " >/dev/null 2>&1 && command ls "$mount_dir" >/dev/null 2>&1
+}
+
+start_machine() {
+  rm -f -- "$machine_socket"
+  BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
+  BLOOM_BROKER_SOCKET="$broker_socket" \
+  BLOOM_MACHINE_IDENTITY="${config_dir}/machine-identity.json" \
+  BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
+  BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
+    "$bloom_bin" --home "$machine_home" serve \
+      --endpoint "unix:${machine_socket}" --mount "$mount_dir" \
+      >>"${log_dir}/machine.log" 2>&1 &
+  machine_pid=$!
+  printf '%s\n' "$machine_pid" > "${log_dir}/machine.pid"
+  chmod 0600 "${log_dir}/machine.pid"
+  wait_for_socket "$machine_socket" "$machine_pid" machine
+  mount_attempts=0
+  while ! mount_is_live; do
+    kill -0 "$machine_pid" 2>/dev/null || die "Machine exited before its kernel mount became ready"
+    mount_attempts=$((mount_attempts + 1))
+    [ "$mount_attempts" -lt 300 ] || die "Machine socket became ready but its kernel mount did not"
+    sleep 0.1
+  done
+}
+
+: > "${log_dir}/machine.log"
+start_machine
 printf 'ready\n' > "$ready_file"
+while kill -0 "$machine_pid" 2>/dev/null; do
+  if ! mount_is_live; then
+    printf 'triad developer launcher: Machine mount disappeared; restarting Machine only\n' >&2
+    kill "$machine_pid" 2>/dev/null || true
+    wait "$machine_pid" 2>/dev/null || true
+    machine_pid=""
+    start_machine
+    printf 'ready\n' > "$ready_file"
+  fi
+  sleep 1
+done
 wait "$machine_pid"
