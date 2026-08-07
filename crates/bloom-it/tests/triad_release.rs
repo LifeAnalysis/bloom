@@ -267,6 +267,146 @@ fn release_bundle_rejects_triad_developer_harness_artifacts() {
 }
 
 #[test]
+fn triad_developer_launcher_supports_vfs_only_mode() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(
+        launcher.contains("required_paths=(\"$developer_root\" \"$machine_home\" \"$machine_socket\" \"$log_dir\" \"$ready_file\")"),
+        "the developer launcher must not require --mount"
+    );
+    assert!(
+        launcher.contains("Bloom is ready without a kernel mount")
+            && launcher.contains("\"$BLOOM_BIN\" vfs ls /")
+            && launcher.contains("\"$BLOOM_BIN\" vfs cat /next.md"),
+        "VFS-only startup must tell the developer how to use the running Machine"
+    );
+    assert!(
+        launcher.contains("wait_for_machine_ipc")
+            && launcher.contains("BLOOM_RPC_ENDPOINT=\"unix:${machine_socket}\"")
+            && launcher.contains("\"$bloom_bin\" --home \"$machine_home\" vfs ls /"),
+        "VFS-only readiness must actively probe the exact launched endpoint"
+    );
+    assert!(
+        launcher.contains("machine socket path already exists"),
+        "the launcher must reject stale or foreign socket paths before startup"
+    );
+}
+
+#[test]
+fn triad_developer_launcher_exports_its_machine_connection() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(
+        launcher.contains("printf 'export BLOOM_RPC_ENDPOINT=%q\\n' \"unix:${machine_socket}\"")
+            && launcher.contains("printf 'export BLOOM_BIN=%q\\n' \"$bloom_bin\""),
+        "triad.env must select the launched Machine and exact bloom binary"
+    );
+}
+
+#[test]
+fn triad_developer_launcher_keeps_explicit_mounts_fail_closed() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(
+        launcher.contains("if [ -n \"$mount_dir\" ]; then")
+            && launcher.contains("machine_args+=(--mount \"$mount_dir\")"),
+        "an explicitly requested mount must still be passed to bloom serve"
+    );
+    assert!(
+        launcher.contains("Machine exited before its requested kernel mount became ready")
+            && launcher.contains("restart without --mount and use bloom vfs commands"),
+        "a requested mount must fail with an actionable VFS-only fallback"
+    );
+    assert!(
+        launcher.contains("[ \"$attempts\" -lt 300 ] || {\n      if [ \"$label\" = machine ] && [ -n \"$mount_dir\" ]; then")
+            && launcher.contains("die \"$label did not publish its socket\""),
+        "a Machine socket timeout must retain the explicit-mount fallback hint"
+    );
+}
+
+#[test]
+fn triad_developer_launcher_can_leave_machine_developer_managed() {
+    let launcher_path = workspace().join("scripts/triad-dev-launch.sh");
+    let launcher = fs::read_to_string(&launcher_path).unwrap();
+
+    assert!(launcher.contains("--services-only) services_only=1; shift ;;"));
+    assert!(launcher.contains("if [ \"$services_only\" -eq 1 ]; then"));
+    assert!(launcher.contains("Bloom triad services are ready; Machine is developer-managed."));
+    assert!(launcher.contains("supervise_services"));
+
+    let directory = tempfile::tempdir().unwrap();
+    let rejected = Command::new(launcher_path)
+        .args([
+            "--services-only",
+            "--developer-root",
+            directory.path().join("developer").to_str().unwrap(),
+            "--machine-home",
+            directory.path().join("machine").to_str().unwrap(),
+            "--mount",
+            directory.path().join("mount").to_str().unwrap(),
+            "--machine-socket",
+            directory.path().join("machine.sock").to_str().unwrap(),
+            "--log-dir",
+            directory.path().join("logs").to_str().unwrap(),
+            "--ready-file",
+            directory.path().join("ready").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("--services-only cannot be combined with --mount"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn triad_developer_launcher_exports_debug_machine_on_path() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(launcher.contains("bloom_bin_dir=\"$(cd \"$(dirname \"$bloom_bin\")\" && pwd -P)\""));
+    assert!(launcher.contains("printf 'export PATH=%q:\"$PATH\"\\n' \"$bloom_bin_dir\""));
+}
+
+#[test]
+fn triad_developer_launcher_owns_only_its_service_processes() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(launcher.contains("trap cleanup EXIT INT TERM HUP"));
+    assert!(
+        launcher.contains(
+            "for pid in \"$machine_pid\" \"$broker_pid\" \"$signer_pid\" \"$session_pid\""
+        )
+    );
+    assert!(launcher.contains("rm -f -- \"$ready_file\""));
+    assert!(launcher.contains("die \"$label exited while supervising triad services\""));
+}
+
+#[test]
+fn serve_starts_audited_projection_refresh_after_fallible_setup() {
+    let source = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
+    let serve = source
+        .split("Cmd::Serve { endpoint, mount } => {")
+        .nth(1)
+        .expect("serve command arm");
+    let mount = serve.find("let mount_handle = mount_bloom").unwrap();
+    let endpoint = serve
+        .find("let endpoint = resolve_server_endpoint")
+        .unwrap();
+    let server = serve.find("let server = IpcServer::new").unwrap();
+    let background = serve
+        .find("let sweeper = d.spawn_background_tasks()")
+        .unwrap();
+
+    assert!(
+        mount < background && endpoint < background && server < background,
+        "audited background refresh must start only after fallible serve setup succeeds"
+    );
+}
+
+#[test]
 fn production_release_rejects_machine_audit_test_features() {
     let gate =
         fs::read_to_string(workspace().join("packaging/triad/release/triad-release-gate.sh"))
@@ -1258,6 +1398,32 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
         root.join("usr/local/libexec/bloom/current/bloom-broker")
             .exists(),
         "per-login uninstall must not remove the shared release"
+    );
+}
+
+#[test]
+fn macos_installer_creates_enrollment_workspace_with_private_modes() {
+    let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    assert!(
+        installer.contains(r#"mkdir -m 0700 "$templates" "$material""#),
+        "macOS enrollment generation directories must not inherit a permissive umask"
+    );
+}
+
+#[test]
+fn macos_installer_silences_transient_health_failures_and_replays_the_last_error() {
+    let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    assert!(
+        installer.contains(r#"health_output="$(mktemp "$scratch/health-check.XXXXXX")""#),
+        "health-check output must be captured privately during activation retries"
+    );
+    assert!(
+        installer.contains(r#">"$health_output" 2>&1; then return"#),
+        "a successful readiness retry must suppress earlier transient failures"
+    );
+    assert!(
+        installer.contains(r#"cat "$health_output" >&2"#),
+        "the final readiness diagnostic must be replayed when activation fails"
     );
 }
 
