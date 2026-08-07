@@ -561,7 +561,7 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
         "audit status",
         "bloom-broker-debug-driver",
         "wallet_id=\"$(jq -r '.wallet_id // empty'",
-        "[[ \"$wallet_id\" =~ ^wallet-[0-9a-f]{24}$ ]]",
+        "[[ \"$wallet_id\" == \"ma05-cached\" ]]",
         "wallet projection \"$wallet_id\"",
         "wallet commit-policy",
         "authenticated-projection-cache.json",
@@ -603,8 +603,8 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
     }
     assert_eq!(
         negative.matches("ma05-cached").count(),
-        1,
-        "the requested Machine wallet label must not be reused as the Signer-originated wallet ID"
+        2,
+        "the requested wallet ID must be asserted at both registration input and Signer result"
     );
 }
 

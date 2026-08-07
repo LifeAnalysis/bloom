@@ -285,9 +285,9 @@ then
   exit 1
 fi
 wallet_id="$(jq -r '.wallet_id // empty' "$work/registration-complete.log")"
-[[ "$wallet_id" =~ ^wallet-[0-9a-f]{24}$ ]] || {
+[[ "$wallet_id" == "ma05-cached" ]] || {
   cat "$work/registration-complete.log" >&2
-  echo "wallet registration did not return a usable Signer-originated wallet ID" >&2
+  echo "wallet registration did not preserve the requested authoritative wallet ID" >&2
   exit 1
 }
 

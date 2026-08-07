@@ -412,14 +412,15 @@ impl WalletsHandler {
                 "wallet name must be 1-64 ASCII alphanumeric, '-' or '_' characters",
             ));
         }
+        let wallet_id = bloom_broker_api::Token::new(request.requested_name.clone())
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
 
         let mut operation_bytes = [0_u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut operation_bytes);
         let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
         let reviewed_terms = serde_jcs::to_vec(&serde_json::json!({
             "ceremony_kind": bloom_broker_api::CeremonyKind::WalletRegistration,
-            "requested_machine_name": request.requested_name,
-            "wallet_id": null,
+            "wallet_id": wallet_id,
         }))
         .map_err(|error| HandlerError::invalid(format!("canonicalize registration: {error}")))?;
         let prepared = self
@@ -429,7 +430,7 @@ impl WalletsHandler {
                 bloom_broker_api::CustodyPrepareRequest {
                     ceremony_kind: bloom_broker_api::CeremonyKind::WalletRegistration,
                     custody_operation_id: operation_id.clone(),
-                    wallet_id: None,
+                    wallet_id: Some(wallet_id),
                     key_ref: None,
                     exact_terms_digest: bloom_broker_api::Digest32::from_bytes(
                         sha2::Sha256::digest(reviewed_terms).into(),
@@ -2929,7 +2930,7 @@ mod tests {
                             ceremony_kind: CeremonyKind::WalletRegistration,
                             custody_operation_id: request.operation_id,
                             public_status: *self.state.lock().unwrap(),
-                            wallet_id: Some(token("registered-wallet")),
+                            wallet_id: Some(token("main")),
                             public_key_refs: Vec::new(),
                             credential_summaries: Vec::new(),
                             initial_policy: None,
@@ -3447,6 +3448,16 @@ mod tests {
             status["ceremony_url"],
             "http://localhost:18734/ceremony/registration-secret"
         );
+        let requests = broker.requests.lock().unwrap();
+        let registration = requests.iter().find_map(|request| match request {
+            MachineBrokerRequest::WalletRegistrationPrepare(request) => Some(request),
+            _ => None,
+        });
+        assert_eq!(
+            registration.and_then(|request| request.wallet_id.as_ref()),
+            Some(&token("main"))
+        );
+        drop(requests);
 
         *broker.omit_ceremony_url.lock().unwrap() = true;
         assert!(matches!(

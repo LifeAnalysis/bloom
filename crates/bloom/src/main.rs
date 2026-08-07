@@ -762,7 +762,7 @@ async fn launch_custody_ceremony(
 
     validate_wallet_name(requested_name)
         .context("requested wallet name must be a safe single path segment")?;
-    bloom_broker_api::Token::new(requested_name.to_owned())
+    let requested_wallet_id = bloom_broker_api::Token::new(requested_name.to_owned())
         .context("requested wallet name must be a protocol token")?;
     let client = configured_broker_client(home)
         .context("custody requires the authenticated Machine-to-Broker edge")?;
@@ -777,10 +777,12 @@ async fn launch_custody_ceremony(
             let mut operation_bytes = [0_u8; 32];
             rand::thread_rng().fill_bytes(&mut operation_bytes);
             let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
+            let effective_wallet_id = wallet_id
+                .clone()
+                .unwrap_or_else(|| requested_wallet_id.clone());
             let reviewed_terms = serde_jcs::to_vec(&serde_json::json!({
                 "ceremony_kind": ceremony_kind,
-                "requested_machine_name": requested_name,
-                "wallet_id": wallet_id.clone(),
+                "wallet_id": effective_wallet_id,
             }))
             .context("canonicalize custody launch terms")?;
             (
@@ -795,7 +797,10 @@ async fn launch_custody_ceremony(
             bloom_broker_api::CustodyPrepareRequest {
                 ceremony_kind,
                 custody_operation_id: operation_id,
-                wallet_id,
+                wallet_id: legacy_passkey_migration
+                    .is_none()
+                    .then_some(requested_wallet_id)
+                    .or(wallet_id),
                 key_ref: None,
                 exact_terms_digest,
                 expected_input_class: bloom_broker_api::Token::new(expected_input_class)
