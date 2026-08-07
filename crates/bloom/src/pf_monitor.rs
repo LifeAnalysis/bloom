@@ -125,8 +125,8 @@ pub fn run_once() -> Result<()> {
             restart_services_for_live_session(login_uid, revoke_gid)?;
         }
     }
-    if !all_available || !trusted_time_available {
-        bail!("Bloom packet-filter or managed-time platform status is unavailable");
+    if !all_available {
+        bail!("Bloom packet-filter platform status is unavailable");
     }
     Ok(())
 }

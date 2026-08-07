@@ -768,21 +768,27 @@ durations expressed as positive integer milliseconds. Windows include
 reserved, committed, and quarantined entries and exclude only durably released
 known non-effects.
 
-Within a boot, each service uses monotonic time anchored to a trusted-source
-UTC reading. A trusted-source reading is one the OS reports as coming from a
-platform time service the packaging has pinned — authenticated NTP, an
-`NTS`-backed source, or the platform's own managed time daemon — as recorded
-in the edge manifest. When the platform cannot report the source, the reading
-is untrusted, the service starts in a degraded mode that serves reads and
-status but denies new rate-limited signing, and the condition is reported
-through `readiness`. Peer-supplied time is never authoritative.
+The edge manifest pins the platform time profile. Linux uses monotonic time
+anchored to UTC from its authenticated NTS-backed source. When Linux cannot
+report that source as synchronized, the service starts in a degraded mode
+that serves reads and status but denies new rate-limited signing. Peer-supplied
+time is never authoritative.
 
-Durable entries store UTC plus boot/monotonic audit anchors. Across restart,
-`effective_now` is the maximum of current trusted UTC and the last durably
-accepted effective time, so rollback never restores budget or extends
-authority.
+The macOS profile uses the host wall clock directly. Changing that clock
+requires administrator authority, and administrator/root compromise is
+outside the service-isolation threat model: that actor can already alter Bloom
+state. Bloom therefore does not persist a second effective clock, reject wall
+clock discontinuities, or require an operator clock-repair ceremony on macOS.
+Expiry and rolling-window semantics follow the host wall clock.
 
-Both directions of clock fault are bounded and both have a repair path:
+Linux durable entries store UTC plus boot/monotonic audit anchors. Across a
+Linux service restart, `effective_now` is the maximum of current trusted UTC
+and the last durably accepted effective time, so rollback never restores
+budget or extends authority. Existing macOS clock-state rows are legacy data
+and are not consulted or updated.
+
+For the Linux authenticated-time profile, both directions of clock fault are
+bounded and both have a repair path:
 
 - **Rollback.** Effective time freezes and new rate-limited signing is denied
   until the clock catches up or an audited operator repair advances it.
@@ -795,8 +801,9 @@ Both directions of clock fault are bounded and both have a repair path:
   An operator may accept the new time through the same audited repair path; a
   repair that would expire live approvals lists them in its confirmation.
 
-Suspend/resume, rollback, forward-jump, and untrusted-source tests are
-mandatory.
+Linux suspend/resume, rollback, forward-jump, and untrusted-source tests are
+mandatory. macOS restart tests must prove that stale durable clock state and
+wall-clock discontinuities do not latch Broker or Signer readiness.
 
 Broker and Signer each evaluate rate limits over their own clock and their own
 reservation timestamps, so their windows can disagree at the boundary. Broker's
@@ -2439,10 +2446,12 @@ ownership table in section 26.
   verifiers is asserted to advertise an empty verifier set and to fail closed
   rather than degrade when policy requires one.
 - **AC-10** Concurrent reservations cannot overspend operation, signature,
-  rolling, lifetime, asset, or fee limits. Clock rollback freezes effective
-  time; a forward jump beyond `max_forward_step` is not adopted and does not
-  expire live approvals or burn rolling windows; an untrusted time source
-  denies new rate-limited signing; and a Signer rate-backstop denial after a
+  rolling, lifetime, asset, or fee limits. In the Linux authenticated-time
+  profile, clock rollback freezes effective time; a forward jump beyond
+  `max_forward_step` is not adopted and does not expire live approvals or burn
+  rolling windows; an untrusted time source denies new rate-limited signing.
+  The macOS profile follows the administratively controlled host wall clock.
+  A Signer rate-backstop denial after a
   Broker reservation releases that reservation in full and is never reported
   as spend.
 - **AC-11** Signer rejects forged, expired, replayed, excessive, wrong-key,
@@ -2592,8 +2601,8 @@ corresponding implementation ships:
   what integrity it actually provides against a compromised service. Section 20
   makes no claim stronger than "truncation is detected through the latest
   independently stored head," and that claim is only as good as this location.
-- The pinned trusted time source per platform and the production value of
-  `max_forward_step`.
+- The pinned time profile per platform and the production Linux value of
+  `max_forward_step`; macOS uses its administrator-controlled host wall clock.
 - Whether any assurance verifier ships in v1. If none does, every reusable
   approval operates at `machine_asserted` and the section 1.1 disclosure is the
   only mitigation.

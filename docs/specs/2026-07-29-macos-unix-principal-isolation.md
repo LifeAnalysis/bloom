@@ -344,17 +344,18 @@ No Keychain access group is required.
 - secrets never appear in plist files, process arguments, logs, status files,
   or the release bundle.
 
-The edge manifest pins `macos-managed-timed`. The root platform monitor
-verifies that automatic network time is enabled and the system
-`com.apple.timed` service is loaded, and includes that result in its fresh,
-root-owned, exact-build platform status. Broker and Signer accept macOS wall
-time only while that status remains valid; they still fail closed on a missing
-attestation, rollback, or an unconfirmed repair. macOS `timed` merges multiple
-reference-clock technologies and is not represented by the kernel NTP state
-returned from `ntp_adjtime`, so that Linux-style query is not used on macOS.
-The disposable W0 host setup enables automatic network time as an explicit VM
-prerequisite. The production installer never changes that administrator
-setting; it reports and rolls back when the prerequisite is disabled.
+The edge manifest pins `macos-managed-timed`, and Broker and Signer use the
+host wall clock for expiry and rolling-window semantics. Changing that clock
+requires administrator authority; administrator/root compromise is outside
+the service-isolation threat model because it can already alter Bloom state.
+The services therefore do not maintain a second durable effective clock,
+reject forward or backward discontinuities, or require clock repair on macOS.
+
+The root platform monitor may continue to report automatic-network-time and
+`com.apple.timed` status as telemetry in the version-3 status schema, but those
+fields are not packet-filter containment claims and do not gate signing. The
+packet-filter availability, exact-build, ownership, and freshness checks
+remain mandatory.
 
 ## 10. Installation and enrollment
 

@@ -230,14 +230,9 @@ BLOOM_TRIAD_DEVELOPER_RUNTIME="$runtime_dir" \
 session_pid=$!
 wait_for_socket "$session_socket" "$session_pid" session
 
-signer_clock_env=(env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS -u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST)
-if [ -n "${BLOOM_TRIAD_DEV_SIGNER_CLOCK_REPAIR_MS:-}" ]; then
-  signer_clock_env+=("BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS=${BLOOM_TRIAD_DEV_SIGNER_CLOCK_REPAIR_MS}")
-fi
-if [ -n "${BLOOM_TRIAD_DEV_SIGNER_CLOCK_REPAIR_CONFIRM:-}" ]; then
-  signer_clock_env+=("BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST=${BLOOM_TRIAD_DEV_SIGNER_CLOCK_REPAIR_CONFIRM}")
-fi
-"${signer_clock_env[@]}" BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
+env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS \
+-u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST \
+BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
 BLOOM_SIGNER_IDENTITY="${config_dir}/signer-identity.json" \
 BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
 BLOOM_SIGNER_CONFIG="${config_dir}/signer.json" \
@@ -249,14 +244,9 @@ BLOOM_SESSION_SOCKET="$session_socket" \
 signer_pid=$!
 wait_for_socket "$signer_socket" "$signer_pid" signer
 
-broker_clock_env=(env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS -u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST)
-if [ -n "${BLOOM_TRIAD_DEV_BROKER_CLOCK_REPAIR_MS:-}" ]; then
-  broker_clock_env+=("BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS=${BLOOM_TRIAD_DEV_BROKER_CLOCK_REPAIR_MS}")
-fi
-if [ -n "${BLOOM_TRIAD_DEV_BROKER_CLOCK_REPAIR_CONFIRM:-}" ]; then
-  broker_clock_env+=("BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST=${BLOOM_TRIAD_DEV_BROKER_CLOCK_REPAIR_CONFIRM}")
-fi
-"${broker_clock_env[@]}" BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
+env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS \
+-u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST \
+BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
 BLOOM_BROKER_IDENTITY="${config_dir}/broker-identity.json" \
 BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
 BLOOM_BROKER_CONFIG="${config_dir}/broker.json" \

@@ -143,19 +143,20 @@ wire detail. It does not amend that specification.
   daemon. The edge manifest pins one reviewed source ID per platform:
   `linux-chrony-nts` or `macos-managed-timed`. Linux packaging requires two
   NTS sources under chrony's `authselectmode require`; the runtime accepts UTC
-  only while the kernel reports a synchronized clock. macOS `timed` merges
-  multiple reference-clock technologies and does not publish its trust state
-  through `ntp_adjtime`; the root platform monitor instead attests automatic
-  network time plus the loaded system `com.apple.timed` service in the same
-  fresh exact-build status that gates every service operation. A missing,
-  cross-platform, or peer-supplied source ID fails closed, and the compiled
-  forward-step bound is the normative one hour.
-  Sampling and durable observation are serialized per service so concurrent
-  requests cannot persist monotonic anchors out of order. SQLite upgrades add
+  only while the kernel reports a synchronized clock and applies the compiled
+  one-hour forward-step bound. macOS `timed` does not publish a comparable
+  trust state. Because changing the macOS host clock requires administrator
+  authority, which can already alter Bloom state, the macOS profile uses the
+  host wall clock directly and does not enter the durable discontinuity or
+  repair paths. A missing, cross-platform, or peer-supplied source ID still
+  fails closed.
+  Linux sampling and durable observation are serialized per service so
+  concurrent requests cannot persist monotonic anchors out of order. SQLite
+  upgrades add
   the UTC, monotonic, and boot-epoch columns in place; historical reservation
   rows retain an explicit zero/unknown anchor but retries preserve their
   original accounting time rather than comparing it with a fresh sample.
-  Broker and Signer expose the same offline operator mode through
+  On Linux, Broker and Signer expose the same offline operator mode through
   `BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS`: it opens only the service's own state,
   lists live approvals that the accepted time expires and requires their
   timestamp-bound digest in
