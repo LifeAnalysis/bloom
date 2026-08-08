@@ -84,10 +84,39 @@ cat wallets/registrations/main/ceremony_url
 - To cancel a live registration, write anything to
   `wallets/registrations/<name>/cancel`.
 
+## Importing an existing private key (passkey ceremony)
+
+Importing a key uses the same asynchronous ceremony as creating a wallet, but
+stages through `wallets/import/<name>` so the **private key never enters the
+VFS, the shell, or the daemon socket** — the human pastes it directly into the
+browser ceremony page, which encrypts it under a new passkey:
+
+```sh
+printf 'main\n' > wallets/import/main
+cat wallets/registrations/main/status.json
+cat wallets/registrations/main/ceremony_url   # forward to the human
+```
+
+- The write to `wallets/import/<name>` carries **only the name** (any non-empty
+  body; never a key). The body MUST NOT contain a key or TOML — the handler
+  refuses it.
+- Forward `ceremony_url` to the human. The page shows a private-key field; the
+  human pastes the key and completes WebAuthn. The key is wrapped under the
+  passkey server-side and never persists as plaintext or a passphrase.
+- The ceremony projection is shared with new-wallet registration
+  (`wallets/registrations/<name>/`), so poll `status.json` until `completed`,
+  then read `wallets/<name>/address`. The recovery key shown at the end IS the
+  imported private key (passkey-wrapped wallets recover to their raw key).
+- Writing `kind = "passkey-import"` to `wallets/new` is rejected with a pointer
+  to `wallets/import/<name>` — use the dedicated path.
+
+## Local / passphrase wallets (synchronous, non-ceremony)
+
 Explicit `kind = "local"` and `kind = "import"` wallets remain synchronous and
 require `allow_passphrase_wallet = true` plus a passphrase in the TOML spec —
-passkey is the default for a reason. `kind = "passkey-import"` is not yet
-supported through the VFS.
+passkey is the default for a reason. These do not use a ceremony; the key (for
+`import`) must be supplied in the TOML, which is why the passkey import path
+above is strongly preferred for any real key.
 
 ## Mounted Sealed Approval flow
 

@@ -80,7 +80,14 @@ use tracing::{debug, info, warn};
 use std::sync::Mutex;
 
 const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
-const PETAL_ACTION_TTL_MS: u64 = 120_000;
+/// Live interval for a petal signing-action identity. The action id is
+/// derived from the request fingerprint *and* the identity's expiry, so once
+/// this elapses [`PetalActionIdentityCache::resolve`] mints a fresh identity
+/// with a new action id — which orphaned any approval grant minted in the
+/// previous lifecycle (the gasless approve-then-retry loop). The window must
+/// comfortably cover an interactive cross-device approval (phone scan +
+/// biometric + relay round-trip), not just a local tap.
+const PETAL_ACTION_TTL_MS: u64 = 10 * 60 * 1000;
 const MAX_ACTIVE_PETAL_ACTION_IDENTITIES: usize = 4_096;
 const PETAL_SIGNING_SUBJECT_KIND: &str = "petal_sign_hash";
 const PETAL_SIGNING_SUBJECT_SCHEMA_V1: &str = "bloom.petal.sign_hash_subject.v1";
@@ -3093,31 +3100,27 @@ mod tests {
             }),
         };
 
-        let (start, _) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 1)
-            .unwrap();
-        let (end_of_bucket, _) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 59_999)
-            .unwrap();
-        assert_eq!(start.action_id(), end_of_bucket.action_id());
-        assert_eq!(end_of_bucket.expires_ms, 120_001);
+        let ctx = req.context.as_ref().unwrap();
 
-        let (next_bucket, _) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 60_000)
-            .unwrap();
-        assert_eq!(start.action_id(), next_bucket.action_id());
-        assert_eq!(next_bucket.expires_ms, start.expires_ms);
+        // The same request fingerprint resolves to a stable identity for its
+        // whole live interval: retries within the TTL reuse the same action id
+        // so an approval grant minted by one call is consumed by the next.
+        let (start, _) = host.petal_action(&req, ctx, 1).unwrap();
+        assert_eq!(start.expires_ms, 1 + PETAL_ACTION_TTL_MS);
 
-        let (last_live_retry, _) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 120_000)
-            .unwrap();
-        assert_eq!(start.action_id(), last_live_retry.action_id());
+        let (mid, _) = host.petal_action(&req, ctx, 60_000).unwrap();
+        assert_eq!(start.action_id(), mid.action_id());
+        assert_eq!(mid.expires_ms, start.expires_ms);
 
-        let (after_expiry, _) = host
-            .petal_action(&req, req.context.as_ref().unwrap(), 120_001)
-            .unwrap();
+        let (last_live, _) = host.petal_action(&req, ctx, PETAL_ACTION_TTL_MS).unwrap();
+        assert_eq!(start.action_id(), last_live.action_id());
+
+        // Past the live interval the identity expires and a brand-new one
+        // (new action id, fresh expiry) is minted — grants from the prior
+        // lifecycle cannot be revived.
+        let (after_expiry, _) = host.petal_action(&req, ctx, start.expires_ms).unwrap();
         assert_ne!(start.action_id(), after_expiry.action_id());
-        assert_eq!(after_expiry.expires_ms, 240_001);
+        assert_eq!(after_expiry.expires_ms, start.expires_ms + PETAL_ACTION_TTL_MS);
     }
 
     #[test]

@@ -149,9 +149,10 @@ fails clearly, before staging anything, if no daemon is reachable.
 Explicit `kind = "local"` / `kind = "import"` wallets remain synchronous and
 require `allow_passphrase_wallet = true` plus a passphrase field — passkey is
 the default specifically to avoid silently minting a fund-holding wallet with
-a machine-chosen passphrase. `kind = "passkey-import"` is not yet supported
-through the VFS; use `bloom wallet import <name> <key>` from a trusted
-foreground terminal instead.
+a machine-chosen passphrase. To import an existing key through a passkey
+ceremony instead, write the name to `wallets/import/<name>`; the human pastes
+the key into the browser ceremony reached via `wallets/registrations/<name>`,
+and it is wrapped under a new passkey — the key never enters the VFS or shell.
 
 ## Wallet addresses & roles
 

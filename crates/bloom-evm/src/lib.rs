@@ -975,7 +975,18 @@ impl ChainRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<ChainClient> {
-        self.inner.read().get(name).cloned()
+        let inner = self.inner.read();
+        if let Some(c) = inner.get(name) {
+            return Some(c.clone());
+        }
+        // Fall back to common chain aliases. Some petals/agents use the
+        // conventional shorthand "mainnet" for the Ethereum mainnet chain,
+        // which bloom keys canonically as "ethereum".
+        let alias = match name {
+            "mainnet" | "eth" => "ethereum",
+            _ => return None,
+        };
+        inner.get(alias).cloned()
     }
 
     pub fn list_names(&self) -> Vec<String> {
@@ -1062,6 +1073,26 @@ mod tests {
         r.add(c);
         assert!(r.get("anvil").is_some());
         assert_eq!(r.list_names(), vec!["anvil".to_string()]);
+    }
+
+    #[test]
+    fn registry_resolves_mainnet_eth_aliases_to_ethereum() {
+        // Petals/agents that use the conventional shorthand "mainnet" (or
+        // "eth") for Ethereum mainnet must resolve to the chain registered as
+        // "ethereum". The aliases must NOT shadow a real registration.
+        let mut spec = ChainSpec::anvil_default();
+        spec.name = "ethereum".into();
+        let c = ChainClient::new(spec).unwrap();
+        let r = ChainRegistry::new();
+        r.add(c);
+        assert!(r.get("ethereum").is_some());
+        assert!(r.get("mainnet").is_some(), "'mainnet' must alias to 'ethereum'");
+        assert!(r.get("eth").is_some(), "'eth' must alias to 'ethereum'");
+        assert!(r.get("sepolia").is_none(), "unknown names still miss");
+        assert_eq!(
+            r.get("mainnet").unwrap().spec().name, "ethereum",
+            "alias resolves to the ethereum client",
+        );
     }
 
     #[test]

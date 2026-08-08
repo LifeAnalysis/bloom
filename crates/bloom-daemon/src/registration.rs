@@ -27,7 +27,7 @@ use parking_lot::{Mutex, RwLock};
 use rand::RngCore;
 use zeroize::Zeroize;
 
-const SESSION_TTL_MS: u64 = 5 * 60 * 1000;
+const SESSION_TTL_MS: u64 = 30 * 60 * 1000;
 const RECOVERY_ACK_TTL_MS: u64 = 5 * 60 * 1000;
 const MAX_ATTEMPTS: usize = 5;
 
@@ -95,10 +95,12 @@ fn complete_body_digest(attempt_id: &str, body: &WalletRegistrationCompleteBody)
         WalletRegistrationCompleteBody::Registration {
             credential,
             prf_output_b64,
+            ..
         } => ("registration", credential, prf_output_b64),
         WalletRegistrationCompleteBody::Fallback {
             credential,
             prf_output_b64,
+            ..
         } => ("fallback", credential, prf_output_b64),
     };
     let mut hasher = blake3::Hasher::new();
@@ -107,6 +109,16 @@ fn complete_body_digest(attempt_id: &str, body: &WalletRegistrationCompleteBody)
     hasher.update(&serde_json::to_vec(credential).unwrap_or_default());
     hasher.update(prf_output_b64.as_bytes());
     *hasher.finalize().as_bytes()
+}
+
+/// Parse a browser-pasted private key (import-mode ceremonies) into a signer.
+/// The hex is decoded through the keystore's `decode_priv_hex` (which zeroizes
+/// its intermediate buffer) and the returned signer is the only copy.
+fn import_signer_from_hex(hex: &str) -> Result<PrivateKeySigner, AuthApiError> {
+    let key_bytes = bloom_keystore::decode_priv_hex(hex)
+        .map_err(|e| AuthApiError::Denied(format!("invalid private key: {e}")))?;
+    PrivateKeySigner::from_bytes(&(*key_bytes).into())
+        .map_err(|e| AuthApiError::Denied(format!("invalid private key: {e}")))
 }
 
 struct SecretSession {
@@ -120,6 +132,10 @@ struct SecretSession {
     completion: Option<CompletionPhase>,
     completing: bool,
     recovery_ack_deadline: Option<u64>,
+    /// Import-mode: the completed wallet wraps a browser-pasted key instead of
+    /// the random `signer` generated at stage time. The pasted key replaces
+    /// `signer` at `complete`, in memory only.
+    import: bool,
 }
 
 impl SecretSession {
@@ -217,7 +233,7 @@ impl RegistrationCoordinator {
         Ok(())
     }
 
-    fn fresh_session(wallet: &str, now_ms: u64) -> (String, SecretSession) {
+    fn fresh_session(wallet: &str, now_ms: u64, import: bool) -> (String, SecretSession) {
         let mut prf_salt = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut prf_salt);
         let token = gen_token();
@@ -234,8 +250,84 @@ impl RegistrationCoordinator {
             completion: None,
             completing: false,
             recovery_ack_deadline: None,
+            import,
         };
         (token, session)
+    }
+
+    /// Shared staging logic for [`stage`] (new passkey wallet) and
+    /// [`stage_import`] (import-mode). `import` only flips a flag on the
+    /// session so the ceremony page renders a private-key paste step; the key
+    /// itself arrives later, browser→localhost at `complete`, never through the
+    /// VFS.
+    async fn stage_inner(
+        &self,
+        wallet: &str,
+        now_ms: u64,
+        import: bool,
+    ) -> Result<WalletRegistrationStatus, AuthApiError> {
+        Keystore::validate_name(wallet).map_err(|e| AuthApiError::Denied(e.to_string()))?;
+
+        let base = self.base_url()?;
+        let _transition = self.transitions.lock().await;
+
+        if self.keystore_root.join(wallet).exists() {
+            return Err(AuthApiError::Denied(format!(
+                "wallet '{wallet}' already exists"
+            )));
+        }
+        // A persisted "completed" registration for a wallet that is no longer
+        // on disk is stale (e.g. left behind by a `wallet delete` that cleared
+        // the keystore but not the registration audit row). It must not block
+        // re-registration — the on-disk check above is the authoritative guard.
+
+        let (live_token, stale_token) = {
+            let state = self.state.lock();
+            let token = state.by_wallet.get(wallet).cloned();
+            match token.as_ref().and_then(|token| state.sessions.get(token)) {
+                Some(session) if session.effective_deadline() > now_ms || session.completing => {
+                    (token, None)
+                }
+                Some(_) => (None, token),
+                None => (None, None),
+            }
+        };
+        if let Some(token) = live_token {
+            return self
+                .store
+                .status_for_session(&token)
+                .await?
+                .ok_or_else(|| AuthApiError::Store("registration session status missing".into()));
+        }
+        if let Some(token) = stale_token {
+            let mut status = self
+                .store
+                .status_for_session(&token)
+                .await?
+                .ok_or_else(|| AuthApiError::Store("registration session status missing".into()))?;
+            if !status.state.is_terminal() {
+                status.state = WalletRegistrationState::Expired;
+                status.ceremony_url = None;
+                self.store.upsert(&token, &status, now_ms).await?;
+            }
+            Self::remove_session_if_current(&mut self.state.lock(), &token, wallet);
+        }
+
+        let (token, session) = Self::fresh_session(wallet, now_ms, import);
+        let url = Self::ceremony_url(&base, &token);
+        let status = WalletRegistrationStatus::awaiting_user(
+            wallet,
+            session.created_at_ms,
+            session.expires_at_ms,
+            url,
+        );
+        self.store.upsert(&token, &status, now_ms).await?;
+        let mut state = self.state.lock();
+        if let Some(stale) = state.by_wallet.insert(wallet.to_string(), token.clone()) {
+            state.sessions.remove(&stale);
+        }
+        state.sessions.insert(token, session);
+        Ok(status)
     }
 
     fn release_completion(&self, token: &str, attempt_id: &str) {
@@ -308,71 +400,15 @@ impl WalletRegistrationVfs for RegistrationCoordinator {
         wallet: &str,
         now_ms: u64,
     ) -> Result<WalletRegistrationStatus, AuthApiError> {
-        Keystore::validate_name(wallet).map_err(|e| AuthApiError::Denied(e.to_string()))?;
+        self.stage_inner(wallet, now_ms, false).await
+    }
 
-        let base = self.base_url()?;
-        let _transition = self.transitions.lock().await;
-
-        if self.keystore_root.join(wallet).exists() {
-            return Err(AuthApiError::Denied(format!(
-                "wallet '{wallet}' already exists"
-            )));
-        }
-        if let Some(persisted) = self.store.status_for_wallet(wallet).await?
-            && persisted.state == WalletRegistrationState::Completed
-        {
-            return Err(AuthApiError::Denied(format!(
-                "wallet '{wallet}' already exists"
-            )));
-        }
-
-        let (live_token, stale_token) = {
-            let state = self.state.lock();
-            let token = state.by_wallet.get(wallet).cloned();
-            match token.as_ref().and_then(|token| state.sessions.get(token)) {
-                Some(session) if session.effective_deadline() > now_ms || session.completing => {
-                    (token, None)
-                }
-                Some(_) => (None, token),
-                None => (None, None),
-            }
-        };
-        if let Some(token) = live_token {
-            return self
-                .store
-                .status_for_session(&token)
-                .await?
-                .ok_or_else(|| AuthApiError::Store("registration session status missing".into()));
-        }
-        if let Some(token) = stale_token {
-            let mut status = self
-                .store
-                .status_for_session(&token)
-                .await?
-                .ok_or_else(|| AuthApiError::Store("registration session status missing".into()))?;
-            if !status.state.is_terminal() {
-                status.state = WalletRegistrationState::Expired;
-                status.ceremony_url = None;
-                self.store.upsert(&token, &status, now_ms).await?;
-            }
-            Self::remove_session_if_current(&mut self.state.lock(), &token, wallet);
-        }
-
-        let (token, session) = Self::fresh_session(wallet, now_ms);
-        let url = Self::ceremony_url(&base, &token);
-        let status = WalletRegistrationStatus::awaiting_user(
-            wallet,
-            session.created_at_ms,
-            session.expires_at_ms,
-            url,
-        );
-        self.store.upsert(&token, &status, now_ms).await?;
-        let mut state = self.state.lock();
-        if let Some(stale) = state.by_wallet.insert(wallet.to_string(), token.clone()) {
-            state.sessions.remove(&stale);
-        }
-        state.sessions.insert(token, session);
-        Ok(status)
+    async fn stage_import(
+        &self,
+        wallet: &str,
+        now_ms: u64,
+    ) -> Result<WalletRegistrationStatus, AuthApiError> {
+        self.stage_inner(wallet, now_ms, true).await
     }
 
     async fn status(&self, wallet: &str) -> Result<Option<WalletRegistrationStatus>, AuthApiError> {
@@ -395,7 +431,7 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
         token: &str,
         now_ms: u64,
     ) -> Result<WalletRegistrationSessionView, AuthApiError> {
-        let (wallet, expires_at_ms, awaiting_ack) = {
+        let (wallet, expires_at_ms, awaiting_ack, import) = {
             let state = self.state.lock();
             let session = state
                 .sessions
@@ -408,6 +444,7 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
                 session.wallet.clone(),
                 session.effective_deadline(),
                 session.completion.is_some(),
+                session.import,
             )
         };
         let default_policy_toml =
@@ -421,6 +458,7 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
             },
             expires_at_ms,
             default_policy_toml,
+            import,
         })
     }
 
@@ -629,6 +667,27 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
                     if session.completing {
                         return Err(AuthApiError::Denied("another attempt is completing".into()));
                     }
+                    // Resolve the signer before setting any busy flag so a bad
+                    // import key returns Err with the session unmodified:
+                    //  - import mode: build the signer from the browser-pasted
+                    //    key (the random `session.signer` is discarded);
+                    //  - new mode: reject if a key was supplied, else use the
+                    //    random staged signer.
+                    let signer = if session.import {
+                        let key_hex = body.private_key_hex().ok_or_else(|| {
+                            AuthApiError::Denied(
+                                "import ceremony requires a private key in the completion body"
+                                    .into(),
+                            )
+                        })?;
+                        import_signer_from_hex(key_hex)?
+                    } else if body.private_key_hex().is_some() {
+                        return Err(AuthApiError::Denied(
+                            "private_key is only accepted in import-mode ceremonies".into(),
+                        ));
+                    } else {
+                        session.signer.clone()
+                    };
                     let attempt = session.attempts.get_mut(attempt_id).ok_or_else(|| {
                         AuthApiError::NotFound("unknown registration attempt".into())
                     })?;
@@ -641,7 +700,7 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
                     session.completing = true;
                     CompleteWork::New(Box::new(CompleteNew {
                         wallet: session.wallet.clone(),
-                        signer: session.signer.clone(),
+                        signer,
                         prf_salt: session.prf_salt,
                         policy_toml: attempt.policy_toml.clone(),
                         reg_state: attempt.reg_state.clone(),
@@ -676,6 +735,7 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
                         WalletRegistrationCompleteBody::Registration {
                             credential,
                             prf_output_b64,
+                            ..
                         } => {
                             let credential: RegisterPublicKeyCredential =
                                 serde_json::from_value(credential.clone()).map_err(|e| {
@@ -690,6 +750,7 @@ impl WalletRegistrationCeremony for RegistrationCoordinator {
                         WalletRegistrationCompleteBody::Fallback {
                             credential,
                             prf_output_b64,
+                            ..
                         } => {
                             let credential: PublicKeyCredential =
                                 serde_json::from_value(credential.clone()).map_err(|e| {
@@ -1129,6 +1190,36 @@ mod tests {
         assert!(err.to_string().contains("already exists"));
     }
 
+    /// A persisted "completed" registration for a wallet that is no longer on
+    /// disk (e.g. left behind by a `wallet delete`) must not block
+    /// re-registration — the on-disk check is the authoritative guard.
+    #[tokio::test]
+    async fn stage_allows_re_registering_after_delete_left_stale_completed() {
+        let (coordinator, _tmp) = coordinator();
+        coordinator.mark_listener_bound("http://localhost:18734");
+
+        // Simulate a completed registration whose wallet dir was later deleted:
+        // a Completed status row with no keystore dir on disk.
+        let mut stale = WalletRegistrationStatus::awaiting_user(
+            "ghost",
+            1_000,
+            1_000 + SESSION_TTL_MS,
+            "http://localhost:18734/x",
+        );
+        stale.state = WalletRegistrationState::Completed;
+        stale.address = Some("0xabc".into());
+        coordinator
+            .store
+            .upsert("stale-token", &stale, 1_000)
+            .await
+            .unwrap();
+        assert!(!_tmp.path().join("keystore").join("ghost").exists());
+
+        // Re-staging must succeed (not reject "already exists").
+        let status = coordinator.stage("ghost", 2_000).await.unwrap();
+        assert_eq!(status.state, WalletRegistrationState::AwaitingUser);
+    }
+
     #[tokio::test]
     async fn stage_rejects_path_traversal_names() {
         let (coordinator, _tmp) = coordinator();
@@ -1228,6 +1319,7 @@ mod tests {
         let body = bloom_auth_api::WalletRegistrationCompleteBody::Registration {
             credential: garbage_credential,
             prf_output_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]),
+            private_key_hex: None,
         };
         // `WalletRegistrationCompleteOutcome` intentionally does not derive
         // `Debug` (it carries the recovery key/receipt), so match instead of
@@ -1289,10 +1381,12 @@ mod tests {
         let reg_a = WalletRegistrationCompleteBody::Registration {
             credential: cred_a.clone(),
             prf_output_b64: "AAAA".into(),
+            private_key_hex: None,
         };
         let reg_a_again = WalletRegistrationCompleteBody::Registration {
             credential: cred_a.clone(),
             prf_output_b64: "AAAA".into(),
+            private_key_hex: None,
         };
         assert_eq!(
             complete_body_digest("att-1", &reg_a),
@@ -1303,6 +1397,7 @@ mod tests {
         let reg_b = WalletRegistrationCompleteBody::Registration {
             credential: cred_b,
             prf_output_b64: "AAAA".into(),
+            private_key_hex: None,
         };
         assert_ne!(
             complete_body_digest("att-1", &reg_a),
@@ -1313,6 +1408,7 @@ mod tests {
         let reg_diff_prf = WalletRegistrationCompleteBody::Registration {
             credential: cred_a.clone(),
             prf_output_b64: "BBBB".into(),
+            private_key_hex: None,
         };
         assert_ne!(
             complete_body_digest("att-1", &reg_a),
@@ -1329,6 +1425,7 @@ mod tests {
         let fallback_a = WalletRegistrationCompleteBody::Fallback {
             credential: cred_a,
             prf_output_b64: "AAAA".into(),
+            private_key_hex: None,
         };
         assert_ne!(
             complete_body_digest("att-1", &reg_a),
@@ -1449,11 +1546,11 @@ mod tests {
         // recovery-ack deadline (300_000ms out) outlives the original
         // SESSION_TTL_MS (also 300_000ms in these tests) only if we push
         // "now" past the original expiry but before the ack deadline.
-        stage_and_finalize_directly(&coordinator, "alice", "0xabc", "receipt-1", 1_000, 600_000)
+        stage_and_finalize_directly(&coordinator, "alice", "0xabc", "receipt-1", 1_000, SESSION_TTL_MS + 300_000)
             .await;
 
-        // Past the original 5-minute ceremony deadline, but still within
-        // the recovery-ack window: must NOT be treated as dead.
+        // Past the original ceremony deadline, but still within the ack
+        // window: must NOT be treated as dead.
         let status = coordinator
             .stage("alice", 1_000 + SESSION_TTL_MS + 1)
             .await
@@ -1496,7 +1593,7 @@ mod tests {
             "0xabc",
             "receipt-1",
             1_000,
-            600_000,
+            SESSION_TTL_MS + 300_000,
         )
         .await;
 

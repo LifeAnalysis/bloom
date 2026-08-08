@@ -77,7 +77,7 @@ pub const PETAL_POLICY_DIGEST_DOMAIN: &[u8] = b"bloom.petal_policy.v1";
 pub const SIGNING_ATTESTATION_FACTS_DIGEST_DOMAIN: &[u8] = b"bloom.signing_attestation.facts.v1";
 
 /// Hard ceiling on Sealed Approval Grant lifetime (§6.4 recommended default).
-pub const GRANT_MAX_TTL_MS: u64 = 120_000;
+pub const GRANT_MAX_TTL_MS: u64 = 600_000;
 
 /// Loopback port the daemon-owned Sealed Approval ceremony server binds for
 /// Interaction Mode 3 (mounted VFS). The `ceremony_url` written into

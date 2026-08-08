@@ -1955,6 +1955,16 @@ impl WalletsHandler {
         if segs[0] == "registrations" {
             return self.lookup_registrations(&segs[1..]).await;
         }
+        // `wallets/import/<name>`: write-only sink that stages an import-mode
+        // ceremony. `<name>` is a writable file; the import dir itself lists
+        // currently-staged import sessions.
+        if segs[0] == "import" {
+            return match segs.len() {
+                1 => Ok(Entry::dir("import")),
+                2 => Ok(Entry::writable_file(&segs[1])),
+                _ => Err(HandlerError::not_found(path.to_string_path())),
+            };
+        }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
         self.migrate_legacy_policy_updates(wallet);
@@ -2083,7 +2093,8 @@ impl WalletsHandler {
 #   printf 'name = \"alice\"\\nkind = \"watch\"\\naddress = \"0xabc\"\\n' > /wallets/new\n\
 # kind: passkey (default, async) | local | import (with private_key) | watch (with address)\n\
 # local/import require allow_passphrase_wallet = true and a passphrase field.\n\
-# passkey-import is not supported via the VFS yet.\n\
+# passkey-import: write the name to wallets/import/<name> instead -- the key is\n\
+# pasted into the browser ceremony (never the VFS) and wrapped by a passkey.\n\
 #\n\
 # after a passkey write, read:\n\
 #   /wallets/registrations/<name>/status.json   -- registration state\n\
@@ -2174,6 +2185,12 @@ impl WalletsHandler {
         if segs.len() == 1 && segs[0] == "new" {
             return self.write_new_wallet(data).await;
         }
+        // `wallets/import/<name>`: stage an import-mode passkey ceremony. The
+        // body carries NO private key — the key is pasted directly into the
+        // browser ceremony. Only the wallet name (path segment) is consumed.
+        if segs.len() == 2 && segs[0] == "import" {
+            return self.write_import_wallet(&segs[1], data).await;
+        }
         if segs[0] == "registrations" {
             return self.write_registrations(&segs[1..], data).await;
         }
@@ -2260,11 +2277,30 @@ impl WalletsHandler {
             let infos = self.keystore.list().map_err(err_be)?;
             let mut out: Vec<Entry> = infos.into_iter().map(|i| Entry::dir(&i.name)).collect();
             out.push(Entry::writable_file("new"));
+            out.push(Entry::dir("import"));
             out.push(Entry::dir("registrations"));
             return Ok(out);
         }
         if segs[0] == "registrations" {
             return self.list_registrations(&segs[1..]).await;
+        }
+        // `wallets/import/` lists currently-staged (non-terminal) registration
+        // ceremonies — the agent reads `registrations/<name>/status.json` for
+        // each to see whether it is an in-flight import.
+        if segs.len() == 1 && segs[0] == "import" {
+            let coordinator = self.auth_services.require_registration_coordinator()?;
+            let wallets = coordinator.list_wallets().await.map_err(err_be)?;
+            let mut out = Vec::new();
+            for wallet in wallets {
+                if let Ok(status) = self.registration_status(&wallet).await {
+                    if !status.state.is_terminal() {
+                        out.push(
+                            Entry::dir(&wallet).with_modified_ms(status.created_at_ms as u128),
+                        );
+                    }
+                }
+            }
+            return Ok(out);
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
@@ -2959,6 +2995,45 @@ impl WalletsHandler {
         }
     }
 
+    async fn write_import_wallet(&self, name: &str, data: &[u8]) -> Result<(), HandlerError> {
+        // The body carries NO private key — the key is pasted directly into the
+        // browser ceremony, never through the VFS. Defense-in-depth: if the
+        // body looks like TOML/JSON or a 0x key, refuse with a pointer to the
+        // ceremony rather than silently ignoring it (helps agents that reach
+        // here with the wrong mental model).
+        let body = data.trim_ascii();
+        if body.is_empty() {
+            return Err(HandlerError::invalid(
+                "wallets/import/<name> body is empty — write any non-empty value to stage",
+            ));
+        }
+        if body.starts_with(b"0x")
+            || body.contains(&b'=')
+            || body.contains(&b'{')
+            || body.contains(&b'\n')
+        {
+            return Err(HandlerError::invalid(
+                "wallets/import/<name> must not carry a private key or TOML — the key is pasted \
+                 directly into the browser ceremony at \
+                 wallets/registrations/<name>/ceremony_url",
+            ));
+        }
+        bloom_keystore::Keystore::validate_name(name).map_err(err_be)?;
+        self.write_permit()?;
+        let status = self
+            .auth_services
+            .require_registration_coordinator()?
+            .stage_import(name, now_ms_u64())
+            .await
+            .map_err(err_be)?;
+        tracing::info!(
+            wallet = %name,
+            state = status.state.as_str(),
+            "wallet.import_registration_staged"
+        );
+        Ok(())
+    }
+
     async fn write_new_wallet(&self, data: &[u8]) -> Result<(), HandlerError> {
         let body = std::str::from_utf8(data)
             .map_err(|_| HandlerError::invalid("wallets/new body must be utf-8"))?
@@ -3013,12 +3088,13 @@ impl WalletsHandler {
             return Ok(());
         }
         if spec.kind == "passkey-import" {
-            return Err(HandlerError::Unsupported(
-                "passkey-import via the VFS is not supported yet: asynchronous passkey-import \
-                 requires holding a caller-supplied private key in session state, which this \
-                 protocol does not yet support safely. Use `bloom wallet import <name> \
-                 <private-key>` from a trusted foreground terminal instead."
-                    .into(),
+            // Redirect to the dedicated import-ceremony path. The private key
+            // never enters `wallets/new`; it is pasted into the browser page
+            // reached via `wallets/import/<name>` → `wallets/registrations/<name>`.
+            return Err(HandlerError::invalid(
+                "to import a private key, write the wallet name to \
+                 wallets/import/<name> instead of using kind = \"passkey-import\" on \
+                 wallets/new — the key is pasted into the browser ceremony, never the VFS",
             ));
         }
 
@@ -3423,6 +3499,17 @@ mod tests {
             );
             statuses.insert(wallet.to_string(), status.clone());
             Ok(status)
+        }
+
+        async fn stage_import(
+            &self,
+            wallet: &str,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::WalletRegistrationStatus, AuthApiError> {
+            // Import stages identically to a new-wallet ceremony in this stub;
+            // the import flag only affects the rendered ceremony HTML in the
+            // real coordinator.
+            self.stage(wallet, now_ms).await
         }
 
         async fn status(
@@ -4075,18 +4162,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passkey_import_via_vfs_is_rejected_with_precise_message() {
+    async fn passkey_import_on_new_redirects_to_import_path() {
+        // `kind = "passkey-import"` on `wallets/new` is rejected with a pointer
+        // to the dedicated `wallets/import/<name>` ceremony path — the private
+        // key never enters `wallets/new`.
         let f = make_handler_with_registration(true);
         let p = VfsPath::parse("/new").unwrap();
         let body = b"name = \"frank\"\nkind = \"passkey-import\"\nprivate_key = \"0x01\"\n";
         let err = f.handler.write(&p, body).await.unwrap_err();
         match err {
-            HandlerError::Unsupported(msg) => {
-                assert!(msg.contains("passkey-import"));
-                assert!(msg.contains("bloom wallet import"));
+            HandlerError::Invalid(msg) => {
+                assert!(msg.contains("wallets/import/<name>"), "got: {msg}");
+                assert!(msg.contains("never the VFS"), "got: {msg}");
             }
-            other => panic!("expected Unsupported, got {other:?}"),
+            other => panic!("expected Invalid redirect, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn import_path_stages_an_import_registration_without_a_key() {
+        // Writing a name to `wallets/import/<name>` stages an import-mode
+        // ceremony. The body must NOT carry a key; the ceremony URL is
+        // reachable through `wallets/registrations/<name>`.
+        let f = make_handler_with_registration(true);
+
+        // A key-shaped body is refused.
+        let err = f
+            .handler
+            .write(&VfsPath::parse("/import/main").unwrap(), b"0xdeadbeef")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::Invalid(_)), "got: {err:?}");
+
+        // A plain non-empty body stages the ceremony.
+        f.handler
+            .write(&VfsPath::parse("/import/main").unwrap(), b"import")
+            .await
+            .unwrap();
+
+        // The staged session surfaces under `wallets/registrations/main/`.
+        let status_bytes = f
+            .handler
+            .read(&VfsPath::parse("/registrations/main/status.json").unwrap())
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&status_bytes).unwrap();
+        assert_eq!(status["state"], "awaiting_user");
+        assert!(
+            status["ceremony_url"]
+                .as_str()
+                .unwrap()
+                .contains("/wallet-registration/")
+        );
+
+        // `ls wallets/` advertises the import sink.
+        let root = f.handler.list(&VfsPath::parse("/").unwrap()).await.unwrap();
+        assert!(
+            root.iter().any(|e| e.name == "import"),
+            "wallets root must advertise import/"
+        );
     }
 
     #[tokio::test]

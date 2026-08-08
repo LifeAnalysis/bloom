@@ -645,8 +645,13 @@ impl Config {
             validate_petal_runtime_name("preinstalled entry", name)?;
             if !matches!(
                 name.as_str(),
-                "polymarket" | "hyperliquid" | "near-intents" | "enso" | "gasless"
-                    | "privacy-pools" | "venice-x402"
+                "polymarket"
+                    | "hyperliquid"
+                    | "near-intents"
+                    | "enso"
+                    | "gasless"
+                    | "privacy-pools"
+                    | "venice-x402"
             ) {
                 return Err(ConfigError::Invalid(format!(
                     "unknown preinstalled Petal {name:?}"

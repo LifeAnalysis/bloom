@@ -144,6 +144,11 @@ pub struct WalletRegistrationSessionView {
     pub state: WalletRegistrationState,
     pub expires_at_ms: u64,
     pub default_policy_toml: String,
+    /// Import-mode sessions render an extra "paste private key" step in the
+    /// browser. The key itself never flows through the VFS or this view; only
+    /// this flag does.
+    #[serde(default)]
+    pub import: bool,
 }
 
 /// Immutable policy attempt and WebAuthn creation options.
@@ -164,17 +169,40 @@ pub struct WalletRegistrationFallbackOptions {
 }
 
 /// Direct registration or two-ceremony PRF-fallback completion.
+///
+/// `private_key_hex` is set only in import-mode sessions (the browser pastes
+/// the key). It is `Deserialize`-only (never `Serialize`d or logged) and is
+/// consumed once to build the signer, then dropped.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WalletRegistrationCompleteBody {
     Registration {
         credential: serde_json::Value,
         prf_output_b64: String,
+        #[serde(default)]
+        private_key_hex: Option<String>,
     },
     Fallback {
         credential: serde_json::Value,
         prf_output_b64: String,
+        #[serde(default)]
+        private_key_hex: Option<String>,
     },
+}
+
+impl WalletRegistrationCompleteBody {
+    /// Import-mode key material, present only when the browser pasted a
+    /// private key. `None` for new-wallet ceremonies.
+    pub fn private_key_hex(&self) -> Option<&str> {
+        match self {
+            Self::Registration {
+                private_key_hex, ..
+            }
+            | Self::Fallback {
+                private_key_hex, ..
+            } => private_key_hex.as_deref(),
+        }
+    }
 }
 
 /// One-time secret completion payload; never persisted or logged.
@@ -220,6 +248,17 @@ pub trait WalletRegistrationLifecycle: Send + Sync {
 #[async_trait]
 pub trait WalletRegistrationVfs: Send + Sync {
     async fn stage(
+        &self,
+        wallet: &str,
+        now_ms: u64,
+    ) -> Result<WalletRegistrationStatus, AuthApiError>;
+
+    /// Stage an import-mode registration. Same lifecycle as [`stage`], but the
+    /// ceremony page renders a private-key paste step and the completed wallet
+    /// wraps the caller-pasted key under the new passkey. Only the wallet name
+    /// is supplied here — the private key never enters the VFS; it is pasted
+    /// directly into the browser ceremony.
+    async fn stage_import(
         &self,
         wallet: &str,
         now_ms: u64,

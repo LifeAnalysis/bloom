@@ -2520,35 +2520,43 @@ impl TxEngine {
         policy: &Policy,
         signed: &SignedRawTx,
     ) -> Result<SubmitResult, TxEngineError> {
-        if policy.private.enabled {
-            if !matches!(
+        // Use the private RPC provider only when the policy enables it AND the
+        // configured provider supports this chain (mainnet/sepolia). When
+        // private RPC is enabled but the chain is unsupported (e.g.
+        // MEV-Blocker on an L2), fall back to the public RPC so the wallet can
+        // still transact instead of hard-failing.
+        let private_eligible = policy.private.enabled
+            && matches!(
                 staged.chain_id,
                 bloom_mempool::MAINNET_CHAIN_ID | bloom_mempool::SEPOLIA_CHAIN_ID
-            ) {
-                return Err(TxEngineError::PrivateNotSupportedOnChain(
-                    chain.spec().name.clone(),
-                ));
-            }
+            );
+        if private_eligible {
             let returned = self
                 .submit_via_private(staged.chain_id, &policy.private.provider, &signed.raw)
                 .await?;
-            Ok(SubmitResult {
+            return Ok(SubmitResult {
                 transport: BroadcastTransport::PrivateRpc,
                 returned_hash: Some(returned),
-            })
-        } else {
-            let returned = chain.send_raw(signed.raw.clone()).await?;
-            if returned != signed.hash {
-                return Err(TxEngineError::BroadcastHashMismatch {
-                    expected: format!("{:#x}", signed.hash),
-                    returned: format!("{:#x}", returned),
-                });
-            }
-            Ok(SubmitResult {
-                transport: BroadcastTransport::PublicRpc,
-                returned_hash: Some(returned),
-            })
+            });
         }
+        if policy.private.enabled {
+            tracing::warn!(
+                chain = %chain.spec().name,
+                provider = %policy.private.provider,
+                "private RPC not supported on this chain; broadcasting via public RPC",
+            );
+        }
+        let returned = chain.send_raw(signed.raw.clone()).await?;
+        if returned != signed.hash {
+            return Err(TxEngineError::BroadcastHashMismatch {
+                expected: format!("{:#x}", signed.hash),
+                returned: format!("{:#x}", returned),
+            });
+        }
+        Ok(SubmitResult {
+            transport: BroadcastTransport::PublicRpc,
+            returned_hash: Some(returned),
+        })
     }
 
     async fn submit_with_marker(
@@ -2562,16 +2570,15 @@ impl TxEngine {
     ) -> Result<B256, TxEngineError> {
         let kind = action_kind.broadcast_kind();
         self.ensure_broadcast_allowed(chain.spec())?;
-        if policy.private.enabled
-            && !matches!(
+        // Private RPC eligibility is resolved inside `submit_signed_raw`
+        // (which falls back to public RPC when the chain is unsupported).
+        // Mirrored here only so the broadcast-attempt metadata records the
+        // transport that will actually be used.
+        let private_eligible = policy.private.enabled
+            && matches!(
                 staged.chain_id,
                 bloom_mempool::MAINNET_CHAIN_ID | bloom_mempool::SEPOLIA_CHAIN_ID
-            )
-        {
-            return Err(TxEngineError::PrivateNotSupportedOnChain(
-                chain.spec().name.clone(),
-            ));
-        }
+            );
         // Refuse to broadcast into a nonce gap (would be queued and never mine).
         // Do this before signing/marker writes so a refused attempt leaves no
         // half-broadcast state — just an advisory beside the pending entry.
@@ -2609,14 +2616,12 @@ impl TxEngine {
             nonce: staged.nonce,
             chain_id: staged.chain_id,
             created_ms: now_ms(),
-            transport: if policy.private.enabled {
+            transport: if private_eligible {
                 BroadcastTransport::PrivateRpc
             } else {
                 BroadcastTransport::PublicRpc
             },
-            private_provider: policy
-                .private
-                .enabled
+            private_provider: private_eligible
                 .then(|| policy.private.provider.clone()),
         };
         self.outbox.write_broadcast_attempt(entry, kind, &attempt)?;
@@ -7868,11 +7873,11 @@ mod tests {
         assert_eq!(hash, alloy::primitives::keccak256(&mock.submissions()[0]));
     }
 
-    /// Private routing is allowlisted by chain. When `policy.private.enabled`
-    /// is set on an unsupported local/test chain, `broadcast` must reject
-    /// before touching the RPC.
+    /// With `policy.private.enabled` on a chain the private path does not
+    /// cover (e.g. MEV-Blocker on an L2), `broadcast` must fall back to the
+    /// public RPC rather than reject.
     #[tokio::test]
-    async fn broadcast_rejects_private_on_non_mainnet() {
+    async fn broadcast_falls_back_to_public_rpc_when_private_unsupported_for_chain() {
         let (engine, spec, _dir) = fake_engine(60_000);
         let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
         let signer = test_signer();
@@ -7880,15 +7885,19 @@ mod tests {
         policy.private.enabled = true;
         policy.private.provider = "mev_blocker".into();
 
-        // fake_staged_1559 uses chain_id 31337 (anvil) — not mainnet.
+        // fake_staged_1559 uses chain_id 31337 (anvil) — not mainnet/sepolia,
+        // so `private_eligible` is false and the engine must use public RPC.
         let staged = fake_staged_1559("0001-private-testnet");
 
         let r = engine.broadcast(&staged, &chain, &signer, &policy).await;
+        // Must NOT be rejected for private-RPC support; instead it falls back
+        // to the public RPC (which only fails here because `fake_engine` points
+        // at a dummy RPC URL → a chain transport error).
         match r {
-            Err(TxEngineError::PrivateNotSupportedOnChain(name)) => {
-                assert_eq!(name, "anvil");
+            Err(TxEngineError::PrivateNotSupportedOnChain(_)) => {
+                panic!("expected public-RPC fallback, got PrivateNotSupportedOnChain");
             }
-            other => panic!("expected PrivateNotSupportedOnChain, got {other:?}"),
+            _ => {}
         }
     }
 

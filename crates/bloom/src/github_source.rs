@@ -89,6 +89,7 @@ const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.1",
     archive: "gasless-v0.1.1.petal.tar.gz",
     expected_hash: Some("26c75bd577e6c24c648dd99bd86c124ff602d9134bd5825649b5906851d2724a"),
+    upgrade_policy: PreinstalledUpgradePolicy::Automatic,
 };
 
 const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
@@ -98,6 +99,7 @@ const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.2",
     archive: "privacy-pools-v0.1.2.petal.tar.gz",
     expected_hash: Some("f86cf4fac3dcd5dc86fa6d60daadeb2377b7d3a655774f64a109a7f5aca446b4"),
+    upgrade_policy: PreinstalledUpgradePolicy::Automatic,
 };
 
 const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
@@ -107,6 +109,7 @@ const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.0",
     archive: "venice-x402-v0.1.0.petal.tar.gz",
     expected_hash: Some("473df7e6a3f948480684d4485f07836918f0e36042d1b2105dc82fdb0370bf18"),
+    upgrade_policy: PreinstalledUpgradePolicy::Automatic,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
