@@ -1198,7 +1198,7 @@ impl PetalHost for DaemonPetalHost {
 
     async fn evm_tx_stage(
         &self,
-        req: EvmTransactionRequest,
+        mut req: EvmTransactionRequest,
     ) -> Result<EvmOutboxOutcome, HostError> {
         let context = req.context.as_ref().ok_or_else(|| {
             HostError::Denied("Petal EVM outbox requires trusted Petal route context".into())
@@ -1230,6 +1230,12 @@ impl PetalHost for DaemonPetalHost {
             .keystore
             .info(&req.wallet)
             .map_err(|e| HostError::Invalid(format!("wallet: {e}")))?;
+        // Canonicalize the chain key up front (e.g. "mainnet" -> "ethereum"):
+        // the outbox stores entries under the resolved spec name, so duplicate
+        // checks, staging, and outcome reads must all use that canonical key.
+        if let Some(c) = service.chains.get(&req.chain) {
+            req.chain = c.spec().name.clone();
+        }
         let chain = service
             .chains
             .get(&req.chain)
@@ -1329,6 +1335,13 @@ impl PetalHost for DaemonPetalHost {
             .tx_outbox
             .as_ref()
             .ok_or_else(|| HostError::Denied("EVM outbox is unavailable".into()))?;
+        // Canonicalize the chain key (e.g. "mainnet" -> "ethereum") so the
+        // outbox read/confirm keys consistently with how staging stored it.
+        let chain_name = service
+            .chains
+            .get(&chain_name)
+            .map(|c| c.spec().name.clone())
+            .unwrap_or(chain_name);
         let permit = service
             .write_permit
             .as_deref()
@@ -1393,6 +1406,13 @@ impl PetalHost for DaemonPetalHost {
             .tx_outbox
             .as_ref()
             .ok_or_else(|| HostError::Denied("EVM outbox is unavailable".into()))?;
+        // Canonicalize the chain key (e.g. "mainnet" -> "ethereum") so the
+        // outbox read keys consistently with how staging stored the entry.
+        let chain_name = service
+            .chains
+            .get(&chain_name)
+            .map(|c| c.spec().name.clone())
+            .unwrap_or(chain_name);
         let entry = service
             .tx_engine
             .outbox
