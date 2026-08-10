@@ -1588,6 +1588,21 @@ enum WalletCmd {
 #[tokio::main]
 async fn main() -> ExitCode {
     #[cfg(feature = "triad-dev-harness")]
+    if std::env::args_os().len() == 4
+        && std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new(
+                "--triad-enroll-developer-petal-provenance",
+            ))
+    {
+        return match triad_enrollment::run_developer_petal_provenance_from_process_args() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Bloom developer Petal provenance enrollment failed: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(feature = "triad-dev-harness")]
     if std::env::args_os().len() == 5
         && std::env::args_os().nth(1).as_deref()
             == Some(std::ffi::OsStr::new("--triad-render-developer-enrollment"))
