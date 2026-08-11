@@ -56,6 +56,12 @@ pub struct MinedReceipt {
     /// Decoded revert reason (best-effort) when `outcome == "reverted"`.
     #[serde(default)]
     pub revert_reason: Option<String>,
+    /// Event logs from the transaction receipt. Petals (e.g. privacy-pools)
+    /// need these to reconcile on-chain events like `Deposited`. Stored as
+    /// raw JSON to avoid coupling the outbox receipt to a specific log type
+    /// across chains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<serde_json::Value>,
 }
 
 impl MinedReceipt {
