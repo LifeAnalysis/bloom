@@ -312,7 +312,9 @@ fn triad_developer_launcher_supports_vfs_only_mode() {
     let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
 
     assert!(
-        launcher.contains("required_paths=(\"$developer_root\" \"$machine_socket\" \"$log_dir\" \"$ready_file\")"),
+        launcher.contains(
+            "required_paths=(\"$developer_root\" \"$machine_socket\" \"$log_dir\" \"$ready_file\")"
+        ),
         "the developer launcher must not require --mount"
     );
     assert!(
@@ -434,7 +436,7 @@ fn triad_developer_launcher_owns_only_its_service_processes() {
 fn serve_starts_audited_projection_refresh_after_fallible_setup() {
     let source = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
     let serve = source
-        .split("Cmd::Serve { endpoint, mount } => {")
+        .split("Cmd::Serve {")
         .nth(1)
         .expect("serve command arm");
     let mount = serve.find("let mount_handle = mount_bloom").unwrap();
@@ -790,10 +792,8 @@ fn acceptance_rerun_is_bound_to_the_verified_bundle_when_present() {
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
-            expected_version
-        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout.lines().next().unwrap_or_default(), expected_version);
     }
 }
 
@@ -1322,7 +1322,8 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     }
     let containment_plist = root.join("Library/LaunchDaemons/com.bloom.containment.plist");
     let containment_source = fs::read_to_string(&containment_plist).unwrap();
-    assert!(containment_source.contains("--triad-pf-monitor-once"));
+    assert!(containment_source.contains("<string>serve</string>"));
+    assert!(containment_source.contains("<string>triad-pf-monitor-once</string>"));
     assert!(!containment_source.contains("@BLOOM_"));
     assert_eq!(
         fs::metadata(&containment_plist)

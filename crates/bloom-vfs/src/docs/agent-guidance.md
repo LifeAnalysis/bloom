@@ -51,10 +51,11 @@ completes:
 ```sh
 printf 'main\n' > wallets/new
 cat wallets/registrations/main/status.json
-cat wallets/registrations/main/ceremony_url
 ```
 
-- Read `status.json` and `ceremony_url` right after the write.
+- The registration projection is keyed by the requested wallet petname. Verify
+  its `requested_name` before opening or polling its `ceremony_url`, or
+  cancelling it.
 - Open or forward `ceremony_url` to a human; do not attempt it yourself. Never
   imitate WebAuthn, supply PRF material, read recovery material, or silently
   downgrade to a Machine-local credential flow — none of that is available or safe from
@@ -64,13 +65,13 @@ cat wallets/registrations/main/ceremony_url
   (iCloud Keychain, Google Password Manager), or a compatible hardware
   security key — and specifically to choose **"Use browser, device, or
   hardware key"** if Bitwarden intercepts the prompt.
-- Do not proceed until `status.json`'s `state` is `completed`; only then read
+- Do not proceed until `status.json`'s `ceremony_state` is `COMPLETED`; only then read
   the new wallet's address at `wallets/<name>/address`.
 - Registration requires Machine's authenticated Broker edge. If Broker or
   Signer is unavailable, the write fails closed; do not fall back to a
   Machine-owned wallet-creation path.
-- To cancel a live registration, write anything to
-  `wallets/registrations/<name>/cancel`.
+- To cancel a live registration, write `y`, `yes`, or `cancel` to
+  `wallets/registrations/<petname>/cancel`.
 
 Import, recovery, rebind, and deletion are also Broker custody operations.
 Sensitive inputs belong only in the Broker-hosted owner ceremony, never in a

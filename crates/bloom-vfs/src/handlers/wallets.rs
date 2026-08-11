@@ -6,9 +6,10 @@
 //!
 //! Paths handled:
 //! - `wallets/`                                                     — list wallets
-//! - `wallets/new`                                                  — write non-secret metadata to prepare registration
-//! - `wallets/registrations/<petname>/{status.json,result.json}`  — public registration projection
-//! - `wallets/registrations/<petname>/cancel`                     — write `cancel` before acceptance
+//! - `wallets/new`                                                  — write a wallet name to prepare registration
+//! - `wallets/registrations/<petname>/status.json`                 — public registration projection
+//! - `wallets/registrations/<petname>/result.json`                 — completed registration result
+//! - `wallets/registrations/<petname>/cancel`                       — write `y`, `yes`, or `cancel` before acceptance
 //! - `wallets/<wallet>/address`                                     — checksummed owner/signer address
 //! - `wallets/<wallet>/address.qr.svg`                              — scannable QR image for the owner/signer address
 //! - `wallets/<wallet>/address.qr.png`                              — scannable QR image for the owner/signer address
@@ -30,6 +31,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bloom_broker_api::ProtocolErrorCode;
 use bloom_evm::ChainRegistry;
 use bloom_machine_client::WalletProjection;
 use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
@@ -82,14 +84,7 @@ struct ApprovalCeremonyProjection {
     response: bloom_broker_api::SealedApprovalPrepareResponse,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WalletRegistrationRequest {
-    schema: String,
-    requested_name: String,
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct WalletRegistrationProjection {
     schema: String,
@@ -216,16 +211,28 @@ impl WalletsHandler {
     }
 
     async fn wallet_projection_list(&self) -> Result<Vec<WalletProjection>, HandlerError> {
-        self.wallet_projections
-            .as_ref()
-            .ok_or_else(|| {
-                HandlerError::backend(
-                    "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
-                )
-            })?
-            .list_wallets()
-            .await
-            .map_err(|error| HandlerError::backend(error.to_string()))
+        let Some(projections) = &self.wallet_projections else {
+            return Ok(Vec::new());
+        };
+        match projections.list_wallets().await {
+            Ok(wallets) => Ok(wallets),
+            // Root directory enumeration is navigation, not an authority
+            // decision. Prefer a previously authenticated cache when the live
+            // edge is unavailable, and keep `new`/`registrations` reachable
+            // even if no safe cached projection remains.
+            Err(error) if error.code == ProtocolErrorCode::ServiceUnavailable => {
+                match projections.cached_wallets() {
+                    Ok(wallets) => Ok(wallets),
+                    Err(cache_error)
+                        if cache_error.code == ProtocolErrorCode::ServiceUnavailable =>
+                    {
+                        Ok(Vec::new())
+                    }
+                    Err(cache_error) => Err(HandlerError::backend(cache_error.to_string())),
+                }
+            }
+            Err(error) => Err(HandlerError::backend(error.to_string())),
+        }
     }
 
     async fn planning_wallet_inputs(
@@ -348,6 +355,12 @@ impl WalletsHandler {
         })
     }
 
+    fn custody_broker(&self) -> Result<&MachineBrokerClient, HandlerError> {
+        self.broker.as_ref().ok_or_else(|| {
+            HandlerError::backend("custody requires the authenticated Machine-to-Broker edge")
+        })
+    }
+
     fn registration_root(&self) -> std::path::PathBuf {
         self.policy_projection_root.join("registrations")
     }
@@ -389,6 +402,37 @@ impl WalletsHandler {
                     "Machine wallet registration projection identity is invalid",
                 ));
             }
+            if let Some(existing_index) = records.iter().position(
+                |(_, existing): &(std::path::PathBuf, WalletRegistrationProjection)| {
+                    existing.requested_name == projection.requested_name
+                },
+            ) {
+                let canonical_path = self.registration_path(&projection.requested_name);
+                let (existing_path, existing_projection) = &records[existing_index];
+                if existing_projection != &projection
+                    || existing_projection.operation_id != projection.operation_id
+                    || (existing_path != &canonical_path && path != canonical_path)
+                {
+                    return Err(HandlerError::backend(
+                        "multiple wallet registration projections claim the same petname",
+                    ));
+                }
+                let legacy_path = if path == canonical_path {
+                    let legacy = existing_path.clone();
+                    records[existing_index] = (path, projection);
+                    legacy
+                } else {
+                    path
+                };
+                if let Err(error) = std::fs::remove_file(&legacy_path) {
+                    tracing::warn!(
+                        path = %legacy_path.display(),
+                        %error,
+                        "wallet_registration.legacy_duplicate_cleanup_failed"
+                    );
+                }
+                continue;
+            }
             records.push((path, projection));
         }
         Ok(records)
@@ -429,30 +473,36 @@ impl WalletsHandler {
         Ok(record)
     }
 
+    fn registration_result_ready(projection: &WalletRegistrationProjection) -> bool {
+        projection.ceremony_state == bloom_broker_api::CeremonyState::Completed
+    }
+
+    fn registration_status_entry(
+        projection: &WalletRegistrationProjection,
+    ) -> Result<Entry, HandlerError> {
+        let size = serde_json::to_vec_pretty(projection)
+            .map_err(|error| HandlerError::backend(error.to_string()))?
+            .len()
+            .saturating_add(1);
+        Ok(Entry::file("status.json").with_size(size as u64))
+    }
+
     async fn prepare_wallet_registration(&self, data: &[u8]) -> Result<(), HandlerError> {
         use sha2::Digest as _;
 
-        const REQUEST_SCHEMA: &str = "bloom.wallet-registration-request.1";
         const PROJECTION_SCHEMA: &str = "bloom.machine-wallet-registration-projection.1";
         const MAX_REQUEST_BYTES: usize = 4096;
         if data.len() > MAX_REQUEST_BYTES {
-            return Err(HandlerError::invalid(
-                "wallet registration metadata is too large",
-            ));
+            return Err(HandlerError::invalid("wallet name is too large"));
         }
-        let request: WalletRegistrationRequest = serde_json::from_slice(data).map_err(|error| {
-            HandlerError::invalid(format!(
-                "wallet registration requires JSON metadata: {error}"
-            ))
-        })?;
-        if request.schema != REQUEST_SCHEMA {
-            return Err(HandlerError::invalid(format!(
-                "wallet registration schema must be {REQUEST_SCHEMA}"
-            )));
-        }
-        if request.requested_name.is_empty()
-            || request.requested_name.len() > 64
-            || !request.requested_name.chars().all(|character| {
+        let requested_name = std::str::from_utf8(data)
+            .map_err(|error| {
+                HandlerError::invalid(format!("wallet name must be valid UTF-8: {error}"))
+            })?
+            .trim();
+        if requested_name.is_empty()
+            || requested_name.len() > 64
+            || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
             })
         {
@@ -460,22 +510,34 @@ impl WalletsHandler {
                 "wallet name must be 1-64 ASCII alphanumeric, '-' or '_' characters",
             ));
         }
-        let wallet_id = bloom_broker_api::Token::new(request.requested_name.clone())
+        let wallet_id = bloom_broker_api::Token::new(requested_name.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
-        let mut existing_paths =
-            self.registration_records()?
-                .into_iter()
-                .filter_map(|(path, existing)| {
-                    (existing.requested_name == request.requested_name).then_some(path)
-                });
-        let registration_path = existing_paths
-            .next()
-            .unwrap_or_else(|| self.registration_path(&request.requested_name));
-        if existing_paths.next().is_some() {
+        let mut existing_records = self
+            .registration_records()?
+            .into_iter()
+            .filter(|(_, existing)| existing.requested_name == requested_name);
+        let existing = existing_records.next();
+        if existing_records.next().is_some() {
             return Err(HandlerError::backend(
                 "multiple wallet registration projections claim the same petname",
             ));
         }
+        if let Some((_, projection)) = &existing
+            && projection.ceremony_state == bloom_broker_api::CeremonyState::AwaitingUser
+        {
+            // A shell retry (or an NFS client replaying a committed write) must
+            // not allocate a second Broker operation for the same live
+            // registration. Refreshing also proves that the retained launch is
+            // still actionable before reporting the retry as successful.
+            let refreshed = self.registration_projection(requested_name).await?;
+            if refreshed.ceremony_state == bloom_broker_api::CeremonyState::AwaitingUser {
+                return Ok(());
+            }
+        }
+        let registration_path = self.registration_path(requested_name);
+        let legacy_registration_path = existing
+            .map(|(path, _)| path)
+            .filter(|path| path != &registration_path);
 
         let mut operation_bytes = [0_u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut operation_bytes);
@@ -486,7 +548,7 @@ impl WalletsHandler {
         }))
         .map_err(|error| HandlerError::invalid(format!("canonicalize registration: {error}")))?;
         let prepared = self
-            .broker()?
+            .custody_broker()?
             .prepare_custody(
                 bloom_machine_client::CustodyPrepareMethod::WalletRegistration,
                 bloom_broker_api::CustodyPrepareRequest {
@@ -517,7 +579,7 @@ impl WalletsHandler {
         }
         let projection = WalletRegistrationProjection {
             schema: PROJECTION_SCHEMA.into(),
-            requested_name: request.requested_name,
+            requested_name: requested_name.to_owned(),
             operation_id,
             ceremony_kind: prepared.ceremony_kind,
             ceremony_state: bloom_broker_api::CeremonyState::AwaitingUser,
@@ -525,7 +587,11 @@ impl WalletsHandler {
             ceremony_expires_at_ms: Some(prepared.ceremony_expires_at_ms),
             signer_contribution_digest: prepared.signer_contribution_digest,
         };
-        write_atomic_json(&registration_path, &projection)
+        write_atomic_json(&registration_path, &projection)?;
+        if let Some(legacy_path) = legacy_registration_path {
+            std::fs::remove_file(legacy_path)?;
+        }
+        Ok(())
     }
 
     async fn registration_projection(
@@ -533,11 +599,40 @@ impl WalletsHandler {
         requested_name: &str,
     ) -> Result<WalletRegistrationProjection, HandlerError> {
         let (path, mut projection) = self.registration_record(requested_name)?;
-        let status = self
-            .broker()?
+        if matches!(
+            projection.ceremony_state,
+            bloom_broker_api::CeremonyState::Completed
+                | bloom_broker_api::CeremonyState::Succeeded
+                | bloom_broker_api::CeremonyState::Cancelled
+                | bloom_broker_api::CeremonyState::Expired
+                | bloom_broker_api::CeremonyState::Failed
+        ) {
+            return Ok(projection);
+        }
+        let local_launch_expired = projection
+            .ceremony_expires_at_ms
+            .as_ref()
+            .is_some_and(|expires_at| expires_at.get() <= now_ms_u64());
+        let status = match self
+            .custody_broker()?
             .ceremony_status(projection.operation_id.clone())
             .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        {
+            Ok(status) => status,
+            Err(error)
+                if local_launch_expired && error.code == ProtocolErrorCode::ServiceUnavailable =>
+            {
+                // Never infer a terminal result from the launch deadline. The
+                // owner may have completed at the boundary while Broker was
+                // becoming unavailable. Remove only the stale bearer URL and
+                // retain the operation for a later authoritative retry.
+                projection.ceremony_url = None;
+                projection.ceremony_expires_at_ms = None;
+                write_atomic_json(&path, &projection)?;
+                return Err(HandlerError::backend(error.to_string()));
+            }
+            Err(error) => return Err(HandlerError::backend(error.to_string())),
+        };
         if status.operation_id != projection.operation_id
             || status.ceremony_kind != bloom_broker_api::CeremonyKind::WalletRegistration
         {
@@ -579,7 +674,7 @@ impl WalletsHandler {
             ));
         }
         let status = self
-            .broker()?
+            .custody_broker()?
             .cancel_ceremony(operation_id.clone())
             .await
             .map_err(|error| HandlerError::backend(error.to_string()))?;
@@ -602,7 +697,7 @@ impl WalletsHandler {
         let projection = self.registration_projection(requested_name).await?;
         let operation_id = projection.operation_id;
         let result = self
-            .broker()?
+            .custody_broker()?
             .custody_result(bloom_broker_api::OperationRequest {
                 operation_id: operation_id.clone(),
             })
@@ -1527,7 +1622,7 @@ impl WalletsHandler {
 
     fn outbox_dir_entries() -> Vec<Entry> {
         vec![
-            Entry::file("new.tx"),
+            Entry::writable_file("new.tx"),
             Entry::dir("pending"),
             Entry::dir("sent"),
             Entry::dir("failed"),
@@ -1735,6 +1830,30 @@ fn parse_state_seg(s: &str) -> Result<OutboxState, HandlerError> {
     OutboxState::parse(s).ok_or_else(|| HandlerError::not_found(format!("outbox state '{}'", s)))
 }
 
+fn open_regular_outbox_artifact(dir: &Path, fname: &str) -> Result<std::fs::File, HandlerError> {
+    let path = dir.join(fname);
+    let descriptor = rustix::fs::open(
+        &path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) {
+            HandlerError::not_found(fname)
+        } else {
+            HandlerError::Io(std::io::Error::from_raw_os_error(error.raw_os_error()))
+        }
+    })?;
+    let file = std::fs::File::from(descriptor);
+    if !file.metadata()?.file_type().is_file() {
+        return Err(HandlerError::not_found(fname));
+    }
+    Ok(file)
+}
+
 fn first_confirm_line(confirm_text: &str) -> &str {
     confirm_text.lines().next().unwrap_or(confirm_text).trim()
 }
@@ -1887,17 +2006,23 @@ impl WalletsHandler {
             return match segs {
                 [_] => Ok(Entry::dir("registrations")),
                 [_, requested_name] => {
-                    let _ = self.registration_projection(requested_name).await?;
+                    let _ = self.registration_record(requested_name)?;
                     Ok(Entry::dir(requested_name))
                 }
-                [_, requested_name, leaf]
-                    if matches!(leaf.as_str(), "status.json" | "result.json") =>
-                {
-                    let _ = self.registration_projection(requested_name).await?;
-                    Ok(Entry::file(leaf))
+                [_, requested_name, leaf] if leaf == "status.json" => {
+                    let (_, projection) = self.registration_record(requested_name)?;
+                    Self::registration_status_entry(&projection)
+                }
+                [_, requested_name, leaf] if leaf == "result.json" => {
+                    let projection = self.registration_projection(requested_name).await?;
+                    if Self::registration_result_ready(&projection) {
+                        Ok(Entry::file(leaf))
+                    } else {
+                        Err(HandlerError::not_found(path.to_string_path()))
+                    }
                 }
                 [_, requested_name, leaf] if leaf == "cancel" => {
-                    let _ = self.registration_projection(requested_name).await?;
+                    let _ = self.registration_record(requested_name)?;
                     Ok(Entry::writable_file("cancel"))
                 }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
@@ -2027,7 +2152,7 @@ impl WalletsHandler {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
         if segs.len() == 1 && segs[0] == "new" {
-            return Ok(b"{\"schema\":\"bloom.wallet-registration-request.1\",\"requested_name\":\"main\"}\n".to_vec());
+            return Ok(b"Write a wallet name matching [A-Za-z0-9_-]{1,64}.\n".to_vec());
         }
         if segs[0] == "registrations" {
             return match segs {
@@ -2039,6 +2164,10 @@ impl WalletsHandler {
                     Ok(bytes)
                 }
                 [_, requested_name, leaf] if leaf == "result.json" => {
+                    let projection = self.registration_projection(requested_name).await?;
+                    if !Self::registration_result_ready(&projection) {
+                        return Err(HandlerError::not_found(path.to_string_path()));
+                    }
                     self.wallet_registration_result_json(requested_name).await
                 }
                 _ => Err(HandlerError::NotAFile(path.to_string_path())),
@@ -2179,9 +2308,19 @@ impl WalletsHandler {
                 && leaf == "cancel"
             {
                 self.write_permit()?;
-                if data != b"cancel" && data != b"cancel\n" {
+                let confirmation = std::str::from_utf8(data)
+                    .map_err(|_| {
+                        HandlerError::invalid(
+                            "registration cancellation requires UTF-8 confirmation",
+                        )
+                    })?
+                    .trim();
+                if !confirmation.eq_ignore_ascii_case("y")
+                    && !confirmation.eq_ignore_ascii_case("yes")
+                    && !confirmation.eq_ignore_ascii_case("cancel")
+                {
                     return Err(HandlerError::invalid(
-                        "registration cancellation accepts only `cancel`",
+                        "registration cancellation accepts only `y`, `yes`, or `cancel`",
                     ));
                 }
                 return self.cancel_wallet_registration(requested_name).await;
@@ -2245,12 +2384,18 @@ impl WalletsHandler {
                     .map(|name| Entry::dir(&name))
                     .collect()),
                 [_, requested_name] => {
-                    let _ = self.registration_projection(requested_name).await?;
-                    Ok(vec![
-                        Entry::file("status.json"),
+                    // Directory enumeration and GETATTR must remain local:
+                    // shells issue them implicitly for `cd` and `ls`, and a
+                    // stale or unavailable Broker is not a filesystem error.
+                    let (_, projection) = self.registration_record(requested_name)?;
+                    let mut entries = vec![
+                        Self::registration_status_entry(&projection)?,
                         Entry::writable_file("cancel"),
-                        Entry::file("result.json"),
-                    ])
+                    ];
+                    if Self::registration_result_ready(&projection) {
+                        entries.push(Entry::file("result.json"));
+                    }
+                    Ok(entries)
                 }
                 _ => Err(HandlerError::NotADir(path.to_string_path())),
             };
@@ -2393,6 +2538,7 @@ impl WalletsHandler {
                 {
                     Ok(Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms))
                 } else {
+                    open_regular_outbox_artifact(&entry.dir, fname)?;
                     Ok(Entry::file(fname).with_modified_ms(entry.staged.created_ms))
                 }
             }
@@ -2518,8 +2664,9 @@ impl WalletsHandler {
                     .outbox
                     .read_in_state(wallet, chain, id, st)
                     .map_err(err_be)?;
-                let path = entry.dir.join(fname.as_str());
-                let bytes = std::fs::read(&path).map_err(HandlerError::Io)?;
+                let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes)?;
                 Ok(bytes)
             }
             [s] if s == "pending_external.jsonl" => {
@@ -2682,27 +2829,23 @@ impl WalletsHandler {
                 let mut out = Vec::new();
                 if let Ok(rd) = std::fs::read_dir(&entry.dir) {
                     for r in rd.flatten() {
-                        if let Some(n) = r.file_name().to_str() {
-                            if r.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                                // Pending entries' control files are writable;
-                                // everything else is read-only metadata.
-                                if entry.state == OutboxState::Pending
-                                    && matches!(
-                                        n,
-                                        "confirm" | "confirm.override" | "replace" | "cancel"
-                                    )
-                                {
-                                    out.push(
-                                        Entry::writable_file(n)
-                                            .with_modified_ms(entry.staged.created_ms),
-                                    );
-                                } else {
-                                    out.push(
-                                        Entry::file(n).with_modified_ms(entry.staged.created_ms),
-                                    );
-                                }
+                        if let Some(n) = r.file_name().to_str()
+                            && r.file_type().map(|t| t.is_file()).unwrap_or(false)
+                        {
+                            // Pending entries' control files are writable;
+                            // everything else is read-only metadata.
+                            if entry.state == OutboxState::Pending
+                                && matches!(
+                                    n,
+                                    "confirm" | "confirm.override" | "replace" | "cancel"
+                                )
+                            {
+                                out.push(
+                                    Entry::writable_file(n)
+                                        .with_modified_ms(entry.staged.created_ms),
+                                );
                             } else {
-                                out.push(Entry::dir(n).with_modified_ms(entry.staged.created_ms));
+                                out.push(Entry::file(n).with_modified_ms(entry.staged.created_ms));
                             }
                         }
                     }
@@ -2918,6 +3061,7 @@ mod tests {
         requests: Mutex<Vec<MachineBrokerRequest>>,
         state: Mutex<CeremonyState>,
         omit_ceremony_url: Mutex<bool>,
+        status_error: Mutex<Option<ProtocolErrorCode>>,
     }
 
     impl MachineBrokerService for RegistrationBroker {
@@ -2940,6 +3084,12 @@ mod tests {
                         }),
                     ),
                     MachineBrokerRequest::CeremonyStatus(request) => {
+                        if let Some(code) = *self.status_error.lock().unwrap() {
+                            return Err(ProtocolError::new(
+                                code,
+                                "registration status unavailable",
+                            ));
+                        }
                         let state = *self.state.lock().unwrap();
                         let omit_ceremony_url = *self.omit_ceremony_url.lock().unwrap();
                         Ok(MachineBrokerResponse::CeremonyStatus(
@@ -2998,6 +3148,62 @@ mod tests {
 
     #[derive(Clone)]
     struct StaticProjection(WalletProjection);
+
+    struct UnavailableProjection;
+
+    struct IntegrityFailureProjection(Arc<dyn WalletProjectionReader>);
+
+    #[async_trait]
+    impl WalletProjectionReader for IntegrityFailureProjection {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "wallet projection identity is invalid",
+            ))
+        }
+
+        async fn get_wallet(
+            &self,
+            wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            self.0.get_wallet(wallet_id).await
+        }
+
+        fn cached_wallets(&self) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            self.0.cached_wallets()
+        }
+    }
+
+    #[async_trait]
+    impl WalletProjectionReader for UnavailableProjection {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "wallet projection edge unavailable",
+            ))
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "wallet projection edge unavailable",
+            ))
+        }
+
+        fn cached_wallets(&self) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "wallet projection cache unavailable",
+            ))
+        }
+    }
 
     #[async_trait]
     impl WalletProjectionReader for StaticProjection {
@@ -3419,9 +3625,16 @@ mod tests {
     async fn direct_machine_wallet_creation_is_removed_for_every_legacy_body() {
         let f = make_handler();
         let path = VfsPath::parse("/new").unwrap();
+        let error = f.handler.write(&path, b"alice").await.unwrap_err();
+        assert!(matches!(&error, HandlerError::Backend(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("custody requires the authenticated Machine-to-Broker edge"),
+            "unexpected missing-Broker error: {error}"
+        );
         for body in [
-            &b"alice"[..],
-            b"name = \"bob\"\nkind = \"local\"\npassphrase = \"secret\"\n",
+            &b"name = \"bob\"\nkind = \"local\"\npassphrase = \"secret\"\n"[..],
             b"name = \"observer\"\nkind = \"watch\"\naddress = \"0x0000000000000000000000000000000000000001\"\n",
             b"name = \"imported\"\nkind = \"import\"\nprivate_key = \"secret\"\n",
         ] {
@@ -3446,38 +3659,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mounted_registration_is_non_secret_broker_custody_adapter() {
+    async fn wallet_root_controls_remain_accessible_when_projection_reader_is_unavailable() {
+        let mut f = make_handler();
+        f.handler.wallet_projections = Some(Arc::new(UnavailableProjection));
+        let entries = f.handler.list(&VfsPath::parse("/").unwrap()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["new", "registrations"]);
+    }
+
+    #[tokio::test]
+    async fn wallet_root_does_not_mask_projection_integrity_failures_with_cached_wallets() {
+        let mut f = make_handler();
+        let cached = f.handler.wallet_projections.take().unwrap();
+        f.handler.wallet_projections = Some(Arc::new(IntegrityFailureProjection(cached)));
+        let error = f
+            .handler
+            .list(&VfsPath::parse("/").unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HandlerError::Backend(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("wallet projection identity is invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn mounted_registration_accepts_a_trimmed_plain_name() {
         let mut fixture = make_handler();
         let broker = Arc::new(RegistrationBroker {
             requests: Mutex::new(Vec::new()),
             state: Mutex::new(CeremonyState::AwaitingUser),
             omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
         });
         fixture.handler = fixture
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
 
         let new = VfsPath::parse("/new").unwrap();
-        let secret_attempt = br#"{"schema":"bloom.wallet-registration-request.1","requested_name":"main","private_key":"nope"}"#;
-        assert!(matches!(
-            fixture.handler.write(&new, secret_attempt).await,
-            Err(HandlerError::Invalid(_))
-        ));
-        assert!(matches!(
-            fixture.handler.write(
-                &new,
-                br#"{"schema":"bloom.wallet-registration-request.1","requested_name":"main/sub"}"#,
-            ).await,
-            Err(HandlerError::Invalid(_))
-        ));
-        fixture
-            .handler
-            .write(
-                &new,
-                br#"{"schema":"bloom.wallet-registration-request.1","requested_name":"main"}"#,
-            )
-            .await
-            .unwrap();
+        fixture.handler.write(&new, b" \nmain\t\n").await.unwrap();
+
+        assert_eq!(
+            fixture.handler.read(&new).await.unwrap(),
+            b"Write a wallet name matching [A-Za-z0-9_-]{1,64}.\n"
+        );
 
         let petnamed_projection_path = fixture.handler.registration_path("main");
         assert!(petnamed_projection_path.is_file());
@@ -3515,16 +3742,89 @@ mod tests {
             status["ceremony_url"],
             "http://localhost:18734/ceremony/registration-secret"
         );
-        let requests = broker.requests.lock().unwrap();
-        let registration = requests.iter().find_map(|request| match request {
-            MachineBrokerRequest::WalletRegistrationPrepare(request) => Some(request),
-            _ => None,
-        });
+        let registration_wallet_id =
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|request| match request {
+                    MachineBrokerRequest::WalletRegistrationPrepare(request) => {
+                        request.wallet_id.clone()
+                    }
+                    _ => None,
+                });
+        assert_eq!(registration_wallet_id.as_ref(), Some(&token("main")));
+
+        let metadata_request_count = broker.requests.lock().unwrap().len();
+        fixture
+            .handler
+            .lookup(&VfsPath::parse("/registrations/main").unwrap())
+            .await
+            .unwrap();
+        fixture
+            .handler
+            .lookup(&VfsPath::parse("/registrations/main/status.json").unwrap())
+            .await
+            .unwrap();
+        fixture
+            .handler
+            .lookup(&VfsPath::parse("/registrations/main/cancel").unwrap())
+            .await
+            .unwrap();
+        let pending_entries = fixture
+            .handler
+            .list(&VfsPath::parse("/registrations/main").unwrap())
+            .await
+            .unwrap();
         assert_eq!(
-            registration.and_then(|request| request.wallet_id.as_ref()),
-            Some(&token("main"))
+            pending_entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["status.json", "cancel"]
         );
-        drop(requests);
+        assert_eq!(
+            broker.requests.lock().unwrap().len(),
+            metadata_request_count,
+            "registration directory metadata must not contact the Broker"
+        );
+        assert!(matches!(
+            fixture
+                .handler
+                .lookup(&VfsPath::parse("/registrations/main/result.json").unwrap())
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
+        assert!(matches!(
+            fixture
+                .handler
+                .read(&VfsPath::parse("/registrations/main/result.json").unwrap())
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
+
+        let prepare_count = broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| matches!(request, MachineBrokerRequest::WalletRegistrationPrepare(_)))
+            .count();
+        fixture.handler.write(&new, b"main\n").await.unwrap();
+        assert_eq!(
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    matches!(request, MachineBrokerRequest::WalletRegistrationPrepare(_))
+                })
+                .count(),
+            prepare_count,
+            "retrying a live registration must reuse its Broker operation"
+        );
 
         *broker.omit_ceremony_url.lock().unwrap() = true;
         assert!(matches!(
@@ -3540,12 +3840,22 @@ mod tests {
                 .await,
             Err(HandlerError::Invalid(_))
         ));
+        assert!(matches!(
+            fixture
+                .handler
+                .write(
+                    &VfsPath::parse("/registrations/main/cancel").unwrap(),
+                    b"maybe\n",
+                )
+                .await,
+            Err(HandlerError::Invalid(_))
+        ));
 
         fixture
             .handler
             .write(
                 &VfsPath::parse("/registrations/main/cancel").unwrap(),
-                b"cancel\n",
+                b"y\n",
             )
             .await
             .unwrap();
@@ -3553,6 +3863,34 @@ mod tests {
             serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
         assert_eq!(terminal["ceremony_state"], "CANCELLED");
         assert!(terminal["ceremony_url"].is_null());
+        assert!(matches!(
+            fixture
+                .handler
+                .read(&VfsPath::parse("/registrations/main/result.json").unwrap())
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
+
+        let (projection_path, mut completion_projection) =
+            fixture.handler.registration_record("main").unwrap();
+        completion_projection.ceremony_state = CeremonyState::AwaitingUser;
+        completion_projection.ceremony_url =
+            Some("http://localhost:18734/ceremony/registration-secret".into());
+        completion_projection.ceremony_expires_at_ms = Some(DecimalU64::new(1));
+        write_atomic_json(&projection_path, &completion_projection).unwrap();
+        *broker.state.lock().unwrap() = CeremonyState::Completed;
+        let _: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        let completed_entries = fixture
+            .handler
+            .list(&VfsPath::parse("/registrations/main").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            completed_entries
+                .iter()
+                .any(|entry| entry.name == "result.json")
+        );
         let result = fixture
             .handler
             .read(&VfsPath::parse("/registrations/main/result.json").unwrap())
@@ -3574,6 +3912,180 @@ mod tests {
                     MachineBrokerRequest::WalletRegistrationPrepare(_)
                 ))
         );
+
+        let (projection_path, mut expired_projection) =
+            fixture.handler.registration_record("main").unwrap();
+        expired_projection.ceremony_state = CeremonyState::AwaitingUser;
+        expired_projection.ceremony_url = Some("http://localhost:18734/ceremony/expired".into());
+        expired_projection.ceremony_expires_at_ms = Some(DecimalU64::new(1));
+        write_atomic_json(&projection_path, &expired_projection).unwrap();
+        *broker.state.lock().unwrap() = CeremonyState::Expired;
+        let requests_before_expiry_reconciliation = broker.requests.lock().unwrap().len();
+
+        let expired: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        assert_eq!(expired["ceremony_state"], "EXPIRED");
+        assert!(expired["ceremony_url"].is_null());
+        assert_eq!(
+            broker.requests.lock().unwrap().len(),
+            requests_before_expiry_reconciliation + 1,
+            "local expiry must reconcile with Broker before becoming terminal"
+        );
+        let expired_again: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        assert_eq!(expired_again["ceremony_state"], "EXPIRED");
+        assert_eq!(
+            broker.requests.lock().unwrap().len(),
+            requests_before_expiry_reconciliation + 1,
+            "persisted terminal status must not be refreshed from the Broker"
+        );
+    }
+
+    #[tokio::test]
+    async fn mounted_registration_rejects_invalid_names_without_calling_broker() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let new = VfsPath::parse("/new").unwrap();
+
+        for body in [
+            &b" \n\t"[..],
+            b"main/sub",
+            br#"{"schema":"bloom.wallet-registration-request.1","requested_name":"main"}"#,
+            &[0xff],
+            &[b'a'; 65],
+        ] {
+            assert!(
+                matches!(
+                    fixture.handler.write(&new, body).await,
+                    Err(HandlerError::Invalid(_))
+                ),
+                "unexpected registration result for {body:?}"
+            );
+            assert!(
+                broker.requests.lock().unwrap().is_empty(),
+                "invalid registration reached Broker for {body:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_canonical_and_legacy_registration_records_recover_after_crash() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        fixture
+            .handler
+            .write(&VfsPath::parse("/new").unwrap(), b"main")
+            .await
+            .unwrap();
+
+        let canonical = fixture.handler.registration_path("main");
+        let projection: WalletRegistrationProjection = read_json(&canonical).unwrap();
+        let legacy = fixture
+            .handler
+            .registration_path(projection.operation_id.as_str());
+        std::fs::copy(&canonical, &legacy).unwrap();
+
+        let entries = fixture
+            .handler
+            .list(&VfsPath::parse("/registrations").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "main");
+        assert!(canonical.is_file());
+        assert!(!legacy.exists());
+        assert_eq!(
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| matches!(
+                    request,
+                    MachineBrokerRequest::WalletRegistrationPrepare(_)
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_registration_clears_stale_url_but_stays_retryable_when_broker_is_unavailable()
+    {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        fixture
+            .handler
+            .write(&VfsPath::parse("/new").unwrap(), b"main")
+            .await
+            .unwrap();
+        let (path, mut projection) = fixture.handler.registration_record("main").unwrap();
+        projection.ceremony_expires_at_ms = Some(DecimalU64::new(1));
+        write_atomic_json(&path, &projection).unwrap();
+        *broker.status_error.lock().unwrap() = Some(ProtocolErrorCode::ServiceUnavailable);
+
+        let error = fixture
+            .handler
+            .read(&VfsPath::parse("/registrations/main/status.json").unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HandlerError::Backend(_)));
+        let retained: WalletRegistrationProjection = read_json(&path).unwrap();
+        assert_eq!(retained.ceremony_state, CeremonyState::AwaitingUser);
+        assert!(retained.ceremony_url.is_none());
+        assert!(retained.ceremony_expires_at_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn mounted_registration_accepts_a_64_character_name() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let name = "a".repeat(64);
+
+        fixture
+            .handler
+            .write(&VfsPath::parse("/new").unwrap(), name.as_bytes())
+            .await
+            .unwrap();
+
+        let requests = broker.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let MachineBrokerRequest::WalletRegistrationPrepare(request) = &requests[0] else {
+            panic!("expected wallet registration prepare request")
+        };
+        assert_eq!(request.wallet_id.as_ref(), Some(&token(&name)));
     }
 
     #[tokio::test]
@@ -3980,6 +4492,171 @@ mod tests {
         .unwrap();
         let r = f.handler.list(&p).await;
         assert!(r.is_err(), "expected NotFound, got {r:?}");
+    }
+
+    #[tokio::test]
+    async fn outbox_listing_advertises_new_tx_as_writable() {
+        let f = make_handler_with_chain(true);
+        let p = VfsPath::parse(&format!("/{}/chains/anvil/outbox", f.wallet_name)).unwrap();
+
+        let entries = f.handler.list(&p).await.unwrap();
+        let new_tx = entries.iter().find(|entry| entry.name == "new.tx").unwrap();
+
+        assert_eq!(new_tx.mode, 0o644);
+    }
+
+    #[tokio::test]
+    async fn outbox_lookup_rejects_absent_artifacts_but_preserves_virtual_sinks() {
+        let f = make_handler_with_chain(true);
+        for (state_name, state, id) in [
+            ("pending", OutboxState::Pending, "0001-pending"),
+            ("sent", OutboxState::Sent, "0002-sent"),
+            ("failed", OutboxState::Failed, "0003-failed"),
+        ] {
+            seed_pending(&f, id);
+            let entry = f
+                .handler
+                .tx_engine
+                .outbox
+                .read_in_state(&f.wallet_name, "anvil", id, OutboxState::Pending)
+                .unwrap();
+            std::fs::write(entry.dir.join("runtime-result-42.json"), state_name).unwrap();
+            if state != OutboxState::Pending {
+                f.handler
+                    .tx_engine
+                    .outbox
+                    .transition(&entry, state)
+                    .unwrap();
+            }
+
+            let real_suffix = format!("{state_name}/{id}/runtime-result-42.json");
+            let real = VfsPath::parse(&format!(
+                "/{}/chains/anvil/outbox/{real_suffix}",
+                f.wallet_name
+            ))
+            .unwrap();
+            let metadata = f.handler.lookup(&real).await.unwrap();
+            assert_eq!(metadata.kind, crate::handler::EntryKind::File);
+            assert_eq!(metadata.mode, 0o444);
+            assert_eq!(f.handler.read(&real).await.unwrap(), state_name.as_bytes());
+
+            let absent = VfsPath::parse(&format!(
+                "/{}/chains/anvil/outbox/{state_name}/{id}/does-not-exist.json",
+                f.wallet_name
+            ))
+            .unwrap();
+            assert!(matches!(
+                f.handler.lookup(&absent).await,
+                Err(HandlerError::NotFound(_))
+            ));
+            assert!(matches!(
+                f.handler.read(&absent).await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
+
+        let new_tx =
+            VfsPath::parse(&format!("/{}/chains/anvil/outbox/new.tx", f.wallet_name)).unwrap();
+        let metadata = f.handler.lookup(&new_tx).await.unwrap();
+        assert_eq!(metadata.kind, crate::handler::EntryKind::File);
+        assert_eq!(metadata.mode, 0o644);
+
+        for control in ["confirm", "confirm.override", "replace", "cancel"] {
+            let path = VfsPath::parse(&format!(
+                "/{}/chains/anvil/outbox/pending/0001-pending/{control}",
+                f.wallet_name
+            ))
+            .unwrap();
+            let metadata = f.handler.lookup(&path).await.unwrap();
+            assert_eq!(metadata.kind, crate::handler::EntryKind::File);
+            assert_eq!(metadata.mode, 0o644);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outbox_lookup_and_read_reject_non_regular_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read_in_state(&f.wallet_name, "anvil", "0001-test", OutboxState::Pending)
+            .unwrap();
+        std::fs::create_dir(entry.dir.join("artifact-dir")).unwrap();
+        let outside = f._tmp.path().join("outside-secret.json");
+        std::fs::write(&outside, b"secret").unwrap();
+        symlink(&outside, entry.dir.join("artifact-link.json")).unwrap();
+
+        for artifact in ["artifact-dir", "artifact-link.json"] {
+            let path = VfsPath::parse(&format!(
+                "/{}/chains/anvil/outbox/pending/0001-test/{artifact}",
+                f.wallet_name
+            ))
+            .unwrap();
+            assert!(matches!(
+                f.handler.lookup(&path).await,
+                Err(HandlerError::NotFound(_))
+            ));
+            assert!(matches!(
+                f.handler.read(&path).await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
+
+        let directory = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/0001-test",
+            f.wallet_name
+        ))
+        .unwrap();
+        let entries = f.handler.list(&directory).await.unwrap();
+        assert!(!entries.iter().any(|entry| entry.name == "artifact-dir"));
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.name == "artifact-link.json")
+        );
+
+        let intent = entries
+            .iter()
+            .find(|entry| entry.name == "intent.json")
+            .unwrap();
+        assert_eq!(intent.kind, crate::handler::EntryKind::File);
+        assert_eq!(intent.mode, 0o444);
+        for control in ["confirm", "confirm.override", "replace", "cancel"] {
+            let metadata = entries.iter().find(|entry| entry.name == control).unwrap();
+            assert_eq!(metadata.kind, crate::handler::EntryKind::File);
+            assert_eq!(metadata.mode, 0o644);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_outbox_artifact_is_pinned_across_path_replacement() {
+        use std::io::Read as _;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("result.json");
+        let displaced = directory.path().join("result.original.json");
+        let outside = directory.path().join("outside-secret.json");
+        std::fs::write(&artifact, b"original").unwrap();
+        std::fs::write(&outside, b"secret").unwrap();
+
+        let mut opened = open_regular_outbox_artifact(directory.path(), "result.json").unwrap();
+        std::fs::rename(&artifact, &displaced).unwrap();
+        symlink(&outside, &artifact).unwrap();
+
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
+        assert!(matches!(
+            open_regular_outbox_artifact(directory.path(), "result.json"),
+            Err(HandlerError::NotFound(_))
+        ));
     }
 
     /// Fix #9: writing an empty body to `pending/<id>/confirm` must

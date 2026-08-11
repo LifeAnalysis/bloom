@@ -36,13 +36,15 @@ Wallet paths are authenticated public projections, not key storage.
 ```sh
 printf 'alice\n' > /bloom/wallets/new
 cat /bloom/wallets/registrations/alice/status.json
-cat /bloom/wallets/registrations/alice/ceremony_url
 ```
 
-Broker originates the custody ceremony and Signer creates the key after owner
+The registration projection is keyed by the requested wallet petname. Verify
+that `requested_name` is `alice` before opening its `ceremony_url`, polling it,
+or cancelling it. Broker
+originates the custody ceremony and Signer creates the key after owner
 authentication. Machine exposes only the resulting public projection. Import,
-recovery, rebind, credential changes, and deletion use the same custody
-boundary and never accept secret material through the mount.
+recovery, rebind, credential changes, and deletion use the same custody boundary
+and never accept secret material through the mount.
 
 ## Stage, review, and confirm
 

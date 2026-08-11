@@ -18,13 +18,15 @@ it never creates or imports key material in Machine.
 ```sh
 printf 'alice\n' > /bloom/wallets/new
 cat /bloom/wallets/registrations/alice/status.json
-cat /bloom/wallets/registrations/alice/ceremony_url
 ```
 
-Wallet names must match `[A-Za-z0-9_-]{1,64}`. Complete the projected browser
-ceremony and wait for `status.json` to report `completed` before reading the
-wallet. Import, recovery, rebind, and deletion are likewise Broker custody
-operations; sensitive inputs belong only in the Broker-hosted ceremony.
+Wallet names must match `[A-Za-z0-9_-]{1,64}`. The registration projection is
+keyed by the requested wallet petname; verify its `requested_name` before
+opening its `ceremony_url`, polling it, or cancelling it. Complete the
+projected browser ceremony and wait for
+`ceremony_state` to report `COMPLETED` before reading the wallet. Import,
+recovery, rebind, and deletion are likewise Broker custody operations; sensitive
+inputs belong only in the Broker-hosted ceremony.
 
 ### Per-wallet leaves
 

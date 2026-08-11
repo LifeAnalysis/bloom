@@ -51,11 +51,13 @@ projects a browser ceremony; it does not create custody inside Machine.
 ```sh
 printf 'alice\n' > wallets/new
 cat wallets/registrations/alice/status.json
-cat wallets/registrations/alice/ceremony_url
 ```
 
-Complete the passkey ceremony, wait for completed status, then inspect the
-public wallet projection:
+The registration projection is keyed by the requested wallet petname. Verify
+that `requested_name` is `alice` before opening its `ceremony_url`, polling it,
+or cancelling it. Complete
+the passkey ceremony and wait for `ceremony_state` to become `COMPLETED`, then
+inspect the public wallet projection:
 
 ```sh
 cat wallets/alice/address

@@ -133,12 +133,14 @@ completes:
 ```sh
 printf 'main\n' > /bloom/wallets/new
 cat /bloom/wallets/registrations/main/status.json
-cat /bloom/wallets/registrations/main/ceremony_url
 ```
 
-Open or forward `ceremony_url` to a human, then poll `status.json` until its
-`state` is `completed`; only then does `wallets/main/address` exist. Write to
-`wallets/registrations/<name>/cancel` to cancel a live registration. Broker
+The registration projection is keyed by the requested wallet petname. Verify
+that `requested_name` in `status.json` is `main` before opening its
+`ceremony_url`, polling it, or cancelling it. Poll until `ceremony_state` is
+`COMPLETED`; only then does
+`wallets/main/address` exist. Write `cancel` to
+`wallets/registrations/<petname>/cancel` to cancel a live registration. Broker
 owns ceremony orchestration and Signer owns custody. If either is unavailable,
 the operation fails closed; Machine has no local fallback. Import, recovery,
 rebind, and deletion likewise use Broker custody ceremonies, never mounted
