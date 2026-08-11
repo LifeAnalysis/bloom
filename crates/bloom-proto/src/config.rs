@@ -83,7 +83,13 @@ impl Default for PetalsConfig {
 }
 
 fn default_preinstalled_petals() -> Vec<String> {
-    vec!["near-intents".to_string(), "enso".to_string()]
+    vec![
+        "near-intents".to_string(),
+        "enso".to_string(),
+        "gasless".to_string(),
+        "privacy-pools".to_string(),
+        "venice-x402".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -529,7 +535,10 @@ impl Config {
         let mut seen_preinstalled = std::collections::BTreeSet::new();
         for name in &self.petals.preinstalled {
             validate_petal_runtime_name("preinstalled entry", name)?;
-            if !matches!(name.as_str(), "near-intents" | "enso") {
+            if !matches!(
+                name.as_str(),
+                "near-intents" | "enso" | "gasless" | "privacy-pools" | "venice-x402"
+            ) {
                 return Err(ConfigError::Invalid(format!(
                     "unknown preinstalled Petal {name:?}"
                 )));
@@ -608,7 +617,16 @@ mod tests {
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-        assert_eq!(cfg.petals.preinstalled, ["near-intents", "enso"]);
+        assert_eq!(
+            cfg.petals.preinstalled,
+            [
+                "near-intents",
+                "enso",
+                "gasless",
+                "privacy-pools",
+                "venice-x402"
+            ]
+        );
         assert_eq!(cfg.chains.len(), 13);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);

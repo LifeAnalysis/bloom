@@ -48,6 +48,33 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     expected_hash: Some("82e541b237cd8dde0a566dfca7f3d20d6e688aacd23f62b1d0f1306f9c76ecb7"),
 };
 
+const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
+    name: "gasless",
+    repository: "https://github.com/bloom-directory/bloom-petal-gasless",
+    commit: "73ccf05b4f10d7993fbc8fa453e8f91987564aab",
+    release_tag: "v0.1.1",
+    archive: "gasless-v0.1.1.petal.tar.gz",
+    expected_hash: Some("26c75bd577e6c24c648dd99bd86c124ff602d9134bd5825649b5906851d2724a"),
+};
+
+const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
+    name: "privacy-pools",
+    repository: "https://github.com/bloom-directory/bloom-petal-privacy-pools",
+    commit: "ae01a7d398416af4fa38a985b684ac973e128208",
+    release_tag: "v0.1.2",
+    archive: "privacy-pools-v0.1.2.petal.tar.gz",
+    expected_hash: Some("f86cf4fac3dcd5dc86fa6d60daadeb2377b7d3a655774f64a109a7f5aca446b4"),
+};
+
+const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
+    name: "venice-x402",
+    repository: "https://github.com/bloom-directory/bloom-petal-venice-x402",
+    commit: "f8d6a1b287397b2c66fa11ca777fe2b762640964",
+    release_tag: "v0.1.0",
+    archive: "venice-x402-v0.1.0.petal.tar.gz",
+    expected_hash: Some("473df7e6a3f948480684d4485f07836918f0e36042d1b2105dc82fdb0370bf18"),
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitHubRepo {
     pub owner: String,
@@ -713,6 +740,9 @@ fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
     match name {
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "enso" => Some(&PREINSTALLED_ENSO),
+        "gasless" => Some(&PREINSTALLED_GASLESS),
+        "privacy-pools" => Some(&PREINSTALLED_PRIVACY_POOLS),
+        "venice-x402" => Some(&PREINSTALLED_VENICE_X402),
         _ => None,
     }
 }
@@ -1313,6 +1343,12 @@ mod tests {
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
         assert_eq!(enso.archive, "enso-v0.1.2.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
+        for name in ["gasless", "privacy-pools", "venice-x402"] {
+            let entry = preinstalled_petal(name).unwrap();
+            assert_eq!(entry.name, name);
+            assert_eq!(entry.commit.len(), 40);
+            assert!(entry.expected_hash.is_some());
+        }
         assert!(preinstalled_petal("polymarket").is_none());
         assert!(preinstalled_petal("hyperliquid").is_none());
         assert!(preinstalled_petal("unknown").is_none());
