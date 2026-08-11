@@ -313,7 +313,10 @@ impl DaemonPetalHost {
     fn unsafe_debug_signer(&self, wallet: &str) -> Option<&Arc<PrivateKeySigner>> {
         self.unsafe_debug_signer
             .as_ref()
-            .filter(|(configured, _)| configured == wallet)
+            .filter(|(configured, signer)| {
+                configured.eq_ignore_ascii_case(wallet)
+                    || signer.address().to_string().eq_ignore_ascii_case(wallet)
+            })
             .map(|(_, signer)| signer)
     }
 
