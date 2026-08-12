@@ -60,14 +60,23 @@ record, LaunchDaemon definitions, session LaunchAgent, and packet-filter
 anchor. Broker and Signer state/checkpoint roots remain owned by their
 respective service UIDs and mode `0700`.
 
-The installer intentionally has only two operations: install one signed
-release for a login and permanently uninstall that login after an exact
-confirmation. Reinstalling the same digest verifies the existing immutable
-release bytes. Installing a different digest is rejected; the operator must
-explicitly uninstall first. Upgrade transactions, live configuration or
-identity rotation, retained-custody uninstall, and crash-recovery journals are
-not part of this installer. Their former implementation was deleted rather
-than moved behind helper scripts.
+The installer keeps digest-named releases immutable. A same-digest install
+verifies every installed binary and repairs integration files without replacing
+custody. A compatible different digest is staged, all enrolled jobs are stopped,
+the shared `current` symlink and enrollment build digests are switched
+atomically, and each installed triad is checked before the new digest is
+published `active`. A durable transaction makes the next invocation roll an
+interrupted or failed activation back to the prior complete digest. Compatibility
+metadata is mandatory and a state-schema downgrade is rejected before services
+are stopped.
+
+`uninstall --retain-custody / LOGIN_UID` removes launchd, packet-filter, and
+runtime integration while preserving service principals, identities, and
+encrypted state. `restore` accepts only the exact signed retained release and
+publishes Machine access after triad health succeeds. Permanent deletion remains
+a separate `delete-bloom-login-LOGIN_UID` confirmation and is described as a
+purge because it destroys custody irrecoverably. Upgrade and restore never run
+enrollment-material generation and never rotate transport or custody identity.
 
 Production enrollment invokes the installed Machine binary's root-only
 enrollment-material mode against the signed public templates in `config/`.
@@ -90,7 +99,8 @@ ownership, mode, availability bit, and freshness before readiness or any
 signing/custody/policy mutation; revocation and public status remain
 available. Production activation is prohibited until the disposable macOS W0
 lane proves IPv4/IPv6, TCP/UDP, loopback, accepted Broker responses, anchor
-drift, Fast User Switching, and removal behavior. Local Signer is the only
+drift, Fast User Switching, upgrade/rollback, interrupted recovery,
+retain/restore, same-digest repair, and purge behavior. Local Signer is the only
 initial backend.
 
 Static template and staged-root tests are conformance inputs, not proof of an

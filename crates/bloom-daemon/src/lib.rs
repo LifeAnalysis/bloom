@@ -233,8 +233,8 @@ struct DaemonPetalHost {
     petal_signing_lock: tokio::sync::Mutex<()>,
 }
 
-const PETAL_KEY_STATE_SCHEMA: &str = "bloom.machine.petal-key-request.v1";
-const PETAL_KEY_INPUT_CLASS: &str = "petal-key-scope-v1";
+const PETAL_KEY_STATE_SCHEMA: &str = "bloom.machine.petal-key-request.v2";
+const PETAL_KEY_INPUT_CLASS: &str = "petal-key-scope-v2";
 
 /// Machine-owned public reconciliation record. The ceremony URL is retained
 /// here for an owner-readable status projection, but is never returned across
@@ -243,7 +243,7 @@ const PETAL_KEY_INPUT_CLASS: &str = "petal-key-scope-v1";
 #[serde(deny_unknown_fields)]
 struct PetalKeyRequestState {
     schema: String,
-    request_id: String,
+    key_slot: String,
     scope: bloom_broker_api::PetalKeyScope,
     scope_digest: bloom_broker_api::Digest32,
     /// Digest of the installer-signed provenance record that Broker will
@@ -381,18 +381,14 @@ impl DaemonPetalHost {
         self
     }
 
-    fn petal_key_state_path(
-        &self,
-        context: &PetalRouteContext,
-        request_id: &str,
-    ) -> Result<PathBuf, HostError> {
+    fn petal_key_state_path(&self, lineage_id: &str, key_slot: &str) -> Result<PathBuf, HostError> {
         let root = self.petal_key_state_root.as_ref().ok_or_else(|| {
             HostError::Backend("Petal key request state is not configured".into())
         })?;
         let identity = blake3::hash(
             format!(
-                "bloom-petal-key-request-state/v1\0{}\0{}\0{}",
-                context.package_hash, context.route_id, request_id
+                "bloom-petal-key-request-state/v2\0{}\0{}",
+                lineage_id, key_slot
             )
             .as_bytes(),
         );
@@ -720,17 +716,15 @@ impl PetalHost for DaemonPetalHost {
             HostError::Denied("Petal key request requires trusted route provenance".into())
         })?;
         Self::petal_execution_origin(context)?;
-        if req.request_id.is_empty()
-            || req.request_id.len() > 256
-            || req.request_id.chars().any(char::is_control)
-        {
-            return Err(HostError::Invalid(
-                "Petal key request_id must contain 1-256 bytes without control characters".into(),
-            ));
-        }
         let wallet_id = bloom_broker_api::Token::new(req.wallet_id.clone())
             .map_err(|error| HostError::Invalid(error.to_string()))?;
-        let purpose = bloom_broker_api::Token::new(req.purpose.clone())
+        let key_slot = bloom_broker_api::Token::new(req.key_slot.clone())
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let allowed_operation_classes = req
+            .allowed_operation_classes
+            .iter()
+            .map(|class| bloom_broker_api::Token::new(class.clone()))
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         if req.maximum_lifetime_ms == 0 {
             return Err(HostError::Invalid(
@@ -770,10 +764,36 @@ impl PetalHost for DaemonPetalHost {
                     .into(),
             ));
         };
+        let provenance_subject = bloom_broker_api::ProvenanceSubject::Petal {
+            package_hash: bloom_broker_api::Digest32::new(context.package_hash.clone())
+                .map_err(|error| HostError::Invalid(error.to_string()))?,
+            route: context.route_id.clone(),
+        };
+        let provenance_record = self
+            .provenance_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.record(&provenance_subject))
+            .ok_or_else(|| {
+                HostError::Denied("Petal route is absent from installer provenance".into())
+            })?;
+        let lineage = provenance_record
+            .petal_lineage
+            .as_ref()
+            .filter(|entry| entry.active)
+            .ok_or_else(|| {
+                HostError::Denied("Petal package has no active lineage membership".into())
+            })?;
+        if !req.allowed_routes.contains(&context.route_id) {
+            return Err(HostError::Denied(
+                "executing route is outside the requested Petal key scope".into(),
+            ));
+        }
         let operation_hash = blake3::hash(
             format!(
-                "bloom-petal-key-custody-operation/v1\0{}\0{}\0{}",
-                context.package_hash, context.route_id, req.request_id
+                "bloom-petal-key-custody-operation/v2\0{}\0{}\0{}",
+                wallet_id.as_str(),
+                lineage.lineage_id,
+                key_slot.as_str()
             )
             .as_bytes(),
         );
@@ -785,8 +805,10 @@ impl PetalHost for DaemonPetalHost {
             package_hash: bloom_broker_api::Digest32::new(context.package_hash.clone())
                 .map_err(|error| HostError::Invalid(error.to_string()))?,
             route: context.route_id.clone(),
-            agent_id: req.agent_id.clone(),
-            purpose,
+            lineage_id: lineage.lineage_id.clone(),
+            key_slot: key_slot.clone(),
+            allowed_routes: req.allowed_routes.clone(),
+            allowed_operation_classes,
             allowed_crypto_suites: suites,
             maximum_lifetime_ms: bloom_broker_api::DecimalU64::new(req.maximum_lifetime_ms),
             custody_operation_id: custody_operation_id.clone(),
@@ -794,23 +816,21 @@ impl PetalHost for DaemonPetalHost {
         let scope_digest = scope
             .digest()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
-        let provenance_subject = bloom_broker_api::ProvenanceSubject::Petal {
-            package_hash: scope.package_hash.clone(),
-            route: scope.route.clone(),
-        };
-        let provenance_digest = self
-            .provenance_catalog
-            .as_ref()
-            .and_then(|catalog| catalog.record(&provenance_subject))
-            .map(|record| record.digest())
-            .transpose()
-            .map_err(|error| HostError::Denied(error.to_string()))?;
-        let path = self.petal_key_state_path(context, &req.request_id)?;
+        let provenance_digest = Some(
+            provenance_record
+                .digest()
+                .map_err(|error| HostError::Denied(error.to_string()))?,
+        );
+        let path = self.petal_key_state_path(&lineage.lineage_id, key_slot.as_str())?;
 
         if let Some(mut stored) = Self::read_petal_key_state(&path)? {
             if stored.schema != PETAL_KEY_STATE_SCHEMA
-                || stored.request_id != req.request_id
-                || stored.scope != scope
+                || stored.key_slot != req.key_slot
+                || stored
+                    .scope
+                    .digest()
+                    .map_err(|error| HostError::Denied(error.to_string()))?
+                    != scope_digest
                 || stored.scope_digest != scope_digest
                 || stored.provenance_digest != provenance_digest
                 || !matches!(
@@ -914,7 +934,9 @@ impl PetalHost for DaemonPetalHost {
                     custody_operation_id: custody_operation_id.clone(),
                     wallet_id: Some(wallet_id),
                     key_ref: Some(parent_key_ref.clone()),
-                    exact_terms_digest: scope_digest.clone(),
+                    exact_terms_digest: scope
+                        .request_digest()
+                        .map_err(|error| HostError::Invalid(error.to_string()))?,
                     expected_input_class: bloom_broker_api::Token::new(PETAL_KEY_INPUT_CLASS)
                         .expect("static Petal key input class is valid"),
                     browser_output_recipient_key: None,
@@ -935,7 +957,7 @@ impl PetalHost for DaemonPetalHost {
         }
         let stored = PetalKeyRequestState {
             schema: PETAL_KEY_STATE_SCHEMA.into(),
-            request_id: req.request_id,
+            key_slot: req.key_slot,
             scope,
             scope_digest,
             provenance_digest,
@@ -4488,6 +4510,14 @@ mod tests {
                 route: "r000007".into(),
             },
             publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
+            petal_lineage: Some(bloom_broker_api::PetalLineageMembership {
+                lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                release_sequence: bloom_broker_api::DecimalU64::new(1),
+                predecessor_package_hashes: vec![],
+                controller_key_id: bloom_broker_api::Token::new("fixture-controller").unwrap(),
+                controller_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[0x44; 64]),
+                active: true,
+            }),
             operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
                 operation_class: bloom_broker_api::Token::new("exchange-agent").unwrap(),
                 fee_asset: None,
@@ -4513,10 +4543,10 @@ mod tests {
             actor: None,
         };
         let request = bloom_petals::PetalKeyRequest {
-            request_id: "agent-a".into(),
             wallet_id: "primary".into(),
-            purpose: "exchange-agent".into(),
-            agent_id: Some("desk-a".into()),
+            key_slot: "desk-a".into(),
+            allowed_routes: vec!["r000007".into()],
+            allowed_operation_classes: vec!["exchange-agent".into()],
             allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
             maximum_lifetime_ms: 60_000,
             context: Some(context.clone()),
@@ -4541,12 +4571,15 @@ mod tests {
         );
 
         let mut changed = request.clone();
-        changed.purpose = "payment-key".into();
+        changed.allowed_operation_classes = vec!["payment-key".into()];
         let changed_error = host.petal_key_request(changed).await.unwrap_err();
         assert!(changed_error.to_string().contains("different terms"));
 
         let state_path = host
-            .petal_key_state_path(&context, &request.request_id)
+            .petal_key_state_path(
+                "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &request.key_slot,
+            )
             .unwrap();
         let owner_status: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
@@ -4591,7 +4624,7 @@ mod tests {
 
         let mut tampered: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-        tampered["scope"]["route"] = serde_json::json!("r999999");
+        tampered["scope"]["key_slot"] = serde_json::json!("other-slot");
         std::fs::write(&state_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
         let tamper_error = host.petal_key_request(request).await.unwrap_err();
         assert!(tamper_error.to_string().contains("different terms"));
@@ -4628,6 +4661,7 @@ mod tests {
         .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![bloom_broker_api::ProvenanceRecord {
+                petal_lineage: None,
                 subject: subject.clone(),
                 publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
@@ -4771,6 +4805,7 @@ mod tests {
         .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
             records: vec![bloom_broker_api::ProvenanceRecord {
+                petal_lineage: None,
                 subject: bloom_broker_api::ProvenanceSubject::Petal {
                     package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
                     route: "r000010".into(),

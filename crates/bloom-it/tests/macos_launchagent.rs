@@ -243,42 +243,36 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
     }
     assert!(!source.contains("macos-rootless-code-identity"));
     assert!(!source.contains("com.apple.security.application-groups"));
-    assert!(source.lines().count() < 500);
+    assert!(source.lines().count() < 750);
 }
 
 #[test]
-fn macos_installer_has_an_explicit_small_lifecycle() {
+fn macos_installer_has_an_explicit_custody_preserving_lifecycle() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
-    assert!(source.lines().count() < 500);
+    assert!(source.lines().count() < 750);
     assert!(source.contains("install ROOT LOGIN_UID LOGIN_USER PAYLOAD_DIR"));
+    assert!(source.contains("restore ROOT LOGIN_UID LOGIN_USER PAYLOAD_DIR"));
+    assert!(source.contains("uninstall --retain-custody ROOT LOGIN_UID"));
     assert!(source.contains("uninstall ROOT LOGIN_UID delete-bloom-login-LOGIN_UID"));
-    assert!(source.contains("in-place upgrades were removed"));
-    for removed in [
-        "rotate-config",
-        "rotate-identities",
-        "upgrade-transaction",
-        "rotation-transaction",
-        "retain-bloom-login",
+    for required in [
+        "recover_interrupted_upgrade",
+        "stop_all_enrollments",
+        "switch_release",
+        "activate_installed_set",
+        "rollback_upgrade",
+        "state-schema downgrade rejected before activation",
     ] {
-        assert!(
-            !source.contains(removed),
-            "removed lifecycle leaked back into installer: {removed}"
-        );
+        assert!(source.contains(required), "lifecycle is missing {required}");
     }
 }
 
 #[test]
-fn macos_installer_does_not_hide_removed_lifecycle_logic() {
+fn macos_installer_does_not_regenerate_custody_during_lifecycle_operations() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
-    for removed in [
-        "init triad-render-macos-identity-rotation",
-        "recover_interrupted",
-        "retained_restore",
-        "transaction_staging",
-    ] {
-        assert!(!source.contains(removed));
+    for forbidden in ["triad-render-macos-identity-rotation", "rotate-identities"] {
+        assert!(!source.contains(forbidden));
     }
     assert!(!source.contains("source "));
 }
@@ -299,8 +293,8 @@ fn macos_permanent_uninstall_is_explicit_and_small() {
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
     for required in [
         "delete-bloom-login-LOGIN_UID",
-        "uninstall confirmation mismatch",
-        "Bloom macOS enrollment permanently removed",
+        "permanent purge confirmation mismatch",
+        "custody is unrecoverable",
     ] {
         assert!(
             source.contains(required),
@@ -371,6 +365,43 @@ fn production_macos_bundle_forbids_archived_private_identity_material() {
 }
 
 #[test]
+fn macos_w0_workflows_stage_every_required_bundle_binary() {
+    let builder =
+        fs::read_to_string(workspace().join("packaging/triad/release/build-bundle.sh")).unwrap();
+    let required = [
+        "bloom",
+        "bloom-broker",
+        "bloom-signer",
+        "bloom-signer-migrate",
+    ];
+    for workflow in ["macos-unix-w0.yml", "macos-two-login-w0.yml"] {
+        let source =
+            fs::read_to_string(workspace().join(".github/workflows").join(workflow)).unwrap();
+        for binary in required {
+            assert!(
+                builder
+                    .contains("for binary in bloom bloom-broker bloom-signer bloom-signer-migrate"),
+                "bundle builder required-binary declaration drifted"
+            );
+            assert!(
+                source.contains(&format!("release/{binary}")),
+                "{workflow} does not stage required bundle binary {binary}"
+            );
+        }
+        assert!(source.contains("Reject mutable sibling refs"));
+        assert!(source.contains("^[0-9a-f]{40}$"));
+        assert!(
+            source
+                .matches("$name-staging/bin/bloom-signer-migrate")
+                .count()
+                == 1
+                || workflow == "macos-unix-w0.yml",
+            "two-login baseline, candidate, and failing payload loop must share the complete artifact set"
+        );
+    }
+}
+
+#[test]
 fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/macos/w0/run-disposable.sh")).unwrap();
@@ -378,10 +409,6 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("/private/var/db/bloom-w0-disposable-host"));
     assert!(source.contains("bloom-macos-unix-w0-disposable-v1"));
     assert!(source.contains("macos-unix-principals-w0"));
-    assert!(!source.contains("UPGRADE_PAYLOAD"));
-    assert!(!source.contains("upgrade-transaction"));
-    assert!(!source.contains("rotation-transaction"));
-    assert!(!source.contains("retain-bloom-login"));
     assert!(source.contains("/usr/bin/nc -lk 127.0.0.1 18734"));
     assert!(source.contains("no fallback port will be used"));
     assert!(source.contains("Broker opened a fallback TCP listener"));

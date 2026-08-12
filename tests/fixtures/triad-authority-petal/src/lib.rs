@@ -136,7 +136,12 @@ impl Guest for Fixture {
         let preimage = hex::decode(&request.preimage_hex)
             .map_err(|error| RouteError::Invalid(format!("decode preimage_hex: {error}")))?;
         let ordered_hash = Sha256::digest(&preimage);
-        let payload_digest = Sha256::digest(&preimage);
+        let mut payload_digest = Sha256::new();
+        payload_digest.update(b"bloom.petal.payload-batch.v1\0");
+        payload_digest.update(1_u64.to_be_bytes());
+        payload_digest.update((preimage.len() as u64).to_be_bytes());
+        payload_digest.update(&preimage);
+        let payload_digest = payload_digest.finalize();
         let claim = json!({
             "package_hash": ctx.package_hash,
             "route": ROUTE_ID,

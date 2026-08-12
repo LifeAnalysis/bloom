@@ -83,13 +83,10 @@ impl Default for PetalsConfig {
 }
 
 fn default_preinstalled_petals() -> Vec<String> {
-    vec![
-        "near-intents".to_string(),
-        "enso".to_string(),
-        "gasless".to_string(),
-        "privacy-pools".to_string(),
-        "venice-x402".to_string(),
-    ]
+    // Authority-bearing Petals are not defaults until an immutable release is
+    // built against the triad payload-signing ABI. They remain valid explicit
+    // names so an upgraded release can be pinned without a config migration.
+    vec!["near-intents".to_string(), "enso".to_string()]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -617,16 +614,7 @@ mod tests {
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-        assert_eq!(
-            cfg.petals.preinstalled,
-            [
-                "near-intents",
-                "enso",
-                "gasless",
-                "privacy-pools",
-                "venice-x402"
-            ]
-        );
+        assert_eq!(cfg.petals.preinstalled, ["near-intents", "enso"]);
         assert_eq!(cfg.chains.len(), 13);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);

@@ -170,6 +170,39 @@ release_digest="$(field "$login_uid_a" release_digest)"
 sudo -u "$login_user_a" \
   "$machine_binary" serve triad-health-check "$release_digest"
 
+# Same-digest repair must not replace immutable releases or custody material.
+identity_a="/Library/Application Support/BloomTriad/config/$login_uid_a/signer/identity.json"
+identity_before="$(shasum -a 256 "$identity_a" | awk '{print $1}')"
+"$installer" install / "$login_uid_a" "$login_user_a" "$tested_payload"
+[[ "$(shasum -a 256 "$identity_a" | awk '{print $1}')" == "$identity_before" ]]
+sudo -u "$login_user_a" "$machine_binary" serve triad-health-check "$release_digest"
+
+# A durable transaction left before process death must be recovered
+# idempotently before the requested repair is attempted.
+if [[ -n "$upgrade_payload" ]]; then
+  transaction="/Library/Application Support/BloomTriad/upgrade-transaction"
+  mkdir -m 0700 "$transaction"
+  printf '%s\n' bloom.macos-upgrade-transaction.2 >"$transaction/schema"
+  printf '%s\n' "$release_digest" >"$transaction/old-digest"
+  printf '%s\n' "$(payload_release_digest "$payload")" >"$transaction/new-digest"
+  chown -R root:wheel "$transaction"
+  chmod 0600 "$transaction"/*
+  "$installer" install / "$login_uid_a" "$login_user_a" "$tested_payload"
+  [[ ! -e "$transaction" ]]
+  sudo -u "$login_user_a" "$machine_binary" serve triad-health-check "$release_digest"
+fi
+
+# Runtime removal retains the original service identity and encrypted state;
+# restore requires the exact signed release and republishes the same identity.
+"$installer" uninstall --retain-custody / "$login_uid_a"
+[[ ! -e "/Library/Application Support/BloomTriad/enrollments/$login_uid_a.json" ]]
+[[ -f "/Library/Application Support/BloomTriad/retained/$login_uid_a.json" ]]
+[[ "$(shasum -a 256 "$identity_a" | awk '{print $1}')" == "$identity_before" ]]
+"$installer" restore / "$login_uid_a" "$login_user_a" "$tested_payload"
+[[ ! -e "/Library/Application Support/BloomTriad/retained/$login_uid_a.json" ]]
+[[ "$(shasum -a 256 "$identity_a" | awk '{print $1}')" == "$identity_before" ]]
+sudo -u "$login_user_a" "$machine_binary" serve triad-health-check "$release_digest"
+
 # Leave A enrolled and its socket-activated LaunchDaemons loaded, but remove its
 # login-session sentinel so B can become the first canonical-listener owner.
 launchctl bootout "gui/$login_uid_a/com.bloom.session"
@@ -357,7 +390,7 @@ if [[ -n "${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" ]]; then
   subject_digest="$(
     "$triad_source/release/macos-conformance-subject.sh" "$tested_payload"
   )"
-  for criterion in mui_05 mui_06 two_login_lifecycle; do
+  for criterion in mui_05 mui_06 two_login_lifecycle lifecycle_repair_recovery_retain_restore; do
     temporary="$evidence_dir/.$criterion.$$.new"
     printf '%s\n' "$subject_digest" > "$temporary"
     chmod 0644 "$temporary"

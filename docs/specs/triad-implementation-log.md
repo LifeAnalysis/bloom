@@ -42,11 +42,13 @@ wire detail. It does not amend that specification.
   listener. Upgrade and rollback therefore restore every session and Signer
   job first, then bootstrap, authenticate, and stop each recorded Broker with
   an active login-session job serially against the candidate release.
-  Logged-out enrollments remain in the same root-owned atomic file
-  transaction but cannot have a live authenticated health check. Only after
-  every active Broker has passed does the installer restore the exact prior
-  loaded-Broker set. This validates the runnable enrollment set without
-  weakening AC-31 or introducing a fallback port.
+  The compact self-contained installer therefore preflights an active GUI
+  domain for every enrollment before it creates the transaction or stops a
+  job. It validates each Broker serially, then restores the complete job set.
+  An operator must perform a shared-release upgrade while all enrolled logins
+  are active; otherwise it fails before the commit boundary. This validates
+  the runnable enrollment set without weakening AC-31 or introducing a
+  fallback port.
 - Until a disposable W0 VM proves account creation/rollback, system-domain
   launchd ownership, socket modes, `pf` behavior, and uninstall, the installer
   accepts live test activation only for the non-production

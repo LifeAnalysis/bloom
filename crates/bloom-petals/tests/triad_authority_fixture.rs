@@ -178,7 +178,7 @@ fn fixture_is_an_installable_package_with_only_scoped_authority_imports() {
     assert_eq!(package.name, "triad-authority-fixture");
     assert_eq!(
         package.hash,
-        "2e2344e74b7ed11d4bb4c939671be9da72e13147dd16c3f6b6c347ae2c84d1ad"
+        "2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
     );
     assert_eq!(package.route_index.routes.len(), 1);
     assert_eq!(package.route_index.routes[0].pattern, "session.json");

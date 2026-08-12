@@ -8,7 +8,7 @@
 set -euo pipefail
 
 readonly MAX_USD="25"
-readonly FIXTURE_PACKAGE_HASH="2e2344e74b7ed11d4bb4c939671be9da72e13147dd16c3f6b6c347ae2c84d1ad"
+readonly FIXTURE_PACKAGE_HASH="2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Broker, Signer, and Machine developer state remain persistent so existing

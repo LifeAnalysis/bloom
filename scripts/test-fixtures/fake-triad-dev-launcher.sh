@@ -51,7 +51,7 @@ wallet = "test-passkey"
 address = "0x0000000000000000000000000000000000000001"
 session = "manual-mainnet-integration"
 pm_signing_abi = os.environ.get("BLOOM_FAKE_PM_SIGNING_ABI", "0.4.0")
-fixture_package_hash = "2e2344e74b7ed11d4bb4c939671be9da72e13147dd16c3f6b6c347ae2c84d1ad"
+fixture_package_hash = "2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
 fixture_provenance_digest = "66" * 32
 mutate_approval_policy_digest = (
     os.environ.get("BLOOM_FAKE_MUTATE_APPROVAL_POLICY_DIGEST", "0") == "1"

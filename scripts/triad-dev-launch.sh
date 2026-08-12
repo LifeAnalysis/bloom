@@ -103,12 +103,10 @@ config_dir="${developer_root}/config"
 fixture_root="${repo_root}/tests/fixtures/triad-authority-petal"
 fixture_hash=""
 if [ "$install_authority_fixture" -eq 1 ]; then
-  fixture_hash="$($bloom_bin --home "${developer_root}/package-scan" petals build "$fixture_root" |
-    sed -n 's/^hash: //p')"
-  case "$fixture_hash" in
-    [0-9a-f][0-9a-f]*) [ "${#fixture_hash}" -eq 64 ] || die "fixture package hash is malformed" ;;
-    *) die "could not determine fixture package hash" ;;
-  esac
+  # The catalog must be signed before Machine starts, while package building is
+  # intentionally daemon-only. Pin the fixture's reviewed package hash here,
+  # then prove it against the daemon build before installing the fixture.
+  fixture_hash="2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
 fi
 if [ ! -f "${config_dir}/edge-manifest.json" ]; then
   [ ! -e "$config_dir" ] || die "incomplete developer config already exists: $config_dir"
@@ -172,8 +170,6 @@ if [ -n "$hyperliquid_package" ]; then
   [ -x "${hyperliquid_package}/scripts/build.sh" ] ||
     die "integration Petal build script is missing: ${hyperliquid_package}/scripts/build.sh"
   (cd "$hyperliquid_package" && scripts/build.sh)
-  "$bloom_bin" --home "${developer_root}/package-scan" petals build \
-    "$hyperliquid_package" >/dev/null
   "$bloom_bin" init triad-enroll-developer-petal-provenance \
     "$config_dir" "$hyperliquid_package"
 fi
@@ -205,7 +201,8 @@ rewrite_broker_config() {
   source="${config_dir}/broker.json"
   temporary="${source}.new.$$"
   jq --arg signer_socket "$signer_socket" --arg digest "$release_digest" \
-    '.signer_socket_path = $signer_socket | .build_digest = $digest | .network_containment = null' \
+    '.signer_socket_path = $signer_socket | .build_digest = $digest |
+     .network_containment = null | .maximum_requests_per_window = 10000' \
     "$source" > "$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$source"
@@ -214,7 +211,8 @@ rewrite_signer_config() {
   source="${config_dir}/signer.json"
   temporary="${source}.new.$$"
   jq --arg digest "$release_digest" \
-    '.build_digest = $digest | .network_containment = null' "$source" > "$temporary"
+    '.build_digest = $digest | .network_containment = null |
+     .maximum_requests_per_window = 10000' "$source" > "$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$source"
 }
@@ -360,34 +358,9 @@ if [ ! -e "$machine_config" ]; then
   chmod 0600 "$machine_config"
 fi
 
-if [ "$install_authority_fixture" -eq 1 ]; then
-  BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
-  BLOOM_BROKER_SOCKET="$broker_socket" \
-  BLOOM_MACHINE_IDENTITY="${config_dir}/machine-identity.json" \
-  BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
-  BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
-    "$bloom_bin" --home "$machine_home" petals install "$fixture_root" \
-    >"${log_dir}/fixture-install.log" 2>&1
-fi
-
-for integration_petal in \
-  "${BLOOM_TRIAD_DEV_POLYMARKET_PACKAGE:-}" \
-  "${BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE:-}"
-do
-  [ -n "$integration_petal" ] || continue
-  [ -d "$integration_petal" ] || die "integration Petal package is missing: $integration_petal"
-  package_name="$(basename "$integration_petal")"
-  BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
-  BLOOM_BROKER_SOCKET="$broker_socket" \
-  BLOOM_MACHINE_IDENTITY="${config_dir}/machine-identity.json" \
-  BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
-  BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
-    "$bloom_bin" --home "$machine_home" petals install "$integration_petal" \
-    >"${log_dir}/${package_name}-install.log" 2>&1
-done
-
-# Developer Petals are installed explicitly above. Do not download or advertise
-# a stale production release merely to make this isolated harness ready.
+# Developer Petals are installed through the launched Machine below. Do not
+# download or advertise a stale production release merely to make this isolated
+# harness ready.
 [ -f "$machine_config" ] || die "Machine did not create its configuration"
 machine_config_new="${machine_config}.new.$$"
 awk '
@@ -436,7 +409,7 @@ if [ "$services_only" -eq 1 ]; then
 fi
 
 mount_is_live() {
-  mount | grep -F " on ${mount_dir} " >/dev/null 2>&1 && command ls "$mount_dir" >/dev/null 2>&1
+  mount | grep -F " on ${mount_dir} " >/dev/null 2>&1
 }
 
 start_machine() {
@@ -477,6 +450,37 @@ start_machine() {
 
 : > "${log_dir}/machine.log"
 start_machine
+
+machine_cli() {
+  BLOOM_RPC_ENDPOINT="unix:${machine_socket}" \
+  BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
+  BLOOM_BROKER_SOCKET="$broker_socket" \
+  BLOOM_MACHINE_IDENTITY="${config_dir}/machine-identity.json" \
+  BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
+  BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
+    "$bloom_bin" --home "$machine_home" "$@"
+}
+
+if [ "$install_authority_fixture" -eq 1 ]; then
+  machine_cli petals build "$fixture_root" >"${log_dir}/fixture-build.log" 2>&1
+  built_fixture_hash="$(sed -n 's/^hash: //p' "${log_dir}/fixture-build.log")"
+  [ "$built_fixture_hash" = "$fixture_hash" ] || {
+    cat "${log_dir}/fixture-build.log" >&2
+    die "authority fixture package hash drifted from its signed provenance record"
+  }
+  machine_cli petals install "$fixture_root" >"${log_dir}/fixture-install.log" 2>&1
+fi
+
+for integration_petal in \
+  "${BLOOM_TRIAD_DEV_POLYMARKET_PACKAGE:-}" \
+  "${BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE:-}"
+do
+  [ -n "$integration_petal" ] || continue
+  [ -d "$integration_petal" ] || die "integration Petal package is missing: $integration_petal"
+  package_name="$(basename "$integration_petal")"
+  machine_cli petals install "$integration_petal" >"${log_dir}/${package_name}-install.log" 2>&1
+done
+
 kill -0 "$machine_pid" 2>/dev/null || die "Machine exited before readiness could be published"
 printf 'ready\n' > "$ready_file"
 if [ -z "$mount_dir" ]; then

@@ -1,7 +1,6 @@
 # Disposable macOS W0 lane
 
-`run-disposable.sh PAYLOAD UID USER [UPGRADE_PAYLOAD
-[FAILING_UPGRADE_PAYLOAD]]` is destructive integration testing for the
+`run-disposable.sh PAYLOAD UID USER` is destructive integration testing for the
 `macos-unix-principals-w0` bundle claim. It creates Directory Service users and
 groups, installs system LaunchDaemons, modifies the dedicated Bloom block in
 `/etc/pf.conf`, and removes them afterward.
@@ -33,10 +32,13 @@ also proves a successful complete-version upgrade is published to both
 enrollments and a deliberately failing subsequent upgrade rolls both back to
 the same healthy version. Upgrade validation gives each Broker exclusive use
 of the canonical listener in turn before restoring the original loaded-job
-set. If
+set. The same lane verifies same-digest repair, recovery of a durable interrupted
+activation journal, custody-preserving runtime removal, exact-release restore,
+and unchanged Signer identity material. If
 `BLOOM_MACOS_W0_EVIDENCE_DIR` names an existing absolute directory, a
 successful run writes digest-bound `mui_05.pass`, `mui_06.pass`, and
-`two_login_lifecycle.pass` evidence for the tested payload. It writes
+`two_login_lifecycle.pass` plus
+`lifecycle_repair_recovery_retain_restore.pass` evidence for the tested payload. It writes
 `mui_09.pass` only when both the successful and failing two-login upgrade cases
 pass.
 
@@ -103,15 +105,10 @@ authenticated triad health fails, and then restores and re-verifies the
 anchor. Real service-UID probes prove Signer cannot emit IPv4 or IPv6 loopback
 TCP/UDP, and that neither Broker nor Signer can create non-loopback IPv4
 TCP/UDP flows; authenticated Broker responses remain covered by the triad
-health check. It also constructs a durable interrupted-enrollment intent plus
-its exact partial Directory Service record and proves the next installer
-invocation removes both without adopting the record. When the optional bundles
-are supplied, it also proves a complete-version upgrade, activation-failure
-rollback, `SIGKILL` during the activating phase, stale PID-lock reclamation,
-journal recovery, and restoration of the exact prior healthy digest.
-It also rotates the complete transport-identity/edge-manifest set, verifies
-that service configs are unchanged, and requires authenticated health with the
-new cross-pins. An unauthorized connection from the login UID must be rejected
+health check. The two-login lane supplies complete baseline, candidate, and
+failing bundles and proves complete-version upgrade, activation-failure
+rollback, journal recovery, same-digest repair, retain/restore, and restoration
+of the exact prior healthy digest without identity rotation. An unauthorized connection from the login UID must be rejected
 by the session sentinel without disrupting authenticated health. A guarded
 session-domain bootout/rebootstrap cycle proves Broker and Signer drain, the
 ceremony listener closes, and socket activation restores authenticated health

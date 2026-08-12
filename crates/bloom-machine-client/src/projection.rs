@@ -12,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use bloom_broker_api::{
-    CredentialPublic, Digest32, KeyPublic, KeyRole, ProtocolError, ProtocolErrorCode,
+    CredentialPublic, Digest32, KeyPublic, KeyRequest, KeyRole, ProtocolError, ProtocolErrorCode,
     SignedPolicySnapshot, Token, WalletPublic,
 };
 use fs2::FileExt as _;
@@ -256,7 +256,35 @@ impl CachedWalletProjectionReader {
                     wallet_id.as_str()
                 )));
             }
-            let keys = broker.keys(wallet_id.clone()).await?;
+            let mut keys = broker.keys(wallet_id.clone()).await?;
+            let mut described = keys
+                .iter()
+                .map(|key| serde_json::to_string(&key.key_ref))
+                .collect::<Result<BTreeSet<_>, _>>()
+                .map_err(|error| {
+                    invalid_projection(format!("encode Broker key reference: {error}"))
+                })?;
+            for key_ref in &wallet.key_refs {
+                let encoded = serde_json::to_string(key_ref).map_err(|error| {
+                    invalid_projection(format!("encode wallet key reference: {error}"))
+                })?;
+                if described.contains(&encoded) {
+                    continue;
+                }
+                let key = broker
+                    .key(KeyRequest {
+                        key_ref: key_ref.clone(),
+                    })
+                    .await?;
+                if key.key_ref != *key_ref {
+                    return Err(invalid_projection(format!(
+                        "Broker returned a different key for wallet {}",
+                        wallet_id.as_str()
+                    )));
+                }
+                described.insert(encoded);
+                keys.push(key);
+            }
             let credentials = broker.credentials(wallet_id.clone()).await?;
             let policy = broker.policy(wallet_id.clone()).await?;
             let projection = build_projection(wallet, keys, credentials, policy, now_ms()?)?;

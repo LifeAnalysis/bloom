@@ -1,14 +1,14 @@
 {
   "schema": "bloom.petal.build-manifest.v1",
-  "source_package_hash": "e25257bfdc154f57e42ec902845c5d91261fda1edde3d713cf9c974d2bc90b62",
+  "source_package_hash": "a7c29cd73a8e1569a21327ca20f24475b7cf00b1296218e7117c54ea454ac6d1",
   "routes": [
     {
       "route_id": "r000001",
       "pattern": "session.json",
       "source_path": "petal/triad-authority-fixture/session.json.wasm",
-      "source_hash": "7eacd1b74dfbea907d1ef334b3d205a7d96f78bd1c0e049a68962075dc4e18d0",
+      "source_hash": "1aa30a36d745ef6b366957fd3257a56c1df6e07d6d72ea109b08cd99d3f4772c",
       "artifact_path": "artifacts/routes/r000001.wasm",
-      "artifact_hash": "7eacd1b74dfbea907d1ef334b3d205a7d96f78bd1c0e049a68962075dc4e18d0",
+      "artifact_hash": "1aa30a36d745ef6b366957fd3257a56c1df6e07d6d72ea109b08cd99d3f4772c",
       "abi": "component:bloom:route@0.1.0"
     }
   ]

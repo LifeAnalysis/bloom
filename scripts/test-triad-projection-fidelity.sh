@@ -17,7 +17,7 @@ case "$startup_timeout_secs" in *[!0-9]*|'') die "startup timeout must be an int
 # a long per-login /var/folders path.
 run_root="$(mktemp -d "${BLOOM_MA03_TMPDIR:-/tmp}/bloom-ma03.XXXXXX")"
 developer_root="${run_root}/developer"
-machine_home="${run_root}/machine-home"
+machine_home="${developer_root}/machine-home"
 mount_dir="${run_root}/mount"
 log_dir="${run_root}/logs"
 machine_socket="${run_root}/run/machine.sock"
@@ -45,7 +45,7 @@ stop_stack() {
     wait "$launcher_pid" 2>/dev/null || true
   fi
   launcher_pid=""
-  rm -f -- "$ready_file"
+  rm -f -- "$ready_file" "$machine_socket"
   attempts=0
   while mount | grep -F " on ${mount_dir} " >/dev/null 2>&1; do
     attempts=$((attempts + 1))
@@ -56,7 +56,7 @@ stop_stack() {
 
 start_stack() {
   : > "$launcher_log"
-  "$launcher" \
+  BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE=1 "$launcher" \
     --developer-root "$developer_root" \
     --machine-home "$machine_home" \
     --mount "$mount_dir" \
@@ -94,14 +94,15 @@ mounted() {
   esac
 }
 
-bounded_mounted_read() {
+bounded_mounted_command() {
   path="$1"
   label="$2"
+  shift 2
   deadline_secs="${BLOOM_MA08_MOUNT_READ_TIMEOUT_SECS:-15}"
   case "$deadline_secs" in *[!0-9]*|'') die "mounted-read timeout must be an integer" ;; esac
   [ "$deadline_secs" -ge 1 ] || die "mounted-read timeout must be positive"
   output="${run_root}/bounded-read.$$.${RANDOM}"
-  cat "$path" > "$output" 2>/dev/null &
+  "$@" "$path" > "$output" 2>/dev/null &
   read_pid=$!
   deadline=$(( $(date +%s) + deadline_secs ))
   while kill -0 "$read_pid" 2>/dev/null; do
@@ -115,16 +116,28 @@ bounded_mounted_read() {
       fi
       kill "$read_pid" 2>/dev/null || true
       rm -f -- "$output"
-      die "${label} exceeded ${deadline_secs}s at mounted path ${path}"
+      printf 'MA-03 projection fidelity: %s exceeded %ss at mounted path %s\n' \
+        "$label" "$deadline_secs" "$path" >&2
+      return 124
     fi
     sleep 0.05
   done
   if ! wait "$read_pid"; then
     rm -f -- "$output"
-    return 1
+    # A not-yet-created projection is normal in the polling callers. Preserve
+    # the hard timeout above, but represent ordinary lookup misses as empty.
+    return 0
   fi
   command cat "$output"
   rm -f -- "$output"
+}
+
+bounded_mounted_read() {
+  bounded_mounted_command "$1" "$2" /bin/cat
+}
+
+bounded_mounted_list() {
+  bounded_mounted_command "$1" "$2" env LC_ALL=C /bin/ls -1
 }
 
 complete_launch() {
@@ -142,7 +155,9 @@ assert_projection_pair() {
   attempts=0
   vfs_projection=""
   while [ "$attempts" -lt 100 ]; do
-    vfs_projection="$(cat "$(mounted "/wallets/${wallet_id}/projection.json")" 2>/dev/null || true)"
+    vfs_projection="$(bounded_mounted_read \
+      "$(mounted "/wallets/${wallet_id}/projection.json")" \
+      "${label} wallet projection read")"
     if printf '%s' "$vfs_projection" | jq -e . >/dev/null 2>&1; then
       break
     fi
@@ -184,7 +199,8 @@ wait_for_fixture_record() {
     while IFS= read -r record_name; do
       [ -n "$record_name" ] || continue
       record_path="$(mounted "/petal-key-requests/${record_name}")"
-      record="$(cat "$record_path" 2>/dev/null || true)"
+      record="$(bounded_mounted_read "$record_path" \
+        "Petal key request record read")"
       if printf '%s' "$record" | jq -e --arg request_id "$request_id" '
         .request_id == $request_id and .status == "awaiting_user" and
         (.ceremony_url | type == "string")
@@ -192,7 +208,8 @@ wait_for_fixture_record() {
         printf '%s\n' "$record"
         return 0
       fi
-    done < <(LC_ALL=C command ls -1 "$(mounted /petal-key-requests)" 2>/dev/null || true)
+    done < <(bounded_mounted_list "$(mounted /petal-key-requests)" \
+      "Petal key request directory read")
     attempts=$((attempts + 1))
     sleep 0.05
   done
@@ -203,7 +220,9 @@ wait_for_fixture_stage() {
   expected="$1"
   attempts=0
   while [ "$attempts" -lt 200 ]; do
-    fixture_body="$(cat "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true)"
+    fixture_body="$(bounded_mounted_read \
+      "$(mounted /petals/triad-authority-fixture/session.json)" \
+      "fixture Petal session read")"
     fixture_stage="$(printf '%s' "$fixture_body" | jq -r '
       if .stage == "key" then "key:" + (.outcome.state // "")
       else .stage // "" end
@@ -340,17 +359,16 @@ if [ -z "${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:-}" ]; then
 fi
 start_stack
 
-# The frozen protocol contains credential add/remove prepare variants for
-# future consumers, but Machine currently retains exactly one credential-change
-# surface: `wallet rebind-passkey` (credential replacement).  Prove that from
-# the actual user-visible CLI and mounted namespace instead of inventing a new
-# Machine command merely to exercise otherwise-unexposed protocol variants.
+# Machine exposes credential replacement and the explicit legacy-passkey
+# receipt migration workflow. Prove the exact user-visible CLI inventory and
+# that neither operation is exposed as an unaudited mounted mutation surface.
 wallet_help="$(cli wallet --help)"
 credential_commands="$(printf '%s\n' "$wallet_help" |
   sed -n 's/^  \([a-z][a-z-]*\)  *.*/\1/p' |
   grep -E '(credential|passkey|authenticator)' || true)"
-[ "$credential_commands" = "rebind-passkey" ] ||
-  die "credential-change CLI inventory is not exactly rebind-passkey: ${credential_commands:-<none>}"
+[ "$credential_commands" = "migrate-passkey
+rebind-passkey" ] ||
+  die "credential-change CLI inventory is not exactly migrate-passkey and rebind-passkey: ${credential_commands:-<none>}"
 
 printf 'MA-03: registering wallet through Broker/Signer...\n'
 registration_launch="$(cli wallet new ma03-registration)"
@@ -361,7 +379,8 @@ printf '%s' "$registered_projection" | jq -e '
   (.credentials | length) == 1 and (.keys | length) == 1
 ' >/dev/null || die "registration projection omitted public authority descriptors"
 original_credential="$(printf '%s' "$registered_projection" | jq -er '.credentials[0].credential_id')"
-wallet_entries="$(LC_ALL=C command ls -1 "$(mounted "/wallets/${registered_wallet}")")"
+wallet_entries="$(bounded_mounted_list "$(mounted "/wallets/${registered_wallet}")" \
+  "wallet projection directory read")"
 if printf '%s\n' "$wallet_entries" | grep -Eiq '(credential|passkey|authenticator|rebind)'; then
   die "unexpected mounted credential mutation surface is exposed"
 fi
@@ -395,16 +414,25 @@ printf '%s' "$rebound_projection" | jq -e \
 printf 'MA-03: committing a policy update through its completed ceremony receipt...\n'
 fixture_hash="$(jq -er '.records[] | select(.subject.kind == "petal" and .subject.route == "r000001") | .subject.package_hash' \
   "${developer_root}/config/provenance-catalog.json" | head -n 1)"
-current_policy="$(cat "$(mounted "/wallets/${registered_wallet}/policy.json")")"
+current_policy="$(bounded_mounted_read \
+  "$(mounted "/wallets/${registered_wallet}/policy.json")" \
+  "current wallet policy read")"
 old_policy_version="$(printf '%s' "$rebound_projection" | jq -er '.policy.version | tonumber')"
 policy_file="${run_root}/proposed-policy.json"
 printf '%s' "$current_policy" | jq -cS --arg package_hash "$fixture_hash" '
   .allowed_petal_packages = ((.allowed_petal_packages + [$package_hash]) | unique | sort)
 ' > "$policy_file"
-policy_launch="$(cli wallet update-policy "$registered_wallet" --file "$policy_file")"
-complete_launch "$policy_launch" replacement-auth --sign-count 2 >/dev/null
+if ! policy_launch="$(cli wallet update-policy "$registered_wallet" --file "$policy_file" 2>&1)"; then
+  die "policy update launch failed: ${policy_launch:-<no diagnostic>}"
+fi
+if ! policy_completion="$(complete_launch "$policy_launch" replacement-auth --sign-count 2 2>&1)"; then
+  die "policy update ceremony failed: ${policy_completion:-<no diagnostic>}"
+fi
 policy_operation="$(printf '%s\n' "$policy_launch" | sed -n 's/^operation_id: //p')"
-cli wallet commit-policy "$policy_operation" >/dev/null
+[[ "$policy_operation" =~ ^[0-9a-f]{64}$ ]] || die "policy update launch omitted a valid operation_id"
+if ! policy_commit="$(cli wallet commit-policy "$policy_operation" 2>&1)"; then
+  die "policy commit failed: ${policy_commit:-<no diagnostic>}"
+fi
 policy_projection="$(assert_projection_pair "$registered_wallet" policy-update)"
 new_policy_version="$(printf '%s' "$policy_projection" | jq -er '.policy.version | tonumber')"
 [ "$new_policy_version" -eq $((old_policy_version + 1)) ] ||
@@ -413,7 +441,9 @@ printf '%s' "$policy_projection" | jq -e --arg package_hash "$fixture_hash" '
   (.policy.canonical_policy | type == "string") and
   (.wallet.policy_digest == .policy.policy_digest)
 ' >/dev/null || die "policy projection is internally inconsistent"
-mounted_policy="$(cat "$(mounted "/wallets/${registered_wallet}/policy.json")")"
+mounted_policy="$(bounded_mounted_read \
+  "$(mounted "/wallets/${registered_wallet}/policy.json")" \
+  "updated wallet policy read")"
 printf '%s' "$mounted_policy" | jq -e --arg package_hash "$fixture_hash" '
   .allowed_petal_packages | index($package_hash) != null
 ' >/dev/null || die "mounted policy did not expose the committed authority change"
@@ -456,7 +486,8 @@ fixture_key_record_path=""
 while IFS= read -r record_name; do
   [ -n "$record_name" ] || continue
   candidate="/petal-key-requests/${record_name}"
-  candidate_body="$(cat "$(mounted "$candidate")" 2>/dev/null || true)"
+  candidate_body="$(bounded_mounted_read "$(mounted "$candidate")" \
+    "Petal key request candidate read")"
   if printf '%s' "$candidate_body" | jq -e --arg request_id "$request_id" \
     '.request_id == $request_id and .status == "succeeded" and .public_key != null' \
     >/dev/null 2>&1
@@ -465,13 +496,16 @@ while IFS= read -r record_name; do
     fixture_key_record_body="$candidate_body"
     break
   fi
-done < <(LC_ALL=C command ls -1 "$(mounted /petal-key-requests)" 2>/dev/null || true)
+done < <(bounded_mounted_list "$(mounted /petal-key-requests)" \
+  "Petal key request directory read")
 [ -n "$fixture_key_record_path" ] || die "completed fixture key record was not found through the mount"
 
 fixture_key_ref="$(printf '%s' "$fixture_key_record_body" | jq -ec '.public_key.key_ref')"
 fixture_provenance_digest="$(printf '%s' "$fixture_key_record_body" | jq -er '.provenance_digest')"
 fixture_agent_id="$(printf '%s' "$fixture_key_record_body" | jq -c '.scope.agent_id')"
-wallet_authority="$(cat "$(mounted "/wallets/${registered_wallet}/addresses.json")")"
+wallet_authority="$(bounded_mounted_read \
+  "$(mounted "/wallets/${registered_wallet}/addresses.json")" \
+  "wallet authority projection read")"
 policy_version="$(printf '%s' "$wallet_authority" | jq -er '.policy_version')"
 policy_digest="$(printf '%s' "$wallet_authority" | jq -er '.policy_digest')"
 wallet_revocation_epoch="$(printf '%s' "$wallet_authority" | jq -er '.wallet_revocation_epoch')"

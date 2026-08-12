@@ -215,7 +215,8 @@ signer_version="$(sed -n -E 's/^signer = "([^"]+)"$/\1/p' "$script_dir/compatibi
 for identity in \
   "bloom:$machine_version" \
   "bloom-broker:$broker_version" \
-  "bloom-signer:$signer_version"
+  "bloom-signer:$signer_version" \
+  "bloom-signer-migrate:$signer_version"
 do
   binary="${identity%%:*}"
   expected="${identity#*:}"

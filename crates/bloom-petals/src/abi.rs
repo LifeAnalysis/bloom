@@ -187,21 +187,22 @@ pub struct PetalRouteContext {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PetalKeyGuestRequest {
-    pub request_id: String,
     pub wallet_id: String,
-    pub purpose: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
+    /// Stable Petal-owned name for this child key (for example, one exchange
+    /// account). Package hashes and lineage are injected by Machine.
+    pub key_slot: String,
+    pub allowed_routes: Vec<String>,
+    pub allowed_operation_classes: Vec<String>,
     pub allowed_crypto_suites: Vec<String>,
     pub maximum_lifetime_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PetalKeyRequest {
-    pub request_id: String,
     pub wallet_id: String,
-    pub purpose: String,
-    pub agent_id: Option<String>,
+    pub key_slot: String,
+    pub allowed_routes: Vec<String>,
+    pub allowed_operation_classes: Vec<String>,
     pub allowed_crypto_suites: Vec<String>,
     pub maximum_lifetime_ms: u64,
     pub context: Option<PetalRouteContext>,
@@ -210,10 +211,10 @@ pub struct PetalKeyRequest {
 impl From<PetalKeyGuestRequest> for PetalKeyRequest {
     fn from(guest: PetalKeyGuestRequest) -> Self {
         Self {
-            request_id: guest.request_id,
             wallet_id: guest.wallet_id,
-            purpose: guest.purpose,
-            agent_id: guest.agent_id,
+            key_slot: guest.key_slot,
+            allowed_routes: guest.allowed_routes,
+            allowed_operation_classes: guest.allowed_operation_classes,
             allowed_crypto_suites: guest.allowed_crypto_suites,
             maximum_lifetime_ms: guest.maximum_lifetime_ms,
             context: None,

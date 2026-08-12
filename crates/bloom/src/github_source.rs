@@ -28,6 +28,10 @@ pub(crate) struct PreinstalledPetal {
     pub release_tag: &'static str,
     pub archive: &'static str,
     pub expected_hash: Option<&'static str>,
+    pub archive_sha256: &'static str,
+    pub tooling_commit: &'static str,
+    pub petal_abi: &'static str,
+    pub default_eligible: bool,
 }
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
@@ -37,6 +41,10 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.1",
     archive: "near-intents-v0.1.1.petal.tar.gz",
     expected_hash: Some("c3f714c01e17f642b8add45b7501d6675c851a13210ce9e834fd16d23330f166"),
+    archive_sha256: "7f3bcc5b762f7750c2fa9c445491f7be32ffdf233d3f371481e8dc3d0a8116d0",
+    tooling_commit: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6",
+    petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+    default_eligible: true,
 };
 
 const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
@@ -46,6 +54,10 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.2",
     archive: "enso-v0.1.2.petal.tar.gz",
     expected_hash: Some("82e541b237cd8dde0a566dfca7f3d20d6e688aacd23f62b1d0f1306f9c76ecb7"),
+    archive_sha256: "16abd73df768b5f9aba45f20b5c56a50c064368d25bf5e8efa31d3564608422e",
+    tooling_commit: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6",
+    petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+    default_eligible: true,
 };
 
 const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
@@ -55,6 +67,10 @@ const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.1",
     archive: "gasless-v0.1.1.petal.tar.gz",
     expected_hash: Some("26c75bd577e6c24c648dd99bd86c124ff602d9134bd5825649b5906851d2724a"),
+    archive_sha256: "df16e4e793be1767fcbeaac4333545ec887f0e95801ce1ac6ec3d3db2f3d75c8",
+    tooling_commit: "b9fc22d6d8211bc41304b38b1ef8b5269c8035bd",
+    petal_abi: "bloom.petal-host/legacy-hash-signing-v1",
+    default_eligible: false,
 };
 
 const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
@@ -64,6 +80,10 @@ const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.2",
     archive: "privacy-pools-v0.1.2.petal.tar.gz",
     expected_hash: Some("f86cf4fac3dcd5dc86fa6d60daadeb2377b7d3a655774f64a109a7f5aca446b4"),
+    archive_sha256: "997e946b1e81481ed496d416111d144fb48ab6f44f513b4721363a9507e92df1",
+    tooling_commit: "b9fc22d6d8211bc41304b38b1ef8b5269c8035bd",
+    petal_abi: "bloom.petal-host/pre-triad-v1",
+    default_eligible: false,
 };
 
 const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
@@ -73,6 +93,10 @@ const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.0",
     archive: "venice-x402-v0.1.0.petal.tar.gz",
     expected_hash: Some("473df7e6a3f948480684d4485f07836918f0e36042d1b2105dc82fdb0370bf18"),
+    archive_sha256: "d2901177b345dba3c7819406f9decb9ed0d167ca7b1f4c7b2895cf39729922be",
+    tooling_commit: "6489cb85e7a0f8804fa3dd712c52c37e732ddcea",
+    petal_abi: "bloom.petal-host/legacy-hash-signing-v1",
+    default_eligible: false,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,6 +490,13 @@ fn ensure_preinstalled_petals_with(
     for name in &daemon.config.petals.preinstalled {
         let entry = resolve(name).ok_or_else(|| anyhow!("unknown pre-installed Petal {name:?}"))?;
         let entry = &entry;
+        if !entry.default_eligible {
+            bail!(
+                "pre-installed Petal {} is not eligible for triad activation: pinned ABI {} is not the triad payload-signing ABI",
+                entry.name,
+                entry.petal_abi
+            );
+        }
         let replacing = match owners.get(name) {
             Some(hash) => {
                 let meta = daemon.petals.store().load_meta(hash).with_context(|| {
@@ -648,6 +679,12 @@ fn validate_release_manifest(
     }
     if manifest.tooling_repository != "bloom-directory/petal" {
         bail!("Petal release manifest names an untrusted tooling repository");
+    }
+    if manifest.archive_sha256 != entry.archive_sha256 {
+        bail!("Petal release manifest archive hash does not match the catalog");
+    }
+    if manifest.tooling_commit != entry.tooling_commit {
+        bail!("Petal release manifest tooling commit does not match the catalog");
     }
     if let Some(expected_hash) = entry.expected_hash
         && manifest.package_hash != expected_hash
@@ -1348,6 +1385,7 @@ mod tests {
             assert_eq!(entry.name, name);
             assert_eq!(entry.commit.len(), 40);
             assert!(entry.expected_hash.is_some());
+            assert!(!entry.default_eligible);
         }
         assert!(preinstalled_petal("polymarket").is_none());
         assert!(preinstalled_petal("hyperliquid").is_none());
@@ -1500,6 +1538,10 @@ mod tests {
             release_tag,
             archive,
             expected_hash,
+            archive_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+            tooling_commit: "3333333333333333333333333333333333333333",
+            petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+            default_eligible: true,
         }
     }
 
@@ -1801,6 +1843,10 @@ mod tests {
             release_tag: "v0.1.0",
             archive: "unused.petal.tar.gz",
             expected_hash: None,
+            archive_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+            tooling_commit: "3333333333333333333333333333333333333333",
+            petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+            default_eligible: true,
         };
         let release = PetalReleaseManifest {
             schema: "bloom.petal.release.v1".into(),
@@ -1957,10 +2003,10 @@ mod tests {
             source_commit: entry.commit.into(),
             release_tag: entry.release_tag.into(),
             archive: entry.archive.into(),
-            archive_sha256: "a".repeat(64),
+            archive_sha256: entry.archive_sha256.into(),
             package_hash: entry.expected_hash.unwrap().into(),
             tooling_repository: "bloom-directory/petal".into(),
-            tooling_commit: "c".repeat(40),
+            tooling_commit: entry.tooling_commit.into(),
         };
         validate_release_manifest(entry, &repo, &manifest).unwrap();
 

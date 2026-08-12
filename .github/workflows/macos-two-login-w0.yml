@@ -7,12 +7,12 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: c05d9519b97dc74cf49fb293daf374f8db30c7af
+        default: 616edfff92d5f97696221ae0888b6635b30a99df
       signer_ref:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: 3571bf4dc70919d56e3c3d0d47f005b833960306
+        default: 1a1d52376919fff4cb295207e67c54dff60c745d
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -34,11 +34,11 @@ on:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: c05d9519b97dc74cf49fb293daf374f8db30c7af
+        default: 616edfff92d5f97696221ae0888b6635b30a99df
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: 3571bf4dc70919d56e3c3d0d47f005b833960306
+        default: 1a1d52376919fff4cb295207e67c54dff60c745d
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -69,17 +69,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: bloom
+      - name: Reject mutable sibling refs
+        shell: bash
+        env:
+          BROKER_REF: ${{ inputs.broker_ref || '616edfff92d5f97696221ae0888b6635b30a99df' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
+        run: |
+          [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
       - name: Check out Broker
         uses: actions/checkout@v4
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || 'c05d9519b97dc74cf49fb293daf374f8db30c7af' }}
+          ref: ${{ inputs.broker_ref || '616edfff92d5f97696221ae0888b6635b30a99df' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@v4
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || '3571bf4dc70919d56e3c3d0d47f005b833960306' }}
+          ref: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
           path: bloom-signer
       - uses: dtolnay/rust-toolchain@stable
 
@@ -90,7 +98,8 @@ jobs:
           for manifest_and_package in \
             "bloom/Cargo.toml bloom" \
             "bloom-broker/Cargo.toml bloom-broker" \
-            "bloom-signer/Cargo.toml bloom-signer"
+            "bloom-signer/Cargo.toml bloom-signer" \
+            "bloom-signer/Cargo.toml bloom-signer-migrate"
           do
             manifest="${manifest_and_package%% *}"
             package="${manifest_and_package#* }"
@@ -126,6 +135,8 @@ jobs:
           for name in baseline candidate failing; do
             cp "$RUNNER_TEMP/candidate-target/release/bloom-signer" \
               "$RUNNER_TEMP/$name-staging/bin/bloom-signer"
+            cp "$RUNNER_TEMP/candidate-target/release/bloom-signer-migrate" \
+              "$RUNNER_TEMP/$name-staging/bin/bloom-signer-migrate"
           done
           printf '%s\n' bloom-valid-digest-distinct-baseline-v1 \
             > "$RUNNER_TEMP/baseline-staging/W0_BASELINE_VARIANT"

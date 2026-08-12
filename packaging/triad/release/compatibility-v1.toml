@@ -1,5 +1,23 @@
 schema = "bloom.triad-compatibility/1"
 
+[revisions]
+broker_commit = "616edfff92d5f97696221ae0888b6635b30a99df"
+signer_commit = "1a1d52376919fff4cb295207e67c54dff60c745d"
+service_runtime_commit = "2e402f03814166406ea6489b60422b0865d1f6c2"
+petal_contract_commit = "25c89810ecc79481b11a8a4460dfd7b9aa8473fa"
+
+[state.machine]
+current = 1
+downgrade_floor = 1
+
+[state.broker]
+current = 1
+downgrade_floor = 1
+
+[state.signer]
+current = 1
+downgrade_floor = 1
+
 [protocols.machine_broker]
 major = 1
 minor_min = 3

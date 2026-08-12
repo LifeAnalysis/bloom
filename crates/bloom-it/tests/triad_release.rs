@@ -49,6 +49,44 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     assert!(verifier.contains("for authority_edge in machine_broker broker_signer"));
     assert!(verifier.contains("for support_edge in signer_control session"));
     assert!(verifier.contains("must not declare a global protocol range"));
+
+    for revision in [
+        "broker_commit",
+        "signer_commit",
+        "service_runtime_commit",
+        "petal_contract_commit",
+    ] {
+        assert!(compatibility.contains(&format!("{revision} = \"")));
+    }
+    for component in ["machine", "broker", "signer"] {
+        assert!(compatibility.contains(&format!("[state.{component}]")));
+        assert!(compatibility.contains("downgrade_floor = 1"));
+    }
+}
+
+#[test]
+fn external_triad_dependencies_are_full_commit_pins() {
+    let output = Command::new(release_script("check-external-pins.py"))
+        .arg(workspace().join("Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn default_petal_catalog_pins_artifacts_and_excludes_incompatible_defaults() {
+    let output = Command::new(release_script("check-default-petal-releases.py"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -137,6 +175,11 @@ fn make_staging(root: &Path) -> PathBuf {
 
 fn make_installer_payload(root: &Path) -> PathBuf {
     let payload = make_staging(root);
+    fs::copy(
+        release_script("compatibility-v1.toml"),
+        payload.join("compatibility-v1.toml"),
+    )
+    .unwrap();
     let macos = workspace().join("packaging/triad/macos");
     for relative in ["launchagents", "launchdaemons", "pf"] {
         let destination = payload.join("installer/macos").join(relative);
@@ -366,6 +409,10 @@ fn triad_developer_launcher_keeps_explicit_mounts_fail_closed() {
         "a requested mount must fail with an actionable VFS-only fallback"
     );
     assert!(
+        !launcher.contains("command ls \"$mount_dir\""),
+        "mount readiness must not issue an unbounded filesystem operation"
+    );
+    assert!(
         launcher.contains("[ \"$attempts\" -lt 300 ] || {\n      if [ \"$label\" = machine ] && [ -n \"$mount_dir\" ]; then")
             && launcher.contains("die \"$label did not publish its socket\""),
         "a Machine socket timeout must retain the explicit-mount fallback hint"
@@ -436,8 +483,8 @@ fn triad_developer_launcher_owns_only_its_service_processes() {
 fn serve_starts_audited_projection_refresh_after_fallible_setup() {
     let source = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
     let serve = source
-        .split("Cmd::Serve {")
-        .nth(1)
+        .rsplit("Cmd::Serve {")
+        .next()
         .expect("serve command arm");
     let mount = serve.find("let mount_handle = mount_bloom").unwrap();
     let endpoint = serve
@@ -743,6 +790,15 @@ fn macos_subject(payload: &Path) -> std::process::Output {
 }
 
 fn stage_macos_install(installer: &Path, root: &Path, payload: &Path) -> std::process::Output {
+    stage_macos_install_digest(installer, root, payload, &"11".repeat(32))
+}
+
+fn stage_macos_install_digest(
+    installer: &Path,
+    root: &Path,
+    payload: &Path,
+    digest: &str,
+) -> std::process::Output {
     Command::new(installer)
         .args(["install"])
         .arg(root)
@@ -756,7 +812,7 @@ fn stage_macos_install(installer: &Path, root: &Path, payload: &Path) -> std::pr
         .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260501")
         .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260502")
         .env("BLOOM_MACOS_REVOKE_GID", "260503")
-        .env("BLOOM_RELEASE_DIGEST", "11".repeat(32))
+        .env("BLOOM_RELEASE_DIGEST", digest)
         .output()
         .unwrap()
 }
@@ -1085,6 +1141,20 @@ fn bundle_rejects_a_service_outside_the_current_only_matrix() {
     let key = directory.path().join("release-key.pem");
     generate_ed25519_key(&key);
     let built = build(&staging, &directory.path().join("old-signer.tar.gz"), &key);
+    assert!(!built.status.success());
+    assert!(String::from_utf8_lossy(&built.stderr).contains("compatibility matrix"));
+
+    let staging = make_staging(&directory.path().join("migration-skew"));
+    fs::write(
+        staging.join("bin/bloom-signer-migrate"),
+        b"#!/bin/sh\necho bloom-signer-migrate 0.0.9\n",
+    )
+    .unwrap();
+    let built = build(
+        &staging,
+        &directory.path().join("old-migration-tool.tar.gz"),
+        &key,
+    );
     assert!(!built.status.success());
     assert!(String::from_utf8_lossy(&built.stderr).contains("compatibility matrix"));
 }
@@ -1442,9 +1512,8 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     assert!(!broker_plist.exists());
     assert!(!signer_plist.exists());
     assert!(
-        root.join("usr/local/libexec/bloom/current/bloom-broker")
-            .exists(),
-        "per-login uninstall must not remove the shared release"
+        !root.join("usr/local/libexec/bloom").exists(),
+        "the last permanent purge must remove the unreferenced shared release"
     );
 }
 
@@ -1454,6 +1523,193 @@ fn macos_installer_creates_enrollment_workspace_with_private_modes() {
     assert!(
         installer.contains(r#"mkdir -m 0700 "$templates" "$material""#),
         "macOS enrollment generation directories must not inherit a permissive umask"
+    );
+}
+
+#[test]
+fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrade() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let baseline = make_installer_payload(&directory.path().join("baseline"));
+    let candidate = make_installer_payload(&directory.path().join("candidate"));
+    let installer = release_script("install-macos.sh");
+    let old_digest = "11".repeat(32);
+    let new_digest = "22".repeat(32);
+    assert!(
+        stage_macos_install_digest(&installer, &root, &baseline, &old_digest)
+            .status
+            .success()
+    );
+    let identity =
+        root.join("Library/Application Support/BloomTriad/config/501/signer/identity.json");
+    let identity_before = fs::read(&identity).unwrap();
+
+    let upgraded = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
+    assert!(
+        upgraded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgraded.stderr)
+    );
+    assert_eq!(
+        fs::read_link(root.join("usr/local/libexec/bloom/current")).unwrap(),
+        Path::new("releases").join(&new_digest)
+    );
+    assert_eq!(fs::read(&identity).unwrap(), identity_before);
+    assert!(
+        stage_macos_install_digest(&installer, &root, &candidate, &new_digest)
+            .status
+            .success(),
+        "same-digest repair must be idempotent"
+    );
+
+    let retained = Command::new(&installer)
+        .args(["uninstall", "--retain-custody"])
+        .arg(&root)
+        .arg("501")
+        .output()
+        .unwrap();
+    assert!(
+        retained.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retained.stderr)
+    );
+    assert!(
+        !root
+            .join("Library/Application Support/BloomTriad/enrollments/501.json")
+            .exists()
+    );
+    assert!(
+        root.join("Library/Application Support/BloomTriad/retained/501.json")
+            .is_file()
+    );
+    assert_eq!(fs::read(&identity).unwrap(), identity_before);
+
+    let restored = Command::new(&installer)
+        .args(["restore"])
+        .arg(&root)
+        .args(["501", "alice"])
+        .arg(&candidate)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_MACOS_BROKER_UID", "250501")
+        .env("BLOOM_MACOS_SIGNER_UID", "250502")
+        .env("BLOOM_MACOS_BROKER_GID", "260499")
+        .env("BLOOM_MACOS_SIGNER_GID", "260500")
+        .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260501")
+        .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260502")
+        .env("BLOOM_MACOS_REVOKE_GID", "260503")
+        .env("BLOOM_RELEASE_DIGEST", &new_digest)
+        .output()
+        .unwrap();
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert_eq!(fs::read(&identity).unwrap(), identity_before);
+
+    fs::write(
+        root.join("Library/Application Support/BloomTriad/state-schema"),
+        b"machine=2\nbroker=1\nsigner=1\n",
+    )
+    .unwrap();
+    let downgrade = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
+    assert!(!downgrade.status.success());
+    assert!(String::from_utf8_lossy(&downgrade.stderr).contains("downgrade rejected"));
+    assert_eq!(fs::read(&identity).unwrap(), identity_before);
+
+    fs::write(
+        root.join("Library/Application Support/BloomTriad/state-schema"),
+        b"machine=1\nbroker=1\nsigner=1\n",
+    )
+    .unwrap();
+    fs::write(
+        candidate.join("compatibility-v1.toml"),
+        b"malformed = true\n",
+    )
+    .unwrap();
+    let malformed = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
+    assert!(!malformed.status.success());
+    assert!(String::from_utf8_lossy(&malformed.stderr).contains("compatibility metadata"));
+    assert_eq!(fs::read(&identity).unwrap(), identity_before);
+}
+
+#[test]
+fn macos_restore_cannot_downgrade_the_release_shared_by_an_active_login() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let baseline = make_installer_payload(&directory.path().join("baseline"));
+    let candidate = make_installer_payload(&directory.path().join("candidate"));
+    let installer = release_script("install-macos.sh");
+    let old_digest = "11".repeat(32);
+    let new_digest = "22".repeat(32);
+    assert!(
+        stage_macos_install_digest(&installer, &root, &baseline, &old_digest)
+            .status
+            .success()
+    );
+    assert!(
+        Command::new(&installer)
+            .args(["uninstall", "--retain-custody"])
+            .arg(&root)
+            .arg("501")
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let second = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["502", "bob"])
+        .arg(&candidate)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_MACOS_BROKER_UID", "250511")
+        .env("BLOOM_MACOS_SIGNER_UID", "250512")
+        .env("BLOOM_MACOS_BROKER_GID", "260509")
+        .env("BLOOM_MACOS_SIGNER_GID", "260510")
+        .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260511")
+        .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260512")
+        .env("BLOOM_MACOS_REVOKE_GID", "260513")
+        .env("BLOOM_RELEASE_DIGEST", &new_digest)
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let rejected = Command::new(&installer)
+        .args(["restore"])
+        .arg(&root)
+        .args(["501", "alice"])
+        .arg(&baseline)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_MACOS_BROKER_UID", "250501")
+        .env("BLOOM_MACOS_SIGNER_UID", "250502")
+        .env("BLOOM_MACOS_BROKER_GID", "260499")
+        .env("BLOOM_MACOS_SIGNER_GID", "260500")
+        .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260501")
+        .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260502")
+        .env("BLOOM_MACOS_REVOKE_GID", "260503")
+        .env("BLOOM_RELEASE_DIGEST", &old_digest)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("restore cannot change the shared release used by active enrollments")
+    );
+    assert!(
+        root.join("Library/Application Support/BloomTriad/retained/501.json")
+            .is_file()
+    );
+    assert!(
+        !root
+            .join("Library/Application Support/BloomTriad/enrollments/501.json")
+            .exists()
     );
 }
 

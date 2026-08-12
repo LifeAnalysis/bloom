@@ -502,6 +502,8 @@ impl MachineBrokerClient {
             None => unique_key_for_suite(&wallet.key_refs, request.crypto_suite)?,
         };
         let payload_digest = Digest32::from_bytes(Sha256::digest(&request.preimage).into());
+        let claim_payload_digest =
+            petal_batch_payload_digest(std::slice::from_ref(&request.preimage));
         let ordered_hash = suite_hash(request.crypto_suite, &request.preimage);
         let ProvenanceSubject::Petal {
             package_hash,
@@ -518,7 +520,7 @@ impl MachineBrokerClient {
             || &request.claim.route != route
             || request.claim.operation_class != request.operation_class
             || request.claim.crypto_suite != request.crypto_suite
-            || request.claim.payload_digest != payload_digest
+            || request.claim.payload_digest != claim_payload_digest
             || request.claim.ordered_hashes != [ordered_hash.clone()]
         {
             return Err(ProtocolError::new(
@@ -2624,6 +2626,7 @@ mod tests {
         let client = MachineBrokerClient::new(broker.clone());
         let payload = b"exact final bytes".to_vec();
         let payload_digest = Digest32::from_bytes(Sha256::digest(&payload).into());
+        let claim_payload_digest = petal_batch_payload_digest(std::slice::from_ref(&payload));
         let request = TrustedPetalSignRequest {
             wallet_id: token("wallet"),
             preimage: payload.clone(),
@@ -2636,7 +2639,7 @@ mod tests {
                 route: "orders/place".into(),
                 operation_class: token("order.place"),
                 crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
-                payload_digest: payload_digest.clone(),
+                payload_digest: claim_payload_digest,
                 ordered_hashes: vec![payload_digest],
                 declared_debits: vec![],
                 declared_destinations: vec![],
@@ -2692,6 +2695,7 @@ mod tests {
         let client = MachineBrokerClient::new(broker.clone());
         let payload = b"delegated petal action".to_vec();
         let payload_digest = Digest32::from_bytes(Sha256::digest(&payload).into());
+        let claim_payload_digest = petal_batch_payload_digest(std::slice::from_ref(&payload));
         let mut delegated_key_ref = key_ref();
         delegated_key_ref.locator = "wallet/delegated/1".into();
         let request = TrustedPetalSignRequest {
@@ -2706,7 +2710,7 @@ mod tests {
                 route: "orders/cancel".into(),
                 operation_class: token("order.cancel"),
                 crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
-                payload_digest: payload_digest.clone(),
+                payload_digest: claim_payload_digest,
                 ordered_hashes: vec![payload_digest],
                 declared_debits: vec![],
                 declared_destinations: vec![],
@@ -3360,6 +3364,7 @@ mod tests {
         });
         let payload = b"payload".to_vec();
         let hash = Digest32::from_bytes(Sha256::digest(&payload).into());
+        let claim_payload_digest = petal_batch_payload_digest(std::slice::from_ref(&payload));
         let error = MachineBrokerClient::new(broker)
             .sign_petal_payload(TrustedPetalSignRequest {
                 wallet_id: token("wallet"),
@@ -3373,7 +3378,7 @@ mod tests {
                     route: "orders/place".into(),
                     operation_class: token("order.place"),
                     crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
-                    payload_digest: hash.clone(),
+                    payload_digest: claim_payload_digest,
                     ordered_hashes: vec![hash],
                     declared_debits: vec![],
                     declared_destinations: vec![],
