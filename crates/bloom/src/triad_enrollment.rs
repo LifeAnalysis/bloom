@@ -159,6 +159,7 @@ fn enroll_developer_petal_provenance(
                 operation_class: Token::new(intent.to_owned())?,
                 fee_asset: None,
             }],
+            petal_lineage: None,
             installer_key_id: installer_key_id.clone(),
             installer_signature: Base64UrlBytes::from_bytes(&[]),
         });
@@ -179,14 +180,14 @@ fn enroll_developer_petal_provenance(
             ProvenanceSubject::Petal { package_hash: existing, .. } if existing == &package_hash
         )
     });
-    for record in &mut additions {
+    catalog.records.extend(additions);
+    for record in &mut catalog.records {
         let mut message = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
         message.extend_from_slice(&record.unsigned_canonical_bytes()?);
         record.installer_signature =
             Base64UrlBytes::from_bytes(&signing_key.sign(&message).to_bytes());
         message.zeroize();
     }
-    catalog.records.extend(additions);
     catalog.records.sort_by_key(|record| {
         serde_jcs::to_vec(&record.subject).expect("provenance subject is serializable")
     });
