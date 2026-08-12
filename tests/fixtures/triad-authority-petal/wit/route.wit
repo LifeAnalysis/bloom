@@ -5,7 +5,7 @@ world route-file {
 
   import bloom:store/kv@0.1.0;
   import bloom:key/derive@0.1.0;
-  import bloom:sign/signing@0.3.0;
+  import bloom:sign/signing@0.2.0;
 
   export metadata: func(ctx: ctx) -> result<route-meta, route-error>;
   export lookup: func(ctx: ctx) -> result<entry, route-error>;

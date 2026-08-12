@@ -37,7 +37,7 @@ projects it read-only at mounted `petal-key-requests/`. The ceremony URL and
 expiry are owner-readable only while pending and are never returned to the
 guest. Completion clears the URL from the persisted projection.
 
-Versioned `bloom:sign/signing@0.3.0` accepts an optional RFC 8785 canonical
+Versioned `bloom:sign/signing@0.2.0` accepts an optional RFC 8785 canonical
 public `KeyRef` and a closed `exact` or `reusable` selector choice, then routes
 it through the existing payload-bearing `signing.sign` path. Exact mode
 requires an explicit key, binds the choice into the operation identity, and

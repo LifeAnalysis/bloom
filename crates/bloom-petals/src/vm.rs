@@ -820,19 +820,7 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
     {
         let mut sign = linker.instance("bloom:sign/signing@0.2.0")?;
         sign.func_new_async("sign-payload", |store, params, results| {
-            Box::new(async move { component_sign_payload(store, params, results).await })
-        })?;
-    }
-    {
-        let mut sign = linker.instance("bloom:sign/signing@0.3.0")?;
-        sign.func_new_async("sign-payload", |store, params, results| {
-            Box::new(async move { component_sign_payload_scoped(store, params, results).await })
-        })?;
-    }
-    {
-        let mut sign = linker.instance("bloom:sign/signing@0.4.0")?;
-        sign.func_new_async("sign-payload", |store, params, results| {
-            Box::new(async move { component_sign_payload_v4(store, params, results).await })
+            Box::new(async move { component_sign_payload_current(store, params, results).await })
         })?;
         sign.func_new_async("sign-payload-batch", |store, params, results| {
             Box::new(async move { component_sign_payload_batch(store, params, results).await })
@@ -1269,6 +1257,7 @@ async fn component_sign_hash(
     set_component_result(results, component_host_err(legacy_signing_unsupported()))
 }
 
+#[cfg(test)]
 async fn component_sign_payload(
     store: StoreContextMut<'_, StoreData>,
     params: &[ComponentVal],
@@ -1277,6 +1266,7 @@ async fn component_sign_payload(
     component_sign_payload_versioned(store, params, results, false, false).await
 }
 
+#[cfg(test)]
 async fn component_sign_payload_scoped(
     store: StoreContextMut<'_, StoreData>,
     params: &[ComponentVal],
@@ -1285,7 +1275,7 @@ async fn component_sign_payload_scoped(
     component_sign_payload_versioned(store, params, results, true, false).await
 }
 
-async fn component_sign_payload_v4(
+async fn component_sign_payload_current(
     store: StoreContextMut<'_, StoreData>,
     params: &[ComponentVal],
     results: &mut [ComponentVal],
@@ -1571,7 +1561,7 @@ fn component_payload_sign_record(
             }
             ComponentVal::Enum(value) => {
                 return Err(HostError::Invalid(format!(
-                    "unknown bloom:sign/signing@0.3.0 selector {value:?}"
+                    "unknown bloom:sign/signing@0.2.0 selector {value:?}"
                 )));
             }
             other => {
@@ -2898,7 +2888,7 @@ mod tests {
         ])
     }
 
-    fn component_v4_payload_request() -> ComponentVal {
+    fn component_current_payload_request() -> ComponentVal {
         let mut request = component_scoped_payload_request("primary", 3, "orders.place", None);
         let ComponentVal::Record(fields) = &mut request else {
             unreachable!();
@@ -3896,10 +3886,10 @@ paths = ["/status"]
         assert!(host.petal_key_calls.lock().is_empty());
 
         let request = serde_json::to_vec(&serde_json::json!({
-            "request_id": "agent-a",
             "wallet_id": "primary",
-            "purpose": "exchange-agent",
-            "agent_id": "desk-a",
+            "key_slot": "desk-a",
+            "allowed_routes": ["r000007"],
+            "allowed_operation_classes": ["order.place"],
             "allowed_crypto_suites": ["secp256k1-keccak256-recoverable"],
             "maximum_lifetime_ms": 60_000
         }))
@@ -3942,12 +3932,11 @@ paths = ["/status"]
                   (type $bytes (list u8))
                   (type $approval (record
                     (field "action-id" string)
-                    (field "ceremony-url" string)
                     (field "expires-ms" u64)))
-                  (export "approval-required" (type $approval-export (eq $approval)))
+                  (export "approval-pending" (type $approval-export (eq $approval)))
                   (type $sign-result (variant
                     (case "signature" $bytes)
-                    (case "approval-required" $approval-export)))
+                    (case "approval-pending" $approval-export)))
                   (export "sign-result" (type $sign-result-export (eq $sign-result)))
                   (type $maybe-bytes (option $bytes))
                   (type $maybe-string (option string))
@@ -3971,7 +3960,7 @@ paths = ["/status"]
                   (type $sign-func
                     (func (param "request" $payload-export) (result $outcome)))
                   (export "sign-payload" (func (type $sign-func)))))
-              (import "bloom:sign/signing@0.3.0"
+              (import "bloom:sign/signing@0.2.0"
                 (instance $sign (type $sign-interface)))
 
               ;; Canonical ABI forwarding module: its exported functions execute
@@ -4116,9 +4105,10 @@ paths = ["/status"]
 
         let derive = instance.get_func(&mut store, "derive").unwrap();
         let request = serde_json::to_vec(&serde_json::json!({
-            "request_id": "fixture",
             "wallet_id": "primary",
-            "purpose": "petal-agent",
+            "key_slot": "fixture",
+            "allowed_routes": ["r000001"],
+            "allowed_operation_classes": ["order.place"],
             "allowed_crypto_suites": ["secp256k1-keccak256-recoverable"],
             "maximum_lifetime_ms": 60_000
         }))
@@ -4153,18 +4143,19 @@ paths = ["/status"]
 
         let sign = instance.get_func(&mut store, "sign-payload").unwrap();
         let mut signed = vec![ComponentVal::Bool(false)];
-        sign.call_async(
-            &mut store,
-            &[component_scoped_payload_request(
-                "primary",
-                7,
-                "order.place",
-                Some(key_ref_jcs),
-            )],
-            &mut signed,
-        )
-        .await
-        .unwrap();
+        let mut sign_request =
+            component_scoped_payload_request("primary", 7, "order.place", Some(key_ref_jcs));
+        let ComponentVal::Record(fields) = &mut sign_request else {
+            unreachable!();
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name == "petal-use-claim-jcs")
+            .unwrap()
+            .1 = component_bytes(canonical_test_claim());
+        sign.call_async(&mut store, &[sign_request], &mut signed)
+            .await
+            .unwrap();
         sign.post_return_async(&mut store).await.unwrap();
         assert_component_ok_signature(&signed[0], &[7; 65]);
         assert_eq!(host.sign_calls.lock()[0].key_ref.as_ref(), Some(&key_ref));
@@ -4296,18 +4287,18 @@ paths = ["/status"]
     }
 
     #[tokio::test]
-    async fn component_v4_pending_projection_never_exposes_ceremony_url() {
+    async fn component_v2_pending_projection_never_exposes_ceremony_url() {
         let host = Arc::new(MockHost::default());
         *host.sign_outcome.lock() =
             Some(SignOutcome::ApprovalPending(crate::abi::ApprovalPending {
-                action_id: "action-v4".into(),
+                action_id: "action-v2".into(),
                 expires_ms: 444,
             }));
         let mut store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
         let mut result = vec![ComponentVal::Bool(false)];
-        component_sign_payload_v4(
+        component_sign_payload_current(
             store.as_context_mut(),
-            &[component_v4_payload_request()],
+            &[component_current_payload_request()],
             &mut result,
         )
         .await
@@ -4326,14 +4317,14 @@ paths = ["/status"]
         assert_eq!(
             fields,
             &vec![
-                ("action-id".into(), ComponentVal::String("action-v4".into())),
+                ("action-id".into(), ComponentVal::String("action-v2".into())),
                 ("expires-ms".into(), ComponentVal::U64(444)),
             ]
         );
     }
 
     #[tokio::test]
-    async fn component_v4_batch_is_bounded_validated_and_preserves_order_and_context() {
+    async fn component_v2_batch_is_bounded_validated_and_preserves_order_and_context() {
         let host = Arc::new(MockHost::default());
         let mut store =
             component_test_store(BTreeSet::from([Capability::Sign]), None, host.clone());

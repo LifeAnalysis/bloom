@@ -61,7 +61,7 @@ Supported component imports map to manifest capabilities as follows:
 |---|---|
 | `bloom:http/fetch@0.1.0` | `bloom:http` plus `[[net.allow]]` |
 | `bloom:store/kv@0.1.0` | `bloom:store` plus `[store]` namespaces |
-| `bloom:sign/signing@0.3.0` | `bloom:sign` plus `[sign].allowed_intents`; exact payload and optional Signer-owned Petal KeyRef selector |
+| `bloom:sign/signing@0.2.0` | `bloom:sign` plus `[sign].allowed_intents`; exact payload, optional Signer-owned Petal KeyRef selector, and atomic ordered batches |
 | `bloom:tx/outbox@0.1.0` | `bloom:tx.outbox` |
 | `bloom:chain/read@0.1.0` | `bloom:chain` |
 | `bloom:vfs/readwrite@0.1.0` | `bloom:vfs.read` and/or `bloom:vfs.write`, according to used exports |

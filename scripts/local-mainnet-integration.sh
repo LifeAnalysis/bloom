@@ -493,7 +493,7 @@ if [ "$live" -eq 0 ] || [ "$execute_pm" -eq 1 ]; then
   vls_names "/petals/polymarket/trade" >/dev/null
   printf 'Polymarket Petal: mounted and route contract loaded\n'
   pm_triad_compatible="$(printf '%s' "$route_contract" | jq -r '
-    [.. | strings] | any(contains("bloom:sign/signing@0.4.0"))
+    [.. | strings] | any(contains("bloom:sign/signing@0.2.0"))
   ')"
   if [ "$pm_triad_compatible" != "true" ]; then
     printf 'Polymarket Petal: read-only preflight only; local package lacks production triad payload signing\n'

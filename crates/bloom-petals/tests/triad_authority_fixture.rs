@@ -178,7 +178,7 @@ fn fixture_is_an_installable_package_with_only_scoped_authority_imports() {
     assert_eq!(package.name, "triad-authority-fixture");
     assert_eq!(
         package.hash,
-        "2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
+        "09541c75b959a907e643f75a21af175fa1ed3692e323de4278983b1ee9720a58"
     );
     assert_eq!(package.route_index.routes.len(), 1);
     assert_eq!(package.route_index.routes[0].pattern, "session.json");
@@ -188,7 +188,7 @@ fn fixture_is_an_installable_package_with_only_scoped_authority_imports() {
     .unwrap();
     let text = String::from_utf8_lossy(&component);
     assert!(text.contains("bloom:key/derive@0.1.0"));
-    assert!(text.contains("bloom:sign/signing@0.3.0"));
+    assert!(text.contains("bloom:sign/signing@0.2.0"));
     assert!(!text.contains("bloom:sign/signing@0.1.0"));
     assert!(!text.contains("sign-hash"));
 }

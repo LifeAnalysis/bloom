@@ -51,23 +51,21 @@ pub struct PayloadSignRequest {
     pub approval_hint: Option<String>,
     pub action: Option<Vec<u8>>,
     pub advisory: Option<Vec<u8>>,
-    /// v0.2 always supplies `Reusable`; v0.3 requires the guest to choose an
-    /// exact or reusable approval selector explicitly.
+    /// The guest chooses an exact or reusable approval selector explicitly.
     pub selector: bloom_broker_api::PetalSignSelector,
-    /// Explicit Signer-owned sub-key selected by the v0.3 interface. The
-    /// v0.2 interface always leaves this absent and retains root-key behavior.
+    /// Optional explicit Signer-owned sub-key selected by the current interface.
     pub key_ref: Option<bloom_broker_api::KeyRef>,
     pub context: Option<PetalRouteContext>,
 }
 
-/// One exact payload in an atomic v0.4 signing batch.
+/// One exact payload in an atomic v0.2 signing batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayloadSignItem {
     pub preimage: Vec<u8>,
     pub claimed_hash: [u8; 32],
 }
 
-/// Payload-bearing atomic batch used by `bloom:sign/signing@0.4.0`.
+/// Payload-bearing atomic batch used by `bloom:sign/signing@0.2.0`.
 ///
 /// All authority and policy fields apply to the complete ordered payload set;
 /// the host must return either one signature per item, in the same order, or a
@@ -105,7 +103,7 @@ pub struct ApprovalRequired {
     pub expires_ms: u64,
 }
 
-/// Safe component-visible pending state used by signing v0.4.
+/// Safe component-visible pending state used by signing v0.2.
 ///
 /// Ceremony URLs remain owner-only and are deliberately absent from this
 /// projection.

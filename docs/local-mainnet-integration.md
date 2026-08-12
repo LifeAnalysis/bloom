@@ -223,7 +223,7 @@ refuses unavailable markets, incomplete onboarding, insufficient funding, or
 policy failures before its order-specific passkey ceremony or submission.
 
 The harness installs the migrated local package into its disposable Machine
-overlay and requires production payload signing `bloom:sign/signing@0.4.0`.
+overlay and requires production payload signing `bloom:sign/signing@0.2.0`.
 It does not install, patch, or advertise the old hash-signing release.
 
 ## 2. Run bounded mainnet submissions

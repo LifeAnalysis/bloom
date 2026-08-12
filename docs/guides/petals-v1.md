@@ -17,7 +17,7 @@ the full `route-file` world: `metadata`, `lookup`, `list`, `read`, and `write`.
 Unsupported operations should return `route-error.unsupported`. Component routes
 can call mediated `bloom:http/fetch@0.1.0`, `bloom:store/kv@0.1.0`, and
 `bloom:vfs/readwrite@0.1.0`, and payload-bearing
-`bloom:sign/signing@0.3.0` imports when the package manifest grants the
+`bloom:sign/signing@0.2.0` imports when the package manifest grants the
 matching capability. The retired `@0.1.0` hash-only signing import always
 fails closed. Signing routes must also declare `[sign].allowed_intents`, and
 runtime host calls are denied unless the requested intent is in that

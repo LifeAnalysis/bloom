@@ -105,9 +105,10 @@ impl Guest for Fixture {
         validate_request(&request)?;
 
         let derive_request = serde_json::to_vec(&json!({
-            "request_id": request.request_id,
             "wallet_id": request.wallet_id,
-            "purpose": request.purpose,
+            "key_slot": request.request_id,
+            "allowed_routes": [ROUTE_ID],
+            "allowed_operation_classes": [OPERATION_CLASS],
             "allowed_crypto_suites": [CRYPTO_SUITE],
             "maximum_lifetime_ms": request.maximum_lifetime_ms
         }))
@@ -188,13 +189,12 @@ impl Guest for Fixture {
                 "public_key": public_key,
                 "signature_hex": hex::encode(signature)
             })),
-            SignResult::ApprovalRequired(approval) => store_json(&json!({
+            SignResult::ApprovalPending(approval) => store_json(&json!({
                 "schema": "bloom.triad-authority-fixture.result.v1",
                 "stage": "signing",
                 "public_key": public_key,
-                "approval_required": {
+                "approval_pending": {
                     "action_id": approval.action_id,
-                    "ceremony_url": approval.ceremony_url,
                     "expires_ms": approval.expires_ms
                 }
             })),

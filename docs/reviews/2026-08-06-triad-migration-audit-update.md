@@ -52,16 +52,16 @@ There is also one low-severity contract pin drift and one AWS multi-key concern 
 
 ### Low — Bloom remains pinned to the obsolete Petal contract revision
 
-- **User-visible symptom:** `bloom petals build` reports the WIT digest from the old hash-signing contract even when validating a v0.4 payload-signing component.
+- **User-visible symptom:** `bloom petals build` reported the WIT digest from the old hash-signing contract even when validating the then-numbered v0.4 payload-signing component (renumbered to v0.2 before release).
 - **Previously working behavior:** Bloom and the canonical Petal SDK used the same contract revision and therefore reported the same WIT tree.
-- **Exact triad change that caused or exposed it:** Petal moved its canonical WIT to `bloom:sign/signing@0.4.0`, but Bloom added host support manually without updating its `bloom-petal-contract` pin.
+- **Exact triad change that caused or exposed it:** Petal moved its canonical WIT to the then-numbered `bloom:sign/signing@0.4.0` (renumbered to `@0.2.0` before release), but Bloom added host support manually without updating its `bloom-petal-contract` pin.
 - **End-to-end call path:** `bloom petals build` → `bloom_petals::package::contract_wit_digest()` → pinned `bloom-petal-contract` commit `4f6fb57` → obsolete WIT digest.
 - **Concrete file and line references:**
   - Bloom still pins Petal commit `4f6fb57`: `Cargo.toml:123`.
   - The build command prints that dependency’s digest: `crates/bloom/src/main.rs:2535`.
-  - The current Petal contract declares signing v0.4 and key derivation: `../petal/src/lib.rs:8`.
-  - Its current WIT is the approval-safe payload/batch interface: `../petal/wit/route/deps/sign-v0.4/sign.wit:1`.
-- **Why existing tests failed to catch it:** Bloom’s host-shape tests validate its hand-written v0.4 parser/linker, not that `contract_wit_digest()` comes from the same revision as public SDK consumers.
+  - The current Petal contract declares signing v0.2 and key derivation: `../petal/src/lib.rs`.
+  - Its current WIT is the approval-safe payload/batch interface: `../petal/wit/route/deps/sign-v0.2/sign.wit`.
+- **Why existing tests failed to catch it:** Bloom’s host-shape tests validated its hand-written then-numbered v0.4 parser/linker (renumbered to v0.2 before release), not that `contract_wit_digest()` came from the same revision as public SDK consumers.
 - **Smallest appropriate fix:** Update Bloom’s Petal contract pin and lockfile to `42bd25589ff721ce14f43f21e9eaf702bfbc42e5`.
 - **Focused regression test:** Assert Bloom’s reported contract digest and signing interface equal those from the SDK revision used to build Hyperliquid and Polymarket.
 
@@ -86,7 +86,7 @@ There is also one low-severity contract pin drift and one AWS multi-key concern 
 
 - Signer exposes explicit root/derived roles; Broker projects `root_key_ref`; Machine selects and verifies it rather than relying on key ordering.
 - Exact Petal signing now uses payload-bearing Broker/Signer requests, Machine-owned exact approval state, and owner-only ceremony URLs.
-- Petal SDK v0.4 provides scalar and atomic ordered-batch signing without exposing launch secrets.
+- Petal signing v0.2 provides scalar and atomic ordered-batch signing without exposing launch secrets.
 - Hyperliquid pins SDK `42bd255`, uses exact payload signing, and retains random application agent keys only in its private Petal store.
 - Polymarket pins the same SDK, uses atomic payload batches, validates returned signatures, and keeps venue settings in Petal-owned storage rather than interpreting Broker policy.
 - Hyperliquid and Polymarket are absent from production defaults until compatible releases exist. Current defaults are Near Intents and Enso.
@@ -104,7 +104,7 @@ Passed locally:
 - Hyperliquid: 19 tests.
 - Polymarket: 83 tests.
 - `bloom-service-runtime`: 54 tests.
-- Bloom v0.4 contract-shape and confidentiality tests.
+- Bloom’s complete signing contract-shape and confidentiality tests (then numbered v0.4, released as v0.2).
 - Bloom exact approval retry test.
 - Mounted registration handler test.
 - Triad authority fixture tests.

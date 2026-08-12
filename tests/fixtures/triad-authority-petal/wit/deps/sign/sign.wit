@@ -1,15 +1,14 @@
-package bloom:sign@0.3.0;
+package bloom:sign@0.2.0;
 
 interface signing {
-  record approval-required {
+  record approval-pending {
     action-id: string,
-    ceremony-url: string,
     expires-ms: u64,
   }
 
   variant sign-result {
     signature(list<u8>),
-    approval-required(approval-required),
+    approval-pending(approval-pending),
   }
 
   enum selector { exact, reusable }
@@ -29,5 +28,30 @@ interface signing {
     key-ref-jcs: option<list<u8>>,
   }
 
+  record payload-sign-item {
+    preimage: list<u8>,
+    claimed-hash: list<u8>,
+  }
+
+  record payload-batch-sign-request {
+    wallet: string,
+    payloads: list<payload-sign-item>,
+    signature-algorithm: string,
+    operation-class: string,
+    petal-use-claim-jcs: list<u8>,
+    claim-assurance-evidence: option<list<u8>>,
+    approval-hint: option<string>,
+    action: option<list<u8>>,
+    advisory: option<list<u8>>,
+    selector: selector,
+    key-ref-jcs: option<list<u8>>,
+  }
+
+  variant sign-batch-result {
+    signatures(list<list<u8>>),
+    approval-pending(approval-pending),
+  }
+
   sign-payload: func(request: payload-sign-request) -> result<sign-result, string>;
+  sign-payload-batch: func(request: payload-batch-sign-request) -> result<sign-batch-result, string>;
 }

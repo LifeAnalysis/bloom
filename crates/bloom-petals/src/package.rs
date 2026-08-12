@@ -2347,7 +2347,7 @@ fn component_route_type_import(name: &str) -> Option<&'static str> {
 fn component_import_caps(name: &str) -> Option<&'static [&'static str]> {
     if matches!(
         name,
-        "bloom:sign/signing@0.1.0" | "bloom:sign/signing@0.2.0" | "bloom:sign/signing@0.3.0"
+        "bloom:sign/signing@0.1.0" | "bloom:sign/signing@0.2.0"
     ) {
         return Some(&["bloom:sign"]);
     }
@@ -2363,8 +2363,6 @@ enum ComponentHostInterface {
     StoreKv,
     SignSigningV1,
     SignSigningV2,
-    SignSigningV3,
-    SignSigningV4,
     KeyDerive,
     TxOutbox,
     ChainRead,
@@ -2379,19 +2377,13 @@ fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
     if name == "bloom:sign/signing@0.2.0" {
         return Some(ComponentHostInterface::SignSigningV2);
     }
-    if name == "bloom:sign/signing@0.3.0" {
-        return Some(ComponentHostInterface::SignSigningV3);
-    }
-    if name == "bloom:sign/signing@0.4.0" {
-        return Some(ComponentHostInterface::SignSigningV4);
-    }
     if name == "bloom:key/derive@0.1.0" {
         return Some(ComponentHostInterface::KeyDerive);
     }
     match bloom_petal_contract::host_interface(name)? {
         ContractHostInterface::HttpFetch => Some(ComponentHostInterface::HttpFetch),
         ContractHostInterface::StoreKv => Some(ComponentHostInterface::StoreKv),
-        ContractHostInterface::SignSigning => Some(ComponentHostInterface::SignSigningV4),
+        ContractHostInterface::SignSigning => Some(ComponentHostInterface::SignSigningV2),
         ContractHostInterface::KeyDerive => Some(ComponentHostInterface::KeyDerive),
         ContractHostInterface::TxOutbox => Some(ComponentHostInterface::TxOutbox),
         ContractHostInterface::ChainRead => Some(ComponentHostInterface::ChainRead),
@@ -2629,7 +2621,6 @@ enum HostTypeExport {
     SignResultStructured,
     SafeSignResultStructured,
     SignRequestStructured,
-    PayloadSignRequestStructured,
     ScopedPayloadSignRequestStructured,
     PayloadSignItemStructured,
     PayloadBatchSignRequestStructured,
@@ -2649,8 +2640,6 @@ enum HostFuncExport {
     StoreDeleteIfValue,
     SignHashStructured,
     SignHashesStructured,
-    SignPayloadStructured,
-    ScopedSignPayloadStructured,
     SafeSignPayloadStructured,
     PayloadBatchSignStructured,
     PetalKeyRequest,
@@ -2779,49 +2768,34 @@ fn host_type_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
             Some(HostTypeExport::StagedTransaction)
         }
         (ComponentHostInterface::TxOutbox, "inspection") => Some(HostTypeExport::OutboxInspection),
-        (
-            ComponentHostInterface::SignSigningV1
-            | ComponentHostInterface::SignSigningV2
-            | ComponentHostInterface::SignSigningV3,
-            "approval-required",
-        ) => Some(HostTypeExport::SignApprovalRequired),
-        (
-            ComponentHostInterface::SignSigningV1
-            | ComponentHostInterface::SignSigningV2
-            | ComponentHostInterface::SignSigningV3,
-            "sign-result",
-        ) => Some(HostTypeExport::SignResultStructured),
-        (ComponentHostInterface::SignSigningV4, "approval-pending") => {
+        (ComponentHostInterface::SignSigningV1, "approval-required") => {
+            Some(HostTypeExport::SignApprovalRequired)
+        }
+        (ComponentHostInterface::SignSigningV1, "sign-result") => {
+            Some(HostTypeExport::SignResultStructured)
+        }
+        (ComponentHostInterface::SignSigningV2, "approval-pending") => {
             Some(HostTypeExport::SignApprovalPending)
         }
-        (ComponentHostInterface::SignSigningV4, "sign-result") => {
+        (ComponentHostInterface::SignSigningV2, "sign-result") => {
             Some(HostTypeExport::SafeSignResultStructured)
         }
         (ComponentHostInterface::SignSigningV1, "sign-request") => {
             Some(HostTypeExport::SignRequestStructured)
         }
         (ComponentHostInterface::SignSigningV2, "payload-sign-request") => {
-            Some(HostTypeExport::PayloadSignRequestStructured)
-        }
-        (ComponentHostInterface::SignSigningV3, "payload-sign-request") => {
             Some(HostTypeExport::ScopedPayloadSignRequestStructured)
         }
-        (ComponentHostInterface::SignSigningV3, "selector") => {
+        (ComponentHostInterface::SignSigningV2, "selector") => {
             Some(HostTypeExport::PetalSignSelector)
         }
-        (ComponentHostInterface::SignSigningV4, "payload-sign-request") => {
-            Some(HostTypeExport::ScopedPayloadSignRequestStructured)
-        }
-        (ComponentHostInterface::SignSigningV4, "payload-sign-item") => {
+        (ComponentHostInterface::SignSigningV2, "payload-sign-item") => {
             Some(HostTypeExport::PayloadSignItemStructured)
         }
-        (ComponentHostInterface::SignSigningV4, "payload-batch-sign-request") => {
+        (ComponentHostInterface::SignSigningV2, "payload-batch-sign-request") => {
             Some(HostTypeExport::PayloadBatchSignRequestStructured)
         }
-        (ComponentHostInterface::SignSigningV4, "selector") => {
-            Some(HostTypeExport::PetalSignSelector)
-        }
-        (ComponentHostInterface::SignSigningV4, "sign-batch-result") => {
+        (ComponentHostInterface::SignSigningV2, "sign-batch-result") => {
             Some(HostTypeExport::PayloadBatchSignResultStructured)
         }
         (ComponentHostInterface::SignSigningV1, "sign-batch-result") => {
@@ -2849,15 +2823,9 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
             Some(HostFuncExport::SignHashesStructured)
         }
         (ComponentHostInterface::SignSigningV2, "sign-payload") => {
-            Some(HostFuncExport::SignPayloadStructured)
-        }
-        (ComponentHostInterface::SignSigningV3, "sign-payload") => {
-            Some(HostFuncExport::ScopedSignPayloadStructured)
-        }
-        (ComponentHostInterface::SignSigningV4, "sign-payload") => {
             Some(HostFuncExport::SafeSignPayloadStructured)
         }
-        (ComponentHostInterface::SignSigningV4, "sign-payload-batch") => {
+        (ComponentHostInterface::SignSigningV2, "sign-payload-batch") => {
             Some(HostFuncExport::PayloadBatchSignStructured)
         }
         (ComponentHostInterface::KeyDerive, "request") => Some(HostFuncExport::PetalKeyRequest),
@@ -2900,9 +2868,6 @@ fn host_type_export_matches(
         HostTypeExport::SignResultStructured => is_sign_result_petal(&ty, types, 0),
         HostTypeExport::SafeSignResultStructured => is_safe_sign_result_petal(&ty, types, 0),
         HostTypeExport::SignRequestStructured => is_sign_request_petal(&ty, types, 0),
-        HostTypeExport::PayloadSignRequestStructured => {
-            is_payload_sign_request_petal(&ty, types, 0)
-        }
         HostTypeExport::ScopedPayloadSignRequestStructured => {
             is_scoped_payload_sign_request_petal(&ty, types, 0)
         }
@@ -3008,17 +2973,6 @@ fn host_func_export_matches(
                     is_list_of(ty, types, is_sign_request_petal, depth)
                 })],
             ) && result_matches(&ty.result, types, HostOkType::SignBatchResultStructured)
-        }
-        HostFuncExport::SignPayloadStructured => {
-            params_match(params, types, &[("request", is_payload_sign_request_petal)])
-                && result_matches(&ty.result, types, HostOkType::SignResultStructured)
-        }
-        HostFuncExport::ScopedSignPayloadStructured => {
-            params_match(
-                params,
-                types,
-                &[("request", is_scoped_payload_sign_request_petal)],
-            ) && result_matches(&ty.result, types, HostOkType::SignResultStructured)
         }
         HostFuncExport::SafeSignPayloadStructured => {
             params_match(
@@ -3247,40 +3201,6 @@ fn is_sign_request_petal(
             && is_byte_list(&fields[1].1, types, depth)
             && fields[2].0 == "intent"
             && is_string(&fields[2].1)
-    })
-}
-
-fn is_payload_sign_request_petal(
-    ty: &ComponentValType,
-    types: &[ComponentTypeEntry<'_>],
-    depth: usize,
-) -> bool {
-    with_defined_type(ty, types, depth, |defined, types, depth| {
-        let ComponentDefinedType::Record(fields) = defined else {
-            return false;
-        };
-        let fields = fields.as_ref();
-        fields.len() == 10
-            && fields[0].0 == "wallet"
-            && is_string(&fields[0].1)
-            && fields[1].0 == "preimage"
-            && is_byte_list(&fields[1].1, types, depth)
-            && fields[2].0 == "claimed-hash"
-            && is_byte_list(&fields[2].1, types, depth)
-            && fields[3].0 == "signature-algorithm"
-            && is_string(&fields[3].1)
-            && fields[4].0 == "operation-class"
-            && is_string(&fields[4].1)
-            && fields[5].0 == "petal-use-claim-jcs"
-            && is_byte_list(&fields[5].1, types, depth)
-            && fields[6].0 == "claim-assurance-evidence"
-            && is_option_of(&fields[6].1, types, is_byte_list, depth)
-            && fields[7].0 == "approval-hint"
-            && is_option_of(&fields[7].1, types, is_string_type, depth)
-            && fields[8].0 == "action"
-            && is_option_of(&fields[8].1, types, is_byte_list, depth)
-            && fields[9].0 == "advisory"
-            && is_option_of(&fields[9].1, types, is_byte_list, depth)
     })
 }
 
@@ -6344,22 +6264,10 @@ paths = ["/*"]
             component_host_interface("bloom:sign/signing@0.2.0"),
             Some(ComponentHostInterface::SignSigningV2)
         ));
-        assert_eq!(
-            component_import_caps("bloom:sign/signing@0.3.0"),
-            Some(&["bloom:sign"][..])
-        );
-        assert!(matches!(
-            component_host_interface("bloom:sign/signing@0.3.0"),
-            Some(ComponentHostInterface::SignSigningV3)
-        ));
-        assert_eq!(
-            component_import_caps("bloom:sign/signing@0.4.0"),
-            Some(&["bloom:sign"][..])
-        );
-        assert!(matches!(
-            component_host_interface("bloom:sign/signing@0.4.0"),
-            Some(ComponentHostInterface::SignSigningV4)
-        ));
+        assert!(component_import_caps("bloom:sign/signing@0.3.0").is_none());
+        assert!(component_host_interface("bloom:sign/signing@0.3.0").is_none());
+        assert!(component_import_caps("bloom:sign/signing@0.4.0").is_none());
+        assert!(component_host_interface("bloom:sign/signing@0.4.0").is_none());
         assert!(component_import_caps("bloom:sign/signing@9.9.9").is_none());
         assert!(component_host_interface("bloom:sign/signing@9.9.9").is_none());
     }
@@ -6395,19 +6303,19 @@ paths = ["/*"]
     fn petal_component_signing_recognizes_its_exported_nominal_types() {
         let interface = ComponentHostInterface::SignSigningV2;
         assert!(matches!(
-            host_type_export(interface, "approval-required"),
-            Some(HostTypeExport::SignApprovalRequired)
+            host_type_export(interface, "approval-pending"),
+            Some(HostTypeExport::SignApprovalPending)
         ));
         assert!(matches!(
             host_type_export(interface, "sign-result"),
-            Some(HostTypeExport::SignResultStructured)
+            Some(HostTypeExport::SafeSignResultStructured)
         ));
     }
 
     #[test]
-    fn petal_component_signing_v4_accepts_the_safe_atomic_batch_shape() {
+    fn petal_component_signing_v2_accepts_the_safe_atomic_batch_shape() {
         assert!(host_import_instance_matches(
-            ComponentHostInterface::SignSigningV4,
+            ComponentHostInterface::SignSigningV2,
             r#"(component
               (type $interface
                 (instance
@@ -6446,7 +6354,7 @@ paths = ["/*"]
                     (param "request" $request-export)
                     (result $outcome)))
                   (export "sign-payload-batch" (func (type $sign)))))
-              (import "bloom:sign/signing@0.4.0"
+              (import "bloom:sign/signing@0.2.0"
                 (instance (type $interface))))"#,
         ));
     }
