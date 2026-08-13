@@ -1,7 +1,12 @@
 # Private Input Ceremonies
 
-**Status:** implemented (`bloom:private-input/ceremony@0.2.0`)
+**Status:** pre-Triad research prototype; do not merge
 **Audience:** Bloom engineers, Petal authors, and implementation agents
+
+> This implementation targets Bloom's former monolithic daemon architecture.
+> Triad makes Broker the sole ceremony owner and removes the daemon ceremony
+> server and direct keystore access extended here. Preserve this branch only as
+> research evidence; rebuild any successor on Triad's Machine–Broker boundary.
 
 A private-input ceremony lets a Petal collect a value-bearing destination
 (currently: an EVM address) from its owner through a local, passkey-gated
