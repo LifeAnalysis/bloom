@@ -118,7 +118,12 @@ bloom-ens      = { path = "crates/bloom-ens" }
 bloom-prices   = { path = "crates/bloom-prices" }
 bloom-revert   = { path = "crates/bloom-revert" }
 bloom-petals   = { path = "crates/bloom-petals" }
-bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "4f6fb57063a70f95cba288f68bdc139e3ecac7a5" }
+# TODO: point at the merged commit once petal#18 (bloom:private-input@0.2.0
+# contract correction) is reviewed and merged. Currently pinned to that PR's
+# draft branch tip so this crate's HostInterface::PrivateInputCeremony and
+# PRIVATE_INPUT_INTERFACE constant match the versioned contract this PR
+# implements against.
+bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "c9d4829fca1e02f5818e5175ad4b53e643a71805" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-auth-api = { path = "crates/bloom-auth-api" }
 bloom-auth     = { path = "crates/bloom-auth" }

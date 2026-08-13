@@ -121,6 +121,57 @@ pub struct ChainResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateInputKind {
+    EvmAddress,
+}
+
+/// Value-transfer context bound into the sealed passkey approval. Required:
+/// a Petal must not be able to get sign-off on a destination while hiding
+/// how much value moves there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateInputTransferContext {
+    pub network: String,
+    pub asset: String,
+    /// Integer string of base units (e.g. wei), never a display amount.
+    pub amount_base_units: String,
+    pub decimals: u8,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateInputRequest {
+    pub id: String,
+    pub wallet: String,
+    pub approval_wallet: Option<String>,
+    pub title: String,
+    pub prompt: String,
+    pub kind: PrivateInputKind,
+    pub transfer: PrivateInputTransferContext,
+    pub context: Option<PetalRouteContext>,
+}
+
+/// Non-secret, safe to log/persist. Never the bearer credential used to
+/// launch or complete the ceremony.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPrivateInput {
+    pub operation_id: String,
+    pub expires_ms: u64,
+}
+
+/// The one-time consume handle, returned only alongside the value it gates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyPrivateInput {
+    pub handle: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivateInputOutcome {
+    Pending(PendingPrivateInput),
+    Ready(ReadyPrivateInput),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchOp {
     Lookup,
     List,
