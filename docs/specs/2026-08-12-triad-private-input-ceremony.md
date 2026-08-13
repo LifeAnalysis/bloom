@@ -41,20 +41,23 @@ Consequently:
 ## Flow
 
 1. A Petal calls `request-input` with a typed input kind, exact transfer
-   context, and caller request ID. It cannot supply HTML or ceremony copy.
-2. Machine injects installed package provenance. Broker independently verifies
-   that the signed provenance catalog authorizes the exact package and route
-   for `owner-input`.
+   context, subject reference, and caller request ID. It cannot supply HTML,
+   ceremony copy, or choose the credential that counts as owner approval.
+2. Machine injects installed package provenance and resolves the approval
+   identity from owner policy. Broker independently verifies that the signed
+   provenance catalog authorizes the exact package and route for `owner-input`.
 3. Machine sends an idempotent `owner_input.prepare` request to Broker over the
    authenticated Machine–Broker channel.
 4. Broker returns a public operation ID and keeps the single-use ceremony URL
    in its owner-facing projection. Machine may expose that URL only through a
    deliberate owner CLI/UI surface; it is never returned to guest Wasm.
-5. Broker renders host-owned wording plus the exact amount, decimals, asset,
-   network, source, and entered value. A passkey assertion confirms owner
-   presence and binds the review digest. Signer may contribute signed public
-   credential-verification material, but it receives neither the value nor a
-   request to sign or mutate custody.
+5. Broker obtains a narrow, signed verification contribution from Signer for
+   the policy-selected approval identity, then renders host-owned wording plus
+   the exact amount, decimals, asset, network, source, and entered value. The
+   passkey assertion confirms owner presence and binds the review digest.
+   Signer verifies or records the assertion and credential counter against
+   that digest, but receives only the digest—not the entered value—and performs
+   no transaction signing or custody mutation.
 6. Machine polls Broker by operation ID. Once ready, Broker releases the value
    and an acknowledgement token only to the same authenticated Machine request
    and package provenance.
@@ -74,7 +77,7 @@ status, the value hash, review digest, provenance, timestamps, and audit data.
 | Package/route provenance injection | Machine |
 | Machine–Broker adapter and owner projection | Machine |
 | Ceremony HTTP, WebAuthn, value retention, replay and audit | Broker |
-| Public passkey-verification contribution | Signer, without value access or custody mutation |
+| Approval identity, passkey authority, and credential counter | Signer, using a digest-only contribution without value access, signing, or custody mutation |
 | Wallet keys or transaction signatures | Not involved |
 | Persisting the approved private value | Trusted Petal secret store |
 | Binding the final withdrawal to the receipt | Privacy Pools verifier |
@@ -99,6 +102,15 @@ The initial input kind is an EVM address. The initial transfer context is:
 network, asset, amount in base units, decimals, and source ID. New kinds require
 their own canonical validation and host-owned rendering; arbitrary prompts,
 HTML, schemas, labels, or scripts from a Petal are prohibited.
+
+## Contract consequences
+
+The provisional Petal #18 contract is not the final contract. In particular,
+guest-controlled `title`, `prompt`, and `approval-wallet` fields violate the
+ownership split above and must be removed or replaced with closed, host-owned
+types and owner-policy resolution. Its subject reference and transfer context
+also need canonical validation rules shared by Machine and Broker. A version
+number on that draft does not make these decisions stable.
 
 ## Implementation shape
 
