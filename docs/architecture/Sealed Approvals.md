@@ -93,6 +93,26 @@ call. Hash-only guest signing is unsupported. Machine may validate guest
 capabilities and provenance, but only Broker can authorize and only Signer can
 produce the signature.
 
+### Verified chain Petals
+
+A chain driver may run as a Petal while a digest-pinned Broker verifier
+independently parses the final signing payload. Broker uses the verifier's
+extracted facts—not the Petal's Markdown—to render and policy-check every field
+covered by the verifier contract. Exact one-shot approvals still run a required
+verifier: exact bytes prevent substitution but do not prove that an untrusted
+description explains those bytes honestly.
+
+The verifier contract lists both established and unverified fields. Network
+identity, fee quotes, simulation, freshness, and finality remain
+`machine_asserted` unless a separate attestor establishes them. A missing or
+mismatched required verifier fails closed without assurance downgrade. Machine
+provides durable chain-neutral outbox and configured-RPC host services; the
+Petal owns chain-specific construction and external-effect interpretation, and
+Signer remains limited to key/suite enforcement and exact signing.
+
+See [Verified Chain Petals](./Verified%20Chain%20Petals.md) for the complete
+driver, verifier, durable-lifecycle, and failure-containment contract.
+
 ## Ceremony and public projection
 
 Broker owns the canonical `http://localhost:18734` ceremony application,

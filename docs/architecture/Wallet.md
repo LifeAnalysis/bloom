@@ -11,9 +11,9 @@ Petal authors.
 
 - **Signer** owns wallet private keys, credential records, key derivation,
   policy compare-and-swap, counters, replay protection, and signature creation.
-- **Broker** understands Bloom policy and action semantics. It owns Sealed
-  Approvals, constructs exact reviews, hosts ceremonies, and sends authorized
-  operations to Signer.
+- **Broker** owns Bloom policy and action authorization. It owns Sealed
+  Approvals, constructs exact reviews, hosts ceremonies, runs any required
+  digest-pinned semantic verifier, and sends authorized operations to Signer.
 - **Machine** owns unsigned construction, simulation, public presentation,
   Petal execution, and the mounted VFS. It has no wallet private key, decrypted
   signer, credential secret, local approval database, or signing fallback.
@@ -45,6 +45,20 @@ secret bytes in their package-hash-namespaced private store, and use their own
 application keys. Those Petal-owned keys are not Bloom wallet keys. A
 Bloom-managed wallet or derived `KeyRef` remains Broker/Signer-only and is used
 through the payload-bearing Petal signing protocol.
+
+## Verified chain drivers
+
+Chain-specific construction, RPC, simulation, broadcast, and receipt parsing
+may live in a content-addressed Petal. Machine supplies configured-RPC and
+durable-outbox host services, while Broker independently parses every final
+payload field that policy or authoritative review treats as verified. The
+driver selects a public registered child `KeyRef`; it cannot derive an
+unregistered path or access root/child secret material.
+
+The verifier contract is deliberately narrow and lists unverified network
+facts separately. Exact payload approval does not skip a required verifier,
+because byte equality alone cannot prove that an untrusted plan explains those
+bytes honestly. See [Verified Chain Petals](./Verified%20Chain%20Petals.md).
 
 ## Policy updates
 

@@ -73,6 +73,23 @@ narrow installed authority at runtime but may not widen it. A package declaring
 select one of them. The retired `bloom:sign/signing@0.1.0` hash-only import is
 incompatible with production signing and fails closed.
 
+### Planned verified chain-driver profile
+
+The interfaces above describe the currently implemented Petal ABI. The planned
+verified chain-driver profile adds chain-neutral configured-RPC and durable
+outbox interfaces; do not emulate them with detached writes, unrestricted
+`net.fetch`, or package-private state.
+
+A verified driver remains an untrusted Petal for authorization purposes. It
+constructs and operates a chain payload, while a required digest-pinned Broker
+verifier independently extracts every payload fact used for authoritative
+review or policy. Driver Markdown and network observations remain advisory or
+explicitly asserted. Wallet seeds and private child keys stay in Signer.
+
+See [Verified Chain Petals](../architecture/Verified%20Chain%20Petals.md) for
+the manifest, WIT, verifier, upgrade, scheduling, and failure contracts being
+implemented first for Solana.
+
 ## Routes and ABI
 
 Every route artifact is a WebAssembly component implementing

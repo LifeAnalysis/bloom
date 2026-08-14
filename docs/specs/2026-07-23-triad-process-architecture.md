@@ -924,12 +924,14 @@ Broker is the sole approval-policy and declared-usage limit authority. It owns:
 - rolling/lifetime budget evaluation;
 - reserve, commit, release, and quarantine ledger state.
 
-Broker does not decode Petal calldata or require a registered schema before a
-Petal can receive reusable approval. It verifies that Petal identity, route,
-operation class, claim assurance, and declared usage fit the immutable Sealed
-Approval. It derives or checks the cryptographic signing hash only at the
-generic CryptoSuite/envelope layer required to prevent byte substitution; it
-does not infer application meaning from those bytes.
+Broker's baseline policy path does not decode Petal calldata or require a
+registered schema before a Petal can receive reusable approval. It verifies
+that Petal identity, route, operation class, claim assurance, and declared
+usage fit the immutable Sealed Approval. It derives or checks the cryptographic
+signing hash at the generic CryptoSuite/envelope layer required to prevent byte
+substitution. When a selected section 11.1 verifier is required, that isolated
+verifier may additionally decode the payload and establish only the application
+facts in its written contract; the baseline path does not infer further meaning.
 
 The security meaning of a declared-value budget is conditional:
 
@@ -973,6 +975,53 @@ exactly as strictly as `SignerBackend`:
 No verifier is required to ship in v1. A build with no compiled verifiers
 advertises an empty set, and every reusable approval on that build operates at
 `machine_asserted` with the disclosure required by section 1.1.
+
+### 11.2 Verified chain-Petal profile
+
+A chain driver may be a content-addressed Petal without making its description
+of signed bytes authoritative. A **verified chain Petal** has three parts:
+
+1. a driver Petal in Machine for chain-specific construction, configured RPC,
+   simulation, advisory presentation, broadcast, and receipt parsing;
+2. a chain-neutral Machine host for durable operation state, scheduling,
+   provenance, network mediation, audit, and public projection; and
+3. a verifier from section 11.1 that independently parses the final payload and
+   establishes the documented subset of `PetalUseClaim` and review facts.
+
+The verifier is not an ordinary Petal running in Machine. It is a digest-pinned
+Broker crate or a separately keyed invariant attestor, because a second guest in
+the same compromise domain cannot raise ClaimAssurance. Broker constructs
+authoritative policy and review fields from verifier output, not Petal Markdown
+or duplicate claim fields. Every claim field covered by the verifier contract
+must equal the independent extraction exactly.
+
+Exact selectors do not bypass verification when an operation class requires a
+verifier. Exact bytes prevent post-review substitution but do not prove that an
+untrusted plan describes those bytes honestly. Reusable approvals may rely only
+on fields the selected verifier contract establishes; all other fields remain
+visibly `machine_asserted` and cannot silently acquire stronger policy meaning.
+
+Machine owns the durable generic chain-action envelope and pins the driver
+package hash, route, wallet, exact `KeyRef`, chain profile, operation class,
+CryptoSuite, unsigned payload/digest, claim, verifier ID/digest/evidence digest,
+advisory plan digest, and liveness observations. A package update cannot take
+over a pending action without an installer-approved successor/migration
+contract. Detached Petal execution is not a durable scheduler; Machine invokes
+bounded, idempotent driver callbacks after restart.
+
+Configured RPC transport is a Machine host capability. The guest names a chain
+profile and allowed method, never raw endpoint credentials. Machine's endpoint
+and genesis checks improve the honest runtime but do not independently establish
+network identity, fees, simulation, block freshness, or finality. A verifier
+contract must list those as unverified unless a separately pinned network
+attestor proves them.
+
+Broadcast is separate from approval/signing. Machine persists the signature and
+signed-artifact digest before dispatch, sends only through the staged profile,
+retries only identical bytes under the same operation ID, and quarantines an
+ambiguous effect until reconciliation. The complete profile and first Solana
+verifier contract are documented in
+[`Verified Chain Petals.md`](../architecture/Verified%20Chain%20Petals.md).
 
 ## 12. Ceremony ownership and protocol
 
@@ -2279,6 +2328,15 @@ operation class, and CryptoSuite match the approval and whose catalog record
 matches the approval's `provenance_digest`. New Petals do not require Broker
 adapter work or an amendment to this architecture.
 
+A chain-driver Petal may opt into the verified profile in section 11.2. Doing
+so does not make chain RPC, parsers, or transaction orchestration part of
+Signer. It requires the operation class to name a compiled verifier ID/digest,
+and Broker refuses the use rather than falling back to `machine_asserted` when
+that verifier is unavailable or its contract does not establish the policy
+facts being consumed. Machine-owned generic driver services provide durable
+outbox and configured-RPC capabilities; chain-specific logic remains in the
+content-addressed package.
+
 The baseline trust root is the installer-pinned package hash plus the
 authenticated Machine assertion that the request came from that Petal route.
 This provides provenance in the honest runtime, not isolation from a fully
@@ -2551,6 +2609,15 @@ ownership table in section 26.
   commits the root only through current WKEK custody; and leaves no callable
   legacy decrypt or signing backend in Machine, Broker, or Signer's normal
   runtime surface.
+- **AC-37** A verified chain-Petal operation binds the exact driver package and
+  route, durable action, `KeyRef`, payload, claim, verifier ID/artifact/result
+  digests, and CryptoSuite. Broker builds authoritative economic review from
+  independent verifier extraction; a changed destination, amount, signer,
+  program, payload, claim, evidence, or verifier fails before signing; fields
+  outside the verifier contract remain visibly `machine_asserted`; exact
+  selectors cannot skip a required verifier; driver restart/upgrade and
+  pre-/post-broadcast crashes preserve one idempotent operation and never cause
+  a new signature or assurance downgrade.
 
 ## 28. Fixed decisions
 
@@ -2560,7 +2627,7 @@ ownership table in section 26.
 | D-041 | Ratified | Broker owns ceremony HTTP, assets, rendering, and orchestration. Signer independently verifies its nonce, WebAuthn proof, exact approval digest, KeyRef, `allowed_crypto_suites`, activation mode, revocation epoch, and limits. Local PRF is HPKE-encrypted end-to-end to Signer and only forwarded by Broker. |
 | D-042 | Ratified | Signer is extended through reviewed compile-time `SignerBackend` crates/features, initially Local and AWS KMS. Runtime backend plugins are prohibited. |
 | D-043 | Ratified | Key identity is the structured backend-qualified `KeyRef`; AWS uses immutable key ARN without a duplicated region field. |
-| D-044 | Ratified; amended by D-051 | Broker enforces approval policy and limits against canonical PetalUseClaims but does not decode protocol calldata or independently extract application meaning. Signer retains structural approval, exact-hash, key, CryptoSuite, operation/signature count and rate, expiry, replay, and revocation enforcement. |
+| D-044 | Ratified; amended by D-051 and D-065 | Broker's baseline path enforces policy and limits against canonical PetalUseClaims without decoding protocol calldata; a selected assurance verifier may independently extract only the fields in its written contract. Signer retains structural approval, exact-hash, key, CryptoSuite, operation/signature count and rate, expiry, replay, and revocation enforcement. |
 | D-045 | Ratified | `bloom-broker-debug-driver` drives genuine production ceremony interfaces in tests and is absent from production dependency graphs and artifacts. |
 | D-046 | Ratified; amended by D-055 | Sealed Approval is the only **signing**-authorization concept. Exact single-use and reusable bounded behavior are selectors and limits within one canonical structure and lifecycle. |
 | D-047 | Ratified | Canonical Sealed Approvals are durable. Backend key availability and activation persistence are independent, backend-specific state. |
@@ -2581,9 +2648,10 @@ ownership table in section 26.
 | D-062 | Ratified | Assurance verifiers are compile-time, feature-gated, digest-pinned crates with written verifier contracts, advertised through `broker.capabilities`. Fields outside a verifier's contract remain `machine_asserted` even under a verified proof. v1 may ship with none, in which case reusable approvals operate at `machine_asserted` with the section 1.1 disclosure. |
 | D-063 | Ratified | Payload size bounds are hierarchical and independently enforced (frame, single payload, batch child, batch aggregate, child count, HPKE envelope, locator); the frame bound alone does not constrain a batch. Errors are a closed, versioned set with declared retryability and durable-effect class. |
 | D-064 | Ratified | The v0.1 hash-only guest signing interface fails closed on triad builds with no compatibility shim, and its absence from production artifacts is a release scan. Machine supplies no policy reference on the signing call; Broker evaluates its own verified snapshot. Quotas and ceremony-creation bounds apply locally, because an authenticated Machine may still be compromised. |
+| D-065 | Ratified | Chain drivers may ship as content-addressed Petals when Machine supplies chain-neutral configured-RPC and durable-outbox services and Broker independently verifies any payload semantics used for authoritative review or policy. Required verifier ID/digest/result and exact driver provenance are bound into approval and use; missing verification never downgrades to `machine_asserted`. Network facts remain asserted unless a separate attestor establishes them. |
 
 Earlier decisions remain applicable only where consistent with D-040 through
-D-064 and this consolidated normative text. In particular, any earlier decision
+D-065 and this consolidated normative text. In particular, any earlier decision
 requiring a registered semantic adapter before a Petal may hold a reusable or
 standing approval is superseded by D-051 as qualified by section 1.1 and D-062:
 adapters are an optional strengthening mechanism, not a precondition, and the
