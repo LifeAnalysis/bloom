@@ -2,18 +2,24 @@
 
 **Status:** proposed
 
+**Issue:** [bloom#156](https://github.com/bloom-directory/bloom/issues/156)
+
 **Branch:** `feat/solana-support`
 
-**Supersedes:** the pre-triad implementation assumptions in
-[bloom#156](https://github.com/bloom-directory/bloom/issues/156)
+**Depends on:** [BIP-39 multi-curve HD wallets](./2026-08-14-bip39-multicurve-hd-wallets.md)
+([bloom#163](https://github.com/bloom-directory/bloom/issues/163))
 
 ## Goal
 
-Ship a first-party Solana wallet path that can create or import an Ed25519
-wallet through Broker/Signer custody, read SOL state, stage and simulate a
-native SOL transfer, obtain an exact payload-bound approval, sign the frozen
-Solana message inside Signer, broadcast it, and reconcile its result through
-the existing wallet outbox UX.
+Ship a first-party Solana wallet path that allocates a hardened SLIP-10
+Ed25519 child from Bloom's default BIP-39 wallet root, reads SOL state, stages
+and simulates a native SOL transfer, obtains an exact payload-bound approval,
+signs the frozen Solana message inside Signer, broadcasts it, and reconciles
+its result through the existing wallet outbox UX.
+
+Users keep one Bloom wallet identity and the same passkeys they use for EVM.
+Solana support must not provision an unrelated Ed25519 root, introduce another
+mnemonic/private key, or require a second wallet-recovery workflow.
 
 The first usable proof is a local-validator end-to-end transfer. Devnet is the
 release smoke test. Mainnet broadcast is not enabled by default in the first
@@ -46,19 +52,24 @@ blur the rule that Petals receive neither root keys nor Broker credentials.
 There will be no Machine keystore, raw secret import, direct Signer connection,
 hash-only compatibility path, or signing fallback.
 
-### 3. One wallet has one root key family in the first release
+### 3. Solana is a derived account under the shared wallet seed
 
-The current triad contract has one authoritative `root_key_ref` and Broker
-fails closed if Signer projects zero or multiple wallet roots. Preserve that
-invariant:
+This project consumes the wallet model ratified and implemented by bloom#163:
 
-- an existing EVM wallet has a secp256k1 root;
-- a Solana wallet has an Ed25519 root;
-- a wallet exposes only chains compatible with its root key suite.
+- one non-signable `WalletSeedRef` contains the encrypted BIP-39 root;
+- every passkey independently wraps the same WKEK and therefore unlocks the
+  same EVM and Solana accounts;
+- EVM accounts use the versioned BIP-32 secp256k1 profile;
+- Solana accounts use `bip44-solana-slip10-ed25519-v1` with the canonical path
+  `m/44'/501'/<account>'/0'`;
+- the Signer-owned derivation registry allocates the path and issues a typed
+  child `KeyRef` pinned to its Ed25519 public key;
+- only the derived child is signable. The seed root never satisfies a signing
+  request and never crosses the Signer boundary.
 
-Do not turn one wallet into a multi-root identity in this project. A later
-identity/account grouping layer can associate independently recoverable wallets
-without weakening root selection or making suite selection ambiguous.
+Broker and Machine select the exact child account; neither supplies an
+arbitrary path. Adding or replacing a passkey, restoring the wallet, or adding
+another chain must reproduce the same registered Solana address.
 
 ### 4. Sign serialized Solana message bytes, not a digest
 
@@ -87,7 +98,8 @@ silently switch mainnet/devnet/local identity.
 
 Included:
 
-- managed Ed25519 wallet generation and import through custody ceremonies;
+- allocation and projection of a managed Ed25519 child through the versioned
+  HD-wallet custody ceremony from bloom#163;
 - canonical base58 public key/address projection;
 - local validator and devnet cluster configuration;
 - cluster health, slot/block-height, fee, SOL balance, and signature status;
@@ -106,7 +118,7 @@ Deferred:
 - multisigner and partial-signature transactions;
 - durable nonce accounts and offline signing;
 - staking, Solana Pay, NFTs/Metaplex, Jupiter, and other protocol surfaces;
-- Ed25519 hierarchical derivation, hardware wallets, and multi-root wallets;
+- additional Solana accounts/paths, hardware wallets, and non-BIP-39 roots;
 - mainnet broadcast by default.
 
 These boundaries keep the first signing policy reviewable. Solana transactions
@@ -131,49 +143,51 @@ program/account-aware policy and plan rendering.
 Gate: Broker, Signer, and Machine share the same vectors and reject every
 cross-suite or altered-payload case.
 
-### Phase 1 — Signer local Ed25519 backend
+### Phase 1 — Release the derived Ed25519 signing edge
 
 This work belongs in `bloom-directory/bloom-signer` and must release before
 Bloom pins the new edge.
 
-1. Extend `LocalSignerBackend` root material with a zeroizing 32-byte Ed25519
-   seed variant; do not reuse the service/policy Ed25519 identity keys.
-2. Implement generate/import, activation, encrypted backup/restore, deletion,
-   public description, and exact raw-message signing.
+1. Consume the `bip39-multicurve-v1` root and
+   `bip44-solana-slip10-ed25519-v1` child profile from bloom#163. Do not add a
+   second Ed25519 root variant or reuse service/policy Ed25519 identity keys.
+2. Implement child allocation, public description, activation through the
+   existing WKEK/passkey path, registry-aware backup/restore, retirement, and
+   exact raw-message signing.
 3. Advertise `KeySpec::Ed25519`, `CryptoSuite::Ed25519Message`, message input,
    and raw-64 output only when the backend actually supports them.
 4. Verify every produced signature against the pinned public key before
    journaling it, matching the existing backend contract.
 5. Project a base58 Solana address from the canonical Ed25519 public key;
    replace the EVM-only address helper with key-spec dispatch.
-6. Keep derivation unsupported for Ed25519 in the MVP. Generation and import
-   are sufficient and avoid inventing a derivation contract prematurely.
+6. Reject arbitrary, unhardened, out-of-namespace, unregistered, tombstoned, or
+   cross-profile paths and refuse signing through the `WalletSeedRef` itself.
 
-Gate: backend conformance, custody round-trip, backup/restore, restart,
-cross-suite denial, and zeroization-oriented tests pass.
+Gate: bloom#163's root/registry vectors plus Ed25519 allocation, backup/restore,
+restart, cross-suite/path denial, signature, and zeroization-oriented tests pass.
 
-### Phase 2 — Broker/Signer custody protocol binding
+### Phase 2 — Broker/Signer derived-account binding
 
 This requires synchronized API changes in `bloom-broker-api` and
 `bloom-signer-api`, followed by Broker and Signer releases.
 
-1. Add an explicit requested root `key_spec` (or a versioned wallet profile
-   containing it) to wallet registration/import preparation.
-2. Include that choice in exact terms, operation identity, ceremony review,
+1. Use bloom#163's explicit child-allocation request. Bind the wallet seed
+   profile, Solana derivation profile, semantic role, namespace, expected
+   Ed25519 key spec, and allowed suites.
+2. Include those fields in exact terms, operation identity, ceremony review,
    signer contribution, result validation, audit, and replay/idempotency keys.
-3. Preserve plain-name registration as the legacy secp256k1 request. New
-   clients send a versioned structured request for Ed25519; never infer the
-   suite from a wallet name or selected RPC network inside Broker/Signer.
-4. Render “Solana / Ed25519” in the owner ceremony and fail if the returned
-   root key spec differs from the reviewed request.
-5. Keep exactly one `WalletRoot`. Do not model the Solana key as a derived key
-   under a secp256k1 root.
+3. Render “Add Solana account / Ed25519” in the owner ceremony and commit to
+   the expected public projection before accepting the resulting child.
+4. Fail if Signer returns a different path, profile, key spec, public key,
+   wallet root relationship, or address.
+5. Project the registered child and its CAIP account identity without exposing
+   entropy, WKEK, PRF output, or derived private material.
 6. Add edge golden vectors and compatibility tests before advancing pinned
    dependency revisions in Bloom.
 
-Gate: a Machine request can create/import an Ed25519-root wallet, project its
-public address, and exact-sign a known message without any secret entering
-Machine or Broker.
+Gate: a Machine request can allocate/project the deterministic Solana child and
+exact-sign a known message without any secret entering Machine or Broker; a
+second passkey and restored backup reproduce the same child address.
 
 ### Phase 3 — Solana protocol and RPC crate
 
@@ -208,8 +222,8 @@ Stage:
 
 1. Parse a typed native-transfer request containing cluster, destination, and
    lamports/SOL amount.
-2. Validate the destination public key and use the projected Ed25519 wallet
-   root as fee payer and sole signer.
+2. Validate the destination public key and use the projected Ed25519 child
+   account as fee payer and sole signer.
 3. Fetch `(blockhash, lastValidBlockHeight)`, build the exact message, estimate
    its fee, and simulate it without signature verification.
 4. Freeze message bytes, message digest, blockhash boundary, instruction/program
@@ -239,9 +253,11 @@ RPC timeout before/after submission, exact retry, and reconciliation.
 
 ### Phase 5 — VFS, CLI, configuration, and docs
 
-1. Add structured registration/import input and CLI UX such as
-   `bloom wallet new <name> --network solana-devnet`; resolve the network to an
-   explicit Ed25519 profile before preparing the custody request.
+1. Add explicit account-enablement UX such as
+   `bloom wallet account add <name> --network solana-devnet`; resolve the
+   network to the versioned Solana child profile before preparing the custody
+   request. A new default BIP-39 wallet may enable its first Solana child during
+   registration through the same typed request.
 2. Preserve existing EVM config and routes. Add Solana cluster config and merge
    both registries only at the `/chains` presentation layer.
 3. Expose the compatible subset of:
@@ -273,13 +289,14 @@ Required checks:
 
 ## First implementation slice
 
-Do not start with the RPC/VFS surface. Start with the cross-repository custody
-vertical:
+Do not start with the RPC/VFS surface. Start with the cross-repository derived
+account vertical after bloom#163's BIP-39 root edge is released:
 
 1. golden Ed25519/Solana message vectors;
-2. local Signer Ed25519 generate/import/sign/backup support;
-3. versioned custody request binding the requested root key spec;
-4. Broker projection and Machine exact-sign integration test;
+2. local Signer hardened SLIP-10 child allocation/sign/backup support;
+3. versioned custody request binding the derivation profile and child key spec;
+4. Broker projection, same-address multi-passkey/restore proof, and Machine
+   exact-sign integration test;
 5. pin the released Broker/Signer edges in Bloom.
 
 Only after this passes should `bloom-solana` and transaction staging land. It
@@ -290,8 +307,9 @@ from growing around a temporary or legacy signing path.
 
 Solana support is complete for the MVP when all of the following are observable:
 
-- a user creates or imports an Ed25519-root wallet only through a Broker-hosted
-  ceremony;
+- a default BIP-39 wallet enables a deterministic Solana child only through a
+  Broker-hosted account-allocation ceremony;
+- every active passkey and a restored backup reproduce the same Solana address;
 - the projected base58 address is derived from Signer-authenticated public
   material;
 - Machine reads SOL balance and stages a native transfer with exact instruction,
