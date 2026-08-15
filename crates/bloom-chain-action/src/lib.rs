@@ -21,17 +21,25 @@
 //!   the journal, rejecting envelope mutation, journal mutation, and
 //!   sequence gaps.
 //!
-//! # Rollback limitation (production caveat)
+//! # Rollback resistance (trusted high-water anchor)
 //!
-//! The journal is **tamper-evident, not rollback-resistant**. It detects
-//! mutation of any persisted record, but it cannot detect a rollback that
-//! removes one or more complete trailing records: a valid prefix of the
-//! digest chain is indistinguishable from the full chain by construction.
-//! Production must anchor the latest journal sequence number and record
-//! digest in a separate trusted Machine checkpoint or monotonic snapshot
-//! (compared on reopen) before any security claim may rely on outbox
-//! completeness. Until such an anchor exists, persistence guarantees must
-//! be described as tamper-evident only.
+//! The journal alone is **tamper-evident but not rollback-resistant**: a
+//! valid prefix of the digest chain is indistinguishable from the full chain,
+//! so removal of complete trailing records is undetectable from the journal
+//! alone. The [`Checkpoint`] high-water anchor closes that gap. Machine calls
+//! [`ChainActionOutbox::checkpoint`] after durable transitions; recovery
+//! treats the checkpoint as a floor and fails closed with
+//! [`OutboxError::JournalRollbackDetected`] when the journal is shorter than
+//! the pinned sequence, with [`OutboxError::CheckpointHeadMismatch`] when the
+//! head digest differs, and with [`OutboxError::CheckpointDigestMismatch`]
+//! when the checkpoint itself is mutated.
+//!
+//! With a checkpoint written, persistence is rollback-resistant **within the
+//! Machine-owned directory trust boundary**: rollback must rewrite both the
+//! journal and the checkpoint consistently, which requires write access to
+//! Machine-owned state. Anchoring the latest sequence and digest in a
+//! separate process or store remains available for deployments that need to
+//! remove that residual as well.
 //!
 //! The fixture driver in [`fixture`] is a deterministic, non-cryptographic
 //! test double used to exercise the outbox without any chain SDK.
