@@ -578,6 +578,7 @@ Solana MVP is complete when:
 ## References
 
 - [Verified Chain Petals](../architecture/Verified%20Chain%20Petals.md)
+- [Solana native transfer verifier — wire format and golden vectors](../specs/2026-08-14-solana-native-transfer-verifier.md)
 - [BIP-39 multi-curve HD wallets](./2026-08-14-bip39-multicurve-hd-wallets.md)
 - [Triad process architecture](../specs/2026-07-23-triad-process-architecture.md)
 - [Sealed Approvals](../architecture/Sealed%20Approvals.md)
