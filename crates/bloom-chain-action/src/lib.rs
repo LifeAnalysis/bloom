@@ -21,6 +21,18 @@
 //!   the journal, rejecting envelope mutation, journal mutation, and
 //!   sequence gaps.
 //!
+//! # Rollback limitation (production caveat)
+//!
+//! The journal is **tamper-evident, not rollback-resistant**. It detects
+//! mutation of any persisted record, but it cannot detect a rollback that
+//! removes one or more complete trailing records: a valid prefix of the
+//! digest chain is indistinguishable from the full chain by construction.
+//! Production must anchor the latest journal sequence number and record
+//! digest in a separate trusted Machine checkpoint or monotonic snapshot
+//! (compared on reopen) before any security claim may rely on outbox
+//! completeness. Until such an anchor exists, persistence guarantees must
+//! be described as tamper-evident only.
+//!
 //! The fixture driver in [`fixture`] is a deterministic, non-cryptographic
 //! test double used to exercise the outbox without any chain SDK.
 
