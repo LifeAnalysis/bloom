@@ -24,6 +24,7 @@ members = [
   "crates/bloom-it",
   "crates/bloom-update",
   "crates/bloom-solana",
+  "crates/bloom-chain-action",
 ]
 resolver = "2"
 

@@ -1,0 +1,19 @@
+[package]
+name = "bloom-chain-action"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chain-neutral durable staged-action outbox and state machine for verified chain Petals"
+
+[features]
+default = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
