@@ -77,6 +77,18 @@ The Broker verifier is a reviewed Rust crate compiled into Broker. It is not a
 second ordinary Petal in Machine. Signer has no Solana RPC, transaction parser,
 program policy, or broadcast code.
 
+Static compilation into Broker is the deliberate MVP posture: a new verifier
+requires a Broker release, which centralizes review but couples chain iteration
+to Broker's release cadence. Runtime-loaded verifier modules would force
+installation, sandboxing, rollback, and trust-root decisions that are deferred.
+A separately keyed, sandboxed, digest-pinned verifier/attestor mechanism is a
+recorded future extension point, not a v1 deliverable. Any successor Broker
+that drops, replaces, or re-digests a verifier used by a pending approval or
+signing action is incompatible with that action unless it keeps the original
+ID/digest available and advertised. Upgrade must otherwise drain, cancel where
+safe, or quarantine the affected action rather than silently substituting a
+verifier.
+
 ### 2. Use the shared HD wallet root
 
 This project consumes bloom#163:
@@ -109,11 +121,12 @@ route or Petal-owned private signer.
 
 ### 4. Independent semantic verification is mandatory
 
-The MVP operation class `solana.native-transfer` requires
-`proof_verified` with the exact compiled verifier ID and digest for both exact
-and reusable selectors. Exact review prevents later byte substitution; the
-verifier prevents a deceptive driver/Machine plan from defining what those
-bytes mean.
+The MVP operation class `solana.native-transfer` requires `proof_verified` with
+the exact compiled verifier ID and digest for exact selectors. Exact review
+prevents later byte substitution; the verifier prevents a deceptive
+driver/Machine plan from defining what those bytes mean. Reusable selectors are
+deferred; any future reusable profile must require the same verifier on every
+use and first ratify the bounded vectors listed in MVP scope.
 
 `solana-system-transfer-v1` establishes:
 
@@ -134,6 +147,16 @@ fee quote, balance, simulation result, broadcast acceptance, or finality. Those
 require current network observations and remain visibly `machine_asserted` in
 v1 unless a separate network attestor is added. Policy and UI may not treat
 them as verifier-proven.
+
+The honest runtime enforces freshness and provider-consistency checks before
+signing (see Phase 5) and surfaces the first-class freshness refusal states
+`BLOCKHASH_REFRESH_REQUIRED`, `NETWORK_OBSERVATION_INCONSISTENT`, and
+`INSUFFICIENT_VALIDITY_WINDOW`. These checks detect lagging or inconsistent
+providers. They do not detect a consistently malicious RPC: a single provider
+can lie consistently about blockhash, slot, block height, and
+`isBlockhashValid`. Defending against that adversary requires endpoint quorum,
+a separately trusted attestor, or a light-client mechanism and is out of
+scope for v1.
 
 ### 5. Configured RPC, never arbitrary Petal networking
 
@@ -188,9 +211,18 @@ Included:
 - health, slot/block-height, fee, SOL balance, latest blockhash, simulation,
   broadcast, and signature-status RPC;
 - one legacy, single-signer native SOL transfer through the System Program;
-- exact and verifier-backed policy/review binding;
+- exact-only verifier-backed policy/review binding; reusable approvals are
+  deferred until the bound vectors (exact wallet/`KeyRef`, package, route,
+  operation class, suite and verifier; destination allowlist; per-operation
+  lamport cap; rolling and lifetime lamport budgets; maximum operation and
+  signature counts; rate and validity windows; separate declared-fee budget;
+  verifier rerun per use) are ratified;
 - recent-blockhash and `lastValidBlockHeight` tracking;
-- pending/signed/sent/ambiguous/terminal outbox states;
+- pending/signed/sent/ambiguous/terminal outbox lifecycle states;
+- explicit freshness refusal outbox states
+  (`BLOCKHASH_REFRESH_REQUIRED`, `NETWORK_OBSERVATION_INCONSISTENT`,
+  `INSUFFICIENT_VALIDITY_WINDOW`) that block signing and force restaging with
+  a new approval;
 - restart-safe reconciliation and identical-byte retry; and
 - existing wallet/chain/outbox public UX plus driver-specific routes.
 
@@ -253,10 +285,22 @@ the immutable envelope and signed-artifact record.
    destination, lamports, program, instruction count/data, message/blockhash,
    verifier ID/digest/result/evidence, claim, cluster profile, signature slot,
    and signed artifact.
-6. Define verified and asserted review fields explicitly.
+6. Define verified and asserted review fields explicitly. Freeze the staged
+   profile fields and vectors for maximum local staging age, minimum remaining
+   block-height window, commitment, and context matching; missing or unknown
+   values fail closed.
+7. Build a real Petal component using the production WIT and builder against
+   the pinned Solana codec dependency set on Bloom's actual WASM target
+   (`wasm32-unknown-unknown`). Verify: golden native-transfer message
+   construction under Bloom's Wasmtime host; no undeclared WASM imports;
+   identical package hashes across clean builds; pinned dependency graph
+   with license and advisory review. This gate precedes any later-phase
+   Solana-specific code.
 
-Gate: Petal/Machine/Broker/Signer share canonical envelope vectors; verifier
-vectors use an independent parser and reject every mutation.
+Gate: real Petal component executes under Bloom's Wasmtime host with a
+deterministic package hash and zero undeclared imports; canonical envelope
+vectors shared across Petal/Machine/Broker/Signer; verifier vectors use an
+independent parser and reject every mutation.
 
 ### Phase 1 — Release the HD/Ed25519 Signer edge
 
@@ -311,7 +355,21 @@ same address.
    approved, pre-sign, post-sign, pre-broadcast, ambiguous, and reconciling
    boundaries.
 7. Require identical signed bytes for retry and retain ambiguous reservations.
-8. Define explicit old-package/successor migration behavior.
+8. Define the explicit migration ownership model:
+   - Machine owns the durable migration state machine and invariant
+     enforcement;
+   - the installer/catalog authority signs every allowed old-package →
+     successor relationship;
+   - a successor may provide a deterministic state adapter only for draft
+     actions that have not reached approval preparation;
+   - Broker must advertise compatible verifier IDs and digests; a successor may
+     add a new verifier, but an in-flight action is rejected unless its original
+     ID/digest remains available and advertised;
+   - awaiting-ceremony, approval-prepared, approved, pre-sign, signed, sent, or
+     ambiguous actions never migrate; they complete or cancel where safe using
+     the pinned old artifact, or enter operator-visible quarantine; and
+   - migration cannot alter immutable payloads, signatures, reservations,
+     provenance, or verifier commitments.
 
 #### Broker verifier edge
 
@@ -333,14 +391,13 @@ authority, lose a signed effect, or change the pending package.
 
 1. Create a first-party signed Petal package/repository with routes for account,
    balance, stage, plan, confirm, inspect, and receipt workflows.
-2. Use a minimal WASM-compatible Solana codec/build dependency set. Complete a
-   spike before pinning Anza crates to prove component target compatibility,
-   Rust/toolchain support, deterministic builds, dependency cost, and release
-   targets.
+2. Use the dependency set and toolchain proven by the Phase 0 empirical gate.
+   Re-verify deterministic builds against the pinned Solana codec versions
+   before each release; a new codec version triggers a fresh Phase 0 gate.
 3. Implement configured RPC calls:
    `getGenesisHash`, `getHealth`, `getSlot`, `getBlockHeight`, `getBalance`,
-   `getLatestBlockhash`, `getFeeForMessage`, `simulateTransaction`,
-   `sendTransaction`, and `getSignatureStatuses`.
+   `getLatestBlockhash`, `isBlockhashValid`, `getFeeForMessage`,
+   `simulateTransaction`, `sendTransaction`, and `getSignatureStatuses`.
 4. Build and assemble only legacy, one-signer System Program transfers.
 5. Emit canonical claim/evidence and clearly label the plan advisory.
 6. Handle block-height expiry, exact-byte retry, ambiguous send, status polling,
@@ -374,15 +431,27 @@ payloads fail; no driver-only fact appears as verifier-established review.
 6. Broker verifier extracts fee payer/source, destination, lamports, program,
    signer count, and message commitment; Broker renders authoritative facts and
    labels cluster/fee/simulation/freshness as asserted.
-7. Policy enforces exact or reusable limits only over verified economic fields;
-   fee handling follows the explicitly asserted v1 policy posture.
+7. Policy enforces an exact selector over verified economic fields; fee
+   handling follows the explicitly asserted v1 policy posture. Reusable
+   selectors fail as unsupported in MVP.
 
 #### Confirm and sign
 
 1. Reread the immutable staged envelope; never execute display files.
-2. In the honest runtime, check current block height against claimed
-   `lastValidBlockHeight`. Expiry restages; blockhash is never refreshed behind
-   an approval.
+2. In the honest runtime, refuse to sign and transition to a first-class
+   freshness refusal state when any of the following hold:
+   - the maximum local age since staging is exceeded;
+   - the minimum remaining block-height window is not satisfied;
+   - blockhash, slot, block height, or `isBlockhashValid` returns are
+     inconsistent across observations;
+   - the observed commitment or context does not match the staged profile.
+   Expiry restages; the blockhash is never refreshed behind an approval.
+   The freshness refusal states (`BLOCKHASH_REFRESH_REQUIRED`,
+   `NETWORK_OBSERVATION_INCONSISTENT`, `INSUFFICIENT_VALIDITY_WINDOW`) are
+   first-class outbox transitions surfaced to the user and recorded in the
+   transition audit. These checks detect lagging or inconsistent providers;
+   they do not detect a consistently malicious RPC, which requires endpoint
+   quorum, a separately trusted attestor, or a light-client mechanism.
 3. Resubmit exact payload/claim/evidence to Broker; rerun the verifier on use.
 4. Sign with `Ed25519Message`; validate receipts and locally verify the raw
    signature against the pinned child public key.
@@ -418,8 +487,17 @@ submission, exact replay, restart, package update, and reconciliation.
 5. Render verified and asserted facts separately in Broker ceremony, VFS plan,
    CLI, receipt, and audit surfaces.
 6. Update root/agent/Petal authoring guidance and capability inventory.
-7. Run local-validator CI, opt-in devnet smoke, EVM regressions, release builds,
-   dependency/license/advisory scans, and production-artifact verifier scans.
+7. Run local-validator CI with an adversarial RPC fault-injection harness,
+   opt-in devnet smoke, EVM regressions, release builds, dependency/license/
+   advisory scans, and production-artifact verifier scans. The harness
+   exercises old-but-valid blockhashes, expired blockhashes, conflicting
+   height and status responses, wrong genesis hash, timeouts before and after
+   submission, selective transaction drops, inclusion followed by false
+   "not found," and provider disagreement during reconciliation; it runs in
+   CI on every change to the Solana driver, verifier, or RPC host interface,
+   not as a manual operator step. Mainnet-beta is gated on an explicit
+   opt-in read-only/canary step; mainnet-shaped fee-market and censorship
+   behavior cannot be established by ordinary devnet smoke.
 
 Gate: a fresh install can enable the derived account, install/discover the
 driver, fund locally, stage/read/approve/confirm a transfer, and observe a
@@ -443,6 +521,11 @@ Required adversarial cases:
 - driver tries raw `net.fetch`, direct Broker/Signer access, arbitrary path
   derivation, or root signing;
 - driver crashes or upgrades before/after every durable transition;
+- fault-injected RPC behavior through a controlled proxy or harness producing
+  old-but-valid blockhashes, expired blockhashes, conflicting height and
+  status responses, wrong genesis hash, timeouts before and after submission,
+  selective transaction drops, inclusion followed by false "not found," and
+  provider disagreement during reconciliation;
 - broadcast returns success then timeout, timeout then inclusion, duplicate
   submission, expiration without inclusion, or conflicting provider status;
 - verifier feature omitted from Broker build or digest changed; and
@@ -476,12 +559,17 @@ Solana MVP is complete when:
   and public projections;
 - Broker independently verifies every authoritative economic fact and labels
   network-only observations asserted;
-- exact and reusable approvals cannot bypass or downgrade the required verifier;
+- exact approvals cannot bypass or downgrade the required verifier; reusable
+  approvals are deferred until bound vectors are ratified and are not
+  supported in MVP;
 - Signer signs only the exact verified legacy message with the exact child;
 - a native transfer broadcasts/reconciles restart-safely through a local
   validator and opt-in devnet;
 - changed semantics, unsupported forms, wrong cluster in the honest runtime,
   unavailable verifier, ambiguous effects, and package upgrades fail closed;
+- the verifier corpus (golden, mutation, and differential vectors) is
+  published as a release artifact with a recorded digest, so verifier changes
+  are detectable out-of-band and independent of the Broker build pipeline;
 - mnemonic/seed/WKEK/PRF/private child never enter Machine, Broker, or Petal;
   and
 - existing EVM, Sealed Approval, Petal, outbox, packaging, and release behavior
@@ -497,6 +585,7 @@ Solana MVP is complete when:
 - [Petal authoring](../petals/authoring-petals.md)
 - [Solana transaction structure](https://solana.com/docs/core/transactions)
 - [Solana `getLatestBlockhash`](https://solana.com/docs/rpc/http/getlatestblockhash)
+- [Solana `isBlockhashValid`](https://solana.com/docs/rpc/http/isblockhashvalid)
 - [Solana `simulateTransaction`](https://solana.com/docs/rpc/http/simulatetransaction)
 - [Solana `sendTransaction`](https://solana.com/docs/rpc/http/sendtransaction)
 - [Solana `getSignatureStatuses`](https://solana.com/docs/rpc/http/getsignaturestatuses)

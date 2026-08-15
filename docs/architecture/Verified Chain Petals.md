@@ -48,6 +48,13 @@ ClaimAssurance. It is a reviewed Rust artifact compiled into Broker under the
 assurance-verifier registry, or a separately keyed invariant attestor with an
 equivalent pinned contract.
 
+Compile-time, feature-gated Broker verifiers are the MVP posture. A future
+separately keyed verifier/attestor module is a deliberate extension point, but
+it may not become runtime-loadable until its installation authority, sandbox
+and resource limits, rollback behavior, digest/version compatibility, and trust
+root are independently ratified. Evidence from such a module remains bound to
+an exact advertised verifier contract and cannot downgrade a required proof.
+
 ## Canonical flow
 
 ```text
@@ -197,6 +204,17 @@ Pending operations pin the exact package hash. Upgrade uses one of:
 - an installer-approved successor whose migration contract explicitly accepts
   the old driver/state schema; or
 - fail closed and require an operator-visible recovery action.
+
+Machine owns the migration state machine and invariant enforcement; the
+installer/catalog authority signs each admitted old-package-to-successor
+relationship. Only drafts that have not reached approval preparation may pass
+through a successor's deterministic state adapter. Awaiting-ceremony,
+approval-prepared, approved, pre-sign, signed, sent, or ambiguous actions remain
+pinned to the old package and verifier commitments; they complete or cancel
+where safe with the old artifact, or enter operator-visible quarantine. Broker
+must continue to advertise every verifier ID/digest required by an in-flight
+approval or signing action, and migration never changes immutable payloads,
+signatures, reservations, provenance, or verifier commitments.
 
 Best-effort detached route execution is not a scheduler. Reconciliation must be
 driven by durable Machine jobs that can resume after restart and invoke bounded
