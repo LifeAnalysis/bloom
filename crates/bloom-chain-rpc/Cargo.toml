@@ -1,0 +1,20 @@
+[package]
+name = "bloom-chain-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chain-neutral Machine RPC mediation, fault-injection harness, and blockhash freshness evaluation for verified chain Petals"
+
+[features]
+default = []
+
+[dependencies]
+bloom-chain-action.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

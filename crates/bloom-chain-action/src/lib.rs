@@ -182,12 +182,31 @@ pub struct NewAction {
     pub expires_at_ms: u64,
 }
 
+/// Why the honest runtime refused to sign for freshness reasons. These are
+/// liveness/consistency refusals against lagging or inconsistent providers;
+/// they do not detect a consistently malicious RPC (see the Solana plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessReason {
+    /// The staged blockhash is too old or reported invalid; restage with a
+    /// fresh blockhash and a new approval.
+    BlockhashRefreshRequired,
+    /// Observations disagree (blockhash, height, validity, or commitment);
+    /// the network view cannot be trusted enough to sign.
+    NetworkObservationInconsistent,
+    /// The remaining block-height validity window is too small to sign into.
+    InsufficientValidityWindow,
+}
+
 /// One journal transition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Transition {
     /// First journal record; written with the immutable envelope.
     Staged,
+    /// Pre-sign freshness refusal. Terminal for this action: signing is
+    /// blocked and progress requires restaging under a new approval.
+    FreshnessRefused { reason: FreshnessReason },
     /// Exact signature and assembled signed artifact. Recorded at most once.
     Signed {
         signature_hex: String,
@@ -231,6 +250,8 @@ pub enum ActionState {
     Cancelled,
     Expired,
     Quarantined,
+    /// Pre-sign freshness refusal. Terminal; a fresh action must be staged.
+    FreshnessRefused,
 }
 
 impl ActionState {
@@ -245,13 +266,19 @@ impl ActionState {
             Self::Cancelled => "cancelled",
             Self::Expired => "expired",
             Self::Quarantined => "quarantined",
+            Self::FreshnessRefused => "freshness_refused",
         }
     }
 
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Confirmed | Self::Failed | Self::Cancelled | Self::Expired | Self::Quarantined
+            Self::Confirmed
+                | Self::Failed
+                | Self::Cancelled
+                | Self::Expired
+                | Self::Quarantined
+                | Self::FreshnessRefused
         )
     }
 }
@@ -371,7 +398,38 @@ pub enum OutboxError {
     AttemptOutcomeConflict(u64),
     #[error("journal record {0} already exists")]
     JournalSeqExists(u64),
+    #[error(
+        "journal rollback detected: checkpoint pins seq {checkpoint_seq} but only {have} records exist"
+    )]
+    JournalRollbackDetected { have: u64, checkpoint_seq: u64 },
+    #[error("checkpoint digest mismatch (checkpoint mutated on disk)")]
+    CheckpointDigestMismatch,
+    #[error("journal record {0} does not match the trusted checkpoint")]
+    CheckpointHeadMismatch(u64),
 }
+
+/// A trusted high-water checkpoint pinning the journal head at write time.
+///
+/// The checkpoint is Machine-owned durable state written beside the journal.
+/// Recovery treats it as a floor: a journal shorter than `seq`, or a head
+/// record whose digest differs from `record_digest_hex`, is rollback or
+/// tampering and fails closed. A journal that merely grew past the checkpoint
+/// is fine — the checkpoint is a floor, not a ceiling. (An attacker with
+/// write access to both files could rewrite them consistently; the trust
+/// anchor is the Machine-owned directory permission, matching the EVM
+/// outbox's threat model.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub schema: String,
+    pub operation_id: String,
+    /// 1-based journal sequence this checkpoint pins.
+    pub seq: u64,
+    pub record_digest_hex: String,
+    pub at_ms: u64,
+    pub checkpoint_digest_hex: String,
+}
+
+pub const CHECKPOINT_SCHEMA: &str = "bloom.chain-action.checkpoint/1";
 
 /// The chain-neutral durable outbox.
 ///
@@ -569,6 +627,28 @@ impl ChainActionOutbox {
         }
         if records.is_empty() || !matches!(records[0].transition, Transition::Staged) {
             return Err(OutboxError::MissingStagedRecord);
+        }
+
+        // Trusted high-water checkpoint: a floor under the journal head.
+        let cp_path = self.action_dir(operation_id).join("checkpoint.json");
+        if cp_path.exists() {
+            let cp: Checkpoint = serde_json::from_slice(&fs::read(&cp_path)?)?;
+            if cp.schema != CHECKPOINT_SCHEMA || cp.operation_id != operation_id {
+                return Err(OutboxError::CheckpointDigestMismatch);
+            }
+            let canonical = CheckpointDigestInput::canonical(&cp);
+            if cp.checkpoint_digest_hex != sha256_hex(&canonical) {
+                return Err(OutboxError::CheckpointDigestMismatch);
+            }
+            if (records.len() as u64) < cp.seq {
+                return Err(OutboxError::JournalRollbackDetected {
+                    have: records.len() as u64,
+                    checkpoint_seq: cp.seq,
+                });
+            }
+            if records[(cp.seq - 1) as usize].record_digest_hex != cp.record_digest_hex {
+                return Err(OutboxError::CheckpointHeadMismatch(cp.seq));
+            }
         }
 
         replay(envelope, records)
@@ -779,6 +859,60 @@ impl ChainActionOutbox {
         self.load(operation_id)
     }
 
+    /// Record a pre-sign freshness refusal. Terminal: legal only from
+    /// `Staged`, blocks signing, and requires restaging under a new approval.
+    pub fn refuse_for_freshness(
+        &self,
+        operation_id: &str,
+        now_ms: u64,
+        reason: FreshnessReason,
+    ) -> Result<Action, OutboxError> {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let action = self.load(operation_id)?;
+        match action.state {
+            ActionState::Staged => {}
+            other => {
+                return Err(OutboxError::InvalidTransition {
+                    from: other.as_str(),
+                    to: "freshness_refused",
+                });
+            }
+        }
+        self.append(
+            operation_id,
+            now_ms,
+            Transition::FreshnessRefused { reason },
+        )?;
+        self.load(operation_id)
+    }
+
+    /// Write a trusted high-water checkpoint pinning the current journal head.
+    pub fn checkpoint(&self, operation_id: &str, now_ms: u64) -> Result<Checkpoint, OutboxError> {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let action = self.load(operation_id)?;
+        let last = action
+            .journal
+            .last()
+            .ok_or(OutboxError::MissingStagedRecord)?;
+        let cp = Checkpoint {
+            schema: CHECKPOINT_SCHEMA.to_string(),
+            operation_id: operation_id.to_string(),
+            seq: last.seq,
+            record_digest_hex: last.record_digest_hex.clone(),
+            at_ms: now_ms,
+            checkpoint_digest_hex: String::new(),
+        };
+        let canonical = CheckpointDigestInput::canonical(&cp);
+        let mut cp = cp;
+        cp.checkpoint_digest_hex = sha256_hex(&canonical);
+        let path = self.action_dir(operation_id).join("checkpoint.json");
+        let bytes = serde_json::to_vec_pretty(&cp)?;
+        let tmp = self.tmp_path(&path);
+        fs::write(&tmp, &bytes)?;
+        fs::rename(&tmp, &path)?;
+        Ok(cp)
+    }
+
     /// Transition every non-terminal action whose validity window has elapsed
     /// to `Expired`. Returns the ids that were expired. Expiry proves a
     /// non-effect only when nothing was ever dispatched through this outbox.
@@ -866,6 +1000,29 @@ impl<'a> RecordDigestInput<'a> {
             prev_digest_hex,
         })
         .expect("record digest input serializes")
+    }
+}
+
+/// Canonical digest preimage for a checkpoint (digest field excluded).
+#[derive(Serialize)]
+struct CheckpointDigestInput<'a> {
+    schema: &'a str,
+    operation_id: &'a str,
+    seq: u64,
+    record_digest_hex: &'a str,
+    at_ms: u64,
+}
+
+impl<'a> CheckpointDigestInput<'a> {
+    fn canonical(cp: &'a Checkpoint) -> Vec<u8> {
+        serde_json::to_vec(&Self {
+            schema: &cp.schema,
+            operation_id: &cp.operation_id,
+            seq: cp.seq,
+            record_digest_hex: &cp.record_digest_hex,
+            at_ms: cp.at_ms,
+        })
+        .expect("checkpoint digest input serializes")
     }
 }
 
@@ -987,6 +1144,10 @@ fn replay(envelope: Envelope, records: Vec<Record>) -> Result<Action, OutboxErro
             Transition::Cancelled => {
                 require(&state, &[ActionState::Staged], "cancelled")?;
                 state = ActionState::Cancelled;
+            }
+            Transition::FreshnessRefused { .. } => {
+                require(&state, &[ActionState::Staged], "freshness_refused")?;
+                state = ActionState::FreshnessRefused;
             }
             Transition::Expired { .. } => {
                 require(

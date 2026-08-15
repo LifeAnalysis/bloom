@@ -776,3 +776,136 @@ fn fixture_driver_end_to_end_orchestration() {
         done.attempts[1].artifact_digest_hex
     );
 }
+
+#[test]
+fn freshness_refusal_is_terminal_and_blocks_signing() {
+    use bloom_chain_action::FreshnessReason;
+
+    let dir = TempDir::new().unwrap();
+    let outbox = ChainActionOutbox::new(dir.path()).unwrap();
+    let d = driver();
+    stage(&outbox, &d, 80);
+
+    let refused = outbox
+        .refuse_for_freshness(&op(80), 300, FreshnessReason::InsufficientValidityWindow)
+        .unwrap();
+    assert_eq!(refused.state, ActionState::FreshnessRefused);
+    assert!(refused.state.is_terminal());
+
+    // Signing is blocked by the refusal.
+    let payload = hex::decode(&refused.envelope.payload_hex).unwrap();
+    let artifact = d.assemble_artifact(&payload);
+    let signature = d.fixture_sign(&payload);
+    assert!(matches!(
+        outbox
+            .record_signed(&op(80), 400, &signature, &artifact)
+            .unwrap_err(),
+        OutboxError::InvalidTransition {
+            from: "freshness_refused",
+            to: "signed"
+        }
+    ));
+    // The refusal reason is recorded in the journal.
+    let binding = outbox.load(&op(80)).unwrap();
+    let last = binding.journal.last().unwrap();
+    assert!(matches!(
+        &last.transition,
+        bloom_chain_action::Transition::FreshnessRefused {
+            reason: FreshnessReason::InsufficientValidityWindow
+        }
+    ));
+    // Expiry sweep skips it (already terminal).
+    assert!(outbox.sweep_expired(u64::MAX).unwrap().is_empty());
+}
+
+#[test]
+fn freshness_refusal_only_from_staged() {
+    use bloom_chain_action::FreshnessReason;
+
+    let dir = TempDir::new().unwrap();
+    let outbox = ChainActionOutbox::new(dir.path()).unwrap();
+    let d = driver();
+    stage(&outbox, &d, 81);
+    sign(&outbox, &d, 81);
+    assert!(matches!(
+        outbox
+            .refuse_for_freshness(&op(81), 300, FreshnessReason::BlockhashRefreshRequired)
+            .unwrap_err(),
+        OutboxError::InvalidTransition {
+            from: "signed",
+            to: "freshness_refused"
+        }
+    ));
+}
+
+#[test]
+fn checkpoint_pins_the_journal_head_and_detects_truncation() {
+    let dir = TempDir::new().unwrap();
+    let outbox = ChainActionOutbox::new(dir.path()).unwrap();
+    let d = driver();
+    stage(&outbox, &d, 82);
+    sign(&outbox, &d, 82);
+    outbox.record_broadcast_attempt(&op(82), 300).unwrap();
+    outbox
+        .record_broadcast_outcome(&op(82), 400, 1, BroadcastOutcome::Accepted)
+        .unwrap();
+
+    // Checkpoint the head (seq 4), then tamper by truncating the tail.
+    let cp = outbox.checkpoint(&op(82), 500).unwrap();
+    assert_eq!(cp.seq, 4);
+    fs::remove_file(journal_file(&dir, 82, "00000004")).unwrap();
+    fs::remove_file(journal_file(&dir, 82, "00000003")).unwrap();
+    assert!(matches!(
+        outbox.load(&op(82)).unwrap_err(),
+        OutboxError::JournalRollbackDetected {
+            have: 2,
+            checkpoint_seq: 4
+        }
+    ));
+
+    // A checkpointed journal that merely grew past the floor still loads.
+    let dir2 = TempDir::new().unwrap();
+    let outbox2 = ChainActionOutbox::new(dir2.path()).unwrap();
+    stage(&outbox2, &d, 83);
+    outbox2.checkpoint(&op(83), 200).unwrap();
+    sign(&outbox2, &d, 83);
+    let grown = outbox2.load(&op(83)).unwrap();
+    assert_eq!(grown.state, ActionState::Signed);
+    assert_eq!(grown.journal.len(), 2);
+}
+
+#[test]
+fn checkpoint_mutation_is_detected() {
+    let dir = TempDir::new().unwrap();
+    let outbox = ChainActionOutbox::new(dir.path()).unwrap();
+    let d = driver();
+    stage(&outbox, &d, 84);
+    outbox.checkpoint(&op(84), 200).unwrap();
+
+    let path = dir
+        .path()
+        .join("actions")
+        .join(op(84))
+        .join("checkpoint.json");
+    let raw = fs::read_to_string(&path).unwrap();
+    let tampered = raw.replace("\"seq\": 1", "\"seq\": 2");
+    assert_ne!(raw, tampered);
+    fs::write(&path, tampered).unwrap();
+    assert!(matches!(
+        outbox.load(&op(84)).unwrap_err(),
+        OutboxError::CheckpointDigestMismatch
+    ));
+
+    // Head-digest rewrite is caught even with a self-consistent digest.
+    fs::write(&path, &raw).unwrap();
+    outbox.checkpoint(&op(84), 300).unwrap();
+    let raw2 = fs::read_to_string(&path).unwrap();
+    let record = journal_file(&dir, 84, "00000001");
+    let rr = fs::read_to_string(&record).unwrap();
+    let forged = raw2.replace(
+        &rr.split("\"record_digest_hex\": \"").nth(1).unwrap()[..64],
+        &"e".repeat(64),
+    );
+    fs::write(&path, forged).unwrap();
+    assert!(outbox.load(&op(84)).is_err());
+}
