@@ -34,12 +34,15 @@
 //! head digest differs, and with [`OutboxError::CheckpointDigestMismatch`]
 //! when the checkpoint itself is mutated.
 //!
-//! With a checkpoint written, persistence is rollback-resistant **within the
-//! Machine-owned directory trust boundary**: rollback must rewrite both the
-//! journal and the checkpoint consistently, which requires write access to
-//! Machine-owned state. Anchoring the latest sequence and digest in a
-//! separate process or store remains available for deployments that need to
-//! remove that residual as well.
+//! With a checkpoint written, persistence is rollback-resistant **while the
+//! checkpoint file remains trusted**: rollback detection holds as long as
+//! the checkpoint is not itself rewritten. This is rollback resistance
+//! within a stated trust boundary — the Machine-owned directory — not
+//! adversarial rollback-proofness: an attacker with write access to
+//! Machine-owned state can rewrite the journal and the checkpoint
+//! consistently. Anchoring the latest sequence and digest in a separate
+//! process or store remains available for deployments that need to remove
+//! that residual as well.
 //!
 //! The fixture driver in [`fixture`] is a deterministic, non-cryptographic
 //! test double used to exercise the outbox without any chain SDK.
