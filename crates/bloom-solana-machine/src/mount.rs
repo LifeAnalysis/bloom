@@ -17,7 +17,7 @@ use serde::Deserialize;
 /// the Petal source produces a different package hash and must update this
 /// constant through review — there is no floating install.
 pub const PINNED_SOLANA_DRIVER_PACKAGE_HASH: &str =
-    "c6e70cb2a9cb614b951712abcc82cd54b3fd2799d23c0f2b9372e035b17fa545";
+    "55d66c0f5078632f1dfe9dd43da9686093283afa80797672471160739343aecd";
 
 #[derive(Debug, Deserialize)]
 struct BuildManifest {
