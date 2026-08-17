@@ -222,6 +222,24 @@ pub enum Transition {
     /// approved ceiling. Informational: fees are machine-asserted facts,
     /// never verifier-proven, and this records what was observed and bound.
     FeeObserved { lamports: u64, max_lamports: u64 },
+    /// Verifier-established facts for the exact staged payload, with the
+    /// verifier identity and result digest. Every field here was extracted
+    /// by the independent verifier, not asserted by the driver.
+    FactsVerified {
+        fee_payer_base58: String,
+        destination_base58: String,
+        lamports: u64,
+        verifier_id: String,
+        verifier_result_digest_hex: String,
+        message_digest_hex: String,
+    },
+    /// Liveness observation at staging: the blockhash embedded in the payload
+    /// and its observed validity window. Machine-asserted network facts.
+    LivenessObserved {
+        blockhash_base58: String,
+        last_valid_block_height: u64,
+        observed_at_ms: u64,
+    },
     /// Exact signature and assembled signed artifact. Recorded at most once.
     Signed {
         signature_hex: String,
@@ -897,6 +915,89 @@ impl ChainActionOutbox {
         self.load(operation_id)
     }
 
+    /// Record the verifier-established facts for the staged payload.
+    /// Informational, staging-only, at most once.
+    #[allow(clippy::too_many_arguments)] // journal record fields
+    pub fn record_facts_verified(
+        &self,
+        operation_id: &str,
+        now_ms: u64,
+        fee_payer_base58: String,
+        destination_base58: String,
+        lamports: u64,
+        verifier_id: String,
+        verifier_result_digest_hex: String,
+        message_digest_hex: String,
+    ) -> Result<Action, OutboxError> {
+        self.record_informational(
+            operation_id,
+            now_ms,
+            Transition::FactsVerified {
+                fee_payer_base58,
+                destination_base58,
+                lamports,
+                verifier_id,
+                verifier_result_digest_hex,
+                message_digest_hex,
+            },
+            "facts_verified",
+        )
+    }
+
+    /// Record the staging-time liveness observation. Informational,
+    /// staging-only, at most once.
+    pub fn record_liveness_observed(
+        &self,
+        operation_id: &str,
+        now_ms: u64,
+        blockhash_base58: String,
+        last_valid_block_height: u64,
+        observed_at_ms: u64,
+    ) -> Result<Action, OutboxError> {
+        self.record_informational(
+            operation_id,
+            now_ms,
+            Transition::LivenessObserved {
+                blockhash_base58,
+                last_valid_block_height,
+                observed_at_ms,
+            },
+            "liveness_observed",
+        )
+    }
+
+    fn record_informational(
+        &self,
+        operation_id: &str,
+        now_ms: u64,
+        transition: Transition,
+        name: &'static str,
+    ) -> Result<Action, OutboxError> {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let action = self.load(operation_id)?;
+        let already = action
+            .journal
+            .iter()
+            .any(|r| std::mem::discriminant(&r.transition) == std::mem::discriminant(&transition));
+        if already {
+            return Err(OutboxError::InvalidTransition {
+                from: action.state.as_str(),
+                to: name,
+            });
+        }
+        match action.state {
+            ActionState::Staged => {}
+            other => {
+                return Err(OutboxError::InvalidTransition {
+                    from: other.as_str(),
+                    to: name,
+                });
+            }
+        }
+        self.append(operation_id, now_ms, transition)?;
+        self.load(operation_id)
+    }
+
     /// Cancel an action. Legal only from `Staged`: once a signature exists,
     /// cancellation cannot prove a non-effect.
     pub fn cancel(&self, operation_id: &str, now_ms: u64) -> Result<Action, OutboxError> {
@@ -1208,6 +1309,14 @@ fn replay(envelope: Envelope, records: Vec<Record>) -> Result<Action, OutboxErro
             Transition::FeeObserved { .. } => {
                 // Informational, no lifecycle effect; staging-only.
                 require(&state, &[ActionState::Staged], "fee_observed")?;
+            }
+            Transition::FactsVerified { .. } => {
+                // Informational; staging-only.
+                require(&state, &[ActionState::Staged], "facts_verified")?;
+            }
+            Transition::LivenessObserved { .. } => {
+                // Informational; staging-only.
+                require(&state, &[ActionState::Staged], "liveness_observed")?;
             }
             Transition::Expired { .. } => {
                 require(

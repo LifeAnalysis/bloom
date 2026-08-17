@@ -32,9 +32,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod account;
 pub mod fixture;
 pub mod host;
 pub mod mount;
+pub mod projection;
 
 use std::sync::Arc;
 
@@ -52,7 +54,13 @@ use bloom_solana::adapter::{
 };
 use bloom_solana::{Pubkey, RejectionReason};
 use bloom_vfs::path::VfsPath;
+
+pub use account::{AccountError, AccountRegistry, EnabledAccount};
 use bloom_vfs::{Handler, Vfs};
+pub use projection::{
+    AccountProjection, AssertedFacts, BindingProjections, ClusterProjection, FinalityProjection,
+    FreshnessSummary, OperationProjection, PROJECTION_SCHEMA, VerifiedFacts,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -414,7 +422,8 @@ impl SolanaMachine {
         let verified = self
             .verify_staged(named, request, &message_hex, &payload_digest_hex)
             .map_err(MachineError::VerifierRejected)?;
-        bloom_solana::adapter::run_verifier(&verified).map_err(MachineError::VerifierRejected)?;
+        let verified_result = bloom_solana::adapter::run_verifier(&verified)
+            .map_err(MachineError::VerifierRejected)?;
 
         // Fee observation for the exact message. Asserted, bounded, displayed
         // as asserted — never verifier-proven.
@@ -424,6 +433,23 @@ impl SolanaMachine {
             now_ms,
             fee_lamports,
             request.max_fee_lamports,
+        )?;
+        self.outbox.record_facts_verified(
+            &request.operation_id,
+            now_ms,
+            request.fee_payer_base58.clone(),
+            request.destination_base58.clone(),
+            request.lamports,
+            verified_result.verifier_id.clone(),
+            verified_result.result_digest_hex.clone(),
+            payload_digest_hex.clone(),
+        )?;
+        self.outbox.record_liveness_observed(
+            &request.operation_id,
+            now_ms,
+            blockhash_base58.clone(),
+            last_valid,
+            now_ms,
         )?;
 
         Ok(StagedTransfer {
@@ -726,69 +752,41 @@ impl SolanaMachine {
         )?)
     }
 
-    /// Public projection for Machine/VFS/CLI surfaces: state, verified
-    /// economic facts, signing identity, and every broadcast attempt.
-    pub fn project(&self, operation_id: &str) -> Result<Value, MachineError> {
+    /// The typed VFS projection for one operation: durable outbox records
+    /// only, verified facts structurally separated from machine-asserted
+    /// observations. Digests over payload bytes throughout.
+    pub fn project(
+        &self,
+        operation_id: &str,
+        now_ms: u64,
+    ) -> Result<OperationProjection, MachineError> {
         let action = self.outbox.load(operation_id)?;
-        let env = &action.envelope;
-        let fee: Option<FeeObservedView> =
-            action
-                .journal
-                .iter()
-                .rev()
-                .find_map(|r| match &r.transition {
-                    bloom_chain_action::Transition::FeeObserved {
-                        lamports,
-                        max_lamports,
-                    } => Some(FeeObservedView {
-                        lamports: *lamports,
-                        max_lamports: *max_lamports,
-                    }),
-                    _ => None,
-                });
-        let mut attempts = Vec::new();
-        for a in &action.attempts {
-            attempts.push(json!({
-                "attempt": a.attempt,
-                "artifact_digest_hex": a.artifact_digest_hex,
-                "outcome": match &a.outcome {
-                    None => Value::Null,
-                    Some(bloom_chain_action::AttemptOutcome::Accepted) => json!("accepted"),
-                    Some(bloom_chain_action::AttemptOutcome::Ambiguous) => json!("ambiguous"),
-                    Some(bloom_chain_action::AttemptOutcome::Rejected { reason }) => json!({
-                        "rejected": reason
-                    }),
-                },
-            }));
+        let profile = self.mediator.profile();
+        projection::project_operation(
+            &action,
+            now_ms,
+            &profile_caip2(profile),
+            &profile.expected_genesis_hex,
+        )
+    }
+
+    /// JSON convenience over [`Self::project`] for file/CLI surfaces.
+    pub fn project_json(&self, operation_id: &str, now_ms: u64) -> Result<Value, MachineError> {
+        let projection = self.project(operation_id, now_ms)?;
+        serde_json::to_value(&projection).map_err(MachineError::Json)
+    }
+
+    /// Cluster identity projection from the operator-configured profile.
+    pub fn project_cluster(&self) -> ClusterProjection {
+        let profile = self.mediator.profile();
+        ClusterProjection {
+            schema: "bloom.solana.cluster-projection/1".to_string(),
+            profile: profile.name.clone(),
+            family: profile.family.clone(),
+            caip2: profile_caip2(profile),
+            expected_genesis_hex: profile.expected_genesis_hex.clone(),
+            broadcast_enabled: profile.allow_broadcast,
         }
-        Ok(json!({
-            "schema": "bloom.solana.operation-projection/1",
-            "operation_id": env.operation_id,
-            "state": action.state.as_str(),
-            "terminal": action.state.is_terminal(),
-            "wallet_id": env.wallet_id,
-            "chain": {
-                "family": env.chain.family,
-                "profile": env.chain.profile,
-                "claimed_caip2": env.chain.claimed_caip2,
-            },
-            "operation_class": env.operation_class,
-            "crypto_suite": env.crypto_suite,
-            "payload_digest_hex": env.payload_digest_hex,
-            // Fee facts are asserted by the driver/provider, bounded at
-            // approval, and never verifier-proven.
-            "fee_assurance": "machine_asserted",
-            "fee_lamports": fee.as_ref().map(|f| f.lamports),
-            "max_fee_lamports": fee.as_ref().map(|f| f.max_lamports),
-            "total_debit_lamports": fee
-                .as_ref()
-                .and_then(|f| env_hex_lamports(&action).ok().map(|l| l + f.lamports)),
-            "signature_base58": action.artifact.as_ref().map(|a| {
-                bs58::encode(&a.signature).into_string()
-            }),
-            "transaction_digest_hex": action.artifact.as_ref().map(|a| a.digest_hex.clone()),
-            "attempts": attempts,
-        }))
     }
 
     /// The mediated profile in effect (public projection; no credentials).
@@ -821,28 +819,11 @@ impl SolanaMachine {
     }
 }
 
-#[derive(Clone, Copy)]
-struct FeeObservedView {
-    lamports: u64,
-    max_lamports: u64,
-}
-
-/// Extract the transfer lamports from the canonical message payload so the
-/// projection can display the total debit without re-verifying.
-fn env_hex_lamports(action: &Action) -> Result<u64, MachineError> {
-    let payload = hex::decode(&action.envelope.payload_hex)
-        .map_err(|e| MachineError::BadHex(e.to_string()))?;
-    // Canonical layout: the single instruction's data is the final
-    // short-vec: [len][2u32 LE opcode][lamports u64 LE].
-    // The canonical single-instruction message ends with the 12-byte
-    // transfer data; the lamports are its final 8 bytes, little-endian.
-    if payload.len() < 12 {
-        return Err(MachineError::MissingField("transfer data"));
-    }
-    let start = payload.len() - 8;
-    Ok(u64::from_le_bytes(payload[start..].try_into().map_err(
-        |_| MachineError::MissingField("transfer data"),
-    )?))
+/// Derive the profile's CAIP-2 identity from family + name. Profile names
+/// are operator-configured tokens; the CAIP-2 reference uses the namespace
+/// truncated form.
+fn profile_caip2(profile: &ChainRpcProfile) -> String {
+    format!("{}:{}", profile.family, profile.name)
 }
 
 /// A Solana transaction's signature (single signer) is the base58 of the

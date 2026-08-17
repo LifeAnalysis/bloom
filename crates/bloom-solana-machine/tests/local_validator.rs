@@ -209,10 +209,10 @@ async fn full_lifecycle_on_local_validator() {
     assert!(machine.load_action(&op).state.is_terminal());
 
     // The fee the validator quoted matches the journal's bound.
-    let projection = machine.project(&op).unwrap();
-    assert_eq!(projection["fee_lamports"].as_u64(), Some(fee));
+    let projection = machine.project_json(&op, 9).unwrap();
+    assert_eq!(projection["asserted"]["fee_lamports"].as_u64(), Some(fee));
     assert_eq!(
-        projection["total_debit_lamports"].as_u64(),
+        projection["asserted"]["total_debit_lamports"].as_u64(),
         Some(1_000_000_000 + fee)
     );
 

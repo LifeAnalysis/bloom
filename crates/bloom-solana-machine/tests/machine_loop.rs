@@ -179,10 +179,16 @@ async fn full_lifecycle_stage_sign_broadcast_confirm() {
     );
 
     // Projection surface.
-    let projection = machine.project(&req.operation_id).unwrap();
+    let projection = machine.project_json(&req.operation_id, 2_000).unwrap();
     assert_eq!(projection["state"], "confirmed");
     assert_eq!(projection["terminal"], serde_json::json!(true));
-    assert_eq!(projection["payload_digest_hex"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        projection["bindings"]["payload_digest_hex"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     assert!(
         projection["signature_base58"]
             .as_str()
@@ -378,13 +384,18 @@ async fn fee_is_observed_bound_and_displayed_as_total_debit() {
     let req = request(&machine, "0a");
     machine.prepare_transfer(&req, 1_000).await.unwrap();
 
-    let projection = machine.project(&req.operation_id).unwrap();
-    assert_eq!(projection["fee_assurance"], "machine_asserted");
-    assert_eq!(projection["fee_lamports"], serde_json::json!(5_000));
-    assert_eq!(projection["max_fee_lamports"], serde_json::json!(10_000));
+    let projection = machine.project_json(&req.operation_id, 2_000).unwrap();
+    assert_eq!(
+        projection["asserted"]["fee_lamports"],
+        serde_json::json!(5_000)
+    );
+    assert_eq!(
+        projection["asserted"]["max_fee_lamports"],
+        serde_json::json!(10_000)
+    );
     // 1 SOL transfer + 5000-lamport fee.
     assert_eq!(
-        projection["total_debit_lamports"],
+        projection["asserted"]["total_debit_lamports"],
         serde_json::json!(1_000_005_000)
     );
 
@@ -661,7 +672,7 @@ async fn restart_recovers_ambiguous_broadcast_and_confirms() {
         );
 
         // Projection survives cold load.
-        let projection = recovered.project(&req_id).unwrap();
+        let projection = recovered.project_json(&req_id, 2_500).unwrap();
         assert_eq!(projection["state"], "confirmed");
         assert_eq!(projection["terminal"], serde_json::json!(true));
     }
