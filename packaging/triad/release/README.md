@@ -11,8 +11,7 @@ and Signer. `check-external-pins.py` rejects mutable or abbreviated Git pins;
 its `--remote` mode additionally proves the recorded commits through GitHub.
 
 `build-bundle.sh` accepts the three service binaries, the bounded
-`bloom-signer-migrate` staging tool, and a
-reviewed Ed25519 release key. It verifies semantic versions, scans every
+`bloom-signer-migrate` staging tool, and an ephemeral candidate key. It verifies semantic versions, scans every
 staged and generated bundle file for release-blocking markers, records all
 three Git revisions, embeds both platform installers, signs the internal
 payload manifest for post-elevation verification, normalizes metadata, and
@@ -69,14 +68,35 @@ For one candidate payload `C`, the disposable evidence matrix is:
 
 The signer refuses a mixture of evidence from different candidates.
 
-`triad-release-gate.sh` rejects modified or untracked release inputs, runs
-locked fmt, clippy, and tests in all three sibling workspaces, builds release
+`triad-release-gate.sh` rejects modified or untracked release inputs, requires
+the Broker and Signer checkouts to match the full revisions in the matrix, runs
+locked format checks across all three workspaces, applies strict Clippy to the
+Machine workspace, builds release
 binaries, assembles the bundle twice, verifies both, requires byte-identical
 archives, matches the signed source revisions back to the three clean
 workspaces, executes each extracted production binary, then reruns all three
-workspace suites with the verified bundle bound as acceptance input.
-`--test-signing-key` is CI-only; production invocation must set
-`TRIAD_RELEASE_SIGNING_KEY`.
+workspace suites with the verified bundle bound as acceptance input. The gate
+requires `--test-signing-key`; a production key is never available while a
+newly built binary or its tests execute. `--output-dir` preserves the verified
+candidate for the release workflow.
+
+`verify-release-candidate.sh` verifies the transferred ephemeral signature and
+binds the candidate to the resolved version and all three full source commits.
+The candidate remains `test-unclaimed`; only the isolated signing pass rewrites
+that claim to `linux` before recalculating the signed payload manifest.
+
+`sign-release-candidate.sh` is the isolated production signing pass. It never
+executes a candidate-owned binary or script. It replaces the ephemeral inner
+signature, deterministically repacks the payload, signs the outer checksum,
+and refuses a private key that does not match `bloom-release-v1.pub`. GitHub
+Actions makes this key available only to the `production-release` signing job.
+The tag workflow publishes the Linux x86_64 artifact as a prerelease so it can
+be validated before anything directs agents to it.
+
+Before merging release-workflow changes, dispatch the branch with
+`dry_run=true`. That path builds and signs the exact branch through the
+protected environment, uploads the signed artifact for inspection, and skips
+the publish job. Normal tag pushes and tag retries cannot select dry-run mode.
 
 Before compiling, `check-machine-authority-boundary.sh --require-clean`
 resolves every entry in `machine-production-feature-sets.tsv` with locked
@@ -117,6 +137,12 @@ On Linux,
 `nts-servers.conf`. The last file contains at least two distinct reviewed NTS
 host names, one per line. AWS credentials and `aws-kms-ip-allow.conf` are an
 optional paired site overlay.
+
+The v0.1.4 Linux archive is an operator-integration prerelease, not yet a
+public fresh-install package. The low-level Linux installer requires those
+site-specific inputs and does not yet generate a complete per-login enrollment
+or prove live systemd health. The website must remain pinned to v0.1.3 until a
+self-contained Linux enrollment path and disposable-host acceptance lane land.
 
 Production macOS enrollment does not accept that private fixture layout. Its
 installed Machine binary generates fresh per-login Machine, Broker, Signer,

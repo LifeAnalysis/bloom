@@ -112,6 +112,46 @@ fn machine_authority_boundary_is_directly_enforced_and_strict_release_is_blocked
 
     let release_gate = fs::read_to_string(release_dir.join("triad-release-gate.sh")).unwrap();
     assert!(release_gate.contains("check-machine-authority-boundary.sh\" --require-clean"));
+    assert!(release_gate.contains("--output-dir"));
+    assert!(release_gate.contains("bloom-triad-test-unclaimed.tar.gz"));
+    assert!(release_gate.contains("cargo test --workspace --locked -- --skip macos_"));
+}
+
+#[test]
+fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
+    let workflow = fs::read_to_string(workspace().join(".github/workflows/release.yml")).unwrap();
+    assert!(workflow.contains("repository: bloom-directory/bloom-broker"));
+    assert!(workflow.contains("ref: ${{ needs.prepare.outputs.broker_sha }}"));
+    assert!(workflow.contains("repository: bloom-directory/bloom-signer"));
+    assert!(workflow.contains("ref: ${{ needs.prepare.outputs.signer_sha }}"));
+    assert!(workflow.contains("--test-signing-key"));
+    assert!(!workflow.contains("--platform-claim linux"));
+    assert!(workflow.contains("verify-release-candidate.sh"));
+    assert!(workflow.contains("environment: production-release"));
+    assert!(workflow.contains("sign-release-candidate.sh"));
+    assert!(workflow.contains("packaging/triad/release/bloom-release-v1.pub"));
+    assert!(workflow.contains("--prerelease"));
+    assert!(workflow.contains("--latest=false"));
+    assert!(workflow.contains("dry_run:"));
+    assert!(workflow.contains("if: needs.prepare.outputs.dry_run != 'true'"));
+    assert!(workflow.contains("release dry runs require workflow_dispatch"));
+    assert!(!workflow.contains("--all-features"));
+    assert!(!workflow.contains("--clobber"));
+    assert!(workflow.contains("umask 077"));
+    assert!(workflow.contains("unset RELEASE_SIGNING_KEY"));
+    assert!(workflow.contains("published asset $name is immutable"));
+    assert_eq!(
+        workflow
+            .matches("secrets.TRIAD_RELEASE_SIGNING_KEY")
+            .count(),
+        1,
+        "the production key must be exposed to exactly one workflow step"
+    );
+
+    let proposal =
+        fs::read_to_string(workspace().join(".github/workflows/propose-release.yml")).unwrap();
+    assert!(proposal.contains("packaging/triad/release/compatibility-v1.toml"));
+    assert!(proposal.contains("machine ="));
 }
 
 #[test]
@@ -155,6 +195,18 @@ fn generate_ed25519_key(path: &Path) {
     );
 }
 
+fn write_ed25519_public_key(private_key: &Path, public_key: &Path) {
+    let output = Command::new(release_script("ssh-ed25519-public-key.sh"))
+        .args([private_key, public_key])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn make_staging(root: &Path) -> PathBuf {
     let staging = root.join("staging");
     fs::create_dir_all(staging.join("bin")).unwrap();
@@ -165,8 +217,19 @@ fn make_staging(root: &Path) -> PathBuf {
         "bloom-signer-migrate",
     ] {
         let path = staging.join("bin").join(binary);
-        let version = if binary == "bloom" { "0.1.3" } else { "0.1.0" };
-        fs::write(&path, format!("#!/bin/sh\necho {binary} {version}\n")).unwrap();
+        let version = if binary == "bloom" {
+            env!("CARGO_PKG_VERSION")
+        } else {
+            "0.1.0"
+        };
+        let version_output = if binary == "bloom" {
+            format!(
+                "echo '{binary} {version}'\necho 'bloom-daemon unavailable'\necho 'bloom-ipc 1 (not negotiated)'"
+            )
+        } else {
+            format!("echo '{binary} {version}'")
+        };
+        fs::write(&path, format!("#!/bin/sh\n{version_output}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     fs::write(staging.join("PLATFORM_CLAIM"), b"test-unclaimed\n").unwrap();
@@ -237,9 +300,9 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
     Command::new(release_script("build-bundle.sh"))
         .args([staging.as_os_str(), output.as_os_str(), key.as_os_str()])
         .arg("1700000000")
-        .env("BLOOM_MACHINE_SHA", "1111111")
-        .env("BLOOM_BROKER_SHA", "2222222")
-        .env("BLOOM_SIGNER_SHA", "3333333")
+        .env("BLOOM_MACHINE_SHA", "11".repeat(20))
+        .env("BLOOM_BROKER_SHA", "22".repeat(20))
+        .env("BLOOM_SIGNER_SHA", "33".repeat(20))
         .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
         .output()
         .unwrap()
@@ -269,9 +332,9 @@ fn release_bundle_fails_closed_when_binary_format_scanner_fails() {
     let built = Command::new(release_script("build-bundle.sh"))
         .args([staging.as_os_str(), archive.as_os_str(), key.as_os_str()])
         .arg("1700000000")
-        .env("BLOOM_MACHINE_SHA", "1111111")
-        .env("BLOOM_BROKER_SHA", "2222222")
-        .env("BLOOM_SIGNER_SHA", "3333333")
+        .env("BLOOM_MACHINE_SHA", "11".repeat(20))
+        .env("BLOOM_BROKER_SHA", "22".repeat(20))
+        .env("BLOOM_SIGNER_SHA", "33".repeat(20))
         .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
         .env("PATH", path)
         .output()
@@ -911,6 +974,138 @@ fn triad_bundle_is_reproducible_signed_and_self_verifying() {
     assert!(
         !wrong_namespace.status.success(),
         "an archive signature must not verify in the payload namespace"
+    );
+}
+
+#[test]
+fn production_candidate_signing_is_data_only_reproducible_and_key_pinned() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    let execution_marker = directory.path().join("candidate-executed");
+    for binary in [
+        "bloom",
+        "bloom-broker",
+        "bloom-signer",
+        "bloom-signer-migrate",
+    ] {
+        let path = staging.join("bin").join(binary);
+        let script = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            script.replacen(
+                "#!/bin/sh\n",
+                &format!("#!/bin/sh\ntouch '{}'\n", execution_marker.display()),
+                1,
+            ),
+        )
+        .unwrap();
+    }
+
+    let candidate_key = directory.path().join("candidate-key");
+    generate_ed25519_key(&candidate_key);
+    let candidate = directory.path().join("candidate.tar.gz");
+    let built = build(&staging, &candidate, &candidate_key);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(execution_marker.exists());
+    fs::remove_file(&execution_marker).unwrap();
+
+    let release_key = directory.path().join("release-key");
+    let release_public_key = directory.path().join("release-key.pub.pinned");
+    generate_ed25519_key(&release_key);
+    write_ed25519_public_key(&release_key, &release_public_key);
+    let first_dir = directory.path().join("signed-a");
+    let second_dir = directory.path().join("signed-b");
+    fs::create_dir(&first_dir).unwrap();
+    fs::create_dir(&second_dir).unwrap();
+    let first = first_dir.join("bloom-triad-linux-x86_64.tar.gz");
+    let second = second_dir.join("bloom-triad-linux-x86_64.tar.gz");
+    let expected_machine_sha = "11".repeat(20);
+    let expected_broker_sha = "22".repeat(20);
+    let expected_signer_sha = "33".repeat(20);
+    for output in [&first, &second] {
+        let signed = Command::new(release_script("sign-release-candidate.sh"))
+            .args([
+                candidate.as_os_str(),
+                output.as_os_str(),
+                release_key.as_os_str(),
+                release_public_key.as_os_str(),
+            ])
+            .args([
+                "1700000000",
+                env!("CARGO_PKG_VERSION"),
+                &expected_machine_sha,
+                &expected_broker_sha,
+                &expected_signer_sha,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            signed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&signed.stderr)
+        );
+    }
+    assert!(!execution_marker.exists());
+    assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+
+    let first_checksum = PathBuf::from(format!("{}.sha256", first.display()));
+    let first_signature = PathBuf::from(format!("{}.sig", first.display()));
+    let verifier_tools = directory.path().join("verifier-tools");
+    fs::create_dir(&verifier_tools).unwrap();
+    let file = verifier_tools.join("file");
+    fs::write(&file, "#!/bin/sh\necho 'ELF 64-bit LSB executable'\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+    let verified = Command::new(release_script("verify-bundle.sh"))
+        .args([
+            first.as_os_str(),
+            first_checksum.as_os_str(),
+            first_signature.as_os_str(),
+            release_public_key.as_os_str(),
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                verifier_tools.display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+
+    let wrong_key = directory.path().join("wrong-key");
+    let wrong_public_key = directory.path().join("wrong-key.pub.pinned");
+    generate_ed25519_key(&wrong_key);
+    write_ed25519_public_key(&wrong_key, &wrong_public_key);
+    let rejected = Command::new(release_script("sign-release-candidate.sh"))
+        .args([
+            candidate.as_os_str(),
+            directory.path().join("wrong.tar.gz").as_os_str(),
+            release_key.as_os_str(),
+            wrong_public_key.as_os_str(),
+        ])
+        .args([
+            "1700000000",
+            env!("CARGO_PKG_VERSION"),
+            &expected_machine_sha,
+            &expected_broker_sha,
+            &expected_signer_sha,
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("does not match the reviewed public key")
     );
 }
 

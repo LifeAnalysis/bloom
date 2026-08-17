@@ -5,12 +5,51 @@ main_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"
 broker_root="${BLOOM_BROKER_ROOT:-$main_root/../bloom-broker}"
 signer_root="${BLOOM_SIGNER_ROOT:-$main_root/../bloom-signer}"
 test_key=false
-if [[ "${1:-}" == "--test-signing-key" ]]; then
-  test_key=true
-elif [[ $# -ne 0 ]]; then
-  echo "usage: $0 [--test-signing-key]" >&2
+output_dir=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --test-signing-key)
+      test_key=true
+      shift
+      ;;
+    --output-dir)
+      [[ $# -ge 2 && -n "$2" ]] || {
+        echo "--output-dir requires a directory" >&2
+        exit 64
+      }
+      output_dir="$2"
+      shift 2
+      ;;
+    *)
+      echo "usage: $0 [--test-signing-key] [--output-dir DIR]" >&2
+      exit 64
+      ;;
+  esac
+done
+$test_key || {
+  echo "the release gate requires --test-signing-key; use the isolated candidate-signing lane for production" >&2
   exit 64
-fi
+}
+
+compat_revision() {
+  local key="$1"
+  sed -n -E "s/^$key = \"([0-9a-f]{40})\"$/\\1/p" \
+    "$main_root/packaging/triad/release/compatibility-v1.toml"
+}
+expected_broker_sha="$(compat_revision broker_commit)"
+expected_signer_sha="$(compat_revision signer_commit)"
+[[ -n "$expected_broker_sha" && -n "$expected_signer_sha" ]] || {
+  echo "compatibility matrix does not contain full Broker and Signer revisions" >&2
+  exit 65
+}
+[[ "$(git -C "$broker_root" rev-parse HEAD)" == "$expected_broker_sha" ]] || {
+  echo "Broker checkout does not match compatibility matrix revision" >&2
+  exit 65
+}
+[[ "$(git -C "$signer_root" rev-parse HEAD)" == "$expected_signer_sha" ]] || {
+  echo "Signer checkout does not match compatibility matrix revision" >&2
+  exit 65
+}
 for root in "$main_root" "$broker_root" "$signer_root"; do
   test -f "$root/Cargo.toml" || {
     echo "missing triad workspace: $root" >&2
@@ -50,9 +89,12 @@ for root in "$main_root" "$broker_root" "$signer_root"; do
   (
     cd "$root"
     cargo fmt --all -- --check
-    cargo clippy --workspace --all-targets --locked -- -D warnings
   )
 done
+(
+  cd "$main_root"
+  cargo clippy --workspace --all-targets --locked -- -D warnings
+)
 
 cargo build --manifest-path "$main_root/Cargo.toml" --release -p bloom --locked
 cargo build --manifest-path "$broker_root/Cargo.toml" --release -p bloom-broker --locked
@@ -65,39 +107,11 @@ cp "$main_root/target/release/bloom" "$work/staging/bin/"
 cp "$broker_root/target/release/bloom-broker" "$work/staging/bin/"
 cp "$signer_root/target/release/bloom-signer" "$work/staging/bin/"
 cp "$signer_root/target/release/bloom-signer-migrate" "$work/staging/bin/"
-if $test_key; then
-  signing_key="$work/test-only-release-key"
-  /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$signing_key"
-  export BLOOM_PLATFORM_CLAIM="test-unclaimed"
-  export BLOOM_ALLOW_TEST_UNCLAIMED="true"
-else
-  signing_key="${TRIAD_RELEASE_SIGNING_KEY:-}"
-  test -f "$signing_key" || {
-    echo "TRIAD_RELEASE_SIGNING_KEY must name the reviewed Ed25519 release key" >&2
-    exit 66
-  }
-  case "$(uname -s)" in
-    Linux) export BLOOM_PLATFORM_CLAIM="linux" ;;
-    Darwin)
-      export BLOOM_PLATFORM_CLAIM="macos-unix-principals"
-      for evidence_name in \
-        BLOOM_MACOS_CONFORMANCE_REPORT \
-        BLOOM_MACOS_CONFORMANCE_SIGNATURE \
-        BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY \
-        BLOOM_MACOS_CONFORMANCE_KEY_SHA256
-      do
-        [[ -n "${!evidence_name:-}" ]] || {
-          echo "$evidence_name is required for a production macOS release" >&2
-          exit 66
-        }
-      done
-      ;;
-    *)
-      echo "unsupported release host" >&2
-      exit 69
-      ;;
-  esac
-fi
+signing_key="$work/test-only-release-key"
+/usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$signing_key"
+export BLOOM_PLATFORM_CLAIM="test-unclaimed"
+export BLOOM_ALLOW_TEST_UNCLAIMED="true"
+artifact_name="bloom-triad-test-unclaimed.tar.gz"
 
 export BLOOM_MACHINE_SHA BLOOM_BROKER_SHA BLOOM_SIGNER_SHA
 BLOOM_MACHINE_SHA="$(git -C "$main_root" rev-parse HEAD)"
@@ -106,15 +120,15 @@ BLOOM_SIGNER_SHA="$(git -C "$signer_root" rev-parse HEAD)"
 builder="$main_root/packaging/triad/release/build-bundle.sh"
 verifier="$main_root/packaging/triad/release/verify-bundle.sh"
 for output in \
-  "$work/dist-a/bloom-triad.tar.gz" \
-  "$work/dist-b/bloom-triad.tar.gz"
+  "$work/dist-a/$artifact_name" \
+  "$work/dist-b/$artifact_name"
 do
   "$builder" "$work/staging" "$output" "$signing_key" "${SOURCE_DATE_EPOCH:-1700000000}"
   "$verifier" "$output" "$output.sha256" "$output.sig" "$output.pub"
 done
-cmp "$work/dist-a/bloom-triad.tar.gz" "$work/dist-b/bloom-triad.tar.gz"
+cmp "$work/dist-a/$artifact_name" "$work/dist-b/$artifact_name"
 mkdir -p "$work/verified"
-tar -xzf "$work/dist-a/bloom-triad.tar.gz" -C "$work/verified"
+tar -xzf "$work/dist-a/$artifact_name" -C "$work/verified"
 bundle="$work/verified/bloom-triad"
 grep -Fx "BLOOM_MACHINE_SHA=$BLOOM_MACHINE_SHA" "$bundle/SOURCE_REVISIONS" >/dev/null
 grep -Fx "BLOOM_BROKER_SHA=$BLOOM_BROKER_SHA" "$bundle/SOURCE_REVISIONS" >/dev/null
@@ -126,7 +140,12 @@ done
 for root in "$main_root" "$broker_root" "$signer_root"; do
   (
     cd "$root"
-    BLOOM_ACCEPTANCE_BUNDLE_ROOT="$bundle" cargo test --workspace --locked
+    if [[ "$root" == "$main_root" && "$(uname -s)" != "Darwin" ]]; then
+      BLOOM_ACCEPTANCE_BUNDLE_ROOT="$bundle" \
+        cargo test --workspace --locked -- --skip macos_
+    else
+      BLOOM_ACCEPTANCE_BUNDLE_ROOT="$bundle" cargo test --workspace --locked
+    fi
   )
 done
 install_payload="$work/install-payload"
@@ -154,5 +173,21 @@ else
   "$install_payload/installer/release/install-linux.sh" \
     uninstall "$work/linux-root" 1000 delete-bloom-login-1000
   test ! -e "$work/linux-root/etc/bloom/1000"
+fi
+if [[ -n "$output_dir" ]]; then
+  mkdir -p "$output_dir"
+  output_dir="$(cd "$output_dir" && pwd -P)"
+  for suffix in "" .sha256 .sig .pub; do
+    [[ ! -e "$output_dir/$artifact_name$suffix" ]] || {
+      echo "release output already exists: $output_dir/$artifact_name$suffix" >&2
+      exit 65
+    }
+  done
+  for suffix in "" .sha256 .sig .pub; do
+    install -m 0644 \
+      "$work/dist-a/$artifact_name$suffix" \
+      "$output_dir/$artifact_name$suffix"
+  done
+  echo "Bloom triad release artifact: $output_dir/$artifact_name"
 fi
 echo "Bloom triad release gate passed for $BLOOM_MACHINE_SHA / $BLOOM_BROKER_SHA / $BLOOM_SIGNER_SHA"

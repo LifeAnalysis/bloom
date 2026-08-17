@@ -1,6 +1,6 @@
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bloom_daemon::Daemon;
@@ -1126,8 +1126,7 @@ fn run_source_build_streaming(
         use std::os::unix::process::CommandExt as _;
         build_command.process_group(0);
     }
-    let mut child = build_command
-        .spawn()
+    let mut child = spawn_source_build(&mut build_command)
         .with_context(|| format!("run build command {}", build.command))?;
     let stdout = child.stdout.take().context("capture source-build stdout")?;
     let stderr = child.stderr.take().context("capture source-build stderr")?;
@@ -1197,6 +1196,21 @@ fn run_source_build_streaming(
         }
     }
     Ok(SourceBuildOutput { stdout, stderr })
+}
+
+fn spawn_source_build(command: &mut Command) -> std::io::Result<Child> {
+    for retry in 0..=4 {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.kind() == ErrorKind::ExecutableFileBusy && retry < 4 => {
+                // A freshly materialized script can remain transiently busy on
+                // Linux overlay filesystems. Retry only that kernel condition.
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the source-build spawn loop always returns")
 }
 
 fn capture_bounded_stream(

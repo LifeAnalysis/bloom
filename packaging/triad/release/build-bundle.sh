@@ -13,6 +13,13 @@ source_date_epoch="$4"
 tar_command="${TAR:-tar}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
+tar_help="$("$tar_command" --help 2>&1 || true)"
+if [[ "$tar_help" == *"--owner"* ]]; then
+  tar_identity_args=(--owner=0 --group=0)
+else
+  tar_identity_args=(--uid=0 --gid=0 --uname=root --gname=root)
+fi
+
 python3 "$script_dir/check-legacy-hash-only-routes.py"
 
 machine_artifact_paths() {
@@ -220,7 +227,9 @@ for identity in \
 do
   binary="${identity%%:*}"
   expected="${identity#*:}"
-  actual="$("$staging/bin/$binary" --version | awk '{print $2}')"
+  # Bloom reports the CLI, daemon, and negotiated IPC versions on separate
+  # lines. Only the first line identifies the executable being packaged.
+  actual="$("$staging/bin/$binary" --version | sed -n '1{s/^[^ ]* //;p;}')"
   [[ "$actual" == "$expected" ]] || {
     echo "$binary version $actual is outside the compatibility matrix ($expected)" >&2
     exit 65
@@ -405,10 +414,7 @@ archive_tmp="$work/archive.tar"
   find bloom-triad -print | LC_ALL=C sort > archive-files
   "$tar_command" \
   --format=ustar \
-  --uid=0 \
-  --gid=0 \
-  --uname=root \
-  --gname=root \
+  "${tar_identity_args[@]}" \
   --no-recursion \
   -cf "$archive_tmp" \
   -T archive-files
