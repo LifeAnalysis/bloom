@@ -9,6 +9,7 @@ on:
       - "rust-toolchain.toml"
       - "crates/**"
       - "packaging/**"
+      - "petals/**"
       - "scripts/**"
       - "tests/**"
       - "Dockerfile"

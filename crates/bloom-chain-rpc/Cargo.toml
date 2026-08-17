@@ -12,6 +12,7 @@ default = []
 bloom-chain-action.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+bs58.workspace = true
 sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true

@@ -77,13 +77,19 @@ pub enum Fault {
 /// honest [`SimChain`], then falls back to honest behavior.
 #[derive(Debug)]
 pub struct FaultProxy {
-    chain: SimChain,
+    chain: std::sync::Arc<SimChain>,
     script: Mutex<Vec<ScriptedFault>>,
     status_flip: Mutex<bool>,
 }
 
 impl FaultProxy {
     pub fn new(chain: SimChain, script: Vec<ScriptedFault>) -> Self {
+        Self::shared(std::sync::Arc::new(chain), script)
+    }
+
+    /// Build a proxy over a chain shared with the test/production caller, so
+    /// state control (advancing, landing) and mediated calls hit one chain.
+    pub fn shared(chain: std::sync::Arc<SimChain>, script: Vec<ScriptedFault>) -> Self {
         Self {
             chain,
             script: Mutex::new(script),
@@ -125,14 +131,16 @@ impl FaultProxy {
             Fault::OldButValidBlockhash { skew_blocks } => {
                 let height = self.chain.height();
                 let mint = height.saturating_sub(skew_blocks);
-                let (bhash, last_valid) = self.chain.blockhash_at(mint);
-                Ok(json!({ "blockhash": bhash, "lastValidBlockHeight": last_valid }))
+                let (bhash_hex, last_valid) = self.chain.blockhash_at(mint);
+                let b58 = bs58::encode(hex::decode(&bhash_hex).unwrap_or_default()).into_string();
+                Ok(json!({ "blockhash": b58, "lastValidBlockHeight": last_valid }))
             }
             Fault::ExpiredBlockhash => {
                 let height = self.chain.height();
                 let mint = height.saturating_sub(SimChain::VALIDITY + 10);
-                let (bhash, last_valid) = self.chain.blockhash_at(mint);
-                Ok(json!({ "blockhash": bhash, "lastValidBlockHeight": last_valid }))
+                let (bhash_hex, last_valid) = self.chain.blockhash_at(mint);
+                let b58 = bs58::encode(hex::decode(&bhash_hex).unwrap_or_default()).into_string();
+                Ok(json!({ "blockhash": b58, "lastValidBlockHeight": last_valid }))
             }
             Fault::WrongGenesis { genesis } => Ok(json!(genesis)),
             Fault::ConflictingStatus => {
@@ -194,7 +202,8 @@ mod tests {
         );
         assert_eq!(skewed_last, honest_height - 30 + SimChain::VALIDITY);
 
-        // Still a valid blockhash from the chain's perspective.
+        // Still a valid blockhash from the chain's perspective (the fault
+        // emits base58 like the real RPC boundary).
         let valid: Value = p.call("isBlockhashValid", &json!(skewed_hash)).unwrap();
         assert_eq!(valid["valid"], json!(true));
 

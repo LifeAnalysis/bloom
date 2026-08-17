@@ -142,8 +142,8 @@ pub fn run_verifier(input: &VerifierInputV1) -> Result<VerifierResultV1, Rejecti
             detail: format!("message_hex: {e}"),
         })?;
     let mut digest = [0u8; 32];
-    let digest_hex = hex::decode(&input.payload_digest_hex)
-        .map_err(|_| RejectionReason::DigestMismatch)?;
+    let digest_hex =
+        hex::decode(&input.payload_digest_hex).map_err(|_| RejectionReason::DigestMismatch)?;
     let digest_bytes: &[u8] = digest_hex.as_slice();
     if digest_bytes.len() != 32 {
         return Err(RejectionReason::DigestMismatch);

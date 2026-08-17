@@ -26,6 +26,7 @@ members = [
   "crates/bloom-solana",
   "crates/bloom-chain-action",
   "crates/bloom-chain-rpc",
+  "crates/bloom-solana-machine",
 ]
 resolver = "2"
 
@@ -63,6 +64,7 @@ base64 = "0.22"
 bs58 = "0.5"
 bloom-chain-action = { path = "crates/bloom-chain-action" }
 bloom-solana = { path = "crates/bloom-solana" }
+bloom-solana-machine = { path = "crates/bloom-solana-machine" }
 bloom-chain-rpc = { path = "crates/bloom-chain-rpc" }
 argon2 = "0.5"
 chacha20poly1305 = "0.10"

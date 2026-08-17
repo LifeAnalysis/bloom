@@ -61,6 +61,18 @@ impl SimChain {
         sha256_hex(format!("sim/sig/{wire}").as_bytes())
     }
 
+    fn hex_to_base58(hex_str: &str) -> String {
+        let bytes = hex::decode(hex_str).unwrap_or_default();
+        bs58::encode(bytes).into_string()
+    }
+
+    fn base58_to_hex(b58: &str) -> Result<String, RpcError> {
+        let bytes = bs58::decode(b58)
+            .into_vec()
+            .map_err(|e| RpcError::Transport(format!("blockhash base58: {e}")))?;
+        Ok(hex::encode(bytes))
+    }
+
     /// Mint (or look up) the blockhash for an explicit height.
     pub fn blockhash_at(&self, height: u64) -> (String, u64) {
         let mut st = self.state.lock().unwrap();
@@ -82,9 +94,10 @@ impl SimChain {
     pub fn land(&self, signature: &str) {
         let mut st = self.state.lock().unwrap();
         let height = st.height;
-        if st.submitted.contains(signature) {
-            st.landed.insert(signature.to_string(), height);
-        }
+        // Unconditional by design: reconciliation keys by whatever signature
+        // string the caller will query, which for single-signer Solana
+        // transactions is the transaction's own signature.
+        st.landed.insert(signature.to_string(), height);
     }
 
     fn handle(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
@@ -95,23 +108,34 @@ impl SimChain {
             "getBlockHeight" => Ok(json!(st.height)),
             "getSlot" => Ok(json!(st.height)),
             "getLatestBlockhash" => {
+                // Real Solana RPC returns base58 blockhashes; keep the wire
+                // protocol-shaped so real clients (the Petal) parse it.
                 let height = st.height;
-                let bhash = Self::blockhash_for(height);
-                st.minted.insert(bhash.clone(), height);
+                let bhash_hex = Self::blockhash_for(height);
+                st.minted.insert(bhash_hex.clone(), height);
                 Ok(json!({
-                    "blockhash": bhash,
+                    "blockhash": Self::hex_to_base58(&bhash_hex),
                     "lastValidBlockHeight": st.height + Self::VALIDITY,
                 }))
             }
             "isBlockhashValid" => {
+                // Real Solana shape: params = [<blockhash>, <commitment>?];
+                // accept the bare-string form too for direct callers.
                 let bhash = params
                     .as_str()
+                    .or_else(|| {
+                        params
+                            .as_array()
+                            .and_then(|a| a.first())
+                            .and_then(|v| v.as_str())
+                    })
                     .ok_or_else(|| RpcError::Transport("blockhash param missing".into()))?;
+                let bhash_hex = Self::base58_to_hex(bhash)?;
                 // Reverse lookup over plausible mint heights; test heights
                 // are small so this stays trivial.
                 let mint = (0..=st.height)
-                    .find(|h| Self::blockhash_for(*h) == bhash)
-                    .or_else(|| st.minted.get(bhash).copied());
+                    .find(|h| Self::blockhash_for(*h) == bhash_hex)
+                    .or_else(|| st.minted.get(&bhash_hex).copied());
                 let valid = mint.is_some_and(|h| st.height <= h + Self::VALIDITY);
                 Ok(json!({ "valid": valid }))
             }
@@ -159,15 +183,23 @@ impl RpcTransport for SimChain {
 mod tests {
     use super::*;
 
+    fn hex_to_b58(hex_str: &str) -> String {
+        bs58::encode(hex::decode(hex_str).unwrap()).into_string()
+    }
+
     #[test]
     fn blockhash_validity_window() {
         let chain = SimChain::new("aa");
         let (bhash, last_valid) = chain.blockhash_at(chain.height());
         assert_eq!(last_valid, 100 + SimChain::VALIDITY);
-        let ok: Value = chain.call("isBlockhashValid", &json!(bhash)).unwrap();
+        let ok: Value = chain
+            .call("isBlockhashValid", &json!(hex_to_b58(&bhash)))
+            .unwrap();
         assert_eq!(ok["valid"], json!(true));
         chain.advance(SimChain::VALIDITY + 1);
-        let stale: Value = chain.call("isBlockhashValid", &json!(bhash)).unwrap();
+        let stale: Value = chain
+            .call("isBlockhashValid", &json!(hex_to_b58(&bhash)))
+            .unwrap();
         assert_eq!(stale["valid"], json!(false));
     }
 

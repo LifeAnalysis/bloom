@@ -1,0 +1,29 @@
+[package]
+name = "bloom-solana-machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The real Solana Machine lifecycle: Petal construction, mediated RPC, durable outbox, fixture signing, and reconciliation"
+
+[features]
+default = []
+
+[dependencies]
+bloom-chain-action.workspace = true
+bloom-chain-rpc.workspace = true
+bloom-petals.workspace = true
+bloom-solana.workspace = true
+bloom-vfs.workspace = true
+async-trait.workspace = true
+bs58.workspace = true
+ed25519-dalek.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+blake3.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
