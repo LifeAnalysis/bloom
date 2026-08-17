@@ -50,7 +50,7 @@ use tokio::time::interval;
 use tracing::{debug, info, trace, warn};
 
 use bloom_evm::ChainRegistry;
-use bloom_proto::HomeDir;
+use bloom_proto::{AuditLog, AuditRecord, HomeDir};
 
 use crate::{WatchError, WatchKind, WatchRegistry, WatchSpec};
 
@@ -207,6 +207,7 @@ pub struct WatchExecutor {
     handle: Mutex<Option<JoinHandle<()>>>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    audit: Option<Arc<AuditLog>>,
 }
 
 impl WatchExecutor {
@@ -222,7 +223,13 @@ impl WatchExecutor {
             handle: Mutex::new(None),
             shutdown_tx: tx,
             shutdown_rx: rx,
+            audit: None,
         }
+    }
+
+    pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Override the polling interval (default: 2 s).
@@ -387,6 +394,18 @@ impl WatchExecutor {
         head_notify: &Arc<Notify>,
         shutdown_rx: &watch::Receiver<bool>,
     ) {
+        // Production Machine uses the audited poll path. A long-lived WS
+        // receive cannot leave one external-effect intent open for the life
+        // of a subscription, so it is not started when the signed journal is
+        // attached; polling preserves watch semantics with exact per-pass
+        // intent/result boundaries.
+        if self.audit.is_some() {
+            let mut tasks = ws_tasks.lock().await;
+            for (_, task) in tasks.drain() {
+                task.abort();
+            }
+            return;
+        }
         let mut tasks = ws_tasks.lock().await;
         // Reap finished tasks so the next iteration can re-spawn.
         let finished: Vec<String> = tasks
@@ -742,6 +761,71 @@ impl WatchExecutor {
     }
 
     async fn process_spec(
+        &self,
+        spec: &WatchSpec,
+        state: &mut ExecutorState,
+    ) -> Result<(), WatchError> {
+        let Some(audit) = &self.audit else {
+            return self.process_spec_effect(spec, state).await;
+        };
+        let details = serde_json::json!({
+            "operation": "watch.poll_and_project",
+            "wallet": spec.wallet,
+            "watch_id": spec.id,
+            "kind": spec.kind,
+        });
+        let operation_id = bloom_tools::sha256_hex(
+            &serde_jcs::to_vec(&details)
+                .map_err(|error| WatchError::Io(std::io::Error::other(error.to_string())))?,
+        );
+        let correlation_id = format!("{operation_id}:{}", audit.sequence() + 1);
+        audit
+            .append(AuditRecord {
+                ts_ms: 0,
+                kind: "machine.effect.intent".into(),
+                wallet: Some(spec.wallet.clone()),
+                chain: None,
+                data: serde_json::json!({
+                    "operation_id": operation_id,
+                    "correlation_id": correlation_id,
+                    "details": details,
+                }),
+                prev: String::new(),
+                digest: String::new(),
+            })
+            .map_err(|error| {
+                WatchError::Io(std::io::Error::other(format!(
+                    "Machine audit unavailable before watch network effect: {error}"
+                )))
+            })?;
+        let effect = self.process_spec_effect(spec, state).await;
+        let outcome = match &effect {
+            Ok(()) => serde_json::json!({"outcome": "projected"}),
+            Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
+        };
+        audit
+            .append(AuditRecord {
+                ts_ms: 0,
+                kind: "machine.effect.result".into(),
+                wallet: Some(spec.wallet.clone()),
+                chain: None,
+                data: serde_json::json!({
+                    "operation": "watch.poll_and_project",
+                    "correlation_id": correlation_id,
+                    "result": outcome,
+                }),
+                prev: String::new(),
+                digest: String::new(),
+            })
+            .map_err(|error| {
+                WatchError::Io(std::io::Error::other(format!(
+                    "Machine audit unavailable after watch result projection: {error}"
+                )))
+            })?;
+        effect
+    }
+
+    async fn process_spec_effect(
         &self,
         spec: &WatchSpec,
         state: &mut ExecutorState,
@@ -1202,6 +1286,85 @@ mod tests {
     use super::*;
     use std::time::Duration as StdDuration;
     use tempfile::tempdir;
+
+    fn audited_failing_network_executor(
+        directory: &tempfile::TempDir,
+        audit: Arc<AuditLog>,
+    ) -> (WatchExecutor, WatchSpec) {
+        let home = HomeDir::at(directory.path());
+        home.ensure().unwrap();
+        let registry = Arc::new(WatchRegistry::new(home.watch_dir()).unwrap());
+        let chains = ChainRegistry::default();
+        let mut chain_spec = bloom_proto::ChainSpec::anvil_default();
+        chain_spec.rpc_urls = vec!["http://127.0.0.1:1".into()];
+        chains.add(bloom_evm::ChainClient::new(chain_spec).unwrap());
+        let executor = WatchExecutor::new(chains, registry, home).with_audit(audit);
+        let spec = WatchSpec {
+            id: "audit-network".into(),
+            wallet: "alice".into(),
+            created_ms: 1,
+            kind: WatchKind::GasPrice {
+                chain: "anvil".into(),
+                threshold_gwei: 1.0,
+            },
+            note: None,
+        };
+        (executor, spec)
+    }
+
+    #[tokio::test]
+    async fn watch_audit_prewrite_failure_blocks_network_effect() {
+        let directory = tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
+        let (executor, spec) = audited_failing_network_executor(&directory, audit.clone());
+        audit.fail_next_write_for_test();
+        let error = executor
+            .process_spec(&spec, &mut ExecutorState::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("before watch network effect"));
+        assert!(audit.tail(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn watch_result_loss_latches_pending_effect_on_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let audit = Arc::new(AuditLog::open(&path).unwrap());
+        let (executor, spec) = audited_failing_network_executor(&directory, audit.clone());
+        audit.fail_after_writes_for_test(1);
+        assert!(
+            executor
+                .process_spec(&spec, &mut ExecutorState::default())
+                .await
+                .is_err()
+        );
+        drop(executor);
+        drop(audit);
+        let restarted = AuditLog::open(&path).unwrap();
+        assert!(restarted.mutation_degradation().is_some());
+        assert_eq!(restarted.pending_effect_correlations().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn watch_network_failure_closes_signed_result_pair() {
+        let directory = tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
+        let (executor, spec) = audited_failing_network_executor(&directory, audit.clone());
+        assert!(
+            executor
+                .process_spec(&spec, &mut ExecutorState::default())
+                .await
+                .is_err()
+        );
+        let records = audit.tail(2).unwrap();
+        assert_eq!(
+            records[0].data["details"]["operation"],
+            "watch.poll_and_project"
+        );
+        assert_eq!(records[1].data["result"]["outcome"], "error");
+        assert!(audit.pending_effect_correlations().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn rotate_moves_live_and_writes_sentinel() {

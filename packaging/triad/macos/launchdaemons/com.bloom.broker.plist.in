@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bloom.broker.@LOGIN_UID@</string>
+
+  <key>UserName</key>
+  <string>@BLOOM_BROKER_USER@</string>
+  <key>GroupName</key>
+  <string>@BLOOM_BROKER_GROUP@</string>
+  <key>InitGroups</key>
+  <true/>
+  <key>Umask</key>
+  <integer>63</integer>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BLOOM_BROKER_BINARY@</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BLOOM_BROKER_IDENTITY</key>
+    <string>@BLOOM_BROKER_IDENTITY@</string>
+    <key>BLOOM_BROKER_CONFIG</key>
+    <string>@BLOOM_BROKER_CONFIG@</string>
+    <key>BLOOM_EDGE_MANIFEST</key>
+    <string>@BLOOM_EDGE_MANIFEST@</string>
+    <key>BLOOM_AUTHORITY_EDGE_HISTORY</key>
+    <string>@BLOOM_AUTHORITY_EDGE_HISTORY@</string>
+    <key>BLOOM_BROKER_AUDIT_CHECKPOINT_DIR</key>
+    <string>@BLOOM_BROKER_AUDIT_CHECKPOINT_DIR@</string>
+    <key>BLOOM_BROKER_SOCKET</key>
+    <string>@BLOOM_BROKER_SOCKET@</string>
+    <key>BLOOM_BROKER_CONTROL_SOCKET</key>
+    <string>@BLOOM_BROKER_CONTROL_SOCKET@</string>
+    <key>BLOOM_SESSION_SOCKET</key>
+    <string>@BLOOM_SESSION_SOCKET@</string>
+    <key>BLOOM_BROKER_STARTUP_STATUS</key>
+    <string>@BLOOM_BROKER_STARTUP_STATUS@</string>
+  </dict>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>WorkingDirectory</key>
+  <string>@BLOOM_BROKER_STATE_DIR@</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+    <key>NumberOfFiles</key>
+    <integer>1024</integer>
+    <key>NumberOfProcesses</key>
+    <integer>64</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+    <key>NumberOfFiles</key>
+    <integer>1024</integer>
+    <key>NumberOfProcesses</key>
+    <integer>64</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>@BLOOM_BROKER_LOG@</string>
+  <key>StandardErrorPath</key>
+  <string>@BLOOM_BROKER_LOG@</string>
+</dict>
+</plist>

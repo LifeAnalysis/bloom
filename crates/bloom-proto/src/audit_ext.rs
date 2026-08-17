@@ -17,7 +17,7 @@
 //! the labelled kind. `AuditLog::append` fills in `ts_ms`, `prev`, and
 //! `digest` as it does for any other record.
 
-use bloom_auth_api::petal_identity::label_petal_digest;
+use crate::petal_identity::label_petal_digest;
 
 use crate::audit::{AuditLog, AuditRecord};
 

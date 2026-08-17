@@ -2,9 +2,7 @@
 //!
 //! Live integration test against an Ethereum mainnet RPC.
 //!
-//! Skipped unless `BLOOM_MAINNET_RPC` is set. Also `#[ignore]`d so it
-//! never runs under a plain `cargo test` — invoke with
-//! `cargo test -p bloom-ens -- --ignored`.
+//! Exits successfully unless `BLOOM_MAINNET_RPC` is set.
 
 use alloy::primitives::{Address, address};
 use bloom_ens::EnsClient;
@@ -30,15 +28,13 @@ fn mainnet_spec(url: String) -> ChainSpec {
 }
 
 #[tokio::test]
-#[ignore]
 async fn vitalik_eth_round_trip() {
     let url = match std::env::var("BLOOM_MAINNET_RPC") {
         Ok(u) if !u.is_empty() => u,
         _ => {
             eprintln!(
                 "skipping live ENS test: BLOOM_MAINNET_RPC not set. \
-                 Set it to a mainnet HTTPS RPC URL (or a fork URL) and \
-                 run with `cargo test -p bloom-ens -- --ignored`."
+                 Set it to a mainnet HTTPS RPC URL or a fork URL."
             );
             return;
         }

@@ -41,13 +41,13 @@ struct ToolsSession {
 }
 
 #[derive(Default)]
-struct SessionStore {
+struct ToolInputBuffers {
     /// Keyed by `(family, session_id)`, where `family` is e.g.
     /// `"abi/encode"`, `"eip712/hash"`, `"rlp/decode"`, etc.
     inner: HashMap<(String, String), ToolsSession>,
 }
 
-impl SessionStore {
+impl ToolInputBuffers {
     fn purge_expired(&mut self, now: Instant) {
         self.inner.retain(|_, s| s.expires > now);
     }
@@ -75,7 +75,7 @@ impl SessionStore {
 
 #[derive(Clone, Default)]
 pub struct ToolsHandler {
-    sessions: Arc<Mutex<SessionStore>>,
+    sessions: Arc<Mutex<ToolInputBuffers>>,
 }
 
 impl ToolsHandler {

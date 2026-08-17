@@ -1,6 +1,13 @@
 # Open-Internet Sealed Approval Ceremony
 
-**Status:** architecture proposal — relay not implemented
+> **SUPERSEDED — HISTORICAL ONLY.** Do not implement or follow the operational
+> instructions below. They predate the triad authority boundary and incorrectly
+> assign ceremony and signing material to Machine. The normative architecture
+> is [`2026-07-23-triad-process-architecture.md`](../specs/2026-07-23-triad-process-architecture.md):
+> Broker owns the loopback ceremony listener and authorization; Signer owns
+> custody and signature production; Machine never terminates a custody channel.
+
+**Status:** superseded historical record — not normative
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 This document describes how the Sealed Approval ceremony URL becomes reachable
@@ -13,7 +20,7 @@ mounted-VFS implementation supports Bloom Machine-owned loopback ceremony URLs o
 `http://localhost:18734`: `approval_challenge.json` carries a local
 `ceremony_url`, the token is derived from `server_nonce`, and the Bloom Machine owns
 grant minting for the mounted flows (the EVM outbox, paid-HTTP `/requests`, and
-wallet `policy.toml` updates). This document is the target design for
+wallet policy updates). This document is the target design for
 making that same ceremony reachable from another device over the open internet.
 The `ceremony_url` contract itself — the field in `approval_challenge.json`,
 single-use token, `expiry_ms` bound — is defined in
@@ -141,8 +148,8 @@ ways:
   `http://localhost:18734` with RP ID `localhost`; it does not expose that
   endpoint over the open internet.
 - Today `approval_challenge.json` carries a local loopback `ceremony_url` for
-  the mounted flows (EVM outbox, paid-HTTP `/requests`, and wallet
-  `policy.toml` updates). In the target relay design, the same projection
+  the mounted flows (EVM outbox, paid-HTTP `/requests`, and wallet policy
+  updates). In the target relay design, the same projection
   points at a per-install HTTPS hostname.
 - Today there is no relay, per-install hostname, internet exposure setting, or
   Bloom Machine-held public certificate for a relay hostname.

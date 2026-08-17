@@ -24,11 +24,23 @@ pub fn render_qr_svg(data: &str) -> Option<String> {
     )
 }
 
-/// Print the deposit QR + plain address block for a single address.
-pub fn print_deposit(address: &str) {
-    println!("deposit address (same EOA on every EVM chain; send only on supported chains):");
-    if let Some(qr) = render_qr(address) {
-        println!("\n{qr}");
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ADDRESS: &str = "0x0000000000000000000000000000000000000001";
+
+    #[test]
+    fn terminal_qr_is_nonempty_and_preserves_scriptable_address_separately() {
+        let qr = render_qr(ADDRESS).unwrap();
+        assert!(qr.lines().count() > 1);
+        assert!(!qr.contains(ADDRESS));
     }
-    println!("  {address}\n");
+
+    #[test]
+    fn svg_qr_is_a_complete_document() {
+        let svg = render_qr_svg(ADDRESS).unwrap();
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("</svg>"));
+    }
 }

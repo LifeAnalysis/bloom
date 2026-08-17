@@ -8,18 +8,23 @@
 
 use std::net::TcpListener;
 use std::process::Stdio;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use bloom_auth_api::{
-    AssuranceLevel, CANONICAL_INTENT_HEADER_SCHEMA_V1, CanonicalEnvelope, CanonicalIntentHeader,
-    DaemonGrantTerms, EVM_SEALED_INTENT_SUBJECT_KIND, EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1,
-    EVM_TX_SIGN_INTENT, ExecutorKind, GrantStore, PetalPolicySnapshot, SealedAction,
-    SealedApprovalGrant,
-    petal_identity::{
-        FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET,
-    },
+use bloom_broker_api::{
+    ApprovalLifecycleState, ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes,
+    CanonicalWalletPolicy, CredentialPublic, CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef,
+    KeyRole, KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
+    NormalizedSignature, PolicyDestination, ProvenanceCatalog, ProvenanceFeeAsset,
+    ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, ServiceFuture,
+    SignedPolicySnapshot, SigningPayloads, SigningResult, Token, WalletPublic, WalletRequest,
 };
+use bloom_machine_client::MachineBrokerClient;
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -27,6 +32,218 @@ use tokio::time::timeout;
 /// Default funder; anvil's prefunded account #0.
 pub const FUNDER_PRIV_KEY: &str =
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+/// Test-only Broker boundary for real-chain integration tests. It signs the
+/// exact payload bytes received over the production Machine client contract;
+/// it does not expose or emulate the retired hash-only PetalHost path.
+pub struct ExactSigningBrokerFixture {
+    active: AtomicBool,
+    signer: alloy_signer_local::PrivateKeySigner,
+    key_ref: KeyRef,
+    requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
+}
+
+impl ExactSigningBrokerFixture {
+    fn policy_snapshot(&self, wallet_id: Token) -> SignedPolicySnapshot {
+        let canonical_policy = serde_json::to_vec(&CanonicalWalletPolicy {
+            wallet_id: wallet_id.clone(),
+            maximum_approval_lifetime_ms: 3_600_000,
+            allowed_petal_packages: Vec::new(),
+            allowed_destinations: vec![PolicyDestination {
+                chain: Token::new("anvil").unwrap(),
+                destination: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8".into(),
+            }],
+            required_verifiers: Vec::new(),
+        })
+        .unwrap();
+        let policy_digest = Digest32::from_bytes(Sha256::digest(&canonical_policy).into());
+        SignedPolicySnapshot {
+            wallet_id,
+            version: DecimalU64::new(1),
+            canonical_policy: Base64UrlBytes::from_bytes(&canonical_policy),
+            policy_digest,
+            policy_signing_key_id: Token::new("integration-test-policy-key").unwrap(),
+            policy_verifying_key: Base64UrlBytes::from_bytes(&[12; 32]),
+            signer_signature: Base64UrlBytes::from_bytes(&[13; 64]),
+        }
+    }
+
+    fn wallet_public(&self, wallet_id: Token) -> WalletPublic {
+        let policy = self.policy_snapshot(wallet_id.clone());
+        WalletPublic {
+            wallet_id,
+            wallet_kind: Token::new("local").unwrap(),
+            root_key_ref: self.key_ref.clone(),
+            key_refs: vec![self.key_ref.clone()],
+            policy_version: DecimalU64::new(1),
+            policy_digest: policy.policy_digest,
+            wallet_revocation_epoch: DecimalU64::new(0),
+        }
+    }
+
+    fn key_public(&self) -> KeyPublic {
+        KeyPublic {
+            key_ref: self.key_ref.clone(),
+            role: KeyRole::WalletRoot,
+            canonical_public_key: Base64UrlBytes::from_bytes(self.signer.public_key().as_slice()),
+            addresses: vec![format!("{:#x}", self.signer.address())],
+            supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        }
+    }
+
+    pub fn activate(&self) {
+        self.active.store(true, Ordering::SeqCst);
+    }
+
+    pub fn requests(&self) -> Vec<MachineBrokerRequest> {
+        self.requests.lock().clone()
+    }
+}
+
+impl MachineBrokerService for ExactSigningBrokerFixture {
+    fn dispatch<'a>(
+        &'a self,
+        request: MachineBrokerRequest,
+    ) -> ServiceFuture<'a, MachineBrokerResponse> {
+        Box::pin(async move {
+            self.requests.lock().push(request.clone());
+            match request {
+                MachineBrokerRequest::WalletListPublic(_) => {
+                    Ok(MachineBrokerResponse::WalletListPublic(vec![
+                        self.wallet_public(Token::new("alice").unwrap()),
+                    ]))
+                }
+                MachineBrokerRequest::WalletGetPublic(request) => Ok(
+                    MachineBrokerResponse::WalletGetPublic(self.wallet_public(request.wallet_id)),
+                ),
+                MachineBrokerRequest::KeyListPublic(WalletRequest { wallet_id })
+                    if wallet_id.as_str() == "alice" =>
+                {
+                    Ok(MachineBrokerResponse::KeyListPublic(vec![
+                        self.key_public(),
+                    ]))
+                }
+                MachineBrokerRequest::KeyGetPublic(request) if request.key_ref == self.key_ref => {
+                    Ok(MachineBrokerResponse::KeyGetPublic(self.key_public()))
+                }
+                MachineBrokerRequest::CredentialListPublic(WalletRequest { wallet_id })
+                    if wallet_id.as_str() == "alice" =>
+                {
+                    Ok(MachineBrokerResponse::CredentialListPublic(Vec::<
+                        CredentialPublic,
+                    >::new(
+                    )))
+                }
+                MachineBrokerRequest::PolicyRead(WalletRequest { wallet_id })
+                    if wallet_id.as_str() == "alice" =>
+                {
+                    Ok(MachineBrokerResponse::PolicyRead(
+                        self.policy_snapshot(wallet_id),
+                    ))
+                }
+                MachineBrokerRequest::SealedApprovalPrepare(request) => {
+                    Ok(MachineBrokerResponse::SealedApprovalPrepare(
+                        bloom_broker_api::SealedApprovalPrepareResponse {
+                            approval_id: request.terms.approval_id()?,
+                            state: ApprovalPrepareState::AwaitingCeremony,
+                            ceremony_url:
+                                "http://localhost:18734/ceremony/exact-signing-test-secret".into(),
+                            ceremony_expires_at_ms: request.terms.expires_at_ms,
+                            review_manifest_digest: Digest32::from_bytes([8; 32]),
+                        },
+                    ))
+                }
+                MachineBrokerRequest::SealedApprovalStatus(request) => {
+                    let active = self.active.load(Ordering::SeqCst);
+                    Ok(MachineBrokerResponse::SealedApprovalStatus(
+                        ApprovalPublicStatus {
+                            approval_id: request.id,
+                            wallet_id: Token::new("alice").unwrap(),
+                            state: if active {
+                                ApprovalLifecycleState::Active
+                            } else {
+                                ApprovalLifecycleState::AwaitingCeremony
+                            },
+                            effective_claim_assurance: None,
+                            ceremony_url: (!active).then(|| {
+                                "http://localhost:18734/ceremony/exact-signing-test-secret".into()
+                            }),
+                            ceremony_expires_at_ms: (!active).then(|| DecimalU64::new(u64::MAX)),
+                        },
+                    ))
+                }
+                MachineBrokerRequest::SigningSign(request) => {
+                    let SigningPayloads::Single { payload } = &request.payloads else {
+                        panic!("exact signing fixture expects one payload");
+                    };
+                    use alloy::signers::SignerSync as _;
+                    let hash = alloy::primitives::keccak256(payload.decode());
+                    let signature = self.signer.sign_hash_sync(&hash).unwrap();
+                    Ok(MachineBrokerResponse::SigningSign(SigningResult {
+                        operation_id: request.operation_id,
+                        operation_digest: request.operation_digest,
+                        signatures: vec![NormalizedSignature {
+                            crypto_suite: request.crypto_suite,
+                            bytes: Base64UrlBytes::from_bytes(&signature.as_bytes()),
+                        }],
+                        signer_receipt_digest: Digest32::from_bytes([9; 32]),
+                        broker_receipt_digest: Digest32::from_bytes([10; 32]),
+                    }))
+                }
+                other => panic!("unexpected exact signing Broker request: {other:?}"),
+            }
+        })
+    }
+}
+
+pub fn exact_signing_broker(
+    private_key_hex: &str,
+) -> Result<(MachineBrokerClient, Arc<ExactSigningBrokerFixture>)> {
+    let signer = private_key_hex
+        .parse()
+        .map_err(|error| anyhow!("parse exact-signing fixture key: {error}"))?;
+    let fixture = Arc::new(ExactSigningBrokerFixture {
+        active: AtomicBool::new(false),
+        signer,
+        key_ref: KeyRef {
+            backend: Token::new("local").unwrap(),
+            backend_instance: Token::new("integration-test").unwrap(),
+            locator: "integration-test-wallet-key".into(),
+            key_spec: KeySpec::Secp256k1,
+            public_key_fingerprint: Digest32::from_bytes([6; 32]),
+            derivation: None,
+        },
+        requests: parking_lot::Mutex::new(Vec::new()),
+    });
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    Ok((MachineBrokerClient::new(service), fixture))
+}
+
+pub fn exact_signing_catalog(operation_classes: &[&str]) -> ProvenanceCatalog {
+    ProvenanceCatalog {
+        schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+        records: operation_classes
+            .iter()
+            .map(|operation_class| ProvenanceRecord {
+                subject: ProvenanceSubject::System {
+                    component_id: Token::new("bloom-machine").unwrap(),
+                    operation_class: Token::new(*operation_class).unwrap(),
+                },
+                publisher: Token::new("bloom-installer").unwrap(),
+                petal_lineage: None,
+                operation_classes: vec![ProvenanceOperationClass {
+                    operation_class: Token::new(*operation_class).unwrap(),
+                    fee_asset: Some(ProvenanceFeeAsset {
+                        chain: Token::new("ethereum").unwrap(),
+                        asset: "native".into(),
+                    }),
+                }],
+                installer_key_id: Token::new("installer-key").unwrap(),
+                installer_signature: Base64UrlBytes::from_bytes(&[11; 64]),
+            })
+            .collect(),
+    }
+}
 
 /// Foundry binaries; rely on `$PATH`. Override with `BLOOM_ANVIL_BIN` /
 /// `BLOOM_CAST_BIN` if you need to point at a specific install.
@@ -151,60 +368,4 @@ pub async fn cast_send(rpc_url: &str, args: &[&str]) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-pub async fn mint_evm_test_grant(
-    grant_store: &dyn GrantStore,
-    wallet: &str,
-    action_id: &str,
-    action_kind: &str,
-    chain_id: u64,
-    account: &str,
-    now_ms: u64,
-) -> Result<SealedApprovalGrant> {
-    let expires_ms = now_ms.saturating_add(120_000);
-    let header = CanonicalIntentHeader {
-        schema: CANONICAL_INTENT_HEADER_SCHEMA_V1.into(),
-        wallet: wallet.into(),
-        surface: "outbox".into(),
-        action_id: action_id.into(),
-        petal_id: PETAL_ID_EVM_WALLET.into(),
-        petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
-        petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
-        executor_kind: ExecutorKind::FirstParty,
-        network: format!("eip155:{chain_id}"),
-        account: account.into(),
-        action_kind: action_kind.into(),
-        value_movement: true,
-        authority_change: false,
-        expires_ms,
-    };
-    let envelope = CanonicalEnvelope::new(
-        header.clone(),
-        EVM_SEALED_INTENT_SUBJECT_KIND,
-        EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1,
-        serde_json::to_vec(&serde_json::json!({
-            "schema": "bloom.it.evm_test_grant_subject.v1",
-            "wallet": wallet,
-            "action_id": action_id,
-            "action_kind": action_kind,
-            "chain_id": chain_id,
-            "account": account,
-        }))?,
-    );
-    let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Standard);
-    terms.allowed_sign_intents = vec![EVM_TX_SIGN_INTENT.into()];
-    terms.max_signatures = 1;
-    let action = SealedAction::new(
-        envelope,
-        format!("integration grant for {action_kind} {action_id}"),
-        Vec::new(),
-        terms,
-        PetalPolicySnapshot::minimal(&header),
-        now_ms,
-    )?;
-    grant_store
-        .mint(&action, expires_ms, now_ms)
-        .await
-        .map_err(Into::into)
 }

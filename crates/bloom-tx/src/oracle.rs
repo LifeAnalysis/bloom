@@ -6,7 +6,19 @@
 
 use std::sync::Arc;
 
-pub use bloom_auth_api::{AuthApiError, PriceOracle, ValuationQuote};
+use async_trait::async_trait;
+pub use bloom_proto::{ValuationError, ValuationQuote};
+
+#[async_trait]
+pub trait PriceOracle: Send + Sync {
+    async fn quote_usd(
+        &self,
+        asset_id: &str,
+        amount_base_units: &str,
+        asset_decimals: u8,
+        now_ms: u64,
+    ) -> Result<ValuationQuote, ValuationError>;
+}
 
 /// Type alias to keep call sites short.
 pub type DynPriceOracle = Arc<dyn PriceOracle>;
@@ -14,7 +26,6 @@ pub type DynPriceOracle = Arc<dyn PriceOracle>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
 
     /// A deterministic in-test oracle: always returns the configured
     /// price-per-unit. Exposed so unit tests in this crate
@@ -32,10 +43,10 @@ mod tests {
             amount_base_units: &str,
             asset_decimals: u8,
             now_ms: u64,
-        ) -> Result<ValuationQuote, AuthApiError> {
+        ) -> Result<ValuationQuote, ValuationError> {
             let amount = amount_base_units
                 .parse::<f64>()
-                .map_err(|e| AuthApiError::Denied(e.to_string()))?;
+                .map_err(|e| ValuationError::denied(e.to_string()))?;
             let decimals = asset_decimals;
             Ok(ValuationQuote {
                 asset_id: asset_id.into(),

@@ -48,7 +48,7 @@ impl Entry {
     /// views, status, tools output, prices, docs, audit views, wallet
     /// metadata files, watch outputs. Per the v1 spec only a small set
     /// of injection points (wallets/new, sign/*, outbox writes,
-    /// watch/new, defi intents new+confirm, policy.toml) are writable;
+    /// watch/new, defi intents new+confirm, policy.json) are writable;
     /// those should use [`Entry::writable_file`].
     pub fn file(name: &str) -> Self {
         Self::read_only_file(name)
@@ -104,6 +104,13 @@ impl Entry {
 
     pub fn with_modified(mut self, modified: SystemTime) -> Self {
         self.modified = Some(modified);
+        self
+    }
+
+    pub fn with_size(mut self, size: u64) -> Self {
+        if self.kind == EntryKind::File {
+            self.size = size;
+        }
         self
     }
 
@@ -268,6 +275,15 @@ pub trait Handler: Send + Sync {
         let _ = path;
         false
     }
+
+    /// Whether `path` is a small asynchronous command sink whose payload is
+    /// submitted as one complete write. The mount adapter accepts the NFS write
+    /// immediately and runs the command away from the request path; callers
+    /// observe its outcome through status projections.
+    fn is_async_write_command(&self, path: &VfsPath) -> bool {
+        let _ = path;
+        false
+    }
 }
 
 #[cfg(test)]
@@ -310,8 +326,8 @@ mod tests {
 
     #[test]
     fn writable_file_defaults() {
-        let e = Entry::writable_file("policy.toml");
-        assert_eq!(e.name, "policy.toml");
+        let e = Entry::writable_file("policy.json");
+        assert_eq!(e.name, "policy.json");
         assert_eq!(e.kind, EntryKind::File);
         assert_eq!(e.size, 0);
         assert_eq!(e.mode, 0o644);
@@ -346,6 +362,12 @@ mod tests {
         let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(123);
         let e = Entry::file("artifact.json").with_modified(modified);
         assert_eq!(e.modified, Some(modified));
+    }
+
+    #[test]
+    fn with_size_records_file_hint_but_not_directory_hint() {
+        assert_eq!(Entry::file("status.json").with_size(410).size, 410);
+        assert_eq!(Entry::dir("wallets").with_size(410).size, 0);
     }
 
     #[test]

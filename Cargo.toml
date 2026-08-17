@@ -1,9 +1,8 @@
 [workspace]
 members = [
   "crates/bloom",
+  "crates/bloom-machine",
   "crates/bloom-daemon",
-  "crates/bloom-auth-api",
-  "crates/bloom-auth",
   "crates/bloom-vfs",
   "crates/bloom-paid-mpp",
   "crates/bloom-paid-x402",
@@ -11,9 +10,8 @@ members = [
   "crates/bloom-evm",
   "crates/bloom-rpc",
   "crates/bloom-tx",
-  "crates/bloom-keystore",
   "crates/bloom-mempool",
-  "crates/bloom-hyperliquid",
+  "crates/bloom-machine-client",
   "crates/bloom-watch",
   "crates/bloom-mount",
   "crates/bloom-proto",
@@ -52,6 +50,8 @@ async-trait = "0.1"
 parking_lot = "0.12"
 dirs = "5"
 hex = "0.4"
+libc = "0.2"
+rustix = { version = "1", features = ["fs", "process"] }
 blake3 = "1"
 sha3 = "0.10"
 sha2 = "0.10"
@@ -74,6 +74,7 @@ tempfile = "3"
 futures = "0.3"
 lru = "0.12"
 fs2 = "0.4"
+bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
 wasmtime = { version = "26", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
 wasmtime-wasi = "26"
 wat = "1"
@@ -91,9 +92,12 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # Echo-free passphrase entry for interactive wallet creation.
 rpassword = "7"
+serde_jcs = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+ciborium = "0.2"
 
 # Ethereum stack
-alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract", "transport-throttle", "json-rpc"] }
+alloy = { version = "2", default-features = false, features = ["std", "reqwest", "reqwest-rustls-tls", "rpc-types", "providers", "provider-http", "provider-ws-ring", "consensus", "network", "rlp", "json-abi", "k256", "eips", "contract", "transport-throttle", "json-rpc", "signers"] }
 alloy-dyn-abi = { version = "1.5", features = ["eip712"] }
 # OP Stack typed RPC (Base, Optimism deposit/system transactions & receipts).
 op-alloy = { version = "2", features = ["rpc-types", "consensus", "serde", "network"] }
@@ -101,7 +105,6 @@ op-alloy = { version = "2", features = ["rpc-types", "consensus", "serde", "netw
 # Internal crates
 bloom-mempool  = { path = "crates/bloom-mempool" }
 bloom-proto    = { path = "crates/bloom-proto" }
-bloom-keystore = { path = "crates/bloom-keystore" }
 bloom-rpc      = { path = "crates/bloom-rpc" }
 bloom-evm      = { path = "crates/bloom-evm" }
 bloom-tx       = { path = "crates/bloom-tx" }
@@ -110,7 +113,6 @@ bloom-paid-mpp = { path = "crates/bloom-paid-mpp" }
 bloom-paid-x402 = { path = "crates/bloom-paid-x402" }
 bloom-paid-http = { path = "crates/bloom-paid-http" }
 bloom-tools    = { path = "crates/bloom-tools" }
-bloom-hyperliquid = { path = "crates/bloom-hyperliquid" }
 bloom-watch    = { path = "crates/bloom-watch" }
 bloom-mount    = { path = "crates/bloom-mount" }
 bloom-etherscan = { path = "crates/bloom-etherscan" }
@@ -118,11 +120,15 @@ bloom-ens      = { path = "crates/bloom-ens" }
 bloom-prices   = { path = "crates/bloom-prices" }
 bloom-revert   = { path = "crates/bloom-revert" }
 bloom-petals   = { path = "crates/bloom-petals" }
-bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "4f6fb57063a70f95cba288f68bdc139e3ecac7a5" }
+bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "61938d0c127cfe03c7e3e55baed0ba1439bc5ca2" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
-bloom-auth-api = { path = "crates/bloom-auth-api" }
-bloom-auth     = { path = "crates/bloom-auth" }
 bloom-update   = { path = "crates/bloom-update" }
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "1cbb549bea07f78c564ef1e66e52fb087b5f2ffa" }
+bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
+bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
+bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
+bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "2e402f03814166406ea6489b60422b0865d1f6c2" }
+bloom-machine-client = { path = "crates/bloom-machine-client" }
 # ---- example core petal: generic capability primitives (/bloom/core/cap) ----
 
 [profile.release]

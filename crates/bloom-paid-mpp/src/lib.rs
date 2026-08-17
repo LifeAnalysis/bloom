@@ -1,8 +1,11 @@
 //! Tempo MPP protocol adapter for Bloom paid HTTP requests.
 
+use alloy::consensus::SignableTransaction;
+use alloy::eips::{Decodable2718, Encodable2718};
 use alloy::primitives::{Address, B256, Signature};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::{Error as SignerError, Result as SignerResult, Signer};
+use alloy::sol_types::{SolStruct, eip712_domain};
 use async_trait::async_trait;
 use bloom_paid_http::{
     EmptyPaidHttpChainRpcResolver, NormalizedChallenge, PaidHttpChainRpcResolver,
@@ -16,10 +19,15 @@ use mpp::client::tempo::session::channel_ops::{
 };
 use mpp::client::tempo::signing::TempoSigningMode;
 use mpp::protocol::intents::SessionRequest;
+use mpp::protocol::methods::tempo::fee_payer_envelope::FeePayerEnvelope78;
+use mpp::protocol::methods::tempo::session::SessionCredentialPayload;
 use mpp::protocol::methods::tempo::session::TempoSessionExt;
 use serde_json::json;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempo_alloy::TempoNetwork;
+use tempo_alloy::primitives::transaction::{AASigned, PrimitiveSignature, TempoSignature};
 
 /// The `sign-hash` intent string every Tempo MPP host signature is authorized under.
 pub const MPP_SIGN_INTENT: &str = "paid-http.mpp.sign";
@@ -43,6 +51,7 @@ pub struct RealMppBackend {
     pub wallet_address: Address,
     pub host_signer: Arc<dyn PaidHttpHostSigner>,
     pub facts: PaidHttpSigningFacts,
+    pub draft_path: Option<PathBuf>,
 }
 
 impl RealMppBackend {
@@ -59,6 +68,7 @@ impl RealMppBackend {
             wallet_address,
             host_signer,
             facts,
+            draft_path: None,
         }
     }
 
@@ -81,40 +91,21 @@ impl RealMppBackend {
 /// Adapter that satisfies the upstream Alloy signer contract by routing every
 /// digest through Bloom's paid-HTTP host signing seam.
 #[derive(Clone)]
-struct HostMppSigner {
-    host: Arc<dyn PaidHttpHostSigner>,
+struct DraftMppSigner {
     address: Address,
-    facts: Arc<PaidHttpSigningFacts>,
     chain_id: Option<u64>,
 }
 
-impl HostMppSigner {
-    fn new(
-        host: Arc<dyn PaidHttpHostSigner>,
-        address: Address,
-        facts: PaidHttpSigningFacts,
-        chain_id: Option<u64>,
-    ) -> Self {
-        Self {
-            host,
-            address,
-            facts: Arc::new(facts),
-            chain_id,
-        }
+impl DraftMppSigner {
+    fn new(address: Address, chain_id: Option<u64>) -> Self {
+        Self { address, chain_id }
     }
 }
 
 #[async_trait]
-impl Signer for HostMppSigner {
-    async fn sign_hash(&self, hash: &B256) -> SignerResult<Signature> {
-        let mut digest = [0u8; 32];
-        digest.copy_from_slice(hash.as_slice());
-        let raw = self
-            .host
-            .sign_paid_http_hash(MPP_SIGN_INTENT, digest, &self.facts)
-            .await
-            .map_err(SignerError::other)?;
-        Signature::from_raw(&raw).map_err(SignerError::other)
+impl Signer for DraftMppSigner {
+    async fn sign_hash(&self, _hash: &B256) -> SignerResult<Signature> {
+        Signature::from_raw(&[1_u8; 65]).map_err(SignerError::other)
     }
 
     fn address(&self) -> Address {
@@ -134,6 +125,293 @@ pub struct PaymentExecution {
     pub credential_metadata: serde_json::Value,
     pub header_name: &'static str,
     pub header_value: String,
+}
+
+fn persist_draft_atomically(path: &Path, authorization: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "MPP draft path has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("create MPP draft directory: {e}"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("create temporary MPP draft: {e}"))?;
+    temporary
+        .write_all(authorization.as_bytes())
+        .map_err(|e| format!("write temporary MPP draft: {e}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|e| format!("sync temporary MPP draft: {e}"))?;
+    temporary
+        .persist(path)
+        .map_err(|e| format!("persist MPP unsigned draft: {}", e.error))?;
+    Ok(())
+}
+
+fn draft_binding(
+    authorization: &str,
+    challenge: &mpp::PaymentChallenge,
+    chain_id: u64,
+    wallet_address: Address,
+) -> Result<serde_json::Value, String> {
+    let echo = serde_json::to_vec(&challenge.to_echo())
+        .map_err(|error| format!("serialize MPP challenge binding: {error}"))?;
+    Ok(json!({
+        "schema": "bloom.machine_mpp_unsigned_draft.v1",
+        "authorization_sha256": bloom_tools::sha256_hex(authorization.as_bytes()),
+        "challenge_echo_sha256": bloom_tools::sha256_hex(&echo),
+        "source": mpp::PaymentCredential::evm_did(chain_id, &wallet_address.to_string()),
+    }))
+}
+
+fn persist_draft_binding_atomically(
+    path: &Path,
+    authorization: &str,
+    challenge: &mpp::PaymentChallenge,
+    chain_id: u64,
+    wallet_address: Address,
+) -> Result<(), String> {
+    let envelope = json!({
+        "schema": "bloom.machine_mpp_unsigned_draft_envelope.v1",
+        "authorization": authorization,
+        "binding": draft_binding(authorization, challenge, chain_id, wallet_address)?,
+    });
+    let encoded = serde_json::to_string(&envelope)
+        .map_err(|error| format!("serialize MPP draft envelope: {error}"))?;
+    persist_draft_atomically(path, &encoded)
+}
+
+fn validate_persisted_draft_binding(
+    path: &Path,
+    challenge: &mpp::PaymentChallenge,
+    chain_id: u64,
+    wallet_address: Address,
+) -> Result<String, String> {
+    let envelope: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path).map_err(|error| format!("read MPP draft envelope: {error}"))?,
+    )
+    .map_err(|error| format!("parse MPP draft envelope: {error}"))?;
+    if envelope["schema"] != "bloom.machine_mpp_unsigned_draft_envelope.v1" {
+        return Err("MPP unsigned draft envelope schema is unsupported".into());
+    }
+    let authorization = envelope["authorization"]
+        .as_str()
+        .ok_or_else(|| "MPP unsigned draft envelope has no authorization".to_string())?;
+    let expected = draft_binding(authorization, challenge, chain_id, wallet_address)?;
+    if envelope["binding"] != expected {
+        return Err("MPP unsigned draft binding differs from its canonical identity".into());
+    }
+    Ok(authorization.to_owned())
+}
+
+alloy::sol! {
+    struct BloomMppVoucher {
+        bytes32 channelId;
+        uint128 cumulativeAmount;
+    }
+}
+
+async fn exactize_credential(
+    mut credential: mpp::PaymentCredential,
+    challenge: &mpp::PaymentChallenge,
+    chain_id: u64,
+    host: &dyn PaidHttpHostSigner,
+    facts: &PaidHttpSigningFacts,
+) -> Result<mpp::PaymentCredential, String> {
+    if challenge.intent.as_str() == "charge" {
+        let mut payload = credential
+            .charge_payload()
+            .map_err(|error| format!("parse MPP charge draft: {error}"))?;
+        let signed = payload
+            .signed_tx()
+            .ok_or_else(|| "MPP charge draft is not a transaction".to_string())?;
+        payload = mpp::PaymentPayload::transaction(
+            exactize_tempo_transaction(signed, "charge-transaction", host, facts).await?,
+        );
+        credential.payload = serde_json::to_value(payload).map_err(|error| error.to_string())?;
+        return Ok(credential);
+    }
+
+    let payload: SessionCredentialPayload = credential
+        .payload_as()
+        .map_err(|error| format!("parse MPP session draft: {error}"))?;
+    let escrow = resolve_escrow(challenge, chain_id, None)
+        .map_err(|error| format!("resolve MPP session escrow: {error}"))?;
+    let payload = match payload {
+        SessionCredentialPayload::Open {
+            payload_type,
+            channel_id,
+            transaction,
+            authorized_signer,
+            cumulative_amount,
+            signature: _,
+        } => {
+            let transaction =
+                exactize_tempo_transaction(&transaction, "session-open-transaction", host, facts)
+                    .await?;
+            let signature = exactize_voucher(
+                &channel_id,
+                &cumulative_amount,
+                escrow,
+                chain_id,
+                "session-open-voucher",
+                host,
+                facts,
+            )
+            .await?;
+            SessionCredentialPayload::Open {
+                payload_type,
+                channel_id,
+                transaction,
+                authorized_signer,
+                cumulative_amount,
+                signature,
+            }
+        }
+        SessionCredentialPayload::TopUp {
+            payload_type,
+            channel_id,
+            transaction,
+            additional_deposit,
+        } => SessionCredentialPayload::TopUp {
+            payload_type,
+            channel_id,
+            transaction: exactize_tempo_transaction(
+                &transaction,
+                "session-topup-transaction",
+                host,
+                facts,
+            )
+            .await?,
+            additional_deposit,
+        },
+        SessionCredentialPayload::Voucher {
+            channel_id,
+            cumulative_amount,
+            signature: _,
+        } => SessionCredentialPayload::Voucher {
+            signature: exactize_voucher(
+                &channel_id,
+                &cumulative_amount,
+                escrow,
+                chain_id,
+                "session-voucher",
+                host,
+                facts,
+            )
+            .await?,
+            channel_id,
+            cumulative_amount,
+        },
+        SessionCredentialPayload::Close {
+            channel_id,
+            cumulative_amount,
+            signature: _,
+        } => SessionCredentialPayload::Close {
+            signature: exactize_voucher(
+                &channel_id,
+                &cumulative_amount,
+                escrow,
+                chain_id,
+                "session-close-voucher",
+                host,
+                facts,
+            )
+            .await?,
+            channel_id,
+            cumulative_amount,
+        },
+    };
+    credential.payload = serde_json::to_value(payload).map_err(|error| error.to_string())?;
+    Ok(credential)
+}
+
+fn validate_credential_binding(
+    credential: &mpp::PaymentCredential,
+    challenge: &mpp::PaymentChallenge,
+    chain_id: u64,
+    wallet_address: Address,
+) -> Result<(), String> {
+    let actual_echo = serde_json::to_value(&credential.challenge)
+        .map_err(|error| format!("serialize MPP draft challenge echo: {error}"))?;
+    let expected_echo = serde_json::to_value(challenge.to_echo())
+        .map_err(|error| format!("serialize MPP expected challenge echo: {error}"))?;
+    if actual_echo != expected_echo {
+        return Err("MPP unsigned draft challenge echo differs from the sealed challenge".into());
+    }
+    let expected_source = mpp::PaymentCredential::evm_did(chain_id, &wallet_address.to_string());
+    if credential.source.as_deref() != Some(expected_source.as_str()) {
+        return Err("MPP unsigned draft payer differs from the selected wallet".into());
+    }
+    Ok(())
+}
+
+async fn exactize_tempo_transaction(
+    encoded: &str,
+    signing_slot: &str,
+    host: &dyn PaidHttpHostSigner,
+    facts: &PaidHttpSigningFacts,
+) -> Result<String, String> {
+    let bytes = alloy::hex::decode(encoded).map_err(|error| format!("decode Tempo tx: {error}"))?;
+    if bytes.first() == Some(&0x78) {
+        let mut envelope = FeePayerEnvelope78::decode_envelope(&bytes)
+            .map_err(|error| format!("decode Tempo fee-payer envelope: {error}"))?;
+        let recoverable = envelope.to_recoverable_signed();
+        let preimage = recoverable.tx().encoded_for_signing();
+        let hash: [u8; 32] = alloy::primitives::keccak256(&preimage).into();
+        let raw = host
+            .sign_paid_http_payload(MPP_SIGN_INTENT, signing_slot, &preimage, hash, facts)
+            .await?;
+        let signature = Signature::from_raw(&raw).map_err(|error| error.to_string())?;
+        envelope.signature = TempoSignature::Primitive(PrimitiveSignature::Secp256k1(signature));
+        return Ok(alloy::hex::encode_prefixed(envelope.encoded_envelope()));
+    }
+    let signed = AASigned::decode_2718(&mut bytes.as_slice())
+        .map_err(|error| format!("decode signed Tempo transaction: {error}"))?;
+    let tx = signed.strip_signature();
+    let preimage = tx.encoded_for_signing();
+    let hash: [u8; 32] = alloy::primitives::keccak256(&preimage).into();
+    let raw = host
+        .sign_paid_http_payload(MPP_SIGN_INTENT, signing_slot, &preimage, hash, facts)
+        .await?;
+    let signature = Signature::from_raw(&raw).map_err(|error| error.to_string())?;
+    let signed = tx.into_signed(TempoSignature::Primitive(PrimitiveSignature::Secp256k1(
+        signature,
+    )));
+    Ok(alloy::hex::encode_prefixed(signed.encoded_2718()))
+}
+
+async fn exactize_voucher(
+    channel_id: &str,
+    cumulative_amount: &str,
+    escrow: Address,
+    chain_id: u64,
+    signing_slot: &str,
+    host: &dyn PaidHttpHostSigner,
+    facts: &PaidHttpSigningFacts,
+) -> Result<String, String> {
+    let domain = eip712_domain! {
+        name: mpp::protocol::methods::tempo::voucher::DOMAIN_NAME,
+        version: mpp::protocol::methods::tempo::voucher::DOMAIN_VERSION,
+        chain_id: chain_id,
+        verifying_contract: escrow,
+    };
+    let voucher = BloomMppVoucher {
+        channelId: channel_id
+            .parse::<B256>()
+            .map_err(|error| format!("parse MPP channel id: {error}"))?,
+        cumulativeAmount: cumulative_amount
+            .parse::<u128>()
+            .map_err(|error| format!("parse MPP cumulative amount: {error}"))?,
+    };
+    let mut preimage = Vec::with_capacity(66);
+    preimage.extend_from_slice(&[0x19, 0x01]);
+    preimage.extend_from_slice(domain.separator().as_slice());
+    preimage.extend_from_slice(voucher.eip712_hash_struct().as_slice());
+    let hash: [u8; 32] = alloy::primitives::keccak256(&preimage).into();
+    let raw = host
+        .sign_paid_http_payload(MPP_SIGN_INTENT, signing_slot, &preimage, hash, facts)
+        .await?;
+    Ok(alloy::hex::encode_prefixed(raw))
 }
 
 #[async_trait]
@@ -166,32 +444,79 @@ impl PaymentBackend for RealMppBackend {
                 format!("no configured HTTP RPC URL for Tempo MPP chain_id {chain_id}")
             })?;
         let payment_challenge = parse_stored_mpp_challenge(challenge)?;
-        let signer = HostMppSigner::new(
-            Arc::clone(&self.host_signer),
-            self.wallet_address,
-            self.facts.clone(),
-            Some(chain_id),
-        );
-        let credential = match challenge.intent.as_str() {
-            "charge" => prepare_charge_credential(&payment_challenge, &signer, &rpc_url).await,
-            "session" => {
-                prepare_session_credential(
+        let signer = DraftMppSigner::new(self.wallet_address, Some(chain_id));
+        let draft_exists = match self.draft_path.as_ref() {
+            Some(path) => path
+                .try_exists()
+                .map_err(|error| format!("inspect MPP draft envelope: {error}"))?,
+            None => false,
+        };
+        let (draft_authorization, generated_draft) = match self.draft_path.as_ref() {
+            Some(path) if draft_exists => (
+                validate_persisted_draft_binding(
+                    path,
                     &payment_challenge,
-                    &signer,
-                    &rpc_url,
-                    policy
-                        .payments
-                        .sessions
-                        .max_deposit_usd
-                        .and_then(|usd| usd_to_atomic_units(challenge.asset.as_deref(), usd)),
-                )
-                .await
+                    chain_id,
+                    self.wallet_address,
+                )?,
+                false,
+            ),
+            Some(_) | None => {
+                let credential = match challenge.intent.as_str() {
+                    "charge" => {
+                        prepare_charge_credential(&payment_challenge, &signer, &rpc_url).await
+                    }
+                    "session" => {
+                        prepare_session_credential(
+                            &payment_challenge,
+                            &signer,
+                            &rpc_url,
+                            policy.payments.sessions.max_deposit_usd.and_then(|usd| {
+                                usd_to_atomic_units(challenge.asset.as_deref(), usd)
+                            }),
+                        )
+                        .await
+                    }
+                    other => {
+                        return Err(format!("unsupported MPP intent '{other}'"));
+                    }
+                }
+                .map_err(|e| format!("Tempo MPP credential: {e}"))?;
+                let authorization = mpp::format_authorization(&credential)
+                    .map_err(|e| format!("format MPP unsigned authorization: {e}"))?;
+                (authorization, true)
             }
-            other => {
-                return Err(format!("unsupported MPP intent '{other}'"));
-            }
+        };
+        let credential = mpp::parse_authorization(&draft_authorization)
+            .map_err(|e| format!("parse MPP unsigned draft: {e}"))?;
+        validate_credential_binding(
+            &credential,
+            &payment_challenge,
+            chain_id,
+            self.wallet_address,
+        )?;
+        let exactized = exactize_credential(
+            credential,
+            &payment_challenge,
+            chain_id,
+            self.host_signer.as_ref(),
+            &self.facts,
+        )
+        .await;
+        // The production host persists the immutable semantic-slot signing
+        // identity before returning either a ceremony or a signature. Persist
+        // the retry draft only after that point, eliminating a crash window in
+        // which an unbound draft could become the first signed payload.
+        if generated_draft && let Some(path) = &self.draft_path {
+            persist_draft_binding_atomically(
+                path,
+                &draft_authorization,
+                &payment_challenge,
+                chain_id,
+                self.wallet_address,
+            )?;
         }
-        .map_err(|e| format!("Tempo MPP credential: {e}"))?;
+        let credential = exactized?;
         let authorization = mpp::format_authorization(&credential)
             .map_err(|e| format!("format MPP Authorization: {e}"))?;
         let authorization_sha256 = bloom_tools::sha256_hex(authorization.as_bytes());
@@ -223,7 +548,7 @@ impl PaymentBackend for RealMppBackend {
 
 async fn prepare_charge_credential(
     challenge: &mpp::PaymentChallenge,
-    signer: &HostMppSigner,
+    signer: &DraftMppSigner,
     rpc_url: &str,
 ) -> Result<mpp::PaymentCredential, mpp::MppError> {
     let mut charge = TempoCharge::from_challenge(challenge)?;
@@ -246,7 +571,7 @@ async fn prepare_charge_credential(
 
 async fn prepare_session_credential(
     challenge: &mpp::PaymentChallenge,
-    signer: &HostMppSigner,
+    signer: &DraftMppSigner,
     rpc_url: &str,
     max_deposit: Option<u128>,
 ) -> Result<mpp::PaymentCredential, mpp::MppError> {
@@ -350,4 +675,131 @@ fn parse_stored_mpp_challenge(
         .ok_or_else(|| {
             "stored challenge is missing a parseable Tempo MPP WWW-Authenticate header".to_string()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DraftMppSigner, MPP_SIGN_INTENT, exactize_tempo_transaction,
+        persist_draft_binding_atomically, validate_persisted_draft_binding,
+    };
+    use alloy::primitives::{Address, Bytes, TxKind, U256};
+    use async_trait::async_trait;
+    use bloom_paid_http::{PaidHttpHostSigner, PaidHttpSigningFacts};
+    use mpp::client::tempo::charge::tx_builder::{TempoTxOptions, build_tempo_tx};
+    use mpp::client::tempo::signing::{TempoSigningMode, sign_and_encode_async};
+    use std::sync::Mutex;
+    use tempo_alloy::primitives::transaction::Call;
+
+    #[derive(Default)]
+    struct ExactHost(Mutex<Vec<Vec<u8>>>);
+
+    #[async_trait]
+    impl PaidHttpHostSigner for ExactHost {
+        async fn sign_paid_http_payload(
+            &self,
+            intent: &str,
+            _signing_slot: &str,
+            preimage: &[u8],
+            signing_hash: [u8; 32],
+            _facts: &PaidHttpSigningFacts,
+        ) -> Result<[u8; 65], String> {
+            assert_eq!(intent, MPP_SIGN_INTENT);
+            assert_eq!(
+                alloy::primitives::keccak256(preimage).as_slice(),
+                signing_hash
+            );
+            self.0.lock().unwrap().push(preimage.to_vec());
+            let mut signature = [2_u8; 65];
+            signature[64] = 1;
+            Ok(signature)
+        }
+
+        async fn sign_paid_http_hash(
+            &self,
+            _intent: &str,
+            _signing_hash: [u8; 32],
+            _facts: &PaidHttpSigningFacts,
+        ) -> Result<[u8; 65], String> {
+            panic!("hash-only MPP signing must not be used")
+        }
+    }
+
+    #[tokio::test]
+    async fn tempo_transaction_is_resigned_from_exact_encoded_preimage() {
+        let tx = build_tempo_tx(TempoTxOptions {
+            calls: vec![Call {
+                to: TxKind::Call(Address::repeat_byte(0x22)),
+                value: U256::ZERO,
+                input: Bytes::from_static(b"payment"),
+            }],
+            chain_id: 42431,
+            fee_token: Address::repeat_byte(0x33),
+            nonce: 7,
+            nonce_key: U256::ZERO,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            fee_payer: false,
+            valid_before: None,
+            key_authorization: None,
+        });
+        let signer = DraftMppSigner::new(Address::repeat_byte(0x11), Some(42431));
+        let draft = sign_and_encode_async(tx, &signer, &TempoSigningMode::Direct)
+            .await
+            .unwrap();
+        let host = ExactHost::default();
+        let signed = exactize_tempo_transaction(
+            &alloy::hex::encode_prefixed(&draft),
+            "charge-transaction",
+            &host,
+            &PaidHttpSigningFacts::default(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(signed, alloy::hex::encode_prefixed(draft));
+        let preimages = host.0.lock().unwrap();
+        assert_eq!(preimages.len(), 1);
+        assert!(!preimages[0].is_empty());
+    }
+
+    #[tokio::test]
+    async fn altered_persisted_transaction_is_rejected_by_canonical_binding() {
+        let challenge = mpp::PaymentChallenge::new(
+            "charge-binding",
+            "merchant.test",
+            "tempo",
+            "charge",
+            mpp::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1",
+                "currency": format!("{:#x}", Address::repeat_byte(0x33)),
+                "recipient": format!("{:#x}", Address::repeat_byte(0x22)),
+                "methodDetails": { "chainId": 42431 }
+            }))
+            .unwrap(),
+        );
+        let wallet = Address::repeat_byte(0x11);
+        let original = mpp::PaymentCredential::with_source(
+            challenge.to_echo(),
+            mpp::PaymentCredential::evm_did(42431, &wallet.to_string()),
+            mpp::PaymentPayload::transaction("0x7601"),
+        );
+        let original = mpp::format_authorization(&original).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mpp-unsigned-draft");
+        persist_draft_binding_atomically(&path, &original, &challenge, 42431, wallet).unwrap();
+
+        let altered = mpp::PaymentCredential::with_source(
+            challenge.to_echo(),
+            mpp::PaymentCredential::evm_did(42431, &wallet.to_string()),
+            mpp::PaymentPayload::transaction("0x76ffff"),
+        );
+        let altered = mpp::format_authorization(&altered).unwrap();
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        envelope["authorization"] = altered.into();
+        std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        let error = validate_persisted_draft_binding(&path, &challenge, 42431, wallet).unwrap_err();
+        assert!(error.contains("canonical identity"));
+    }
 }

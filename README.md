@@ -132,9 +132,10 @@ A fresh Bloom VFS root exposes these default entries:
   addresses, ERC-20 balances, NFTs, txs, receipts, contract metadata,
   ABI methods/events/storage/proxy reads, and optional mempool views
   when a WebSocket mempool provider is configured.
-- `wallets/<name>/` — managed wallets, per-chain balances/nonce,
-  policy, `outbox/` staging/confirmation, and
-  `sign/{message,hash,typed_data}`.
+- `wallets/<name>/` — Broker-projected wallets, per-chain balances/nonce,
+  canonical policy custody, and `outbox/` staging/confirmation. Legacy raw
+  signing leaves fail closed; transactions and Petals use payload-bearing
+  Broker signing routes.
 - `simulate/<session>/` — `eth_call` + state-override sandbox; no
   signing and no broadcast.
 - `watch/<id>/` — poll-based subscriptions for balances, blocks, gas,
@@ -146,8 +147,9 @@ A fresh Bloom VFS root exposes these default entries:
 - `addressbook/<alias>` — local petname directory.
 - `ens/<name>.eth` — ENS forward resolution as a read surface.
 - `petals/` — installed local Petal app surfaces. `bloom init` provisions the
-  pinned Polymarket, Near Intents, and
-  [Enso](https://github.com/bloom-directory/bloom-petal-enso) packages.
+  pinned Near Intents and
+  [Enso](https://github.com/bloom-directory/bloom-petal-enso) packages;
+  unreleased migrated venue Petals are installed explicitly.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
@@ -174,12 +176,13 @@ Bloom is a Rust Cargo workspace. The main user-facing/runtime crates are:
 
 | Crate | Responsibility |
 |-------|----------------|
-| `bloom` | CLI binary; thin client plus in-process daemon driver. |
-| `bloom-daemon` | Wires home dir, config, chains, keystore, VFS, IPC, ENS, watches, and optional feature adapters. |
+| `bloom` | Machine CLI/runtime; reads, stages, simulates, and delegates every authority operation to Broker. |
+| `bloom-daemon` | Wires key-free public projections, config, chains, VFS, IPC, ENS, watches, and execution adapters. |
+| `bloom-machine-client` | Authenticated Machine-to-Broker client and rollback-safe public projection cache. |
+| [`bloom-service-runtime`](https://github.com/bloom-directory/bloom-service-runtime) (external) | Independently auditable RPC wire, local transport, activation, audit-checkpoint, and trusted-time substrate. |
 | `bloom-vfs` | Path router, handler trait, per-path caching, and vendored docs. |
 | `bloom-evm` / `bloom-rpc` | RPC pools, per-chain engines, chain reads, and provider health. |
-| `bloom-tx` | Tx staging, simulation, signing, broadcast, nonce management, and policy enforcement. |
-| `bloom-keystore` | Encrypted local key storage and signer integration. |
+| `bloom-tx` | Unsigned transaction staging, simulation, Broker signing orchestration, broadcast, and nonce management. |
 | `bloom-mempool` | Optional pending-transaction indexing for configured WebSocket providers. |
 | `bloom-watch` | Subscription registry and polling executor. |
 | `bloom-mount` | NFSv4 adapter that mounts Bloom's VFS as an ordinary filesystem. |
@@ -197,33 +200,27 @@ and example crates used by the broader Bloom runtime and examples.
 - **Broadcast routing enabled by default.** Per-chain `allow_broadcast`
   defaults to `true`. Signing, policy, confirmation, and Sealed Approval
   gates still apply.
-- **Private keys are never readable through the FS.** The keystore
-  lives outside the mount; only `address` and `public_key` are
-  exposed.
-- **Encrypted at rest.** Local keys use argon2id KDF plus
-  chacha20poly1305 envelopes.
+- **Machine contains no wallet keys.** Custody and signing cross Machine's
+  authenticated Broker edge; Signer alone owns private keys and delegated
+  Petal sub-keys. The mount exposes only public projections and signatures
+  needed for execution.
 - **Hash-chained audit log.** Every write and side-effecting read is
   appended to `<home>/audit.jsonl`; read the head digest at
   `status/audit/head`.
 - **Stage-confirm write flow.** A staged tx becomes a transaction only
   when a non-empty confirm file is written.
-- **Policy enforcement before signing.** Per-wallet `policy.toml`
-  enforces caps, recipient allow/deny lists, contract-call gates,
-  private orderflow settings, and automation thresholds.
-- **Passkey policy review is plain-language first.** `bloom wallet
-  sign-policy <wallet>` opens a local review page where the user chooses
-  whether Bloom must ask before every money-moving action or may act later
-  only when the action passes the signed policy. Technical hashes and raw
-  policy TOML stay behind advanced details.
+- **Policy custody before signing.** The writable `policy.json` surface uses
+  Broker `policy.validate_update`, a Signer-completed `policy_update` custody
+  ceremony, and receipt-only `policy.commit_update`.
 - **Private orderflow is opt-in and fail-closed.** On unsupported
   chains, private broadcast returns an error instead of silently falling
   back to public RPC.
 
 ## Limitations
 
-- **Single-user daemon.** No daemon-level auth or multi-tenant
-  isolation; the mount inherits the OS user's permissions on
-  `~/.bloom`.
+- **Per-login Machine surface.** Production Broker and Signer run as isolated
+  service principals and authenticate local RPC peers. The mounted Machine
+  surface remains scoped to its enrolled login.
 - **Broadcast config is not an approval boundary.** Set a chain's
   `allow_broadcast = false` to disable broadcast on that chain. Value-moving
   actions still pass Bloom's signing, policy, and confirmation controls.

@@ -8,12 +8,6 @@
 //! `ChainClient::trace_revert` + `DecoderChain` and asserts the decoded
 //! attribution matches the expected source / signature / args.
 //!
-//! Marked `#[ignore]` so it only runs explicitly:
-//!
-//! ```text
-//! cargo test -p bloom-it --test revert_decoding -- --ignored --nocapture
-//! ```
-//!
 //! Requires `anvil` and `cast` from Foundry on `$PATH` (override with
 //! `BLOOM_ANVIL_BIN` / `BLOOM_CAST_BIN`).
 
@@ -128,7 +122,6 @@ fn build_decoder_chain(abi: alloy::json_abi::JsonAbi) -> DecoderChain {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn anvil_decodes_three_revert_kinds() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

@@ -6,8 +6,9 @@
 
 use alloy::primitives::U256;
 use async_trait::async_trait;
-use bloom_auth_api::{AuthApiError, PriceOracle, ValuationQuote};
 use bloom_prices::{CoinId, PricesClient};
+use bloom_proto::{ValuationError, ValuationQuote};
+use bloom_tx::PriceOracle;
 
 /// Maps a chain's native symbol to a CoinId via the chain name when
 /// possible, falling back to the bare symbol. Most ETH-style L2s already
@@ -36,32 +37,32 @@ impl PricesOracle {
         }
     }
 
-    fn coin_for_asset(asset_id: &str) -> Result<CoinId, AuthApiError> {
+    fn coin_for_asset(asset_id: &str) -> Result<CoinId, ValuationError> {
         if let Some(chain) = asset_id.strip_prefix("native:") {
             return Ok(Self::coin_for_chain(chain));
         }
         let (chain, address) = asset_id
             .split_once(':')
-            .ok_or_else(|| AuthApiError::Denied(format!("invalid price asset id: {asset_id}")))?;
+            .ok_or_else(|| ValuationError::denied(format!("invalid price asset id: {asset_id}")))?;
         let chain = chain.trim().to_ascii_lowercase();
         let chain = match chain.as_str() {
             "mainnet" | "anvil" | "local" => "ethereum".to_string(),
             other => other.to_string(),
         };
         CoinId::parse(&format!("{chain}:{address}"))
-            .map_err(|error| AuthApiError::Denied(format!("invalid price asset id: {error}")))
+            .map_err(|error| ValuationError::denied(format!("invalid price asset id: {error}")))
     }
 
     fn amount_to_usd_micro(
         amount_base_units: &str,
         decimals: u8,
         price_usd: f64,
-    ) -> Result<i128, AuthApiError> {
+    ) -> Result<i128, ValuationError> {
         if !price_usd.is_finite() || price_usd <= 0.0 {
-            return Err(AuthApiError::Denied("price quote is invalid".into()));
+            return Err(ValuationError::denied("price quote is invalid"));
         }
         let amount = U256::from_str_radix(amount_base_units, 10)
-            .map_err(|_| AuthApiError::Denied("amount_base_units is invalid".into()))?;
+            .map_err(|_| ValuationError::denied("amount_base_units is invalid"))?;
         if amount.is_zero() {
             return Ok(0);
         }
@@ -80,12 +81,12 @@ impl PricesOracle {
         let mut numerator = amount
             .checked_mul(U256::from(mantissa))
             .and_then(|value| value.checked_mul(U256::from(1_000_000u64)))
-            .ok_or_else(|| AuthApiError::Denied("computed USD value is invalid".into()))?;
+            .ok_or_else(|| ValuationError::denied("computed USD value is invalid"))?;
         let mut denominator = U256::from(10).pow(U256::from(decimals));
         if binary_exponent >= 0 {
             numerator = numerator
                 .checked_shl(binary_exponent as usize)
-                .ok_or_else(|| AuthApiError::Denied("computed USD value is invalid".into()))?;
+                .ok_or_else(|| ValuationError::denied("computed USD value is invalid"))?;
         } else {
             // A denominator this large means the exact value is below one
             // micro-dollar. Round conservatively upward rather than to zero.
@@ -99,12 +100,12 @@ impl PricesOracle {
         let rounded = if remainder > U256::ZERO {
             quotient
                 .checked_add(U256::from(1u8))
-                .ok_or_else(|| AuthApiError::Denied("computed USD value is invalid".into()))?
+                .ok_or_else(|| ValuationError::denied("computed USD value is invalid"))?
         } else {
             quotient
         };
         if rounded > U256::from(i128::MAX as u128) {
-            return Err(AuthApiError::Denied("computed USD value is invalid".into()));
+            return Err(ValuationError::denied("computed USD value is invalid"));
         }
         Ok(rounded.to::<u128>() as i128)
     }
@@ -118,30 +119,27 @@ impl PriceOracle for PricesOracle {
         amount_base_units: &str,
         asset_decimals: u8,
         now_ms: u64,
-    ) -> Result<ValuationQuote, AuthApiError> {
+    ) -> Result<ValuationQuote, ValuationError> {
         let coin = Self::coin_for_asset(asset_id)?;
-        let quote =
-            self.client.current(coin).await.map_err(|error| {
-                AuthApiError::Denied(format!("price oracle unavailable: {error}"))
-            })?;
+        let quote = self.client.current(coin).await.map_err(|error| {
+            ValuationError::denied(format!("price oracle unavailable: {error}"))
+        })?;
         if let Some(provider_decimals) = quote.decimals
             && provider_decimals != asset_decimals
         {
-            return Err(AuthApiError::Denied(format!(
+            return Err(ValuationError::denied(format!(
                 "price quote decimals mismatch: provider={provider_decimals} trusted={asset_decimals}"
             )));
         }
         if quote.timestamp == 0 {
-            return Err(AuthApiError::Denied("price quote timestamp missing".into()));
+            return Err(ValuationError::denied("price quote timestamp missing"));
         }
         let confidence_ppm = match quote.confidence {
             Some(confidence) if confidence.is_finite() && confidence >= 0.0 => {
                 Some((confidence.min(1.0) * 1_000_000.0).round() as u32)
             }
             Some(_) => {
-                return Err(AuthApiError::Denied(
-                    "price quote confidence is invalid".into(),
-                ));
+                return Err(ValuationError::denied("price quote confidence is invalid"));
             }
             None => None,
         };

@@ -5,17 +5,23 @@ edition.workspace = true
 license.workspace = true
 description = "Shared types and config for bloom"
 
+[features]
+default = []
+# Fault injection for audit failure-path tests. Never enabled by packaged
+# Machine builds.
+audit-test-seam = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 thiserror.workspace = true
-bloom-auth-api.workspace = true
 hex.workspace = true
 blake3.workspace = true
 humantime-serde.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+ed25519-dalek.workspace = true
 alloy.workspace = true
 dirs.workspace = true
 url.workspace = true

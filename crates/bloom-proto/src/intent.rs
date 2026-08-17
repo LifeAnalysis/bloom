@@ -11,6 +11,30 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Domain tag for hashes of canonical action-intent bytes.
+pub const INTENT_HASH_DOMAIN: &[u8] = b"bloom.intent.v1";
+
+/// Compute the stable domain-separated hash used to correlate an action's
+/// canonical intent across Machine-owned projections.
+pub fn intent_hash_of(canonical_bytes: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(INTENT_HASH_DOMAIN);
+    hasher.update(canonical_bytes);
+    hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(test)]
+mod intent_hash_tests {
+    use super::*;
+
+    #[test]
+    fn intent_hash_is_domain_separated_and_stable() {
+        let expected = intent_hash_of(b"canonical");
+        assert_eq!(expected, intent_hash_of(b"canonical"));
+        assert_ne!(expected, blake3::hash(b"canonical").to_hex().to_string());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(untagged)]
 pub enum ValueOrToken {

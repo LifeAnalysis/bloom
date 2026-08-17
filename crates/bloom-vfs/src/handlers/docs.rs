@@ -197,6 +197,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mounted_help_uses_canonical_sealed_approval_vocabulary() {
+        let help = String::from_utf8(
+            DocsHandler::new()
+                .read(&VfsPath::parse("/README.md").unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!help.contains(concat!("policy-", "session")), "{help}");
+        assert!(help.contains("sealed-approvals"), "{help}");
+        assert!(help.contains("Broker enforces"), "{help}");
+        assert!(help.contains("policy.json"), "{help}");
+        assert!(help.contains("policy.validate_update"), "{help}");
+        assert!(help.contains("policy.commit_update"), "{help}");
+        assert!(
+            help.contains("same proposed bytes") && help.contains("**exact"),
+            "{help}"
+        );
+        for stale in ["policy.toml", "host signer", "the grant", "a grant"] {
+            assert!(
+                !help.contains(stale),
+                "mounted help retains stale Machine-authority vocabulary {stale:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn petals_doc_is_rendered_at_read_time() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let renderer_calls = calls.clone();
@@ -243,9 +270,14 @@ mod tests {
                 .await
                 .unwrap();
             let s = String::from_utf8(bytes).unwrap();
+            let normalized = s.to_ascii_lowercase();
             assert!(
                 s.contains("wallets/registrations/") && s.contains("status.json"),
-                "{name} must document wallets/registrations/<name>/status.json"
+                "{name} must document petname-keyed registration status"
+            );
+            assert!(
+                normalized.contains("requested_name") && normalized.contains("petname"),
+                "{name} must document the petname-keyed registration projection"
             );
             assert!(
                 !(s.contains("plain name") && s.contains("creates a local wallet")),

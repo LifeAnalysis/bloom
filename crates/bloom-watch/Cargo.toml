@@ -7,10 +7,12 @@ description = "Subscriptions and live tails for bloom"
 
 [dependencies]
 bloom-proto.workspace = true
+bloom-tools.workspace = true
 bloom-evm.workspace = true
 alloy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_jcs.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
@@ -20,6 +22,7 @@ parking_lot.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+bloom-proto = { workspace = true, features = ["audit-test-seam"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time"] }
 tracing-subscriber.workspace = true

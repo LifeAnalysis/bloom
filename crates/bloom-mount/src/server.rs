@@ -327,7 +327,7 @@ mod tests {
     //! (which is the same primitive `serve_nfs_with` uses) and exercise
     //! the handle lifecycle by constructing handles directly with a
     //! dummy server task. Tests that genuinely require a real mount are
-    //! gated behind `#[ignore]` and documented inline.
+    //! covered by explicit integration tests documented inline.
     use super::*;
     use std::sync::Arc;
     use std::time::Instant;

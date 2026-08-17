@@ -16,10 +16,12 @@ exports are invoked by the component runner. Each normal file route must export
 the full `route-file` world: `metadata`, `lookup`, `list`, `read`, and `write`.
 Unsupported operations should return `route-error.unsupported`. Component routes
 can call mediated `bloom:http/fetch@0.1.0`, `bloom:store/kv@0.1.0`, and
-`bloom:vfs/readwrite@0.1.0`, and `bloom:sign/signing@0.1.0` imports when the
-package manifest grants the matching capability. Signing routes must also
-declare `[sign].allowed_intents`, and runtime host calls are denied unless the
-requested intent is in that allow-list. `bloom:store/kv@0.1.0` includes atomic
+`bloom:vfs/readwrite@0.1.0`, and payload-bearing
+`bloom:sign/signing@0.2.0` imports when the package manifest grants the
+matching capability. The retired `@0.1.0` hash-only signing import always
+fails closed. Signing routes must also declare `[sign].allowed_intents`, and
+runtime host calls are denied unless the requested intent is in that
+allow-list. `bloom:store/kv@0.1.0` includes atomic
 `put-new` and `delete-if-value` operations for route locks/idempotency.
 `bloom:chain/read@0.1.0` is linked
 through the component runner for future host support, but install validation

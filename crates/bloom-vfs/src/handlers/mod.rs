@@ -7,8 +7,9 @@ pub mod chains_mempool;
 mod chains_nfts;
 pub mod docs;
 pub mod ens;
-pub mod hyperliquid;
 pub mod outbox;
+pub mod petal_key_requests;
+pub mod petal_signing_requests;
 pub mod prices;
 pub mod requests;
 pub mod simulate;
@@ -23,8 +24,11 @@ pub use chains::ChainsHandler;
 pub use chains_mempool::MempoolHandler;
 pub use docs::DocsHandler;
 pub use ens::EnsHandler;
-pub use hyperliquid::HyperliquidHandler;
 pub use outbox::{CentralOutbox, OutboxHandler};
+pub use petal_key_requests::PetalKeyRequestsHandler;
+pub use petal_signing_requests::{
+    PETAL_SIGNING_STATE_SCHEMA, PetalSigningRequestProjection, PetalSigningRequestsHandler,
+};
 pub use prices::PricesHandler;
 pub use requests::RequestsHandler;
 pub use simulate::SimulateHandler;

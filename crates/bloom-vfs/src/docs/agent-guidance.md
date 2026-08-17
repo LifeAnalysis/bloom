@@ -22,25 +22,21 @@ bloom gatekeeps every value-moving action through capabilities:
 
 - **Reads are always safe.** No signing, no ceremony, no wallet needed for chain
   state, balances, prices, books, candles, account state.
-- **Direct writes require owner approval.** The outbox stage-confirm flow,
-  one-off Hyperliquid exchange orders, and Polymarket trades each cross an
-  owner gate (passkey ceremony or local passphrase unlock).
+- **Direct writes require owner approval.** The outbox stage-confirm flow and
+  one-off Petal operations cross a Broker-owned ceremony when fresh owner
+  approval is required.
 - **Automated action uses a capability.** Create a bounded session/capability
   first — the human approves the bounds once, then the agent operates inside
   them without re-prompting until expiry, breach, or revocation.
-- **The owner key is never handed off.** For capabilities that depend on owner
-  signing (EVM and installed Petals), the key will
-  reside in daemon RAM for a bounded window and auto-lock on expiry.
-  Hyperliquid already uses an ephemeral agent key that does not need the
-  owner key after session creation.
+- **The owner key is never handed off.** EVM and installed-Petal authority is
+  prepared by Broker and signed only by Signer; Machine never receives the
+  private key.
 
-To see what a wallet can do without a human, check its per-chain state and
-outbox, or its Hyperliquid sessions under `hyperliquid/<net>/agent_sessions/`.
+To see what a wallet can do without a human, check its per-chain state, outbox,
+and the mounted capability views of installed Petals.
 A read-only `wallets/<wallet>/capabilities/` roll-up and a VFS-root `next.md`
 aggregator expose the current capability and next-action view when the daemon
 has the relevant handlers mounted.
-
-Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
 
 ## Wallets
 
@@ -55,32 +51,31 @@ completes:
 ```sh
 printf 'main\n' > wallets/new
 cat wallets/registrations/main/status.json
-cat wallets/registrations/main/ceremony_url
 ```
 
-- Read `status.json` and `ceremony_url` right after the write.
+- The registration projection is keyed by the requested wallet petname. Verify
+  its `requested_name` before opening or polling its `ceremony_url`, or
+  cancelling it.
 - Open or forward `ceremony_url` to a human; do not attempt it yourself. Never
   imitate WebAuthn, supply PRF material, read recovery material, or silently
-  downgrade to a passphrase wallet — none of that is available or safe from
+  downgrade to a Machine-local credential flow — none of that is available or safe from
   an agent.
 - If the registration page reports an unsupported passkey method, ask the
   human to retry with a browser/device passkey, a password-manager passkey
   (iCloud Keychain, Google Password Manager), or a compatible hardware
   security key — and specifically to choose **"Use browser, device, or
   hardware key"** if Bitwarden intercepts the prompt.
-- Do not proceed until `status.json`'s `state` is `completed`; only then read
+- Do not proceed until `status.json`'s `ceremony_state` is `COMPLETED`; only then read
   the new wallet's address at `wallets/<name>/address`.
-- Asynchronous passkey registration requires a running `bloom serve` daemon.
-  If no registration service is available, the write fails clearly and tells
-  you to start `bloom serve`; retry after it is running rather than falling
-  back to any other wallet-creation path.
-- To cancel a live registration, write anything to
-  `wallets/registrations/<name>/cancel`.
+- Registration requires Machine's authenticated Broker edge. If Broker or
+  Signer is unavailable, the write fails closed; do not fall back to a
+  Machine-owned wallet-creation path.
+- To cancel a live registration, write `y`, `yes`, or `cancel` to
+  `wallets/registrations/<petname>/cancel`.
 
-Explicit `kind = "local"` and `kind = "import"` wallets remain synchronous and
-require `allow_passphrase_wallet = true` plus a passphrase in the TOML spec —
-passkey is the default for a reason. `kind = "passkey-import"` is not yet
-supported through the VFS.
+Import, recovery, rebind, and deletion are also Broker custody operations.
+Sensitive inputs belong only in the Broker-hosted owner ceremony, never in a
+mounted write.
 
 ## Mounted Sealed Approval flow
 
@@ -109,11 +104,10 @@ Before opening the ceremony, verify that `approval_challenge.json` has the same
 `action_id` as the directory you are acting on and that `expiry_ms` is still in
 the future. Then open or forward `ceremony_url`.
 
-The ceremony page offers two modes:
-
-- **grant**: mints only an in-memory daemon grant. Retry the same mounted
-  confirm write to execute from the sealed bytes.
-- **grant + execute**: mints the grant and executes immediately in the daemon.
+The ceremony is owned by Broker and completed cryptographically by Signer.
+After successful completion, retry the same mounted confirm write. Machine has
+no local approval or signer state and cannot substitute another action's
+receipt.
 
 If the pending transaction has soft policy warnings and you intend to bypass
 them, use the sibling write sink `confirm.override`. Mounted override intent
@@ -125,43 +119,40 @@ After execution, inspect `outbox/sent/<action_id>/` or
 artifacts. Petal-specific wallet paths are projections of the same central
 action id; do not treat them as separate approval queues.
 
-## Editing a passkey wallet policy
+## Updating wallet policy
 
-For a passkey (WebAuthn-gated) wallet, `policy.toml` is signed authorization
-state (`policy.toml.sig`). Editing it through the mount is a Sealed Approval
-action — the daemon installs both the new `policy.toml` and its matching
-signature only after owner approval. Local (passphrase) wallets keep their
-old behavior: the write applies immediately.
+`wallets/<wallet>/policy.json` is the only writable policy surface. It accepts
+the complete canonical JSON document.
 
 ```sh
-# 1. Read the current signed policy and edit it locally.
-cat wallets/<wallet>/policy.toml
+# 1. Read the current canonical policy and prepare exact replacement bytes.
+cat wallets/<wallet>/policy.json > proposed-policy.json
 
-# 2. Write the proposed policy. For a passkey wallet the first write fails with
-#    permission denied after the daemon stages a Sealed Approval challenge.
-printf '%s' "$edited_policy" > wallets/<wallet>/policy.toml
+# 2. The initial write stages Broker policy.validate_update. Broker validates
+#    the baseline and proposed bytes and originates a policy_update custody
+#    ceremony; the mounted write returns permission denied while approval waits.
+cp proposed-policy.json wallets/<wallet>/policy.json
 
 # 3. Discover and read the challenge through the mount.
 ls wallets/<wallet>/policy-updates/pending
 cat wallets/<wallet>/policy-updates/latest/status.json
 cat wallets/<wallet>/policy-updates/latest/approval_challenge.json
 
-# 4. Open or forward ceremony_url, approve, then retry the identical write.
-printf '%s' "$edited_policy" > wallets/<wallet>/policy.toml
+# 4. Complete the Broker ceremony, then retry the exact proposed bytes.
+cp proposed-policy.json wallets/<wallet>/policy.json
 ```
 
-The retry must send the **same** proposed bytes: the action id (and therefore
-the grant) is bound to `blake3(old_policy)` and `blake3(proposed_policy)`.
-Different retry bytes re-derive a fresh action id and start a new challenge
-rather than reusing the prior approval. On the approved retry Bloom also
-re-checks that the current on-disk policy still matches the sealed baseline,
-signs the approved proposed policy through the host signer, writes
-`policy.toml.sig`, then installs `policy.toml` — so the wallet is never left with
-a new policy that lacks its matching signature.
+The retry must send the **exact same proposed bytes**. Machine obtains the
+completed custody receipt from Broker and calls `policy.commit_update`; Broker
+then performs Signer's policy compare-and-swap against the authenticated
+baseline. Changed bytes require a distinct operation and fresh review. A stale
+baseline fails the compare-and-swap rather than overwriting concurrent policy.
 
-`status.json` and `approval_challenge.json` are read-only views: they carry
-bounded challenge metadata and `ceremony_url` only, never the signed approval or
-any key/PRF/grant material.
+`status.json` and `approval_challenge.json` are read-only Machine projections.
+They expose operation identity, review digest, ceremony status, retry guidance,
+and the public commit outcome. The completed custody receipt remains on the
+authenticated Broker/Signer path and is reflected in status; private receipt
+material, keys, and passkey output are never exposed through the mount.
 
 ## Paid HTTP (x402 and MPP)
 
@@ -188,13 +179,14 @@ permission denied after writing
 `action_id`, `expiry_ms`, merchant/payment details in `plan.md`, then open or
 forward `ceremony_url`, then retry the same VFS write.
 
-The ceremony mints a short-lived in-memory grant for the sealed request. x402
-and MPP then ask Bloom's host signer to sign the exact payment digest under that
-grant; one allowance is consumed atomically only when a signature is produced.
+Broker records the completed Sealed Approval for the exact request. x402 and
+MPP then ask Broker to authorize the exact payment payload and Signer to
+produce the signature; one allowance is consumed atomically only when a
+signature is produced.
 Failed policy checks, bad attestations, failed credential preparation, or retry
-failures before signing do not consume the grant. Raw payment authorization
-headers, signed payloads, passkey material, and PRF output are not written to
-VFS artifacts; credential metadata is redacted.
+failures before signing do not consume Sealed Approval capacity. Raw payment
+authorization headers, signed payloads, passkey material, and PRF output are
+not written to VFS artifacts; credential metadata is redacted.
 
 Request confirmation executes from the daemon's sealed paid-HTTP subject bytes
 and sealed policy snapshot. Files such as `request.toml`, `challenge.json`, and
@@ -264,22 +256,12 @@ REQUEST
 Prefer request-local USD caps. If `plan.md` says policy is denied, do not retry
 blindly; inspect the wallet policy or ask the human to change it.
 
-## Hyperliquid (session-first)
+## Hyperliquid
 
-Hyperliquid trading uses Sealed Approval for owner authority:
-
-- **Agent sessions (RECOMMENDED):** write an explicit session id to
-  `hyperliquid/mainnet/agent_sessions/<wallet>/new.json`. If the write returns
-  permission denied, read that session directory's `approval_challenge.json`,
-  open or forward its `ceremony_url`, complete the grant ceremony, then retry
-  the same write. The resulting ephemeral API wallet trades inside policy
-  bounds at `hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json`
-  without additional owner prompts until the session expires or is stopped.
-
-- **Owner actions:** `hyperliquid/<network>/exchange/<wallet>/send_asset.json`
-  follows the same challenge/grant/retry flow and requires `transfer_cap_usd`.
-  Generic owner-signed order/cancel/update-leverage writes are disabled; use
-  agent sessions.
+The native Hyperliquid handler and agent-session authority are retired. Use an
+installed Hyperliquid Petal under `petals/<name>/` when one is present; discover
+its exact mounted routes and declared capabilities through `docs/petals.md`.
+Do not assume a Hyperliquid Petal is installed or fall back to native paths.
 
 ## Petals
 
@@ -300,14 +282,9 @@ After choosing a Petal, read `petals/<name>/README.md` and
 route tree. Treat those package documents as authoritative for its workflows
 and review requirements.
 
-## Passkey policy mode
+## Sealed Approval capacity
 
-For passkey wallets, policy writes through `wallets/<wallet>/policy.toml` may
-produce a mounted approval challenge. The review page lets the human choose:
-
-- `Ask me every time`: money-moving actions need a fresh passkey review.
-- `Let Bloom use these rules`: agents may proceed only when every signed policy
-  check passes.
-
-Do not treat `under_policy` as a blanket unlock. It is permission to act inside
-the wallet's signed caps, allowlists, and surface-specific rules.
+Broker may authorize bounded reusable capacity after owner review. Capacity is
+limited by its exact subject, operation classes, counters, expiry, and current
+wallet policy; Signer enforces those bindings for every signature. It is never
+a blanket unlock, and Machine cannot mint, widen, or consume it locally.

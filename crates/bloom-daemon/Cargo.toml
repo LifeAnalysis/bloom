@@ -18,25 +18,21 @@ mount = ["bloom-mount/mount"]
 # decompile fallback to the revert-decoder chain. Heavy build (heimdall
 # pulls a lot of git deps) so opt-in only.
 bytecode-decompile = ["bloom-revert/bytecode-decompile"]
-# Development-only escape hatch for local testing. This compiles private-key
-# loading and approval-bypass paths into the daemon and must remain opt-in.
-unsafe-debug-signer = [
-    "bloom-keystore/unsafe-debug-signer",
-    "bloom-tx/unsafe-debug-signer",
-    "bloom-vfs/unsafe-debug-signer",
-]
+# Explicitly nonproduction constructor seam for external developer harnesses.
+# Release packaging must not enable this feature.
+unsigned-audit-test-seam = []
+triad-dev-harness = ["bloom-machine-client/triad-dev-harness"]
 
 [dependencies]
-bloom-auth-api.workspace = true
-bloom-auth.workspace = true
 bloom-proto.workspace = true
 bloom-paid-http.workspace = true
-bloom-keystore.workspace = true
 bloom-evm.workspace = true
 bloom-mempool.workspace = true
+bloom-machine-client.workspace = true
+bloom-broker-api.workspace = true
 bloom-tx.workspace = true
+bloom-tools.workspace = true
 bloom-vfs.workspace = true
-bloom-hyperliquid.workspace = true
 bloom-watch.workspace = true
 bloom-mount.workspace = true
 bloom-ens.workspace = true
@@ -47,6 +43,8 @@ bloom-petals.workspace = true
 bloom-update.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_jcs.workspace = true
+sha2.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
@@ -56,16 +54,15 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 parking_lot.workspace = true
 alloy.workspace = true
-axum.workspace = true
 url.workspace = true
 base64.workspace = true
 blake3.workspace = true
-rand.workspace = true
 futures.workspace = true
+fs2.workspace = true
 hex.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
-webauthn-rs.workspace = true
-zeroize.workspace = true
+rustix.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+bloom-proto = { workspace = true, features = ["audit-test-seam"] }
