@@ -146,7 +146,7 @@ fn fresh_staging_signs_and_confirms() {
     outbox
         .record_broadcast_outcome(&op(1), 2_300, 1, BroadcastOutcome::Accepted)
         .unwrap();
-    proxy.chain().land(&receipt.signature);
+    proxy.chain().unwrap().land(&receipt.signature);
     let status: Value = mediator
         .read(2_400, "getSignatureStatuses", &json!([receipt.signature]))
         .unwrap();
@@ -183,10 +183,10 @@ fn expired_validity_window_refuses_freshness_before_signing() {
     };
 
     // The chain advances past the window before signing.
-    proxy.chain().advance(SimChain::VALIDITY + 10);
+    proxy.chain().unwrap().advance(SimChain::VALIDITY + 10);
     let obs = NetworkObservation {
         latest_blockhash: staged.blockhash.clone(),
-        latest_block_height: proxy.chain().height(),
+        latest_block_height: proxy.chain().unwrap().height(),
         blockhash_valid: None,
         observed_at_ms: 1_500,
         commitment: "confirmed".into(),
@@ -309,7 +309,7 @@ fn timeout_after_submit_is_ambiguous_then_identical_byte_retry_confirms() {
         .record_broadcast_outcome(&op(3), 9, 2, BroadcastOutcome::Accepted)
         .unwrap();
     assert_eq!(outbox.load(&op(3)).unwrap().state, ActionState::Sent);
-    proxy.chain().land(&receipt.signature);
+    proxy.chain().unwrap().land(&receipt.signature);
 
     let status: Value = mediator
         .read(10, "getSignatureStatuses", &json!([receipt.signature]))
@@ -343,7 +343,7 @@ fn false_not_found_keeps_reconciliation_alive() {
 
     let digest = stage_sign_broadcast(&outbox, &driver, &mediator, 4);
     let signature = SimChain::signature_for("wire-4");
-    proxy.chain().land(&signature);
+    proxy.chain().unwrap().land(&signature);
 
     // The provider lies: not found for a landed transaction.
     let lying = FaultProxy::new(
@@ -409,7 +409,7 @@ fn selective_drop_quarantines() {
         .record_broadcast_outcome(&op(5), 5, 1, BroadcastOutcome::Accepted)
         .unwrap();
     assert_eq!(outbox.load(&op(5)).unwrap().state, ActionState::Sent);
-    proxy.chain().advance(500);
+    proxy.chain().unwrap().advance(500);
     let status: Value = mediator
         .read(6, "getSignatureStatuses", &json!([receipt.signature]))
         .unwrap();

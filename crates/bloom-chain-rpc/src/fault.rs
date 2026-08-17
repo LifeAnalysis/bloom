@@ -94,13 +94,45 @@ pub enum Fault {
     Honest,
 }
 
+/// The honest transport a [`FaultProxy`] wraps: the simulated chain (tests)
+/// or any real transport (fault injection against live validators).
+#[derive(Clone)]
+pub enum HonestTransport {
+    Sim(std::sync::Arc<SimChain>),
+    Direct(std::sync::Arc<dyn crate::transport::RpcTransport>),
+}
+
+impl HonestTransport {
+    fn call(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+        match self {
+            Self::Sim(chain) => chain.call(method, params),
+            Self::Direct(t) => t.call(method, params),
+        }
+    }
+
+    fn as_sim(&self) -> Option<&SimChain> {
+        match self {
+            Self::Sim(chain) => Some(chain),
+            Self::Direct(_) => None,
+        }
+    }
+}
+
 /// A transport wrapper that plays a scripted sequence of faults over an
-/// honest [`SimChain`], then falls back to honest behavior.
+/// honest transport, then falls back to honest behavior.
 #[derive(Debug)]
 pub struct FaultProxy {
-    chain: std::sync::Arc<SimChain>,
+    inner: std::sync::Arc<HonestInner>,
     script: Mutex<Vec<ScriptedFault>>,
     status_flip: Mutex<bool>,
+}
+
+struct HonestInner(HonestTransport);
+
+impl std::fmt::Debug for HonestInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HonestTransport")
+    }
 }
 
 impl FaultProxy {
@@ -111,17 +143,30 @@ impl FaultProxy {
     /// Build a proxy over a chain shared with the test/production caller, so
     /// state control (advancing, landing) and mediated calls hit one chain.
     pub fn shared(chain: std::sync::Arc<SimChain>, script: Vec<ScriptedFault>) -> Self {
+        Self::over_honest(HonestTransport::Sim(chain), script)
+    }
+
+    /// Build a proxy over any real transport (for example the Solana HTTP
+    /// transport) — fault injection against live validators.
+    pub fn over(
+        transport: std::sync::Arc<dyn crate::transport::RpcTransport>,
+        script: Vec<ScriptedFault>,
+    ) -> Self {
+        Self::over_honest(HonestTransport::Direct(transport), script)
+    }
+
+    fn over_honest(inner: HonestTransport, script: Vec<ScriptedFault>) -> Self {
         Self {
-            chain,
+            inner: std::sync::Arc::new(HonestInner(inner)),
             script: Mutex::new(script),
             status_flip: Mutex::new(false),
         }
     }
 
     /// The wrapped honest chain, for direct state control (advancing,
-    /// landing).
-    pub fn chain(&self) -> &SimChain {
-        &self.chain
+    /// landing). `None` when the proxy wraps a non-simulated transport.
+    pub fn chain(&self) -> Option<&SimChain> {
+        self.inner.0.as_sim()
     }
 
     fn take_fault(&self, method: &str) -> Option<Fault> {
@@ -130,6 +175,26 @@ impl FaultProxy {
             .iter()
             .position(|s| s.method.is_none_or(|m| m == method))
             .map(|idx| script.remove(idx).fault)
+    }
+}
+
+impl FaultProxy {
+    fn honest_height(&self) -> u64 {
+        self.chain().map(|c| c.height()).unwrap_or(0)
+    }
+
+    /// Mint a blockhash `skew` blocks behind the sim's head; sim-only.
+    fn mint_blockhash(&self, skew: u64) -> Result<Value, RpcError> {
+        let chain = self.chain().ok_or_else(|| {
+            RpcError::Transport("blockhash-mint fault requires the simulated chain".into())
+        })?;
+        let mint = chain.height().saturating_sub(skew);
+        let (bhash_hex, last_valid) = chain.blockhash_at(mint);
+        let b58 = bs58::encode(hex::decode(&bhash_hex).unwrap_or_default()).into_string();
+        Ok(json!({
+            "context": { "slot": chain.height() },
+            "value": { "blockhash": b58, "lastValidBlockHeight": last_valid }
+        }))
     }
 }
 
@@ -142,35 +207,21 @@ impl RpcTransport for FaultProxy {
         if let Some(fault) = self.take_fault(method) {
             return self.apply(fault, method, params);
         }
-        self.chain.call(method, params)
+        self.inner.0.call(method, params)
     }
 }
 
 impl FaultProxy {
     fn apply(&self, fault: Fault, method: &str, params: &Value) -> Result<Value, RpcError> {
         match fault {
-            Fault::OldButValidBlockhash { skew_blocks } => {
-                let height = self.chain.height();
-                let mint = height.saturating_sub(skew_blocks);
-                let (bhash_hex, last_valid) = self.chain.blockhash_at(mint);
-                let b58 = bs58::encode(hex::decode(&bhash_hex).unwrap_or_default()).into_string();
-                Ok(json!({ "context": { "slot": self.chain.height() },
-                          "value": { "blockhash": b58, "lastValidBlockHeight": last_valid } }))
-            }
-            Fault::ExpiredBlockhash => {
-                let height = self.chain.height();
-                let mint = height.saturating_sub(SimChain::VALIDITY + 10);
-                let (bhash_hex, last_valid) = self.chain.blockhash_at(mint);
-                let b58 = bs58::encode(hex::decode(&bhash_hex).unwrap_or_default()).into_string();
-                Ok(json!({ "context": { "slot": self.chain.height() },
-                          "value": { "blockhash": b58, "lastValidBlockHeight": last_valid } }))
-            }
+            Fault::OldButValidBlockhash { skew_blocks } => self.mint_blockhash(skew_blocks),
+            Fault::ExpiredBlockhash => self.mint_blockhash(SimChain::VALIDITY + 10),
             Fault::WrongGenesis { genesis } => Ok(json!(genesis)),
             Fault::ConflictingStatus => {
                 let mut flip = self.status_flip.lock().unwrap();
                 *flip = !*flip;
                 if *flip {
-                    self.chain.call(method, params)
+                    self.inner.0.call(method, params)
                 } else {
                     let sigs = params.as_array().cloned().unwrap_or_default();
                     Ok(json!({ "value": vec![Value::Null; sigs.len()] }))
@@ -178,31 +229,34 @@ impl FaultProxy {
             }
             Fault::TimeoutBeforeSubmit => Err(RpcError::Timeout),
             Fault::TimeoutAfterSubmit => {
-                // The provider accepted and landed the transaction, then the
-                // response was lost.
-                let sig = self.chain.call("sendTransaction", params)?;
-                if let Some(wire) = sig.as_str() {
-                    self.chain.land(wire);
+                // The provider accepted the transaction, then the response
+                // was lost. On the sim the transaction also lands; on a real
+                // transport acceptance alone is the correct model.
+                let sig = self.inner.0.call("sendTransaction", params)?;
+                if let Some(wire) = sig.as_str()
+                    && let Some(chain) = self.chain()
+                {
+                    chain.land(wire);
                 }
                 Err(RpcError::Timeout)
             }
             Fault::SelectiveDrop => {
                 // Accepted but silently dropped: never lands.
-                self.chain.call("sendTransaction", params)
+                self.inner.0.call("sendTransaction", params)
             }
             Fault::FalseNotFound => {
                 let sigs = params.as_array().cloned().unwrap_or_default();
                 Ok(json!({ "value": vec![Value::Null; sigs.len()] }))
             }
             Fault::ProviderDisagreement { offset_blocks } => match method {
-                "getBlockHeight" => Ok(json!(self.chain.height() + offset_blocks)),
-                _ => self.chain.call(method, params),
+                "getBlockHeight" => Ok(json!(self.honest_height() + offset_blocks)),
+                _ => self.inner.0.call(method, params),
             },
             Fault::FeeNull => {
-                Ok(json!({ "context": { "slot": self.chain.height() }, "value": null }))
+                Ok(json!({ "context": { "slot": self.honest_height() }, "value": null }))
             }
             Fault::FeeSkew { extra_lamports } => {
-                let mut skewed = self.chain.call(method, params)?;
+                let mut skewed = self.inner.0.call(method, params)?;
                 if let Some(lamports) = skewed
                     .pointer("/value")
                     .and_then(|v| v.as_u64())
@@ -213,7 +267,7 @@ impl FaultProxy {
                 }
                 Ok(skewed)
             }
-            Fault::Honest => self.chain.call(method, params),
+            Fault::Honest => self.inner.0.call(method, params),
         }
     }
 }
@@ -232,7 +286,7 @@ mod tests {
             "getLatestBlockhash",
             Fault::OldButValidBlockhash { skew_blocks: 30 },
         )]);
-        let honest_height = p.chain().height();
+        let honest_height = p.chain().unwrap().height();
 
         let skewed: Value = p.call("getLatestBlockhash", &Value::Null).unwrap();
         let (skewed_hash, skewed_last) = (
