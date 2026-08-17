@@ -34,5 +34,7 @@ wat.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
+bloom-solana.workspace = true
+sha2.workspace = true
 futures.workspace = true
 wasm-encoder = "0.252"

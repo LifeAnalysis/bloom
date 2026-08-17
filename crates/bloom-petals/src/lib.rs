@@ -21,9 +21,9 @@ pub mod store;
 pub mod vm;
 
 pub use abi::{
-    ApprovalPending, ApprovalRequired, DispatchEntry, DispatchEntryKind, DispatchOp,
-    DispatchRequest, DispatchResponse, EvmOutboxInspection, EvmOutboxOutcome,
-    EvmTransactionRequest, HttpRequest, HttpResponse, PayloadBatchSignOutcome,
+    ApprovalPending, ApprovalRequired, ChainRequest, ChainResponse, DispatchEntry,
+    DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse, EvmOutboxInspection,
+    EvmOutboxOutcome, EvmTransactionRequest, HttpRequest, HttpResponse, PayloadBatchSignOutcome,
     PayloadBatchSignRequest, PayloadSignItem, PayloadSignRequest, PetalKeyGuestRequest,
     PetalKeyOutcome, PetalKeyRequest, SignBatchOutcome, SignBatchRequest, SignOutcome, SignRequest,
     decode_dispatch_request, decode_dispatch_response, decode_http_request, decode_http_response,

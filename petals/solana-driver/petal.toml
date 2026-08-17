@@ -1,0 +1,11 @@
+schema = "bloom.petal.package.v1"
+name = "solana-driver"
+
+[consent]
+summary = "Solana native SOL transfer driver: constructs legacy single-signer System Program transfers via mediated chain reads; never signs or broadcasts itself."
+
+[caps]
+allowed = ["bloom:chain", "bloom:store"]
+
+[store]
+namespaces = ["solana-driver"]
