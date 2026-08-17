@@ -170,9 +170,13 @@ async fn stage_reproduces_golden_message_and_verifier_accepts() {
 #[tokio::test]
 async fn stage_performs_exactly_one_mediated_read_on_named_profile() {
     let host = Arc::new(ScriptedChainHost::with(vec![Ok(ChainResponse {
+        // Real RPC nests getLatestBlockhash under "value".
         result_json: json!({
-            "blockhash": bs58_of(golden::blockhash()),
-            "lastValidBlockHeight": 250u64,
+            "context": { "slot": 100u64 },
+            "value": {
+                "blockhash": bs58_of(golden::blockhash()),
+                "lastValidBlockHeight": 250u64,
+            }
         })
         .to_string(),
     })]));

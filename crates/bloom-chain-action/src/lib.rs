@@ -218,6 +218,10 @@ pub enum Transition {
     /// Pre-sign freshness refusal. Terminal for this action: signing is
     /// blocked and progress requires restaging under a new approval.
     FreshnessRefused { reason: FreshnessReason },
+    /// Asserted fee observation for the exact staged payload, with the
+    /// approved ceiling. Informational: fees are machine-asserted facts,
+    /// never verifier-proven, and this records what was observed and bound.
+    FeeObserved { lamports: u64, max_lamports: u64 },
     /// Exact signature and assembled signed artifact. Recorded at most once.
     Signed {
         signature_hex: String,
@@ -852,6 +856,47 @@ impl ChainActionOutbox {
         self.load(operation_id)
     }
 
+    /// Record the asserted fee observation and its approved ceiling. Legal
+    /// exactly once, from `Staged`, before anything is signed.
+    pub fn record_fee_observed(
+        &self,
+        operation_id: &str,
+        now_ms: u64,
+        lamports: u64,
+        max_lamports: u64,
+    ) -> Result<Action, OutboxError> {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let action = self.load(operation_id)?;
+        if action
+            .journal
+            .iter()
+            .any(|r| matches!(r.transition, Transition::FeeObserved { .. }))
+        {
+            return Err(OutboxError::InvalidTransition {
+                from: action.state.as_str(),
+                to: "fee_observed",
+            });
+        }
+        match action.state {
+            ActionState::Staged => {}
+            other => {
+                return Err(OutboxError::InvalidTransition {
+                    from: other.as_str(),
+                    to: "fee_observed",
+                });
+            }
+        }
+        self.append(
+            operation_id,
+            now_ms,
+            Transition::FeeObserved {
+                lamports,
+                max_lamports,
+            },
+        )?;
+        self.load(operation_id)
+    }
+
     /// Cancel an action. Legal only from `Staged`: once a signature exists,
     /// cancellation cannot prove a non-effect.
     pub fn cancel(&self, operation_id: &str, now_ms: u64) -> Result<Action, OutboxError> {
@@ -1159,6 +1204,10 @@ fn replay(envelope: Envelope, records: Vec<Record>) -> Result<Action, OutboxErro
             Transition::FreshnessRefused { .. } => {
                 require(&state, &[ActionState::Staged], "freshness_refused")?;
                 state = ActionState::FreshnessRefused;
+            }
+            Transition::FeeObserved { .. } => {
+                // Informational, no lifecycle effect; staging-only.
+                require(&state, &[ActionState::Staged], "fee_observed")?;
             }
             Transition::Expired { .. } => {
                 require(

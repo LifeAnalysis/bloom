@@ -42,6 +42,9 @@ impl SimChain {
     /// Blocks a minted blockhash stays valid after its height.
     pub const VALIDITY: u64 = 150;
 
+    /// Lamports charged per required signature (Solana's base fee).
+    pub const FEE_PER_SIGNATURE: u64 = 5_000;
+
     pub fn new(genesis_hex: &str) -> Self {
         Self {
             genesis_hex: genesis_hex.to_string(),
@@ -114,8 +117,34 @@ impl SimChain {
                 let bhash_hex = Self::blockhash_for(height);
                 st.minted.insert(bhash_hex.clone(), height);
                 Ok(json!({
-                    "blockhash": Self::hex_to_base58(&bhash_hex),
-                    "lastValidBlockHeight": st.height + Self::VALIDITY,
+                    "context": { "slot": st.height },
+                    "value": {
+                        "blockhash": Self::hex_to_base58(&bhash_hex),
+                        "lastValidBlockHeight": st.height + Self::VALIDITY,
+                    }
+                }))
+            }
+            "getFeeForMessage" => {
+                // Real Solana shape: params = [<base64 message>, commitment?];
+                // result = { context: { slot }, value: <lamports|null> }.
+                // Fee model: FEE_PER_SIGNATURE lamports per required
+                // signature, read from the message header's first byte.
+                let b64 = params
+                    .as_str()
+                    .or_else(|| {
+                        params
+                            .as_array()
+                            .and_then(|a| a.first())
+                            .and_then(|v| v.as_str())
+                    })
+                    .ok_or_else(|| RpcError::Transport("message param missing".into()))?;
+                let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                    .map_err(|e| RpcError::Transport(format!("message base64: {e}")))?;
+                let signatures = raw.first().copied().unwrap_or(0);
+                let lamports = u64::from(signatures) * Self::FEE_PER_SIGNATURE;
+                Ok(json!({
+                    "context": { "slot": st.height },
+                    "value": lamports,
                 }))
             }
             "isBlockhashValid" => {
@@ -146,9 +175,19 @@ impl SimChain {
                 Ok(json!(signature))
             }
             "getSignatureStatuses" => {
+                // Real RPC shape: params = [[<sig>, ...]]; accept the flat
+                // [sig, ...] form for direct callers too.
                 let sigs = params
                     .as_array()
                     .ok_or_else(|| RpcError::Transport("signatures param missing".into()))?;
+                let sigs: Vec<serde_json::Value> = if sigs.first().is_some_and(|f| f.is_array()) {
+                    sigs.first()
+                        .and_then(|f| f.as_array())
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    sigs.clone()
+                };
                 let statuses: Vec<Value> = sigs
                     .iter()
                     .map(|s| {

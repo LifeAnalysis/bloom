@@ -54,8 +54,13 @@ fn latest_blockhash(mediator: &Mediator) -> (String, u64) {
         .read(1, "getLatestBlockhash", &Value::Null)
         .unwrap();
     (
-        v["blockhash"].as_str().unwrap().to_string(),
-        v["lastValidBlockHeight"].as_u64().unwrap(),
+        v.pointer("/value/blockhash")
+            .and_then(|b| b.as_str())
+            .unwrap()
+            .to_string(),
+        v.pointer("/value/lastValidBlockHeight")
+            .and_then(|h| h.as_u64())
+            .unwrap(),
     )
 }
 

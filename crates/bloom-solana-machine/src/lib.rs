@@ -70,6 +70,10 @@ pub struct ExactApprovalFacts {
     pub fee_payer_base58: String,
     pub destination_base58: String,
     pub lamports: u64,
+    /// Fee observed at staging (asserted).
+    pub fee_lamports: u64,
+    /// Approved hard fee ceiling.
+    pub max_fee_lamports: u64,
     pub operation_class: String,
     pub crypto_suite: String,
     pub verifier_id: String,
@@ -149,6 +153,8 @@ pub enum MachineError {
     BadHex(String),
     #[error("staged facts no longer match the frozen envelope")]
     StaleStaging,
+    #[error("fee refused: {0:?}")]
+    FeeRefused(FeeRefusal),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -166,6 +172,9 @@ pub struct TransferRequest {
     pub key_ref: FixtureKeyRef,
     /// 0 disables expiry sweeping.
     pub expires_at_ms: u64,
+    /// Hard upper bound on the network fee this operation may consume. The
+    /// honest-runtime fee gate refuses any observation above it.
+    pub max_fee_lamports: u64,
     /// Claimed CAIP-2 identity; visible, never verifier-proven.
     pub claimed_caip2: String,
 }
@@ -211,6 +220,18 @@ pub struct SolanaMachine {
     package_hash: String,
 }
 
+/// Why a fee observation was refused. The fee is `machine_asserted`: these
+/// gates bound honest-provider behavior and quoting, they do not verify it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeRefusal {
+    /// The provider returned `value: null` for the exact message.
+    NullObservation,
+    /// Two observations for the same message disagreed.
+    Inconsistent { staged: u64, observed: u64 },
+    /// The quoted fee exceeds the request's approved ceiling.
+    OverLimit { observed: u64, max: u64 },
+}
+
 /// Everything `stage_transfer` froze, needed to finalize (freshness gate,
 /// approval, signing, assembly) — possibly much later, after a ceremony.
 #[derive(Debug, Clone)]
@@ -220,6 +241,9 @@ pub struct StagedTransfer {
     pub payload_digest_hex: String,
     pub blockhash_base58: String,
     pub last_valid_block_height: u64,
+    /// Fee observed at staging (`getFeeForMessage` for the exact message).
+    /// Asserted, never verifier-proven.
+    pub fee_lamports: u64,
 }
 
 impl SolanaMachine {
@@ -381,7 +405,7 @@ impl SolanaMachine {
             },
             operation_class: REQUIRED_OPERATION_CLASS.to_string(),
             crypto_suite: REQUIRED_SUITE.to_string(),
-            payload: message_bytes,
+            payload: message_bytes.clone(),
             created_at_ms: now_ms,
             expires_at_ms: request.expires_at_ms,
         })?;
@@ -392,13 +416,43 @@ impl SolanaMachine {
             .map_err(MachineError::VerifierRejected)?;
         bloom_solana::adapter::run_verifier(&verified).map_err(MachineError::VerifierRejected)?;
 
+        // Fee observation for the exact message. Asserted, bounded, displayed
+        // as asserted — never verifier-proven.
+        let fee_lamports = self.observe_fee(now_ms, &message_bytes).await?;
+        self.outbox.record_fee_observed(
+            &request.operation_id,
+            now_ms,
+            fee_lamports,
+            request.max_fee_lamports,
+        )?;
+
         Ok(StagedTransfer {
             operation_id: request.operation_id.clone(),
             message_hex,
             payload_digest_hex,
             blockhash_base58: blockhash_base58.clone(),
             last_valid_block_height: last_valid,
+            fee_lamports,
         })
+    }
+
+    /// One mediated `getFeeForMessage` for the exact message bytes. Refuses
+    /// null and over-limit quotes.
+    async fn observe_fee(&self, now_ms: u64, message_bytes: &[u8]) -> Result<u64, MachineError> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(message_bytes);
+        let fee: Value = serde_json::from_str(
+            &self
+                .mediator
+                .read(now_ms, "getFeeForMessage", &serde_json::json!([b64]))?
+                .to_string(),
+        )?;
+        let observed = fee.get("value").and_then(|v| v.as_u64());
+        let observed = match observed {
+            Some(lamports) => lamports,
+            None => return Err(MachineError::FeeRefused(FeeRefusal::NullObservation)),
+        };
+        Ok(observed)
     }
 
     /// Finalize: freshness gate, exact approval, sign, assemble. The staged
@@ -424,6 +478,7 @@ impl SolanaMachine {
             payload_digest_hex,
             blockhash_base58,
             last_valid_block_height: last_valid,
+            fee_lamports: _,
         } = staged;
         let verified = self
             .verify_staged(
@@ -436,7 +491,30 @@ impl SolanaMachine {
         let result = bloom_solana::adapter::run_verifier(&verified)
             .map_err(MachineError::VerifierRejected)?;
 
-        // 4. Freshness gate over mediated observations.
+        // Fee gate: re-observe for the exact frozen message; refuse null,
+        // inconsistency with the staged observation, or a quote over the
+        // approved ceiling. Fees are asserted facts — this bounds honest
+        // quoting, it does not verify it.
+        let observed_fee = self
+            .observe_fee(
+                now_ms,
+                &hex::decode(message_hex).map_err(|e| MachineError::BadHex(e.to_string()))?,
+            )
+            .await?;
+        if observed_fee != staged.fee_lamports {
+            return Err(MachineError::FeeRefused(FeeRefusal::Inconsistent {
+                staged: staged.fee_lamports,
+                observed: observed_fee,
+            }));
+        }
+        if observed_fee > request.max_fee_lamports {
+            return Err(MachineError::FeeRefused(FeeRefusal::OverLimit {
+                observed: observed_fee,
+                max: request.max_fee_lamports,
+            }));
+        }
+
+        // Freshness gate over mediated observations.
         let observation = self.observe_network(now_ms, blockhash_base58).await?;
         let staged_observation = StagedObservation {
             blockhash: blockhash_base58.clone(),
@@ -459,6 +537,8 @@ impl SolanaMachine {
             fee_payer_base58: request.fee_payer_base58.clone(),
             destination_base58: request.destination_base58.clone(),
             lamports: request.lamports,
+            fee_lamports: staged.fee_lamports,
+            max_fee_lamports: request.max_fee_lamports,
             operation_class: REQUIRED_OPERATION_CLASS.to_string(),
             crypto_suite: REQUIRED_SUITE.to_string(),
             verifier_id: result.verifier_id.clone(),
@@ -521,7 +601,8 @@ impl SolanaMachine {
         )?;
         Ok(NetworkObservation {
             latest_blockhash: latest
-                .get("blockhash")
+                .pointer("/value/blockhash")
+                .or_else(|| latest.get("blockhash"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
@@ -577,7 +658,8 @@ impl SolanaMachine {
                 let status: Value = self.mediator.read(
                     now_ms,
                     "getSignatureStatuses",
-                    &serde_json::json!([signature]),
+                    // Real RPC shape: params = [[<signature>, ...]].
+                    &serde_json::json!([[signature]]),
                 )?;
                 let first = status
                     .get("value")
@@ -649,6 +731,21 @@ impl SolanaMachine {
     pub fn project(&self, operation_id: &str) -> Result<Value, MachineError> {
         let action = self.outbox.load(operation_id)?;
         let env = &action.envelope;
+        let fee: Option<FeeObservedView> =
+            action
+                .journal
+                .iter()
+                .rev()
+                .find_map(|r| match &r.transition {
+                    bloom_chain_action::Transition::FeeObserved {
+                        lamports,
+                        max_lamports,
+                    } => Some(FeeObservedView {
+                        lamports: *lamports,
+                        max_lamports: *max_lamports,
+                    }),
+                    _ => None,
+                });
         let mut attempts = Vec::new();
         for a in &action.attempts {
             attempts.push(json!({
@@ -678,6 +775,14 @@ impl SolanaMachine {
             "operation_class": env.operation_class,
             "crypto_suite": env.crypto_suite,
             "payload_digest_hex": env.payload_digest_hex,
+            // Fee facts are asserted by the driver/provider, bounded at
+            // approval, and never verifier-proven.
+            "fee_assurance": "machine_asserted",
+            "fee_lamports": fee.as_ref().map(|f| f.lamports),
+            "max_fee_lamports": fee.as_ref().map(|f| f.max_lamports),
+            "total_debit_lamports": fee
+                .as_ref()
+                .and_then(|f| env_hex_lamports(&action).ok().map(|l| l + f.lamports)),
             "signature_base58": action.artifact.as_ref().map(|a| {
                 bs58::encode(&a.signature).into_string()
             }),
@@ -714,6 +819,30 @@ impl SolanaMachine {
             ..self.clone()
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct FeeObservedView {
+    lamports: u64,
+    max_lamports: u64,
+}
+
+/// Extract the transfer lamports from the canonical message payload so the
+/// projection can display the total debit without re-verifying.
+fn env_hex_lamports(action: &Action) -> Result<u64, MachineError> {
+    let payload = hex::decode(&action.envelope.payload_hex)
+        .map_err(|e| MachineError::BadHex(e.to_string()))?;
+    // Canonical layout: the single instruction's data is the final
+    // short-vec: [len][2u32 LE opcode][lamports u64 LE].
+    // The canonical single-instruction message ends with the 12-byte
+    // transfer data; the lamports are its final 8 bytes, little-endian.
+    if payload.len() < 12 {
+        return Err(MachineError::MissingField("transfer data"));
+    }
+    let start = payload.len() - 8;
+    Ok(u64::from_le_bytes(payload[start..].try_into().map_err(
+        |_| MachineError::MissingField("transfer data"),
+    )?))
 }
 
 /// A Solana transaction's signature (single signer) is the base58 of the

@@ -21,6 +21,8 @@
 
 pub mod fault;
 pub mod freshness;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod mediator;
 pub mod sim;
 pub mod transport;

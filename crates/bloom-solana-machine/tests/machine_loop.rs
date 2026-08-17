@@ -33,6 +33,7 @@ fn profile() -> ChainRpcProfile {
             "getHealth".into(),
             "getBlockHeight".into(),
             "getLatestBlockhash".into(),
+            "getFeeForMessage".into(),
             "isBlockhashValid".into(),
             "getSignatureStatuses".into(),
         ],
@@ -59,6 +60,23 @@ fn signer() -> FixtureEd25519Signer {
 }
 
 async fn machine_with(chain: SimChain, faults: Vec<ScriptedFault>) -> MachineParts {
+    machine_at(
+        chain,
+        faults,
+        tempfile::tempdir().unwrap().keep(),
+        Arc::new(ExactApprovalLedger::new()),
+    )
+    .await
+}
+
+/// Build a machine over an explicit (possibly previously used) outbox root —
+/// the recovery path: a fresh process reopens the same durable state.
+async fn machine_at(
+    chain: SimChain,
+    faults: Vec<ScriptedFault>,
+    outbox_root: std::path::PathBuf,
+    ledger: Arc<ExactApprovalLedger>,
+) -> MachineParts {
     // One shared chain: the proxy mediates every call, tests control state
     // (advancing, landing) through the same instance.
     let chain = Arc::new(chain);
@@ -70,11 +88,8 @@ async fn machine_with(chain: SimChain, faults: Vec<ScriptedFault>) -> MachinePar
         mount_pinned_solana_driver(std::path::Path::new(PETAL_DIR), state.path(), host).unwrap(),
     );
     std::mem::forget(state);
-    let outbox = Arc::new(
-        bloom_chain_action::ChainActionOutbox::new(tempfile::tempdir().unwrap().keep()).unwrap(),
-    );
+    let outbox = Arc::new(bloom_chain_action::ChainActionOutbox::new(outbox_root).unwrap());
     let signer = Arc::new(signer());
-    let ledger = Arc::new(ExactApprovalLedger::new());
     let machine = SolanaMachine::new(
         vfs,
         mediator,
@@ -112,6 +127,7 @@ fn request(machine: &SolanaMachine, op: &str) -> TransferRequest {
             public_key_hex: hex::encode(pk),
         },
         expires_at_ms: 0,
+        max_fee_lamports: 10_000,
         claimed_caip2: "solana:devnet".into(),
     }
 }
@@ -356,6 +372,136 @@ async fn exact_approval_is_one_shot_per_payload() {
 }
 
 #[tokio::test]
+async fn fee_is_observed_bound_and_displayed_as_total_debit() {
+    let parts = machine_with(SimChain::new(GENESIS), vec![]).await;
+    let machine = parts.machine.clone();
+    let req = request(&machine, "0a");
+    machine.prepare_transfer(&req, 1_000).await.unwrap();
+
+    let projection = machine.project(&req.operation_id).unwrap();
+    assert_eq!(projection["fee_assurance"], "machine_asserted");
+    assert_eq!(projection["fee_lamports"], serde_json::json!(5_000));
+    assert_eq!(projection["max_fee_lamports"], serde_json::json!(10_000));
+    // 1 SOL transfer + 5000-lamport fee.
+    assert_eq!(
+        projection["total_debit_lamports"],
+        serde_json::json!(1_000_005_000)
+    );
+
+    // The fee observation is durable and cold-loadable.
+    let action = machine.load_action(&req.operation_id);
+    assert!(action.journal.iter().any(|r| matches!(
+        r.transition,
+        bloom_chain_action::Transition::FeeObserved {
+            lamports: 5_000,
+            max_lamports: 10_000
+        }
+    )));
+}
+
+#[tokio::test]
+async fn null_fee_at_stage_refuses_and_leaves_envelope_staged() {
+    let parts = machine_with(
+        SimChain::new(GENESIS),
+        vec![ScriptedFault::on("getFeeForMessage", Fault::FeeNull)],
+    )
+    .await;
+    let machine = parts.machine.clone();
+    let req = request(&machine, "0b");
+    let err = machine.prepare_transfer(&req, 1_000).await.unwrap_err();
+    assert!(matches!(
+        err,
+        MachineError::FeeRefused(bloom_solana_machine::FeeRefusal::NullObservation)
+    ));
+    // The envelope froze; nothing was approved or signed.
+    assert_eq!(
+        machine.load_action(&req.operation_id).state,
+        ActionState::Staged
+    );
+    assert!(machine.load_action(&req.operation_id).artifact.is_none());
+    assert_eq!(parts.ledger.approval_count(), 0);
+}
+
+#[tokio::test]
+async fn null_fee_at_finalize_refuses() {
+    // The first getFeeForMessage (stage) is honest; the second (finalize)
+    // returns null. Nothing is signed.
+    let parts = machine_with(
+        SimChain::new(GENESIS),
+        ScriptedFault::on_nth("getFeeForMessage", 2, Fault::FeeNull),
+    )
+    .await;
+    let machine = parts.machine.clone();
+    let req = request(&machine, "0c");
+    let staged = machine.stage_transfer(&req, 1_000).await.unwrap();
+    assert_eq!(staged.fee_lamports, 5_000);
+
+    let err = machine
+        .finalize_transfer(&req, &staged, 1_050)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        MachineError::FeeRefused(bloom_solana_machine::FeeRefusal::NullObservation)
+    ));
+    let action = machine.load_action(&req.operation_id);
+    assert!(
+        action.artifact.is_none(),
+        "fee refusal must precede signing"
+    );
+    assert_eq!(parts.ledger.approval_count(), 0);
+}
+
+#[tokio::test]
+async fn inconsistent_fee_between_stage_and_finalize_refuses() {
+    // Stage observes the honest 5000; finalize observes a skewed quote.
+    let parts = machine_with(
+        SimChain::new(GENESIS),
+        ScriptedFault::on_nth(
+            "getFeeForMessage",
+            2,
+            Fault::FeeSkew {
+                extra_lamports: 123,
+            },
+        ),
+    )
+    .await;
+    let machine = parts.machine.clone();
+    let req = request(&machine, "0d");
+    let staged = machine.stage_transfer(&req, 1_000).await.unwrap();
+
+    let err = machine
+        .finalize_transfer(&req, &staged, 1_050)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        MachineError::FeeRefused(bloom_solana_machine::FeeRefusal::Inconsistent {
+            staged: 5_000,
+            observed: 5_123
+        })
+    ));
+    assert!(machine.load_action(&req.operation_id).artifact.is_none());
+}
+
+#[tokio::test]
+async fn over_limit_fee_refuses_before_approval() {
+    let parts = machine_with(SimChain::new(GENESIS), vec![]).await;
+    let machine = parts.machine.clone();
+    let mut req = request(&machine, "0e");
+    req.max_fee_lamports = 100;
+    let err = machine.prepare_transfer(&req, 1_000).await.unwrap_err();
+    assert!(matches!(
+        err,
+        MachineError::FeeRefused(bloom_solana_machine::FeeRefusal::OverLimit {
+            observed: 5_000,
+            max: 100
+        })
+    ));
+    assert_eq!(parts.ledger.approval_count(), 0);
+}
+
+#[tokio::test]
 async fn pinned_mount_rejects_drifted_artifacts() {
     let source = std::path::Path::new(PETAL_DIR);
     let drift = tempfile::tempdir().unwrap();
@@ -429,5 +575,94 @@ impl MachineParts {
         // The sim keys landed transactions by whatever signature string the
         // reconciler will query.
         self.chain.land(signature_b58);
+    }
+}
+
+#[tokio::test]
+async fn restart_recovers_ambiguous_broadcast_and_confirms() {
+    let outbox_root = tempfile::tempdir().unwrap().keep();
+    let ledger = Arc::new(ExactApprovalLedger::new());
+    let req_id = format!("{:0>64}", "20");
+
+    // Process 1: stage, sign, broadcast into an ambiguous timeout.
+    let parts = machine_at(
+        SimChain::new(GENESIS),
+        vec![ScriptedFault::on(
+            "sendTransaction",
+            Fault::TimeoutAfterSubmit,
+        )],
+        outbox_root.clone(),
+        ledger.clone(),
+    )
+    .await;
+    {
+        let machine = parts.machine.clone();
+        let req = request(&machine, "20");
+        assert_eq!(req.operation_id, req_id);
+        machine.prepare_transfer(&req, 1_000).await.unwrap();
+        machine.broadcast(&req_id, 1_100).await.unwrap();
+        assert_eq!(machine.load_action(&req_id).state, ActionState::Ambiguous);
+        // Capture the signature for landing.
+        let sig = machine
+            .load_action(&req_id)
+            .artifact
+            .clone()
+            .unwrap()
+            .signature;
+        let sig_b58 = bs58::encode(&sig).into_string();
+
+        // "Crash": drop every machine component; the durable outbox root and
+        // the shared ledger survive.
+        drop(machine);
+        drop(parts);
+
+        // Process 2: a fresh machine over the same outbox root, a fresh
+        // provider whose chain has the transaction landed.
+        let recovered_parts = machine_at(
+            SimChain::new(GENESIS),
+            vec![],
+            outbox_root.clone(),
+            ledger.clone(),
+        )
+        .await;
+        let recovered = recovered_parts.machine.clone();
+
+        // State recovered from disk, artifact pinned, no re-signing possible.
+        let action = recovered.load_action(&req_id);
+        assert_eq!(action.state, ActionState::Ambiguous);
+        assert!(action.artifact.is_some());
+        assert_eq!(
+            ledger.approval_count(),
+            1,
+            "the one-shot approval was never re-consumed"
+        );
+
+        // The provider reports the landed transaction.
+        recovered_parts.land(&sig_b58);
+        let status = recovered.reconcile(&req_id, 2_000).await.unwrap();
+        match status {
+            LifecycleStatus::Confirmed { confirmation } => assert_eq!(confirmation, "confirmed"),
+            other => panic!("expected confirmation after recovery, got {other:?}"),
+        }
+
+        // The recovered journal shows one attempt, exact-byte retry, terminal.
+        let done = recovered.load_action(&req_id);
+        assert_eq!(done.state, ActionState::Confirmed);
+        assert!(done.state.is_terminal());
+        let digests: Vec<&String> = done
+            .attempts
+            .iter()
+            .map(|a| &a.artifact_digest_hex)
+            .collect();
+        assert!(!digests.is_empty());
+        assert!(
+            digests.windows(2).all(|w| w[0] == w[1]),
+            "every retry reused the exact bytes"
+        );
+
+        // Projection survives cold load.
+        let projection = recovered.project(&req_id).unwrap();
+        assert_eq!(projection["state"], "confirmed");
+        assert_eq!(projection["terminal"], serde_json::json!(true));
     }
 }

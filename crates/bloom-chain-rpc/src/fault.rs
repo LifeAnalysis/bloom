@@ -33,6 +33,18 @@ impl ScriptedFault {
         }
     }
 
+    /// Fire on the `occurrence`-th matching call by consuming the earlier
+    /// matching calls honestly — lets tests target a stage-time or
+    /// finalize-time observation of the same method precisely.
+    pub fn on_nth(method: &'static str, occurrence: usize, fault: Fault) -> Vec<Self> {
+        let mut script = Vec::with_capacity(occurrence);
+        for _ in 1..occurrence {
+            script.push(Self::on(method, Fault::Honest));
+        }
+        script.push(Self::on(method, fault));
+        script
+    }
+
     pub fn any(fault: Fault) -> Self {
         Self {
             method: None,
@@ -71,6 +83,15 @@ pub enum Fault {
     /// `getBlockHeight` reports a wildly different height than the chain, to
     /// construct disagreeing providers.
     ProviderDisagreement { offset_blocks: u64 },
+    /// `getFeeForMessage` returns `value: null` — the provider cannot or
+    /// will not quote a fee.
+    FeeNull,
+    /// `getFeeForMessage` returns the honest fee plus a skew, producing an
+    /// over-limit quote or an inconsistency between two observations.
+    FeeSkew { extra_lamports: u64 },
+    /// No fault: consume a script slot honestly. Used to target a later
+    /// call of a repeated method.
+    Honest,
 }
 
 /// A transport wrapper that plays a scripted sequence of faults over an
@@ -133,14 +154,16 @@ impl FaultProxy {
                 let mint = height.saturating_sub(skew_blocks);
                 let (bhash_hex, last_valid) = self.chain.blockhash_at(mint);
                 let b58 = bs58::encode(hex::decode(&bhash_hex).unwrap_or_default()).into_string();
-                Ok(json!({ "blockhash": b58, "lastValidBlockHeight": last_valid }))
+                Ok(json!({ "context": { "slot": self.chain.height() },
+                          "value": { "blockhash": b58, "lastValidBlockHeight": last_valid } }))
             }
             Fault::ExpiredBlockhash => {
                 let height = self.chain.height();
                 let mint = height.saturating_sub(SimChain::VALIDITY + 10);
                 let (bhash_hex, last_valid) = self.chain.blockhash_at(mint);
                 let b58 = bs58::encode(hex::decode(&bhash_hex).unwrap_or_default()).into_string();
-                Ok(json!({ "blockhash": b58, "lastValidBlockHeight": last_valid }))
+                Ok(json!({ "context": { "slot": self.chain.height() },
+                          "value": { "blockhash": b58, "lastValidBlockHeight": last_valid } }))
             }
             Fault::WrongGenesis { genesis } => Ok(json!(genesis)),
             Fault::ConflictingStatus => {
@@ -175,6 +198,22 @@ impl FaultProxy {
                 "getBlockHeight" => Ok(json!(self.chain.height() + offset_blocks)),
                 _ => self.chain.call(method, params),
             },
+            Fault::FeeNull => {
+                Ok(json!({ "context": { "slot": self.chain.height() }, "value": null }))
+            }
+            Fault::FeeSkew { extra_lamports } => {
+                let mut skewed = self.chain.call(method, params)?;
+                if let Some(lamports) = skewed
+                    .pointer("/value")
+                    .and_then(|v| v.as_u64())
+                    .map(|l| l + extra_lamports)
+                    && let Some(value) = skewed.get_mut("value")
+                {
+                    *value = json!(lamports);
+                }
+                Ok(skewed)
+            }
+            Fault::Honest => self.chain.call(method, params),
         }
     }
 }
@@ -197,8 +236,16 @@ mod tests {
 
         let skewed: Value = p.call("getLatestBlockhash", &Value::Null).unwrap();
         let (skewed_hash, skewed_last) = (
-            skewed["blockhash"].as_str().unwrap(),
-            skewed["lastValidBlockHeight"].as_u64().unwrap(),
+            skewed
+                .pointer("/value/blockhash")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            skewed
+                .pointer("/value/lastValidBlockHeight")
+                .unwrap()
+                .as_u64()
+                .unwrap(),
         );
         assert_eq!(skewed_last, honest_height - 30 + SimChain::VALIDITY);
 
@@ -210,7 +257,11 @@ mod tests {
         // Script exhausted: the next call is honest.
         let honest: Value = p.call("getLatestBlockhash", &Value::Null).unwrap();
         assert_eq!(
-            honest["lastValidBlockHeight"].as_u64().unwrap(),
+            honest
+                .pointer("/value/lastValidBlockHeight")
+                .unwrap()
+                .as_u64()
+                .unwrap(),
             honest_height + SimChain::VALIDITY
         );
     }

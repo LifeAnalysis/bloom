@@ -33,7 +33,9 @@ pub use abi::{
 pub use error::PetalError;
 pub use host::{DenyHost, HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
 pub use meta::{Capability, PetalMeta, PetalMode};
-pub use package::{PetalPackage, RouteMatch, RouteRecord, RouteSpecificity};
+pub use package::{
+    PetalPackage, RouteMatch, RouteRecord, RouteSpecificity, build_petal_package_dir,
+};
 pub use policy::NetPolicy;
 pub use private_store::PrivateStore;
 pub use registry::{NameRegistry, validate_name};

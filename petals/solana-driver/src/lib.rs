@@ -243,12 +243,13 @@ fn mediated_latest_blockhash(profile: &str) -> Result<(solana_message::Hash, u64
 
     let parsed: serde_json::Value =
         serde_json::from_str(&resp.result_json).map_err(|e| RouteError::Backend(e.to_string()))?;
+    // Real Solana RPC nests getLatestBlockhash under "value".
     let blockhash = parsed
-        .get("blockhash")
+        .pointer("/value/blockhash")
         .and_then(|v| v.as_str())
         .ok_or_else(|| RouteError::Backend("missing blockhash".into()))?;
     let last_valid = parsed
-        .get("lastValidBlockHeight")
+        .pointer("/value/lastValidBlockHeight")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| RouteError::Backend("missing lastValidBlockHeight".into()))?;
     let hash = solana_message::Hash::from_str(blockhash)
