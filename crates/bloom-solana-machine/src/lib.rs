@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod catalog;
 pub mod fixture;
 pub mod host;
 pub mod mount;

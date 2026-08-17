@@ -2672,6 +2672,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
