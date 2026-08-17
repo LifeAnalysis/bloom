@@ -78,7 +78,7 @@ impl RpcTransport for SolanaHttpTransport {
             .agent
             .post(&self.endpoint)
             .set("content-type", "application/json");
-        let mut response = request.send_string(&body.to_string()).map_err(|e| {
+        let response = request.send_string(&body.to_string()).map_err(|e| {
             let text = e.to_string();
             if text.contains("timed out") || text.contains("Timeout") {
                 RpcError::Timeout

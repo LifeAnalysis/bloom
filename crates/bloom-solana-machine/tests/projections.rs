@@ -119,7 +119,7 @@ async fn projection_covers_every_field_class_with_verified_asserted_separation()
     assert_eq!(projection.wallet_id, "wallet-1");
 
     // Cluster: CAIP-2 plus the full expected genesis hash.
-    assert_eq!(projection.cluster.caip2, "solana:solana-devnet");
+    assert_eq!(projection.cluster.caip2, "solana:devnet");
     assert_eq!(projection.cluster.expected_genesis_hex, GENESIS);
 
     // Verified facts: fee payer, destination, lamports, verifier identity.

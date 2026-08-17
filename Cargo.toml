@@ -27,6 +27,7 @@ members = [
   "crates/bloom-chain-action",
   "crates/bloom-chain-rpc",
   "crates/bloom-solana-machine",
+  "crates/bloom-solana-cli",
 ]
 resolver = "2"
 

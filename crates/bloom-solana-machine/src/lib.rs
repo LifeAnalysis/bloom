@@ -161,6 +161,8 @@ pub enum MachineError {
     BadHex(String),
     #[error("staged facts no longer match the frozen envelope")]
     StaleStaging,
+    #[error("retry is only legal for ambiguous operations; this one is '{0}'")]
+    RetryNotAmbiguous(&'static str),
     #[error("fee refused: {0:?}")]
     FeeRefused(FeeRefusal),
     #[error("io: {0}")]
@@ -736,6 +738,21 @@ impl SolanaMachine {
         }
     }
 
+    /// Retry an ambiguous operation with the exact persisted bytes. Only
+    /// legal from `Ambiguous`; any other state is an error. No signature is
+    /// requested — the durable artifact is re-dispatched verbatim.
+    pub async fn retry_ambiguous(
+        &self,
+        operation_id: &str,
+        now_ms: u64,
+    ) -> Result<Action, MachineError> {
+        let action = self.outbox.load(operation_id)?;
+        match action.state {
+            ActionState::Ambiguous => self.broadcast(operation_id, now_ms).await,
+            other => Err(MachineError::RetryNotAmbiguous(other.as_str())),
+        }
+    }
+
     /// Quarantine an unresolved operation for operator action.
     pub async fn quarantine(
         &self,
@@ -799,6 +816,12 @@ impl SolanaMachine {
         self.outbox.load(operation_id).expect("action loads")
     }
 
+    /// The signing authority's pinned public key (projection; tests and
+    /// confirm paths verify identity against the registered account).
+    pub fn signer_public_key(&self) -> [u8; 32] {
+        self.signer.public_key_bytes()
+    }
+
     /// The durable outbox, for host-level integration (sweeps, checks).
     pub fn outbox(&self) -> &ChainActionOutbox {
         &self.outbox
@@ -823,7 +846,13 @@ impl SolanaMachine {
 /// are operator-configured tokens; the CAIP-2 reference uses the namespace
 /// truncated form.
 fn profile_caip2(profile: &ChainRpcProfile) -> String {
-    format!("{}:{}", profile.family, profile.name)
+    // Chain profile names carry the family prefix ("solana-devnet"); the
+    // CAIP-2 reference is family:network ("solana:devnet").
+    let network = profile
+        .name
+        .strip_prefix(&format!("{}-", profile.family))
+        .unwrap_or(&profile.name);
+    format!("{}:{}", profile.family, network)
 }
 
 /// A Solana transaction's signature (single signer) is the base58 of the
