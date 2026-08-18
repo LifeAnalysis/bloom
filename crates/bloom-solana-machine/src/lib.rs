@@ -434,24 +434,29 @@ impl SolanaMachine {
         self.outbox.record_fee_observed(
             &request.operation_id,
             now_ms,
-            fee_lamports,
-            request.max_fee_lamports,
+            lamports_fact(fee_lamports),
+            lamports_fact(request.max_fee_lamports),
         )?;
+        let caip2 = profile_caip2(self.mediator.profile());
+        // `canonical_output` mirrors exactly what `run_verifier` hashed for
+        // `result_digest_hex` — this is the fixture-era stand-in for
+        // Broker's byte-exact verifier output; Phase 3 moves this crate's
+        // verifier into Broker and this becomes the real cross-process copy.
+        let canonical_output = serde_json::to_vec(&verified_result.verified)?;
         self.outbox.record_facts_verified(
             &request.operation_id,
             now_ms,
-            request.fee_payer_base58.clone(),
-            request.destination_base58.clone(),
-            request.lamports,
             verified_result.verifier_id.clone(),
+            bloom_solana::adapter::ADAPTER_SCHEMA.to_string(),
+            canonical_output,
             verified_result.result_digest_hex.clone(),
-            payload_digest_hex.clone(),
+            verified_core(&caip2, &payload_digest_hex, &verified_result.verified),
         )?;
         self.outbox.record_liveness_observed(
             &request.operation_id,
             now_ms,
             blockhash_base58.clone(),
-            last_valid,
+            bloom_chain_action::ValidUntil::Height { value: last_valid },
             now_ms,
         )?;
 
@@ -861,4 +866,32 @@ fn profile_caip2(profile: &ChainRpcProfile) -> String {
 fn transaction_signature(action: &Action) -> String {
     let artifact = action.artifact.as_ref().expect("signed action");
     bs58::encode(&artifact.signature).into_string()
+}
+
+/// A lamport quantity as the outbox's chain-neutral [`AmountFact`].
+fn lamports_fact(lamports: u64) -> bloom_chain_action::AmountFact {
+    bloom_chain_action::AmountFact {
+        amount: lamports.to_string(),
+        unit: "lamports".to_string(),
+    }
+}
+
+/// Build the outbox's chain-neutral [`VerifiedCore`] from the Solana
+/// verifier's typed result. CAIP-10 accounts follow this crate's existing
+/// convention (`{caip2}:{base58 address}`, see `account.rs`).
+fn verified_core(
+    caip2: &str,
+    payload_digest_hex: &str,
+    verified: &bloom_solana::verifier::VerifiedTransfer,
+) -> bloom_chain_action::VerifiedCore {
+    bloom_chain_action::VerifiedCore {
+        chain: caip2.to_string(),
+        signer_account: format!("{caip2}:{}", verified.fee_payer),
+        payload_digest_hex: payload_digest_hex.to_string(),
+        transfers: vec![bloom_chain_action::VerifiedTransfer {
+            to: format!("{caip2}:{}", verified.destination),
+            asset: "native".to_string(),
+            amount: verified.lamports.to_string(),
+        }],
+    }
 }

@@ -19,14 +19,20 @@ pub fn staged_from_action(action: &Action) -> bloom_solana_machine::StagedTransf
     for record in &action.journal {
         match &record.transition {
             bloom_chain_action::Transition::LivenessObserved {
-                blockhash_base58,
-                last_valid_block_height,
+                reference,
+                valid_until,
                 ..
             } => {
-                blockhash = blockhash_base58.clone();
-                last_valid = *last_valid_block_height;
+                blockhash = reference.clone();
+                last_valid = match valid_until {
+                    bloom_chain_action::ValidUntil::Height { value }
+                    | bloom_chain_action::ValidUntil::Slot { value }
+                    | bloom_chain_action::ValidUntil::TimeMs { value } => *value,
+                };
             }
-            bloom_chain_action::Transition::FeeObserved { lamports, .. } => fee = *lamports,
+            bloom_chain_action::Transition::FeeObserved { fee: f, .. } => {
+                fee = f.amount.parse().unwrap_or(0)
+            }
             _ => {}
         }
     }
@@ -52,16 +58,14 @@ pub fn request_from_action(
         .iter()
         .rev()
         .find_map(|r| match &r.transition {
-            bloom_chain_action::Transition::FactsVerified {
-                fee_payer_base58,
-                destination_base58,
-                lamports,
-                ..
-            } => Some((
-                fee_payer_base58.clone(),
-                destination_base58.clone(),
-                *lamports,
-            )),
+            bloom_chain_action::Transition::FactsVerified { core, .. } => {
+                let transfer = core.transfers.first()?;
+                Some((
+                    core.signer_account.rsplit(':').next()?.to_string(),
+                    transfer.to.rsplit(':').next()?.to_string(),
+                    transfer.amount.parse().ok()?,
+                ))
+            }
             _ => None,
         });
     let Some((fee_payer_base58, destination, lamports)) = facts else {
@@ -75,7 +79,9 @@ pub fn request_from_action(
         .iter()
         .rev()
         .find_map(|r| match &r.transition {
-            bloom_chain_action::Transition::FeeObserved { max_lamports, .. } => Some(*max_lamports),
+            bloom_chain_action::Transition::FeeObserved { ceiling, .. } => {
+                ceiling.amount.parse().ok()
+            }
             _ => None,
         })
         .unwrap_or(100_000);

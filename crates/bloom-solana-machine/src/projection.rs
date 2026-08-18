@@ -137,36 +137,48 @@ pub fn project_operation(
     for record in &action.journal {
         match &record.transition {
             Transition::FactsVerified {
-                fee_payer_base58,
-                destination_base58,
-                lamports,
                 verifier_id,
-                verifier_result_digest_hex,
-                message_digest_hex,
+                output_digest_hex,
+                core,
+                ..
             } => {
+                let transfer = core.transfers.first().ok_or(MachineError::MissingField(
+                    "facts_verified record: core.transfers[0]",
+                ))?;
                 verified = Some(VerifiedFacts {
-                    fee_payer_base58: fee_payer_base58.clone(),
-                    destination_base58: destination_base58.clone(),
-                    lamports: *lamports,
+                    fee_payer_base58: caip10_address(&core.signer_account).to_string(),
+                    destination_base58: caip10_address(&transfer.to).to_string(),
+                    lamports: transfer
+                        .amount
+                        .parse()
+                        .map_err(|_| MachineError::MissingField("verified transfer amount"))?,
                     verifier_id: verifier_id.clone(),
-                    verifier_result_digest_hex: verifier_result_digest_hex.clone(),
-                    message_digest_hex: message_digest_hex.clone(),
+                    verifier_result_digest_hex: output_digest_hex.clone(),
+                    message_digest_hex: core.payload_digest_hex.clone(),
                 });
             }
-            Transition::FeeObserved {
-                lamports,
-                max_lamports,
-            } => fee = Some((*lamports, *max_lamports)),
+            Transition::FeeObserved { fee: f, ceiling } => {
+                let lamports = f
+                    .amount
+                    .parse()
+                    .map_err(|_| MachineError::MissingField("fee amount"))?;
+                let max_lamports = ceiling
+                    .amount
+                    .parse()
+                    .map_err(|_| MachineError::MissingField("fee ceiling amount"))?;
+                fee = Some((lamports, max_lamports));
+            }
             Transition::LivenessObserved {
-                blockhash_base58,
-                last_valid_block_height,
+                reference,
+                valid_until,
                 observed_at_ms,
             } => {
-                liveness = Some((
-                    blockhash_base58.clone(),
-                    *last_valid_block_height,
-                    *observed_at_ms,
-                ))
+                let last_valid_block_height = match valid_until {
+                    bloom_chain_action::ValidUntil::Height { value } => *value,
+                    bloom_chain_action::ValidUntil::Slot { value } => *value,
+                    bloom_chain_action::ValidUntil::TimeMs { value } => *value,
+                };
+                liveness = Some((reference.clone(), last_valid_block_height, *observed_at_ms))
             }
             Transition::Confirmed { detail } => confirmation = Some(detail.clone()),
             Transition::Failed { reason } => failure_reason = Some(reason.clone()),
@@ -311,6 +323,13 @@ impl OperationProjection {
                 .unwrap_or("<unsigned>")
         )
     }
+}
+
+/// Extract the base58 address out of a `{caip2}:{address}` CAIP-10 string
+/// (this crate's existing convention; see `account.rs`). Falls back to the
+/// whole string if it is somehow bare — never panics on durable data.
+fn caip10_address(caip10: &str) -> &str {
+    caip10.rsplit(':').next().unwrap_or(caip10)
 }
 
 /// State helper for `staged operation ID and lifecycle state` projections.

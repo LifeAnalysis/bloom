@@ -402,11 +402,10 @@ async fn fee_is_observed_bound_and_displayed_as_total_debit() {
     // The fee observation is durable and cold-loadable.
     let action = machine.load_action(&req.operation_id);
     assert!(action.journal.iter().any(|r| matches!(
-        r.transition,
-        bloom_chain_action::Transition::FeeObserved {
-            lamports: 5_000,
-            max_lamports: 10_000
-        }
+        &r.transition,
+        bloom_chain_action::Transition::FeeObserved { fee, ceiling }
+            if fee.amount == "5000" && fee.unit == "lamports"
+                && ceiling.amount == "10000" && ceiling.unit == "lamports"
     )));
 }
 

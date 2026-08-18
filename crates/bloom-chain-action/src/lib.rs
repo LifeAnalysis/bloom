@@ -176,6 +176,55 @@ impl Envelope {
     }
 }
 
+/// An exact decimal-string amount in a chain-defined unit. Never a float;
+/// the unit (e.g. `"lamports"`, `"wei"`) is opaque to this crate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmountFact {
+    pub amount: String,
+    pub unit: String,
+}
+
+/// How long a staged liveness reference remains valid. The variant a chain
+/// uses is chain-defined; this crate only knows how to compare within a
+/// variant, never across chains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ValidUntil {
+    Height { value: u64 },
+    Slot { value: u64 },
+    TimeMs { value: u64 },
+}
+
+/// One value transfer a verifier established for the staged payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedTransfer {
+    /// CAIP-10 destination account.
+    pub to: String,
+    /// CAIP-19 asset identity, or the literal `"native"` for the chain's
+    /// native unit.
+    pub asset: String,
+    /// Exact decimal-string amount (never a float).
+    pub amount: String,
+}
+
+/// The chain-neutral verifier-output contract every compiled verifier must
+/// satisfy (see "Broker semantic verifier contract" in
+/// `Verified Chain Petals.md`). Extracted by the generic host from the
+/// verifier's `canonical_output`; never a chain-specific field name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedCore {
+    /// CAIP-2 chain identity the verifier bound its extraction to.
+    pub chain: String,
+    /// CAIP-10 account identity of the signer the verifier bound.
+    pub signer_account: String,
+    /// Digest of the exact payload bytes the verifier parsed.
+    pub payload_digest_hex: String,
+    /// Value transfers the verifier established, if the operation class
+    /// has any. Empty for operations with no established transfer.
+    #[serde(default)]
+    pub transfers: Vec<VerifiedTransfer>,
+}
+
 /// A request to stage a new action. The payload digest is computed here;
 /// everything else is copied verbatim into the immutable envelope.
 #[derive(Debug, Clone)]
@@ -221,23 +270,34 @@ pub enum Transition {
     /// Asserted fee observation for the exact staged payload, with the
     /// approved ceiling. Informational: fees are machine-asserted facts,
     /// never verifier-proven, and this records what was observed and bound.
-    FeeObserved { lamports: u64, max_lamports: u64 },
-    /// Verifier-established facts for the exact staged payload, with the
-    /// verifier identity and result digest. Every field here was extracted
-    /// by the independent verifier, not asserted by the driver.
+    /// Amounts are exact decimal strings in a chain-defined unit — never a
+    /// chain-specific field name in this crate.
+    FeeObserved { fee: AmountFact, ceiling: AmountFact },
+    /// Verifier-established facts for the exact staged payload. This is a
+    /// byte-exact, digest-bound copy of Broker's compiled verifier output —
+    /// the outbox never hand-assembles or re-derives these fields, and
+    /// `core` never carries a chain-specific field name (see the
+    /// cross-chain verifier contract in `Verified Chain Petals.md`).
     FactsVerified {
-        fee_payer_base58: String,
-        destination_base58: String,
-        lamports: u64,
         verifier_id: String,
-        verifier_result_digest_hex: String,
-        message_digest_hex: String,
+        verifier_schema_version: String,
+        /// Exact JCS bytes of Broker's verifier output, as returned.
+        canonical_output: Vec<u8>,
+        /// Digest of `canonical_output`. Recorded only after
+        /// [`ChainActionOutbox::record_facts_verified`] has checked it
+        /// equals the caller-supplied `verifier_result_digest_hex` — a
+        /// store-time, fail-closed integrity check.
+        output_digest_hex: String,
+        /// Chain-neutral facts every verifier contract must supply,
+        /// extracted from `canonical_output` by the generic host.
+        core: VerifiedCore,
     },
-    /// Liveness observation at staging: the blockhash embedded in the payload
-    /// and its observed validity window. Machine-asserted network facts.
+    /// Liveness observation at staging: an opaque chain-defined liveness
+    /// reference (Solana: a blockhash) and its observed validity window.
+    /// Machine-asserted network facts.
     LivenessObserved {
-        blockhash_base58: String,
-        last_valid_block_height: u64,
+        reference: String,
+        valid_until: ValidUntil,
         observed_at_ms: u64,
     },
     /// Exact signature and assembled signed artifact. Recorded at most once.
@@ -439,6 +499,10 @@ pub enum OutboxError {
     CheckpointDigestMismatch,
     #[error("journal record {0} does not match the trusted checkpoint")]
     CheckpointHeadMismatch(u64),
+    #[error(
+        "verifier output digest mismatch: canonical_output hashes to {computed}, caller claimed {claimed}"
+    )]
+    VerifierOutputDigestMismatch { computed: String, claimed: String },
 }
 
 /// A trusted high-water checkpoint pinning the journal head at write time.
@@ -880,8 +944,8 @@ impl ChainActionOutbox {
         &self,
         operation_id: &str,
         now_ms: u64,
-        lamports: u64,
-        max_lamports: u64,
+        fee: AmountFact,
+        ceiling: AmountFact,
     ) -> Result<Action, OutboxError> {
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let action = self.load(operation_id)?;
@@ -904,41 +968,45 @@ impl ChainActionOutbox {
                 });
             }
         }
-        self.append(
-            operation_id,
-            now_ms,
-            Transition::FeeObserved {
-                lamports,
-                max_lamports,
-            },
-        )?;
+        self.append(operation_id, now_ms, Transition::FeeObserved { fee, ceiling })?;
         self.load(operation_id)
     }
 
     /// Record the verifier-established facts for the staged payload.
     /// Informational, staging-only, at most once.
+    ///
+    /// `canonical_output` must be the exact JCS bytes Broker's compiled
+    /// verifier returned, and `verifier_result_digest_hex` must be its
+    /// digest as computed by the caller. This method independently
+    /// recomputes the digest of `canonical_output` and fails closed on any
+    /// mismatch — the outbox never trusts a caller-asserted digest.
     #[allow(clippy::too_many_arguments)] // journal record fields
     pub fn record_facts_verified(
         &self,
         operation_id: &str,
         now_ms: u64,
-        fee_payer_base58: String,
-        destination_base58: String,
-        lamports: u64,
         verifier_id: String,
+        verifier_schema_version: String,
+        canonical_output: Vec<u8>,
         verifier_result_digest_hex: String,
-        message_digest_hex: String,
+        core: VerifiedCore,
     ) -> Result<Action, OutboxError> {
+        let computed = sha256_hex(&canonical_output);
+        if computed != verifier_result_digest_hex {
+            return Err(OutboxError::VerifierOutputDigestMismatch {
+                computed,
+                claimed: verifier_result_digest_hex,
+            });
+        }
         self.record_informational(
             operation_id,
             now_ms,
             Transition::FactsVerified {
-                fee_payer_base58,
-                destination_base58,
-                lamports,
                 verifier_id,
-                verifier_result_digest_hex,
-                message_digest_hex,
+                verifier_schema_version,
+                canonical_output,
+                output_digest_hex: computed,
+                core,
             },
             "facts_verified",
         )
@@ -950,16 +1018,16 @@ impl ChainActionOutbox {
         &self,
         operation_id: &str,
         now_ms: u64,
-        blockhash_base58: String,
-        last_valid_block_height: u64,
+        reference: String,
+        valid_until: ValidUntil,
         observed_at_ms: u64,
     ) -> Result<Action, OutboxError> {
         self.record_informational(
             operation_id,
             now_ms,
             Transition::LivenessObserved {
-                blockhash_base58,
-                last_valid_block_height,
+                reference,
+                valid_until,
                 observed_at_ms,
             },
             "liveness_observed",
