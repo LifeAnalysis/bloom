@@ -72,7 +72,7 @@ reject_legacy_authority_symbols() {
     return 1
   fi
   if symbol="$(LC_ALL=C grep -E -m1 \
-    'KeystorePetalHost|StoreApprovalVerifier|KeystoreApprovalSignatureVerifier|SignerCache|EphemeralAgentKey|RegistrationCoordinator|AuthServices|InMemoryGrantStore|sign_hash_sync' <<<"$symbol")"; then
+    'KeystorePetalHost|StoreApprovalVerifier|KeystoreApprovalSignatureVerifier|SignerCache|EphemeralAgentKey|RegistrationCoordinator|AuthServices|InMemoryGrantStore|sign_hash_sync|SigningAuthority|ApprovalAuthority|AccountRegistry|FixtureEd25519Signer|ExactApprovalLedger' <<<"$symbol")"; then
     status=0
   else
     status=$?
