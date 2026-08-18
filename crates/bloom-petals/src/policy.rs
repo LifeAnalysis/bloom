@@ -124,6 +124,40 @@ impl NetPolicy {
     }
 }
 
+/// Effective JSON-RPC method allowlist for one configured non-EVM
+/// chain-driver profile (see `bloom:chain/read`). Declarative like
+/// [`NetPolicy`]'s `[[net.allow]]`: a driver names a profile and a JSON-RPC
+/// method; only a configured, allowed method may be dispatched. The
+/// allowed set is operator-configured data (today: `chain-profiles.json`'s
+/// `allowed_read_methods`) — this type only enforces the check.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RpcMethodPolicy {
+    allowed: BTreeSet<String>,
+}
+
+impl RpcMethodPolicy {
+    /// Default-deny policy.
+    pub fn deny_all() -> Self {
+        Self::default()
+    }
+
+    pub fn from_allowed_methods(methods: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            allowed: methods.into_iter().collect(),
+        }
+    }
+
+    pub fn check(&self, method: &str) -> Result<(), HostError> {
+        if self.allowed.contains(method) {
+            Ok(())
+        } else {
+            Err(HostError::Denied(format!(
+                "chain method {method} is not in the configured allowlist"
+            )))
+        }
+    }
+}
+
 /// Effective private-store namespace policy for a single petal invocation.
 ///
 /// `None` at the VM `RunOptions` level preserves legacy/direct VM behavior.
@@ -309,6 +343,28 @@ fn glob_matches(glob: &str, path: &str) -> bool {
         }
     }
     glob_segments.len() == path_segments.len()
+}
+
+#[cfg(test)]
+mod rpc_method_policy_tests {
+    use super::*;
+
+    #[test]
+    fn deny_all_rejects_every_method() {
+        let policy = RpcMethodPolicy::deny_all();
+        assert!(policy.check("getHealth").is_err());
+    }
+
+    #[test]
+    fn configured_methods_are_allowed_and_nothing_else_is() {
+        let policy = RpcMethodPolicy::from_allowed_methods([
+            "getHealth".to_string(),
+            "getGenesisHash".to_string(),
+        ]);
+        assert!(policy.check("getHealth").is_ok());
+        assert!(policy.check("getGenesisHash").is_ok());
+        assert!(policy.check("sendTransaction").is_err());
+    }
 }
 
 #[cfg(test)]

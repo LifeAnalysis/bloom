@@ -36,7 +36,7 @@ pub use meta::{Capability, PetalMeta, PetalMode};
 pub use package::{
     PetalPackage, RouteMatch, RouteRecord, RouteSpecificity, build_petal_package_dir,
 };
-pub use policy::NetPolicy;
+pub use policy::{NetPolicy, RpcMethodPolicy};
 pub use private_store::PrivateStore;
 pub use registry::{NameRegistry, validate_name};
 pub use router::PetalRouter;
