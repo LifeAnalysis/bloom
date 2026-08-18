@@ -54,37 +54,6 @@ pub enum PinError {
     Store(#[from] bloom_petals::PetalError),
 }
 
-/// Trusted catalog verification keys: `(key id, verifying key)` pairs from
-/// the operator's trusted-key file.
-pub type TrustedCatalogKeys = Vec<(String, ed25519_dalek::VerifyingKey)>;
-
-/// Load trusted keys from a JSON file: `[{"key_id": .., "verifying_key_base64": ..}]`.
-pub fn load_trusted_catalog_keys(path: &Path) -> Result<TrustedCatalogKeys, PinError> {
-    use base64::Engine as _;
-    #[derive(serde::Deserialize)]
-    struct KeyFile {
-        #[serde(rename = "key_id")]
-        key_id: String,
-        #[serde(rename = "verifying_key_base64")]
-        verifying_key_base64: String,
-    }
-    let raw = std::fs::read(path)?;
-    let entries: Vec<KeyFile> = serde_json::from_slice(&raw)?;
-    let mut keys = Vec::new();
-    for entry in entries {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&entry.verifying_key_base64)
-            .map_err(|e| PinError::Io(std::io::Error::other(e.to_string())))?;
-        let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-            PinError::Io(std::io::Error::other(format!("key len {}", v.len())))
-        })?;
-        let vk = ed25519_dalek::VerifyingKey::from_bytes(&arr)
-            .map_err(|e| PinError::Io(std::io::Error::other(e.to_string())))?;
-        keys.push((entry.key_id, vk));
-    }
-    Ok(keys)
-}
-
 /// Verify the package tree against its committed manifest and the pinned
 /// package hash, then install and mount under `/petals`.
 pub fn mount_pinned_solana_driver(
@@ -121,30 +90,4 @@ pub fn mount_pinned_solana_driver(
     Ok(Vfs::builder()
         .mount("petals", Arc::new(PetalRouter::new(runner, host)))
         .build())
-}
-
-/// Content pin AND catalog-signature verified mount: the strongest posture.
-/// Requires a signed catalog entry (artifacts/catalog-entry.json in the
-/// package) that verifies under one of the trusted keys and passes every
-/// install gate. `mount_pinned_solana_driver` alone means "content pinned";
-/// this function additionally means "catalog signature verified".
-pub fn mount_pinned_and_catalog_verified_solana_driver(
-    petal_dir: &Path,
-    state_root: &Path,
-    host: Arc<dyn bloom_petals::PetalHost>,
-    trusted_keys: &TrustedCatalogKeys,
-    in_flight_predecessor_ops: &[String],
-) -> Result<Vfs, PinError> {
-    let entry_path = petal_dir.join("artifacts/catalog-entry.json");
-    let raw = std::fs::read(&entry_path)?;
-    let signed: crate::catalog::SignedCatalogEntry =
-        serde_json::from_slice(&raw).map_err(PinError::Json)?;
-    signed
-        .verify(trusted_keys)
-        .map_err(|e| PinError::Io(std::io::Error::other(format!("catalog: {e}"))))?;
-    signed
-        .entry
-        .gate_install(petal_dir, in_flight_predecessor_ops)
-        .map_err(|e| PinError::Io(std::io::Error::other(format!("catalog install gate: {e}"))))?;
-    mount_pinned_solana_driver(petal_dir, state_root, host)
 }
