@@ -132,7 +132,7 @@ fn template_with_duplicate_signature_index_is_refused() {
     let dir = TempDir::new().unwrap();
     let outbox = ChainActionOutbox::new(dir.path()).unwrap();
     let d = driver();
-    let mut request = d.stage_request(&op(10), "w", "k", "dest", 5, 100, 0);
+    let request = d.stage_request(&op(10), "w", "k", "dest", 5, 100, 0);
     let segments = request.artifact_template.segments.clone();
     let mut request = request;
     request.artifact_template.segments = vec![
@@ -174,7 +174,7 @@ fn record_signed_refuses_artifact_not_derived_from_template() {
     let good = action
         .envelope
         .artifact_template
-        .apply(&[signature.clone()])
+        .apply(std::slice::from_ref(&signature))
         .unwrap();
     outbox
         .record_signed(&op(11), 200, &signature, &good)

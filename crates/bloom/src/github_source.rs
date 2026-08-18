@@ -1808,10 +1808,9 @@ mod tests {
         );
 
         // One non-terminal chain action pinned to the installed package.
-        let outbox = bloom_chain_action::ChainActionOutbox::new(
-            daemon.home.root().join("chain-actions"),
-        )
-        .unwrap();
+        let outbox =
+            bloom_chain_action::ChainActionOutbox::new(daemon.home.root().join("chain-actions"))
+                .unwrap();
         let payload = b"pending-message".to_vec();
         outbox
             .stage(bloom_chain_action::NewAction {
