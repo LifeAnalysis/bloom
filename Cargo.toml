@@ -11,6 +11,7 @@ members = [
   "crates/bloom-rpc",
   "crates/bloom-rpc-common",
   "crates/bloom-solana",
+  "crates/bloom-solana-tx",
   "crates/bloom-tx",
   "crates/bloom-mempool",
   "crates/bloom-machine-client",
@@ -111,6 +112,8 @@ bloom-proto    = { path = "crates/bloom-proto" }
 bloom-rpc      = { path = "crates/bloom-rpc" }
 bloom-rpc-common = { path = "crates/bloom-rpc-common" }
 bloom-evm      = { path = "crates/bloom-evm" }
+bloom-solana   = { path = "crates/bloom-solana" }
+bloom-solana-tx = { path = "crates/bloom-solana-tx" }
 bloom-tx       = { path = "crates/bloom-tx" }
 bloom-vfs      = { path = "crates/bloom-vfs" }
 bloom-paid-mpp = { path = "crates/bloom-paid-mpp" }

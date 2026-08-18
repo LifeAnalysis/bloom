@@ -20,9 +20,10 @@ use std::sync::Arc;
 pub use error::SolanaRpcError;
 pub use transport::SolanaRpcClient;
 
-use bloom_proto::EndpointSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+pub use bloom_proto::EndpointSpec;
 
 /// Operator configuration for one Solana cluster.
 ///
@@ -84,6 +85,42 @@ pub struct Simulation {
     pub units_consumed: Option<u64>,
     #[serde(default)]
     pub return_data: Option<Value>,
+}
+
+/// A registry of Solana clients keyed by chain name, mirroring
+/// `bloom-evm::ChainRegistry`.
+#[derive(Clone, Default)]
+pub struct SolanaChainRegistry {
+    inner: std::sync::Arc<parking_lot::RwLock<std::collections::BTreeMap<String, SolanaClient>>>,
+}
+
+impl SolanaChainRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&self, client: SolanaClient) {
+        let name = client.chain_name().to_string();
+        self.inner.write().insert(name, client);
+    }
+
+    pub fn get(&self, name: &str) -> Option<SolanaClient> {
+        self.inner.read().get(name).cloned()
+    }
+
+    pub fn list_names(&self) -> Vec<String> {
+        self.inner.read().keys().cloned().collect()
+    }
+
+    pub fn from_specs<I: IntoIterator<Item = SolanaSpec>>(
+        specs: I,
+    ) -> Result<Self, SolanaRpcError> {
+        let r = Self::new();
+        for spec in specs {
+            r.add(SolanaClient::build(&spec)?);
+        }
+        Ok(r)
+    }
 }
 
 /// The read-only chain client. Clone is cheap (Arc inside).

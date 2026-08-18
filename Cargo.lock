@@ -2614,6 +2614,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-solana-tx"
+version = "0.1.3"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "bloom-solana",
+ "bs58",
+ "hex",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bloom-tools"
 version = "0.1.3"
 dependencies = [

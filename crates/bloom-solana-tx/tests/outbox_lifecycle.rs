@@ -1,0 +1,197 @@
+//! Outbox lifecycle and reconciliation tests driven by fixtures (no network).
+
+use bloom_solana_tx::outbox::{SolanaOutbox, SolanaOutboxState};
+use bloom_solana_tx::types::{SolanaTxStatus, StagedSolanaTransfer};
+use tempfile::TempDir;
+
+fn staged(id: &str) -> StagedSolanaTransfer {
+    StagedSolanaTransfer {
+        id: id.to_string(),
+        wallet: "alice".into(),
+        chain: "solana-devnet".into(),
+        fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
+        destination: "DEST111111111111111111111111111111111111111".into(),
+        lamports: 1_000_000,
+        blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
+        last_valid_block_height: 123456,
+        message_b64: base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"legacy-message-bytes",
+        ),
+        payload_digest_hex: "ab".repeat(32),
+        signature: None,
+        created_ms: 1000,
+        expires_ms: 0,
+        status: SolanaTxStatus::Pending,
+        action_id: None,
+    }
+}
+
+fn outbox() -> (TempDir, SolanaOutbox) {
+    let dir = TempDir::new().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    (dir, outbox)
+}
+
+#[test]
+fn stage_and_read_roundtrip() {
+    let (_dir, outbox) = outbox();
+    let s = staged("0001-00001");
+    outbox.write_pending(&s, "plan").unwrap();
+
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    assert_eq!(entry.state, SolanaOutboxState::Pending);
+    assert_eq!(entry.staged.destination, s.destination);
+    assert_eq!(entry.staged.lamports, 1_000_000);
+
+    // intent.json is write-once in spirit: re-writing identical bytes is
+    // fine, but the stored record is what later reads return.
+    let stored: StagedSolanaTransfer =
+        serde_json::from_slice(&std::fs::read(entry.dir.join("intent.json")).unwrap()).unwrap();
+    assert_eq!(stored, s);
+}
+
+#[test]
+fn transition_moves_entry_atomically() {
+    let (_dir, outbox) = outbox();
+    let s = staged("0001-00001");
+    outbox.write_pending(&s, "plan").unwrap();
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+
+    outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
+    assert!(
+        outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "0001-00001",
+                SolanaOutboxState::Pending
+            )
+            .is_err()
+    );
+    assert!(
+        outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "0001-00001",
+                SolanaOutboxState::Sent
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn read_in_state_distinguishes_wrong_state() {
+    let (_dir, outbox) = outbox();
+    outbox.write_pending(&staged("0001-00001"), "plan").unwrap();
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox
+        .transition(&entry, SolanaOutboxState::Failed)
+        .unwrap();
+
+    let err = outbox
+        .read_in_state(
+            "alice",
+            "solana-devnet",
+            "0001-00001",
+            SolanaOutboxState::Sent,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            bloom_solana_tx::outbox::OutboxError::StateMismatch { .. }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn walk_all_sent_skips_unsigned_entries() {
+    let (_dir, outbox) = outbox();
+    // A pending entry with no signature is not "sent".
+    outbox.write_pending(&staged("0001-00001"), "plan").unwrap();
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
+
+    // No signature recorded -> walk skips it.
+    assert!(outbox.walk_all_sent().unwrap().is_empty());
+
+    // Stamp a signature by rewriting intent.json (simulating the signing
+    // step, which is §4-blocked) and the entry becomes visible.
+    let mut s = staged("0001-00001");
+    s.signature = Some("SIG1111111111111111111111111111111111111111111111111111111111111".into());
+    let dir = outbox.root().join("alice/solana-devnet/sent/0001-00001");
+    std::fs::write(
+        dir.join("intent.json"),
+        serde_json::to_vec_pretty(&s).unwrap(),
+    )
+    .unwrap();
+
+    let sent = outbox.walk_all_sent().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].signature, s.signature.clone().unwrap());
+    assert!(!sent[0].mined);
+}
+
+#[test]
+fn broadcast_attempt_binds_raw_tx_hash() {
+    let (_dir, outbox) = outbox();
+    outbox.write_pending(&staged("0001-00001"), "plan").unwrap();
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+
+    outbox
+        .write_broadcast_attempt(&entry, "SIG", b"signed-tx-bytes", 2000)
+        .unwrap();
+    let raw = outbox.read_broadcast_raw_tx(&entry).unwrap();
+    assert_eq!(raw, b"signed-tx-bytes");
+
+    // Corrupt the raw tx on disk: the hash check must fail closed.
+    std::fs::write(entry.dir.join("raw_tx"), b"tampered").unwrap();
+    assert!(outbox.read_broadcast_raw_tx(&entry).is_err());
+}
+
+#[test]
+fn cancel_moves_pending_to_failed() {
+    let (_dir, outbox) = outbox();
+    outbox.write_pending(&staged("0001-00001"), "plan").unwrap();
+    outbox
+        .cancel("alice", "solana-devnet", "0001-00001")
+        .unwrap();
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    assert_eq!(entry.state, SolanaOutboxState::Failed);
+    assert_eq!(entry.staged.status, SolanaTxStatus::Cancelled);
+}
+
+#[test]
+fn sweep_expired_removes_only_expired() {
+    let (_dir, outbox) = outbox();
+    let mut expiring = staged("0001-00001");
+    expiring.expires_ms = 500;
+    outbox.write_pending(&expiring, "plan").unwrap();
+    outbox.write_pending(&staged("0002-00002"), "plan").unwrap();
+
+    let removed = outbox.sweep_expired(1000).unwrap();
+    assert_eq!(removed, 1);
+    assert!(
+        outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "0001-00001",
+                SolanaOutboxState::Failed
+            )
+            .is_ok()
+    );
+    assert!(
+        outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "0002-00002",
+                SolanaOutboxState::Pending
+            )
+            .is_ok()
+    );
+}
