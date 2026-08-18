@@ -1,6 +1,6 @@
 # Solana Support as a Verified Chain Petal
 
-**Status:** proposed
+**Status:** implemented (lean shape); verifier relocated to `bloom-broker`
 
 **Issue:** [bloom#156](https://github.com/bloom-directory/bloom/issues/156)
 
@@ -10,6 +10,27 @@
 ([bloom#163](https://github.com/bloom-directory/bloom/issues/163))
 
 **Architecture:** [Verified Chain Petals](../architecture/Verified%20Chain%20Petals.md)
+
+## Final homes of each piece (post-cleanup shape)
+
+This plan's original multi-crate shape (a parallel mini-Machine, a second CLI,
+a bespoke signed catalog, an in-tree codec, and an RPC mediator) was reduced to
+extensions of the existing Petal runtime. The final homes are:
+
+| Piece | Home |
+|---|---|
+| Chain-neutral outbox (`bloom-chain-action`) | `crates/bloom-chain-action` in bloom — staging, artifact-template assembly, sign/broadcast/reconcile journal |
+| `solana-system-transfer-v1` verifier + codec | `crates/bloom-solana` in the **bloom-broker** repo — bloom keeps no copy |
+| Driver Petal | separate repo `bloom-petal-solana`, pinned by hash as a `PreinstalledPetal` (`solana-driver`) |
+| Chain-driver profile registry + RPC allowlist | `ChainDriverProfile` in `bloom-daemon`, `RpcMethodPolicy` in `bloom-petals` |
+| Read/broadcast mediation | inline daemon dispatch over `bloom:chain/read` (write class `sendTransaction`, release-gated) |
+| Durable signing request state | `petal-signing-requests` projection (existing) + `chain-actions` VFS projection |
+| Pending-action package pinning | `pending_for_package` refusal in `ensure_preinstalled_petals_with` |
+
+Superseded and deleted: `bloom-solana-machine`, `bloom-solana-cli`,
+`bloom-chain-rpc`, and the in-tree `petals/solana-driver` fossil. The residual
+PR is the chain-neutral outbox, the daemon's inline dispatch, the VFS
+projection, the pin, docs, and CI.
 
 ## Goal
 

@@ -294,6 +294,20 @@ network attestor establishes them. The verifier nevertheless denies fee-altering
 instruction families in the MVP, which narrows fee risk. Broker review and
 policy must never label unverified network observations as verifier-established.
 
+### Implementation home and parser independence
+
+The verifier and its golden vectors live in the `bloom-broker` repo as its own
+`bloom-solana` crate, beside the Broker edge that compiles it — Bloom keeps no
+copy. The production verifier parses with the Anza `solana-message` and
+`solana-transaction` reference crates and requires re-serialization to equal the
+input bytes exactly, so construction and verification never share a hand-rolled
+parser: the driver Petal builds with the Anza codec, the verifier checks with the
+same reference implementation plus a strict shape contract, and the two cannot
+develop a common-mode parsing bug. Golden vectors, mutation tests, and
+differential tests against the pinned Anza versions remain release gates, and the
+verifier corpus digest is published out-of-band so verifier changes are
+detectable independent of the Broker build.
+
 ## Approval and policy rules
 
 - Production Solana native-transfer operations require
