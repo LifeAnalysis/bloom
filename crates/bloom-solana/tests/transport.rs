@@ -4,12 +4,11 @@
 
 use bloom_proto::EndpointSpec;
 use bloom_solana::{SolanaClient, SolanaRpcError, SolanaSpec};
-use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// A stub JSON-RPC server that answers a scripted sequence of outcomes.
-async fn spawn_stub(script: Vec<&'static str>) -> String {
+/// A stub JSON-RPC server that answers a fixed set of methods.
+async fn spawn_stub() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -17,7 +16,6 @@ async fn spawn_stub(script: Vec<&'static str>) -> String {
             let Ok((mut socket, _)) = listener.accept().await else {
                 break;
             };
-            let script = script.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 8192];
@@ -72,7 +70,7 @@ fn spec(endpoint: &str) -> SolanaSpec {
 
 #[tokio::test]
 async fn typed_read_methods_roundtrip() {
-    let endpoint = spawn_stub(vec![]).await;
+    let endpoint = spawn_stub().await;
     let client = SolanaClient::build(&spec(&endpoint)).unwrap();
 
     client.get_health().await.unwrap();
@@ -83,7 +81,7 @@ async fn typed_read_methods_roundtrip() {
 
 #[tokio::test]
 async fn genesis_mismatch_is_refused() {
-    let endpoint = spawn_stub(vec![]).await;
+    let endpoint = spawn_stub().await;
     let mut spec = spec(&endpoint);
     spec.expected_genesis_hex = Some("X".repeat(32));
     let client = SolanaClient::build(&spec).unwrap();
@@ -138,7 +136,7 @@ async fn retries_transient_http_failures() {
 #[tokio::test]
 async fn fails_over_across_endpoints() {
     // First endpoint is a dead port (connection refused), second answers.
-    let good = spawn_stub(vec![]).await;
+    let good = spawn_stub().await;
     let mut spec = spec("http://127.0.0.1:1");
     spec.endpoints.push(EndpointSpec {
         url: good,
