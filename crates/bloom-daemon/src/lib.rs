@@ -57,10 +57,10 @@ use bloom_tx::tx_engine::{
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
-    AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, OutboxHandler,
-    PETAL_SIGNING_STATE_SCHEMA, PetalKeyRequestsHandler, PetalSigningRequestProjection,
-    PetalSigningRequestsHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler,
-    ToolsHandler, WalletsHandler, WatchHandler,
+    AddressBookHandler, CentralOutbox, ChainActionsHandler, ChainsHandler, DocsHandler, EnsHandler,
+    OutboxHandler, PETAL_SIGNING_STATE_SCHEMA, PetalKeyRequestsHandler,
+    PetalSigningRequestProjection, PetalSigningRequestsHandler, PricesHandler, RequestsHandler,
+    SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::{
     BrokerExactPayloadSigner, FileOperationIndex, OperationIndex, PathCache, Vfs, VfsPath,
@@ -728,7 +728,7 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Invalid(format!("Petal VFS path: {error}")))?;
         if matches!(
             parsed.first(),
-            Some("petal-key-requests" | "petal-signing-requests")
+            Some("petal-key-requests" | "petal-signing-requests" | "chain-actions")
         ) {
             return Err(HostError::Denied(
                 "Petal ceremony request projections are owner-only".into(),
@@ -3611,6 +3611,14 @@ impl Daemon {
                     home.cache_dir().join("petal-signing-requests"),
                     broker.clone(),
                 )) as _,
+            )
+            .mount(
+                "chain-actions",
+                Arc::new(
+                    ChainActionsHandler::new(home.root().join("chain-actions")).map_err(|e| {
+                        DaemonError::Audit(format!("chain-actions projection: {e}"))
+                    })?,
+                ) as _,
             )
             .mount(
                 "petals",

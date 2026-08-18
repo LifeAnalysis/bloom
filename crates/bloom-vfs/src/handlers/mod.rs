@@ -1,5 +1,6 @@
 pub mod addressbook;
 mod balances;
+pub mod chain_actions;
 pub mod chains;
 pub mod chains_contracts;
 mod chains_history;
@@ -20,6 +21,7 @@ pub mod watch;
 mod well_known_tokens;
 
 pub use addressbook::AddressBookHandler;
+pub use chain_actions::ChainActionsHandler;
 pub use chains::ChainsHandler;
 pub use chains_mempool::MempoolHandler;
 pub use docs::DocsHandler;
