@@ -921,6 +921,20 @@ impl ChainActionOutbox {
         Ok(out)
     }
 
+    /// Non-terminal action ids whose driver pins `package_hash` — the
+    /// pending-actions view used to refuse activating a successor package
+    /// while in-flight actions still belong to the old one.
+    pub fn pending_for_package(&self, package_hash: &str) -> Result<Vec<String>, OutboxError> {
+        let mut pending = Vec::new();
+        for id in self.list()? {
+            let action = self.load(&id)?;
+            if !action.state.is_terminal() && action.envelope.driver.package_hash == package_hash {
+                pending.push(id);
+            }
+        }
+        Ok(pending)
+    }
+
     /// Record the exact signature and assembled signed artifact. Legal exactly
     /// once, from `Staged`. Recording identical bytes again is idempotent;
     /// anything else is rejected — a second signature is never recorded.
@@ -967,9 +981,9 @@ impl ChainActionOutbox {
             .artifact_template
             .apply(&[signature.to_vec()])?;
         if expected != artifact {
-            return Err(OutboxError::InvalidTemplate(format!(
-                "artifact does not match the staged template applied to the signature"
-            )));
+            return Err(OutboxError::InvalidTemplate(
+                "artifact does not match the staged template applied to the signature".to_string(),
+            ));
         }
         let digest = sha256_hex(artifact);
         self.append(

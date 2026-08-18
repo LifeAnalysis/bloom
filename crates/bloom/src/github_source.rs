@@ -533,6 +533,26 @@ fn ensure_preinstalled_petals_with(
                         continue;
                     }
                     PreinstalledState::Outdated { installed_commit } => {
+                        // Refuse to activate the successor while in-flight
+                        // chain actions still pin the old package: a swap
+                        // now would orphan actions whose broadcast gate
+                        // matched the old driver's provenance.
+                        let outbox = bloom_chain_action::ChainActionOutbox::new(
+                            daemon.home.root().join("chain-actions"),
+                        )
+                        .context("open the durable chain-action outbox")?;
+                        let pending = outbox
+                            .pending_for_package(hash)
+                            .context("inspect pending chain actions")?;
+                        if !pending.is_empty() {
+                            bail!(
+                                "pre-installed Petal {} has {} pending chain action(s) pinned to the installed package; resolve or cancel them before updating from {} to {}",
+                                entry.name,
+                                pending.len(),
+                                installed_commit,
+                                entry.commit
+                            );
+                        }
                         println!(
                             "preinstalled_petal: updating {} from {} to {}",
                             entry.name, installed_commit, entry.commit
@@ -1771,6 +1791,102 @@ mod tests {
             NEAR_OLD_COMMIT
         );
         assert!(!daemon.petals.store().contains_package(new_hash));
+    }
+
+    #[test]
+    fn pending_chain_actions_block_package_update() {
+        let old = build_near_release("v0.1.0");
+        let new = build_near_release("v0.1.1");
+        let (home, home_dir, daemon) =
+            near_home_with_installed(&old.package, NEAR_REPO, NEAR_OLD_COMMIT, None);
+        let new_hash: &'static str = Box::leak(new.package.hash.clone().into_boxed_str());
+        let entry = near_catalog_entry(
+            NEAR_NEW_COMMIT,
+            "v0.1.1",
+            "near-intents-v0.1.1.petal.tar.gz",
+            Some(new_hash),
+        );
+
+        // One non-terminal chain action pinned to the installed package.
+        let outbox = bloom_chain_action::ChainActionOutbox::new(
+            daemon.home.root().join("chain-actions"),
+        )
+        .unwrap();
+        let payload = b"pending-message".to_vec();
+        outbox
+            .stage(bloom_chain_action::NewAction {
+                operation_id: format!("{:064x}", 1u8),
+                idempotency_key: "idem-1".into(),
+                driver: bloom_chain_action::DriverBinding {
+                    package_hash: old.package.hash.clone(),
+                    route: "transfer.stage.json".into(),
+                    abi_version: 1,
+                    state_schema: 1,
+                },
+                wallet_id: "wallet-1".into(),
+                key_ref: "broker-exact-selection".into(),
+                chain: bloom_chain_action::ChainBinding {
+                    family: "solana".into(),
+                    profile: "solana-devnet".into(),
+                    claimed_caip2: "solana:devnet".into(),
+                },
+                operation_class: "solana.native-transfer".into(),
+                crypto_suite: "ed25519-message".into(),
+                artifact_template: bloom_chain_action::ArtifactTemplate {
+                    segments: vec![
+                        bloom_chain_action::ArtifactSegment::Signature { index: 0 },
+                        bloom_chain_action::ArtifactSegment::Literal {
+                            bytes_hex: hex::encode(&payload),
+                        },
+                    ],
+                },
+                payload,
+                created_at_ms: 1,
+                expires_at_ms: 0,
+            })
+            .unwrap();
+
+        let err = ensure_preinstalled_petals_with(
+            &daemon,
+            |name| (name == "near-intents").then_some(entry),
+            |_, _| panic!("a pending chain action must block the package swap"),
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("pending chain action(s) pinned to the installed package"),
+            "{err}"
+        );
+        assert_eq!(
+            installed_owner(&daemon).as_deref(),
+            Some(&*old.package.hash)
+        );
+
+        // A terminal action no longer blocks: freshness refusal is terminal.
+        outbox
+            .refuse_for_freshness(
+                &format!("{:064x}", 1u8),
+                2,
+                bloom_chain_action::FreshnessReason::BlockhashRefreshRequired,
+            )
+            .unwrap();
+        let ready = ensure_preinstalled_petals_with(
+            &daemon,
+            |name| (name == "near-intents").then_some(entry),
+            |daemon, entry| {
+                install_prebuilt_petal_archive(
+                    daemon,
+                    entry,
+                    &near_release_manifest(entry, new_hash),
+                    new.archive.path(),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(ready, vec!["near-intents".to_string()]);
+        assert_eq!(installed_owner(&daemon).as_deref(), Some(new_hash));
+        drop(home);
+        drop(home_dir);
     }
 
     #[test]

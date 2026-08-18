@@ -28,6 +28,7 @@ triad-dev-harness = [
 [dependencies]
 bloom-proto.workspace = true
 bloom-daemon.workspace = true
+bloom-chain-action.workspace = true
 bloom-machine-client.workspace = true
 bloom-triad-local-transport.workspace = true
 bloom-service-activation.workspace = true
