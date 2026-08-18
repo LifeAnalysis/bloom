@@ -2211,22 +2211,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-chain-driver-host"
-version = "0.1.3"
-dependencies = [
- "async-trait",
- "blake3",
- "bloom-chain-action",
- "bloom-chain-rpc",
- "bloom-petals",
- "hex",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "bloom-chain-rpc"
 version = "0.1.3"
 dependencies = [

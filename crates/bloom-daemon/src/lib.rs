@@ -281,9 +281,98 @@ impl PetalKeyRequestState {
 struct PetalTxOutbox {
     tx_engine: TxEngine,
     chains: ChainRegistry,
+    /// Non-EVM verified chain-driver Petals (Solana and future families),
+    /// keyed by operator-configured profile name and dispatched by the
+    /// profile's own `family` field. Empty when no `chain-profiles.json`
+    /// is configured for this home — chain_read simply falls through to
+    /// [`HostError::NotFound`] for any name neither registry knows.
+    chain_drivers: Arc<ChainDriverRegistry>,
     wallet_projections: Arc<dyn WalletProjectionReader>,
     address_book: Arc<AddressBook>,
     write_permit: Option<Arc<HomeWritePermit>>,
+}
+
+/// One operator-configured non-EVM chain-driver profile. Chain-neutral:
+/// every field is data, no chain-specific constant lives in this crate.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ChainDriverProfile {
+    name: String,
+    /// Dispatch tag (e.g. `"solana"`); carried through for clarity but not
+    /// itself gated against a hardcoded family list — the operator config
+    /// file is the trust boundary, not this string.
+    #[allow(dead_code)]
+    family: String,
+    expected_genesis_hex: String,
+    http_endpoint: String,
+    #[serde(default)]
+    allowed_read_methods: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)] // broadcast wiring lands with the post-sign half
+    allow_broadcast: bool,
+}
+
+const CHAIN_DRIVER_PROFILES_SCHEMA: &str = "bloom.chain-driver.profiles/1";
+
+#[derive(serde::Deserialize)]
+struct ChainDriverProfilesFile {
+    schema: String,
+    #[serde(default)]
+    profiles: Vec<ChainDriverProfile>,
+}
+
+fn chain_driver_profile_is_mainnet(profile: &ChainDriverProfile) -> bool {
+    profile.name.to_lowercase().contains("mainnet") || profile.family.to_lowercase().contains("mainnet")
+}
+
+/// Load `<state>/chain-profiles.json`. A missing file means no non-EVM
+/// chain-driver profile is configured — not an error. Mainnet profiles are
+/// refused at load time, matching the EVM side's existing posture.
+fn load_chain_driver_profiles(state_root: &Path) -> Result<Vec<ChainDriverProfile>, DaemonError> {
+    let path = state_root.join("chain-profiles.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|e| DaemonError::Audit(format!("chain-driver profiles: {e}")))?;
+    let file: ChainDriverProfilesFile = serde_json::from_slice(&bytes)
+        .map_err(|e| DaemonError::Audit(format!("chain-driver profiles: {e}")))?;
+    if file.schema != CHAIN_DRIVER_PROFILES_SCHEMA {
+        return Err(DaemonError::Audit(format!(
+            "chain-driver profiles: schema '{}' is not {CHAIN_DRIVER_PROFILES_SCHEMA}",
+            file.schema
+        )));
+    }
+    for profile in &file.profiles {
+        if chain_driver_profile_is_mainnet(profile) {
+            return Err(DaemonError::Audit(format!(
+                "chain-driver profiles: mainnet profile '{}' is disabled in this release posture",
+                profile.name
+            )));
+        }
+    }
+    Ok(file.profiles)
+}
+
+/// Registry of configured chain-driver profiles, keyed by name, with a
+/// one-time-verified genesis flag per profile shared across every clone of
+/// the [`DaemonPetalHost`] that holds it.
+#[derive(Default)]
+struct ChainDriverRegistry {
+    profiles: std::collections::HashMap<String, ChainDriverProfile>,
+    genesis_verified: parking_lot::Mutex<std::collections::HashSet<String>>,
+}
+
+impl ChainDriverRegistry {
+    fn new(profiles: Vec<ChainDriverProfile>) -> Self {
+        Self {
+            profiles: profiles.into_iter().map(|p| (p.name.clone(), p)).collect(),
+            genesis_verified: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&ChainDriverProfile> {
+        self.profiles.get(name)
+    }
 }
 
 impl DaemonPetalHost {
@@ -1870,13 +1959,107 @@ impl PetalHost for DaemonPetalHost {
             .tx_outbox
             .as_ref()
             .ok_or_else(|| HostError::Denied("chain reads are unavailable".into()))?;
-        let chain = service
-            .chains
-            .get(&req.chain)
-            .ok_or_else(|| HostError::NotFound(format!("chain {}", req.chain)))?;
-        let result_json = daemon_petal_chain_read(&chain, &req.method, &req.params_json).await?;
-        Ok(ChainResponse { result_json })
+        // EVM chains first (unchanged, existing behavior), then the
+        // generic verified chain-driver registry (Solana and future
+        // families) — additive; neither registry's names are expected to
+        // collide, but EVM wins on a collision to preserve prior behavior.
+        if let Some(chain) = service.chains.get(&req.chain) {
+            let result_json = daemon_petal_chain_read(&chain, &req.method, &req.params_json).await?;
+            return Ok(ChainResponse { result_json });
+        }
+        if let Some(profile) = service.chain_drivers.get(&req.chain) {
+            let result_json = daemon_petal_chain_driver_read(
+                &self.http,
+                &service.chain_drivers,
+                profile,
+                &req.method,
+                &req.params_json,
+            )
+            .await?;
+            return Ok(ChainResponse { result_json });
+        }
+        Err(HostError::NotFound(format!("chain {}", req.chain)))
     }
+}
+
+/// Response cap for a chain-driver JSON-RPC read, mirroring the EVM path's
+/// implicit trust in its typed alloy responses with an explicit bound here
+/// since this path decodes arbitrary JSON.
+const CHAIN_DRIVER_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Mediated read through a generic, operator-configured chain-driver
+/// profile: method allowlist (via [`bloom_petals::RpcMethodPolicy`]),
+/// genesis-hash binding (checked once per profile, cached), then a plain
+/// JSON-RPC 2.0 call over the daemon's existing HTTP client. No chain-family
+/// -specific parsing of `method`/`params_json` happens here — profiles for
+/// any family dispatch through exactly this path.
+async fn daemon_petal_chain_driver_read(
+    http: &reqwest::Client,
+    registry: &ChainDriverRegistry,
+    profile: &ChainDriverProfile,
+    method: &str,
+    params_json: &str,
+) -> Result<String, HostError> {
+    let params: serde_json::Value = serde_json::from_str(params_json)
+        .map_err(|e| HostError::Invalid(format!("chain params-json must be valid JSON: {e}")))?;
+
+    let policy = bloom_petals::RpcMethodPolicy::from_allowed_methods(
+        profile.allowed_read_methods.iter().cloned(),
+    );
+    policy.check(method)?;
+
+    // Genesis binding: checked once per profile, not once per call. A
+    // failed check is never cached, so a transient endpoint outage doesn't
+    // permanently lock a profile out once it recovers.
+    let already_verified = registry.genesis_verified.lock().contains(&profile.name);
+    if !already_verified {
+        let observed = chain_driver_rpc_call(http, &profile.http_endpoint, "getGenesisHash", &serde_json::Value::Array(vec![]))
+            .await?;
+        let observed = observed.as_str().unwrap_or_default();
+        if observed != profile.expected_genesis_hex {
+            return Err(HostError::Denied(format!(
+                "chain-driver profile '{}' genesis mismatch: expected {}, observed {observed}",
+                profile.name, profile.expected_genesis_hex
+            )));
+        }
+        registry.genesis_verified.lock().insert(profile.name.clone());
+    }
+
+    let result = chain_driver_rpc_call(http, &profile.http_endpoint, method, &params).await?;
+    serde_json::to_string(&result)
+        .map_err(|e| HostError::Backend(format!("encode chain response: {e}")))
+}
+
+/// One JSON-RPC 2.0 call over HTTP, response-size bounded.
+async fn chain_driver_rpc_call(
+    http: &reqwest::Client,
+    endpoint: &str,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, HostError> {
+    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    let response = http
+        .post(endpoint)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| HostError::Backend(format!("chain rpc transport: {e}")))?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| HostError::Backend(format!("chain rpc transport: {e}")))?;
+    if bytes.len() > CHAIN_DRIVER_MAX_RESPONSE_BYTES {
+        return Err(HostError::Backend(format!(
+            "chain rpc response of {} bytes exceeds the {CHAIN_DRIVER_MAX_RESPONSE_BYTES}-byte cap",
+            bytes.len()
+        )));
+    }
+    let payload: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| HostError::Backend(format!("chain rpc decode: {e}")))?;
+    if let Some(error) = payload.get("error") {
+        return Err(HostError::Backend(format!("chain rpc error: {error}")));
+    }
+    Ok(payload.get("result").cloned().unwrap_or(serde_json::Value::Null))
 }
 
 #[derive(serde::Deserialize)]
@@ -2956,6 +3139,16 @@ impl Daemon {
         let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
         let petal_vfs_host = Arc::new(LateVfsHost::new());
+
+        // Generic verified chain-driver registry (Solana and future
+        // non-EVM families), from operator-configured
+        // `~/.bloom/chain-drivers/chain-profiles.json`. Absent that file
+        // this is an empty registry: chain_read for a name neither the EVM
+        // ChainRegistry nor this registry knows simply returns NotFound.
+        let chain_driver_profiles =
+            load_chain_driver_profiles(&home.root().join("chain-drivers"))?;
+        let chain_drivers = Arc::new(ChainDriverRegistry::new(chain_driver_profiles));
+
         let petal_app_host = DaemonPetalHost::new(petal_vfs_host.clone(), audit_arc.clone())
             .with_broker(broker.clone())
             .with_provenance_catalog(provenance_catalog.clone())
@@ -2964,6 +3157,7 @@ impl Daemon {
             .with_tx_outbox(PetalTxOutbox {
                 tx_engine: tx_engine.clone(),
                 chains: chains.clone(),
+                chain_drivers,
                 wallet_projections: wallet_projections.clone(),
                 address_book: address_book_arc.clone(),
                 write_permit: home_write_permit.clone(),
@@ -5102,6 +5296,7 @@ mod tests {
             PetalTxOutbox {
                 tx_engine: daemon.tx_engine.clone(),
                 chains: daemon.chains.clone(),
+                chain_drivers: Arc::new(ChainDriverRegistry::default()),
                 wallet_projections: daemon.wallet_projections.clone(),
                 address_book: daemon.address_book.clone(),
                 write_permit: daemon.home_write_permit.clone(),
@@ -5171,6 +5366,138 @@ mod tests {
         assert!(parse_petal_hex_bytes("70a08231", "data").is_err());
         assert!(parse_petal_hex_quantity("0x0", "value").is_ok());
         assert!(parse_petal_hex_quantity("0", "value").is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_chain_read_dispatches_non_evm_families_through_the_generic_driver_registry()
+    {
+        // A tiny real HTTP JSON-RPC stub standing in for a Solana RPC
+        // endpoint: it answers exactly the calls this test makes and
+        // nothing else, so this test exercises the real reqwest-based
+        // dispatch/allowlist/genesis-binding path without any real network
+        // access (loopback only).
+        async fn spawn_stub_json_rpc() -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = vec![0u8; 4096];
+                        let n = socket.read(&mut buf).await.unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buf[..n]);
+                        let body = if request.contains("getGenesisHash") {
+                            format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{}"}}"#, "ab".repeat(32))
+                        } else if request.contains("getHealth") {
+                            r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#.to_string()
+                        } else {
+                            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#
+                                .to_string()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            format!("http://{addr}/")
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+
+        let endpoint = spawn_stub_json_rpc().await;
+        let profile = ChainDriverProfile {
+            name: "solana-devnet".into(),
+            family: "solana".into(),
+            expected_genesis_hex: "ab".repeat(32),
+            http_endpoint: endpoint,
+            allowed_read_methods: vec!["getHealth".into()],
+            allow_broadcast: false,
+        };
+        let chain_drivers = Arc::new(ChainDriverRegistry::new(vec![profile]));
+
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone())
+            .with_tx_outbox(PetalTxOutbox {
+                tx_engine: daemon.tx_engine.clone(),
+                chains: daemon.chains.clone(),
+                chain_drivers,
+                wallet_projections: daemon.wallet_projections.clone(),
+                address_book: daemon.address_book.clone(),
+                write_permit: daemon.home_write_permit.clone(),
+            });
+        let context = PetalRouteContext {
+            petal_root: "solana-driver".into(),
+            package_hash: "c".repeat(64),
+            route_id: "r000003".into(),
+            op: "read".into(),
+            path: "/transfer.stage.json".into(),
+            params: vec![],
+            actor: None,
+        };
+
+        // An EVM chain name is still looked up in the EVM registry first
+        // (existing behavior is unchanged): it never reaches the new
+        // generic dispatch, evidenced by the EVM-shaped rejection reason
+        // rather than a "chain not found in driver registry" one.
+        let evm_name = daemon.chains.list_names().into_iter().next().unwrap();
+        let evm_result = host
+            .chain_read(ChainRequest {
+                chain: evm_name,
+                method: "eth_chainId".into(),
+                params_json: "[]".into(),
+                context: Some(context.clone()),
+            })
+            .await;
+        assert!(
+            !matches!(evm_result, Err(HostError::NotFound(_))),
+            "EVM chain name must resolve in the EVM registry, not fall through: {evm_result:?}"
+        );
+
+        // The Solana-family profile dispatches through the generic driver
+        // registry: an allowed method succeeds...
+        let ok = host
+            .chain_read(ChainRequest {
+                chain: "solana-devnet".into(),
+                method: "getHealth".into(),
+                params_json: "[]".into(),
+                context: Some(context.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(ok.result_json, "\"ok\"");
+
+        // ...a method outside the profile's configured allowlist is denied
+        // by the Mediator itself, not silently passed through...
+        let denied = host
+            .chain_read(ChainRequest {
+                chain: "solana-devnet".into(),
+                method: "sendTransaction".into(),
+                params_json: "[]".into(),
+                context: Some(context.clone()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(denied, HostError::Denied(_)));
+
+        // ...and an unconfigured chain name is NotFound, exactly as an
+        // unconfigured EVM chain name already was.
+        let missing = host
+            .chain_read(ChainRequest {
+                chain: "solana-mainnet".into(),
+                method: "getHealth".into(),
+                params_json: "[]".into(),
+                context: Some(context),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, HostError::NotFound(_)));
     }
 
     #[tokio::test]

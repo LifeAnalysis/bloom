@@ -28,7 +28,6 @@ members = [
   "crates/bloom-chain-rpc",
   "crates/bloom-solana-machine",
   "crates/bloom-solana-cli",
-  "crates/bloom-chain-driver-host",
 ]
 resolver = "2"
 
@@ -68,7 +67,6 @@ bloom-chain-action = { path = "crates/bloom-chain-action" }
 bloom-solana = { path = "crates/bloom-solana" }
 bloom-solana-machine = { path = "crates/bloom-solana-machine" }
 bloom-chain-rpc = { path = "crates/bloom-chain-rpc" }
-bloom-chain-driver-host = { path = "crates/bloom-chain-driver-host" }
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["zeroize_derive"] }
