@@ -1,0 +1,166 @@
+//! Transport tests against a real loopback HTTP stub standing in for a
+//! Solana RPC node: retry, failover, genesis binding, and the typed read
+//! surface, exercised without any external network access.
+
+use bloom_proto::EndpointSpec;
+use bloom_solana::{SolanaClient, SolanaRpcError, SolanaSpec};
+use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A stub JSON-RPC server that answers a scripted sequence of outcomes.
+async fn spawn_stub(script: Vec<&'static str>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let script = script.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = request
+                    .split("\r\n\r\n")
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let method = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
+                    .unwrap_or_default();
+                let body = match method.as_str() {
+                    "getHealth" => r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#.to_string(),
+                    "getGenesisHash" => {
+                        format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{}"}}"#, "G".repeat(32))
+                    }
+                    "getSlot" => r#"{"jsonrpc":"2.0","id":1,"result":12345}"#.to_string(),
+                    "getBalance" => r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":999}}"#
+                        .to_string(),
+                    _ => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#
+                        .to_string(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+fn spec(endpoint: &str) -> SolanaSpec {
+    SolanaSpec {
+        name: "solana-test".into(),
+        endpoints: vec![EndpointSpec {
+            url: endpoint.to_string(),
+            weight: 100,
+            cu_per_sec: None,
+            max_rps: None,
+            http_only: false,
+        }],
+        expected_genesis_hex: Some("G".repeat(32)),
+        allow_broadcast: false,
+    }
+}
+
+#[tokio::test]
+async fn typed_read_methods_roundtrip() {
+    let endpoint = spawn_stub(vec![]).await;
+    let client = SolanaClient::build(&spec(&endpoint)).unwrap();
+
+    client.get_health().await.unwrap();
+    assert_eq!(client.get_genesis_hash().await.unwrap(), "G".repeat(32));
+    assert_eq!(client.get_slot().await.unwrap(), 12345);
+    assert_eq!(client.get_balance("irrelevant").await.unwrap(), 999);
+}
+
+#[tokio::test]
+async fn genesis_mismatch_is_refused() {
+    let endpoint = spawn_stub(vec![]).await;
+    let mut spec = spec(&endpoint);
+    spec.expected_genesis_hex = Some("X".repeat(32));
+    let client = SolanaClient::build(&spec).unwrap();
+
+    let err = client.verify_genesis().await.unwrap_err();
+    assert!(
+        matches!(err, SolanaRpcError::GenesisMismatch { .. }),
+        "{err}"
+    );
+}
+
+/// A stub that fails the first N requests with 503, then succeeds, to prove
+/// the retry layer recovers a transient outage.
+#[tokio::test]
+async fn retries_transient_http_failures() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let failures = Arc::new(AtomicU64::new(2));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let failures = failures.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await.unwrap_or(0);
+                let remaining =
+                    failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+                let body = if remaining.is_ok() && remaining.unwrap() > 0 {
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                } else {
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":777}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                let _ = socket.write_all(body.as_bytes()).await;
+            });
+        }
+    });
+    let client = SolanaClient::build(&spec(&format!("http://{addr}/"))).unwrap();
+    // The first two calls fail with 503; the third attempt (after retries)
+    // succeeds and decodes the slot.
+    let slot: u64 = client.get_slot().await.unwrap();
+    assert_eq!(slot, 777);
+}
+
+#[tokio::test]
+async fn fails_over_across_endpoints() {
+    // First endpoint is a dead port (connection refused), second answers.
+    let good = spawn_stub(vec![]).await;
+    let mut spec = spec("http://127.0.0.1:1");
+    spec.endpoints.push(EndpointSpec {
+        url: good,
+        weight: 50,
+        cu_per_sec: None,
+        max_rps: None,
+        http_only: false,
+    });
+    let client = SolanaClient::build(&spec).unwrap();
+    assert_eq!(client.get_slot().await.unwrap(), 12345);
+}
+
+#[test]
+fn empty_endpoint_list_is_refused() {
+    let spec = SolanaSpec {
+        name: "solana-test".into(),
+        endpoints: vec![],
+        expected_genesis_hex: None,
+        allow_broadcast: false,
+    };
+    assert!(matches!(
+        SolanaClient::build(&spec),
+        Err(SolanaRpcError::NoEndpoints(_))
+    ));
+}
