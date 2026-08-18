@@ -11,7 +11,9 @@
 //! signing flows through the triad (Broker approval, Signer custody) and is
 //! out of scope for this crate.
 
-use crate::{BroadcastOutcome, ChainBinding, DriverBinding, NewAction};
+use crate::{
+    ArtifactSegment, ArtifactTemplate, BroadcastOutcome, ChainBinding, DriverBinding, NewAction,
+};
 
 /// Scripted broadcast behavior, consumed in order and then repeated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +93,16 @@ impl FixtureDriver {
             },
             operation_class: "fixture.native-transfer".to_string(),
             crypto_suite: "fixture-message".to_string(),
+            // Artifact plan: `payload || fixture-signature` — one payload
+            // literal, one signature slot, matching `assemble_artifact`.
+            artifact_template: ArtifactTemplate {
+                segments: vec![
+                    ArtifactSegment::Literal {
+                        bytes_hex: hex::encode(&payload),
+                    },
+                    ArtifactSegment::Signature { index: 0 },
+                ],
+            },
             payload,
             created_at_ms,
             expires_at_ms,

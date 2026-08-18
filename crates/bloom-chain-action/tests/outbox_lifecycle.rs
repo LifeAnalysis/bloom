@@ -52,7 +52,7 @@ fn happy_path_stage_sign_sent_confirmed() {
 
     let a = stage(&outbox, &d, 1);
     assert_eq!(a.state, ActionState::Staged);
-    assert_eq!(a.envelope.schema, "bloom.chain-action/1");
+    assert_eq!(a.envelope.schema, "bloom.chain-action/2");
 
     sign(&outbox, &d, 1);
     assert_eq!(outbox.load(&op(1)).unwrap().state, ActionState::Signed);
@@ -98,8 +98,88 @@ fn staging_rejects_mutated_envelope_for_same_operation() {
 
     let mut other = d.stage_request(&op(3), "w", "k", "dest", 5, 100, 0);
     other.payload[0] ^= 0xff;
+    // Keep the template coherent with the mutated payload so the envelope
+    // is individually valid and the refusal is the content mismatch.
+    if let Some(bloom_chain_action::ArtifactSegment::Literal { bytes_hex }) =
+        other.artifact_template.segments.first_mut()
+    {
+        *bytes_hex = hex::encode(&other.payload);
+    }
     let err = outbox.stage(other).unwrap_err();
     assert!(matches!(err, OutboxError::EnvelopeMismatch(_)));
+}
+
+#[test]
+fn template_without_payload_literal_is_refused_at_staging() {
+    let dir = TempDir::new().unwrap();
+    let outbox = ChainActionOutbox::new(dir.path()).unwrap();
+    let d = driver();
+    let mut request = d.stage_request(&op(9), "w", "k", "dest", 5, 100, 0);
+    // Point the literal at different bytes: no segment equals the payload.
+    if let Some(bloom_chain_action::ArtifactSegment::Literal { bytes_hex }) =
+        request.artifact_template.segments.first_mut()
+    {
+        let mut bytes = hex::decode(&*bytes_hex).unwrap();
+        bytes[0] ^= 0xff;
+        *bytes_hex = hex::encode(bytes);
+    }
+    let err = outbox.stage(request).unwrap_err();
+    assert!(matches!(err, OutboxError::InvalidTemplate(msg) if msg.contains("payload")));
+}
+
+#[test]
+fn template_with_duplicate_signature_index_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let outbox = ChainActionOutbox::new(dir.path()).unwrap();
+    let d = driver();
+    let mut request = d.stage_request(&op(10), "w", "k", "dest", 5, 100, 0);
+    let segments = request.artifact_template.segments.clone();
+    let mut request = request;
+    request.artifact_template.segments = vec![
+        segments[0].clone(),
+        bloom_chain_action::ArtifactSegment::Signature { index: 0 },
+        bloom_chain_action::ArtifactSegment::Signature { index: 0 },
+    ];
+    let err = outbox.stage(request).unwrap_err();
+    // Either refusal is correct: the slot-count bound fires before the
+    // dense-index check for a two-slot template.
+    assert!(
+        matches!(&err, OutboxError::InvalidTemplate(msg)
+            if msg.contains("dense") || msg.contains("signature slots")),
+        "{err}"
+    );
+}
+
+#[test]
+fn record_signed_refuses_artifact_not_derived_from_template() {
+    let dir = TempDir::new().unwrap();
+    let outbox = ChainActionOutbox::new(dir.path()).unwrap();
+    let d = driver();
+    stage(&outbox, &d, 11);
+    let action = outbox.load(&op(11)).unwrap();
+    let payload = hex::decode(&action.envelope.payload_hex).unwrap();
+    let signature = d.fixture_sign(&payload);
+    let mut forged = d.assemble_artifact(&payload);
+    forged[0] ^= 0xff;
+    let err = outbox
+        .record_signed(&op(11), 200, &signature, &forged)
+        .unwrap_err();
+    assert!(
+        matches!(err, OutboxError::InvalidTemplate(ref msg) if msg.contains("staged template")),
+        "{err}"
+    );
+    // The action remains unsigned after the refusal.
+    assert_eq!(outbox.load(&op(11)).unwrap().state, ActionState::Staged);
+    // The correct template derivation still records.
+    let good = action
+        .envelope
+        .artifact_template
+        .apply(&[signature.clone()])
+        .unwrap();
+    outbox
+        .record_signed(&op(11), 200, &signature, &good)
+        .unwrap();
+    assert_eq!(outbox.load(&op(11)).unwrap().state, ActionState::Signed);
 }
 
 #[test]

@@ -62,7 +62,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// The envelope schema version persisted with every staged action.
-pub const ENVELOPE_SCHEMA: &str = "bloom.chain-action/1";
+///
+/// v2 adds the required `artifact_template` envelope field: the staged
+/// action now carries the exact assembly plan for its signed artifact, so
+/// the runtime records (and broadcasts) only artifacts the template
+/// deterministically derives from the staged payload plus the signature.
+pub const ENVELOPE_SCHEMA: &str = "bloom.chain-action/2";
 
 /// Maximum unsigned payload bytes accepted at staging.
 pub const MAX_PAYLOAD_BYTES: usize = 4096;
@@ -72,6 +77,10 @@ pub const MAX_ARTIFACT_BYTES: usize = 8192;
 pub const MAX_SIGNATURE_BYTES: usize = 256;
 /// Maximum length of any bounded string field.
 pub const MAX_STRING_BYTES: usize = 256;
+/// Maximum number of segments in an [`ArtifactTemplate`].
+pub const MAX_TEMPLATE_SEGMENTS: usize = 16;
+/// Maximum number of signature slots an [`ArtifactTemplate`] may declare.
+pub const MAX_TEMPLATE_SIGNATURES: usize = 1;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -117,6 +126,140 @@ pub struct ChainBinding {
     pub claimed_caip2: String,
 }
 
+/// One segment of an [`ArtifactTemplate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactSegment {
+    /// Verbatim bytes copied into the assembled artifact.
+    Literal {
+        #[serde(rename = "bytes_hex")]
+        bytes_hex: String,
+    },
+    /// Slot for signature `index` (0-based), filled at signing.
+    Signature { index: usize },
+}
+
+/// The deterministic assembly plan for a signed artifact.
+///
+/// An artifact is `template.apply(signatures)`: literals copied verbatim,
+/// signature slots filled left-to-right from the recorded signature bytes.
+/// Staging validates that exactly one `Literal` segment byte-equals the
+/// staged payload, so a recorded artifact always embeds the exact bytes
+/// that were signed — a driver can never swap the message between staging
+/// and broadcast, because broadcast replays an artifact the template
+/// derived from the frozen payload.
+///
+/// Example (Solana legacy wire format): the segments
+/// `[Literal(0x01), Signature(0), Literal(message)]` assemble the exact
+/// signed transaction `0x01 || signature || message`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactTemplate {
+    pub segments: Vec<ArtifactSegment>,
+}
+
+impl ArtifactTemplate {
+    /// Number of signature slots the template declares.
+    pub fn signature_count(&self) -> usize {
+        self.segments
+            .iter()
+            .filter(|s| matches!(s, ArtifactSegment::Signature { .. }))
+            .count()
+    }
+
+    /// Validate the template against the staged payload: bounded segment
+    /// count, dense 0-based signature indices, exactly one literal segment
+    /// byte-equal to `payload`, and an assembled size within the artifact
+    /// cap.
+    pub fn validate(&self, payload: &[u8]) -> Result<(), OutboxError> {
+        if self.segments.is_empty() || self.segments.len() > MAX_TEMPLATE_SEGMENTS {
+            return Err(OutboxError::InvalidTemplate(format!(
+                "template must contain 1-{MAX_TEMPLATE_SEGMENTS} segments"
+            )));
+        }
+        let signature_count = self.signature_count();
+        if signature_count == 0 || signature_count > MAX_TEMPLATE_SIGNATURES {
+            return Err(OutboxError::InvalidTemplate(format!(
+                "template must declare 1-{MAX_TEMPLATE_SIGNATURES} signature slots"
+            )));
+        }
+        let mut seen = vec![false; signature_count];
+        let mut payload_literals = 0usize;
+        let mut assembled = 0usize;
+        for segment in &self.segments {
+            match segment {
+                ArtifactSegment::Literal { bytes_hex } => {
+                    let bytes = hex::decode(bytes_hex).map_err(|e| {
+                        OutboxError::InvalidTemplate(format!("literal bytes_hex: {e}"))
+                    })?;
+                    if bytes == payload {
+                        payload_literals += 1;
+                    }
+                    assembled = assembled
+                        .checked_add(bytes.len())
+                        .ok_or_else(|| OutboxError::InvalidTemplate("size overflow".into()))?;
+                }
+                ArtifactSegment::Signature { index } => {
+                    if *index >= seen.len() || seen[*index] {
+                        return Err(OutboxError::InvalidTemplate(
+                            "signature indices must be dense and unique".into(),
+                        ));
+                    }
+                    seen[*index] = true;
+                    assembled = assembled
+                        .checked_add(MAX_SIGNATURE_BYTES)
+                        .ok_or_else(|| OutboxError::InvalidTemplate("size overflow".into()))?;
+                }
+            }
+        }
+        if payload_literals != 1 {
+            return Err(OutboxError::InvalidTemplate(format!(
+                "exactly one literal segment must byte-equal the staged payload (found {payload_literals})"
+            )));
+        }
+        if assembled > MAX_ARTIFACT_BYTES {
+            return Err(OutboxError::InvalidTemplate(format!(
+                "assembled artifact exceeds {MAX_ARTIFACT_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Assemble the signed artifact: literals copied verbatim, signature
+    /// slots filled by index. `signatures` must supply exactly
+    /// [`ArtifactTemplate::signature_count`] entries.
+    pub fn apply(&self, signatures: &[Vec<u8>]) -> Result<Vec<u8>, OutboxError> {
+        if signatures.len() != self.signature_count() {
+            return Err(OutboxError::InvalidTemplate(format!(
+                "template needs {} signatures, got {}",
+                self.signature_count(),
+                signatures.len()
+            )));
+        }
+        for signature in signatures {
+            if signature.len() > MAX_SIGNATURE_BYTES {
+                return Err(OutboxError::SignatureTooLarge(signature.len()));
+            }
+        }
+        let mut out = Vec::new();
+        for segment in &self.segments {
+            match segment {
+                ArtifactSegment::Literal { bytes_hex } => {
+                    out.extend_from_slice(&hex::decode(bytes_hex).map_err(|e| {
+                        OutboxError::InvalidEnvelope(format!("template literal: {e}"))
+                    })?);
+                }
+                ArtifactSegment::Signature { index } => {
+                    out.extend_from_slice(&signatures[*index]);
+                }
+            }
+        }
+        if out.len() > MAX_ARTIFACT_BYTES {
+            return Err(OutboxError::ArtifactTooLarge(out.len()));
+        }
+        Ok(out)
+    }
+}
+
 /// The immutable staged envelope, written once at staging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -135,6 +278,8 @@ pub struct Envelope {
     pub payload_hex: String,
     /// SHA-256 of the payload bytes.
     pub payload_digest_hex: String,
+    /// Deterministic assembly plan for this action's signed artifact.
+    pub artifact_template: ArtifactTemplate,
     pub created_at_ms: u64,
     /// 0 means no expiry.
     pub expires_at_ms: u64,
@@ -167,6 +312,7 @@ impl Envelope {
         if self.payload_digest_hex != sha256_hex(&self.payload_bytes()?) {
             return Err(OutboxError::PayloadDigestMismatch);
         }
+        self.artifact_template.validate(&self.payload_bytes()?)?;
         Ok(())
     }
 
@@ -238,6 +384,7 @@ pub struct NewAction {
     pub operation_class: String,
     pub crypto_suite: String,
     pub payload: Vec<u8>,
+    pub artifact_template: ArtifactTemplate,
     pub created_at_ms: u64,
     pub expires_at_ms: u64,
 }
@@ -272,7 +419,10 @@ pub enum Transition {
     /// never verifier-proven, and this records what was observed and bound.
     /// Amounts are exact decimal strings in a chain-defined unit — never a
     /// chain-specific field name in this crate.
-    FeeObserved { fee: AmountFact, ceiling: AmountFact },
+    FeeObserved {
+        fee: AmountFact,
+        ceiling: AmountFact,
+    },
     /// Verifier-established facts for the exact staged payload. This is a
     /// byte-exact, digest-bound copy of Broker's compiled verifier output —
     /// the outbox never hand-assembles or re-derives these fields, and
@@ -456,6 +606,8 @@ pub enum OutboxError {
     NotFound(String),
     #[error("invalid envelope: {0}")]
     InvalidEnvelope(String),
+    #[error("invalid artifact template: {0}")]
+    InvalidTemplate(String),
     #[error("envelope schema '{0}' is not {ENVELOPE_SCHEMA}")]
     EnvelopeSchema(String),
     #[error("envelope payload digest mismatch (envelope mutated on disk)")]
@@ -620,6 +772,7 @@ impl ChainActionOutbox {
             crypto_suite: request.crypto_suite,
             payload_hex: hex::encode(&request.payload),
             payload_digest_hex: sha256_hex(&request.payload),
+            artifact_template: request.artifact_template,
             created_at_ms: request.created_at_ms,
             expires_at_ms: request.expires_at_ms,
         };
@@ -771,6 +924,10 @@ impl ChainActionOutbox {
     /// Record the exact signature and assembled signed artifact. Legal exactly
     /// once, from `Staged`. Recording identical bytes again is idempotent;
     /// anything else is rejected — a second signature is never recorded.
+    ///
+    /// The artifact must equal the envelope's [`ArtifactTemplate`] applied to
+    /// the signature, so the persisted artifact is always the deterministic
+    /// derivation of the frozen payload plus the recorded signature bytes.
     pub fn record_signed(
         &self,
         operation_id: &str,
@@ -804,6 +961,15 @@ impl ChainActionOutbox {
                     to: "signed",
                 });
             }
+        }
+        let expected = action
+            .envelope
+            .artifact_template
+            .apply(&[signature.to_vec()])?;
+        if expected != artifact {
+            return Err(OutboxError::InvalidTemplate(format!(
+                "artifact does not match the staged template applied to the signature"
+            )));
         }
         let digest = sha256_hex(artifact);
         self.append(
@@ -968,7 +1134,11 @@ impl ChainActionOutbox {
                 });
             }
         }
-        self.append(operation_id, now_ms, Transition::FeeObserved { fee, ceiling })?;
+        self.append(
+            operation_id,
+            now_ms,
+            Transition::FeeObserved { fee, ceiling },
+        )?;
         self.load(operation_id)
     }
 
