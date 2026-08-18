@@ -60,3 +60,11 @@ examples/local-petal-apps/build/
 
 # Generated Petal build artifacts.
 examples/local-petal-apps/polymarket/app/polymarket/**/*.wasm
+
+# Local Solana validator scratch (test-ledger dirs created by solana-test-validator).
+test-ledger/
+# Session/agent scratch.
+.agents/
+session/
+sessions/
+vfs-agent.md
