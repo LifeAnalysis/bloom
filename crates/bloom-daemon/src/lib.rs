@@ -5942,6 +5942,96 @@ mod tests {
         assert!(matches!(missing, HostError::NotFound(_)));
     }
 
+    /// Real-validator read-path E2E, driven by `solana-validator.yml`. Not a
+    /// unit test: it requires a live Agave local validator and the operator
+    /// endpoint/genesis environment, so it is `#[ignore]`d and run explicitly
+    /// by the workflow against a pinned validator.
+    #[tokio::test]
+    #[ignore]
+    async fn daemon_chain_driver_read_against_live_validator() {
+        let endpoint =
+            std::env::var("SOLANA_VALIDATOR_HTTP").expect("SOLANA_VALIDATOR_HTTP is required");
+        let genesis = std::env::var("SOLANA_VALIDATOR_GENESIS")
+            .expect("SOLANA_VALIDATOR_GENESIS is required");
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+        let profile = ChainDriverProfile {
+            name: "solana-local".into(),
+            family: "solana".into(),
+            expected_genesis_hex: genesis,
+            http_endpoint: endpoint,
+            allowed_read_methods: vec![
+                "getHealth".into(),
+                "getGenesisHash".into(),
+                "getLatestBlockhash".into(),
+                "getBlockHeight".into(),
+            ],
+            broadcast_method: None,
+            allow_broadcast: false,
+        };
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone())
+            .with_tx_outbox(PetalTxOutbox {
+                tx_engine: daemon.tx_engine.clone(),
+                chains: daemon.chains.clone(),
+                chain_drivers: Arc::new(ChainDriverRegistry::new(vec![profile])),
+                wallet_projections: daemon.wallet_projections.clone(),
+                address_book: daemon.address_book.clone(),
+                write_permit: daemon.home_write_permit.clone(),
+            });
+        let context = PetalRouteContext {
+            petal_root: "solana-driver".into(),
+            package_hash: "c".repeat(64),
+            route_id: "r000001".into(),
+            op: "read".into(),
+            path: "/transfer.stage.json".into(),
+            params: vec![],
+            actor: None,
+        };
+
+        // Genesis-bound health through the daemon's inline chain-driver
+        // dispatch (genesis hash checked once per profile, then cached).
+        let health = host
+            .chain_read(ChainRequest {
+                chain: "solana-local".into(),
+                method: "getHealth".into(),
+                params_json: "[]".into(),
+                context: Some(context.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(health.result_json, "\"ok\"");
+
+        let blockhash = host
+            .chain_read(ChainRequest {
+                chain: "solana-local".into(),
+                method: "getLatestBlockhash".into(),
+                params_json: "[]".into(),
+                context: Some(context.clone()),
+            })
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&blockhash.result_json).unwrap();
+        assert!(
+            value.pointer("/value/blockhash").is_some(),
+            "getLatestBlockhash should return a blockhash: {value}"
+        );
+
+        // A write method is refused: broadcast_method is unset for this
+        // profile, so sendTransaction is not the configured write method and
+        // falls through to the read allowlist, which denies it.
+        let denied = host
+            .chain_read(ChainRequest {
+                chain: "solana-local".into(),
+                method: "sendTransaction".into(),
+                params_json: "[\"AA==\"]".into(),
+                context: Some(context),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(denied, HostError::Denied(_)), "{denied}");
+    }
+
     #[tokio::test]
     async fn chain_action_sign_stage_record_and_gated_broadcast() {
         // The stub answers genesis, sendTransaction, and nothing else.

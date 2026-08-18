@@ -3,7 +3,7 @@
 //! Invokes the same pure `build_petal_package_dir` path the daemon's
 //! `petals.build` IPC wraps, writing `artifacts/build-manifest.json` and the
 //! content-addressed route artifacts. Used by hermetic reproduction scripts
-//! (`petals/solana-driver/verify-repro.sh`) where no daemon may be running.
+//! where no daemon may be running.
 //!
 //! Usage: `cargo run -p bloom-petals --example build_petal_package -- <package-dir>`
 
