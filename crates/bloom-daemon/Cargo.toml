@@ -33,6 +33,7 @@ bloom-broker-api.workspace = true
 bloom-tx.workspace = true
 bloom-tools.workspace = true
 bloom-vfs.workspace = true
+bloom-chain-action.workspace = true
 bloom-watch.workspace = true
 bloom-mount.workspace = true
 bloom-ens.workspace = true

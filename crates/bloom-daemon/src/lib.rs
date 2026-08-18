@@ -231,10 +231,350 @@ struct DaemonPetalHost {
     petal_key_lock: tokio::sync::Mutex<()>,
     petal_signing_state_root: Option<PathBuf>,
     petal_signing_lock: tokio::sync::Mutex<()>,
+    /// Durable chain-action outbox (Solana and future non-EVM families),
+    /// rooted at `<home>/chain-actions`. `None` disables the chain-action
+    /// sign path entirely — fail closed, never silently skip.
+    chain_action_outbox: Option<Arc<bloom_chain_action::ChainActionOutbox>>,
+    /// Operator release flag for chain-driver broadcast: latched once at
+    /// daemon start from `BLOOM_CHAIN_BROADCAST_RELEASE=1` and required,
+    /// together with each profile's `allow_broadcast`, before any write
+    /// method dispatches.
+    chain_broadcast_release: bool,
 }
 
 const PETAL_KEY_STATE_SCHEMA: &str = "bloom.machine.petal-key-request.v2";
 const PETAL_KEY_INPUT_CLASS: &str = "petal-key-scope-v2";
+
+/// The chain claim a driver Petal supplies inside `sign-payload`'s `action`
+/// document alongside its artifact template. Every field is a *claim* —
+/// visible provenance, never verifier-proven — and the whole document is
+/// digest-bound into the exact approval facts (`action_digest`), so it
+/// cannot change between approval preparation and signing.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ChainActionChainClaim {
+    family: String,
+    profile: String,
+    claimed_caip2: String,
+}
+
+/// The chain-action portion of a `sign-payload` `action` document. A Petal
+/// that wants its signature recorded in the durable chain-action outbox
+/// supplies exactly this shape; a Petal that does not leaves
+/// `artifact_template` absent and signing proceeds unchanged.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct ChainActionDocument {
+    chain: ChainActionChainClaim,
+    artifact_template: bloom_chain_action::ArtifactTemplate,
+}
+
+impl DaemonPetalHost {
+    /// Parse and stage the chain action for an exact `sign-payload` request
+    /// whose `action` document carries an artifact template. Returns `None`
+    /// when the request is not a chain action (no `artifact_template`
+    /// present). Staging is idempotent per request: the operation id is the
+    /// deterministic `request_id`, so the action staged here is exactly the
+    /// one the `Signed` branch records the artifact for.
+    fn stage_chain_action(
+        &self,
+        context: &PetalRouteContext,
+        req: &bloom_petals::PayloadSignRequest,
+        request_id: &str,
+    ) -> Result<Option<ChainActionDocument>, HostError> {
+        let Some(action) = req.action.as_deref() else {
+            return Ok(None);
+        };
+        // Probe before strict parse: an `action` document that is not JSON,
+        // or valid JSON without an `artifact_template` key, is some other
+        // Petal's frozen action — signing proceeds unchanged, and such a
+        // request can never broadcast (no artifact is ever recorded for it).
+        let Ok(probe) = serde_json::from_slice::<serde_json::Value>(action) else {
+            return Ok(None);
+        };
+        if probe.get("artifact_template").is_none() {
+            return Ok(None);
+        }
+        let document: ChainActionDocument = serde_json::from_value(probe).map_err(|e| {
+            HostError::Invalid(format!(
+                "chain-action sign request has a malformed action document: {e}"
+            ))
+        })?;
+        let outbox = self.chain_action_outbox.as_ref().ok_or_else(|| {
+            HostError::Backend(
+                "SERVICE_UNAVAILABLE: the durable chain-action outbox is not configured".into(),
+            )
+        })?;
+        // Fail closed on an unconfigured profile: the action would never be
+        // broadcastable through the profile it claims.
+        let profile_configured = self
+            .tx_outbox
+            .as_ref()
+            .map(|service| service.chain_drivers.get(&document.chain.profile).is_some())
+            .unwrap_or(false);
+        if !profile_configured {
+            return Err(HostError::Invalid(format!(
+                "chain-action sign request names unconfigured profile {:?}",
+                document.chain.profile
+            )));
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        outbox
+            .stage(bloom_chain_action::NewAction {
+                operation_id: request_id.to_string(),
+                idempotency_key: format!("exact-{request_id}"),
+                driver: bloom_chain_action::DriverBinding {
+                    package_hash: context.package_hash.clone(),
+                    route: context.route_id.clone(),
+                    abi_version: 1,
+                    state_schema: 1,
+                },
+                wallet_id: req.wallet.clone(),
+                // Exact signing uses Machine-owned root selection; this
+                // records that provenance rather than a key coordinate.
+                key_ref: "broker-exact-selection".to_string(),
+                chain: bloom_chain_action::ChainBinding {
+                    family: document.chain.family.clone(),
+                    profile: document.chain.profile.clone(),
+                    claimed_caip2: document.chain.claimed_caip2.clone(),
+                },
+                operation_class: req.operation_class.clone(),
+                crypto_suite: req.signature_algorithm.clone(),
+                payload: req.preimage.clone(),
+                artifact_template: document.artifact_template.clone(),
+                created_at_ms: now_ms,
+                // The approval ceremony owns liveness/expiry; the outbox
+                // keeps this action until it is signed or cancelled.
+                expires_at_ms: 0,
+            })
+            .map_err(|e| HostError::Backend(format!("stage chain action: {e}")))?;
+        Ok(Some(document))
+    }
+
+    /// Record the signed artifact in the same step that marks the exact
+    /// signing request signed: apply the staged template to the signature
+    /// and persist via `record_signed`. `NotFound` (a non-chain-action
+    /// request) is not an error.
+    fn record_signed_chain_action(
+        &self,
+        request_id: &str,
+        signature: &[u8],
+        document: Option<&ChainActionDocument>,
+    ) -> Result<(), HostError> {
+        let Some(outbox) = self.chain_action_outbox.as_ref() else {
+            if document.is_some() {
+                return Err(HostError::Backend(
+                    "SERVICE_UNAVAILABLE: the durable chain-action outbox is not configured".into(),
+                ));
+            }
+            return Ok(());
+        };
+        let action = match outbox.load(request_id) {
+            Ok(action) => action,
+            Err(bloom_chain_action::OutboxError::NotFound(_)) => return Ok(()),
+            Err(e) => {
+                return Err(HostError::Backend(format!(
+                    "load chain action for signing: {e}"
+                )));
+            }
+        };
+        let template = document
+            .as_ref()
+            .map(|d| d.artifact_template.clone())
+            .unwrap_or_else(|| action.envelope.artifact_template.clone());
+        let artifact = template
+            .apply(&[signature.to_vec()])
+            .map_err(|e| HostError::Backend(format!("apply artifact template: {e}")))?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        outbox
+            .record_signed(request_id, now_ms, signature, &artifact)
+            .map_err(|e| HostError::Backend(format!("record signed chain action: {e}")))?;
+        Ok(())
+    }
+
+    /// The separately-gated write path for chain-driver profiles: the only
+    /// method in the write class this release knows is `sendTransaction`,
+    /// and dispatch requires all three gates — the configured
+    /// `broadcast_method`, `allow_broadcast`, and the operator release flag
+    /// (`BLOOM_CHAIN_BROADCAST_RELEASE=1`) — plus the byte-equality gate:
+    /// the submitted transaction bytes must equal the artifact recorded at
+    /// sign time for a staged action of this profile, else the call is
+    /// refused and audited with the outbox left `Signed`.
+    async fn chain_driver_broadcast(
+        &self,
+        profile: &ChainDriverProfile,
+        method: &str,
+        params_json: &str,
+    ) -> Result<String, HostError> {
+        const WRITE_CLASS: &str = "sendTransaction";
+        if method != WRITE_CLASS {
+            return Err(HostError::Denied(format!(
+                "chain write method {method:?} is not in the write-class allowlist"
+            )));
+        }
+        let release_flag = self.chain_broadcast_release;
+        if !profile.allow_broadcast || !release_flag {
+            self.audit_chain_driver_refusal(
+                profile,
+                method,
+                "gated: allow_broadcast and BLOOM_CHAIN_BROADCAST_RELEASE=1 are both required",
+            )?;
+            return Err(HostError::Denied(format!(
+                "chain-driver profile '{}' broadcast is disabled: requires allow_broadcast and the operator release flag",
+                profile.name
+            )));
+        }
+        let outbox = self.chain_action_outbox.as_ref().ok_or_else(|| {
+            HostError::Backend(
+                "SERVICE_UNAVAILABLE: the durable chain-action outbox is not configured".into(),
+            )
+        })?;
+        let params: Vec<serde_json::Value> = serde_json::from_str(params_json).map_err(|e| {
+            HostError::Invalid(format!("broadcast params must be a JSON array: {e}"))
+        })?;
+        if params.is_empty() || params.len() > 2 {
+            return Err(HostError::Invalid(
+                "sendTransaction takes [wire_bytes_base64] with an optional config object".into(),
+            ));
+        }
+        if let Some(encoding) = params
+            .get(1)
+            .and_then(|config| config.get("encoding"))
+            .and_then(|v| v.as_str())
+            && encoding != "base64"
+        {
+            return Err(HostError::Invalid(format!(
+                "unsupported sendTransaction encoding {encoding:?}"
+            )));
+        }
+        use base64::Engine as _;
+        let submitted = base64::engine::general_purpose::STANDARD
+            .decode(params[0].as_str().ok_or_else(|| {
+                HostError::Invalid("sendTransaction wire bytes must be a base64 string".into())
+            })?)
+            .map_err(|e| HostError::Invalid(format!("sendTransaction wire bytes: {e}")))?;
+
+        // Byte-equality gate: the submitted bytes must be the exact artifact
+        // recorded at sign time for an action of this profile.
+        let mut matched = None;
+        for operation_id in outbox.list().map_err(backend_outbox_err)? {
+            let action = outbox.load(&operation_id).map_err(backend_outbox_err)?;
+            let Some(artifact) = action.artifact.as_ref() else {
+                continue;
+            };
+            if artifact.artifact != submitted {
+                continue;
+            }
+            if action.envelope.chain.profile != profile.name {
+                self.audit_chain_driver_refusal(
+                    profile,
+                    method,
+                    &format!(
+                        "artifact of operation {operation_id} belongs to profile {:?}",
+                        action.envelope.chain.profile
+                    ),
+                )?;
+                return Err(HostError::Denied(
+                    "broadcast artifact belongs to a different chain profile".into(),
+                ));
+            }
+            match action.state {
+                bloom_chain_action::ActionState::Signed
+                | bloom_chain_action::ActionState::Ambiguous
+                | bloom_chain_action::ActionState::Sent => {}
+                other => {
+                    return Err(HostError::Denied(format!(
+                        "chain action {operation_id} is state {other}, not broadcastable"
+                    )));
+                }
+            }
+            matched = Some(operation_id);
+            break;
+        }
+        let Some(operation_id) = matched else {
+            self.audit_chain_driver_refusal(
+                profile,
+                method,
+                "submitted bytes match no recorded signed artifact",
+            )?;
+            return Err(HostError::Denied(
+                "broadcast refused: the submitted transaction bytes do not byte-equal any artifact recorded at sign time".into(),
+            ));
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let action = outbox
+            .record_broadcast_attempt(&operation_id, now_ms)
+            .map_err(backend_outbox_err)?;
+        let attempt = action
+            .attempts
+            .last()
+            .expect("attempt just recorded")
+            .attempt;
+        let dispatched = chain_driver_rpc_call_classified(
+            &self.http,
+            &profile.http_endpoint,
+            method,
+            &serde_json::Value::Array(params),
+        )
+        .await;
+        let outcome = match &dispatched {
+            Ok(_) => bloom_chain_action::BroadcastOutcome::Accepted,
+            Err(ChainDriverRpcFailure::Timeout) => bloom_chain_action::BroadcastOutcome::Ambiguous,
+            Err(ChainDriverRpcFailure::Other(reason)) => {
+                bloom_chain_action::BroadcastOutcome::Rejected {
+                    reason: reason.clone(),
+                }
+            }
+        };
+        outbox
+            .record_broadcast_outcome(&operation_id, now_ms, attempt, outcome)
+            .map_err(backend_outbox_err)?;
+        match dispatched {
+            // The provider's own return value (the transaction signature).
+            Ok(value) => serde_json::to_string(&value)
+                .map_err(|e| HostError::Backend(format!("encode broadcast result: {e}"))),
+            Err(ChainDriverRpcFailure::Timeout) => Err(HostError::Backend(
+                "chain rpc timed out after dispatch; outcome recorded as ambiguous".into(),
+            )),
+            Err(ChainDriverRpcFailure::Other(reason)) => {
+                Err(HostError::Backend(format!("chain rpc error: {reason}")))
+            }
+        }
+    }
+
+    fn audit_chain_driver_refusal(
+        &self,
+        profile: &ChainDriverProfile,
+        method: &str,
+        reason: &str,
+    ) -> Result<(), HostError> {
+        self.audit
+            .append(AuditRecord {
+                ts_ms: 0,
+                kind: "machine.effect.refused".into(),
+                wallet: None,
+                chain: Some(profile.name.clone()),
+                data: serde_json::json!({
+                    "operation": "petal.chain_driver_broadcast",
+                    "profile": profile.name,
+                    "method": method,
+                    "reason": reason,
+                }),
+                prev: String::new(),
+                digest: String::new(),
+            })
+            .map_err(|error| HostError::Backend(format!("Machine audit unavailable: {error}")))?;
+        Ok(())
+    }
+}
 
 /// Machine-owned public reconciliation record. The ceremony URL is retained
 /// here for an owner-readable status projection, but is never returned across
@@ -306,8 +646,14 @@ struct ChainDriverProfile {
     http_endpoint: String,
     #[serde(default)]
     allowed_read_methods: Vec<String>,
+    /// The single permitted write method for this profile (the write method
+    /// class). When set, the value must be `sendTransaction` — the only
+    /// method in the write class this release knows — and dispatch is
+    /// additionally gated on [`ChainDriverProfile::allow_broadcast`] plus
+    /// the operator release flag (`BLOOM_CHAIN_BROADCAST_RELEASE=1`).
     #[serde(default)]
-    #[allow(dead_code)] // broadcast wiring lands with the post-sign half
+    broadcast_method: Option<String>,
+    #[serde(default)]
     allow_broadcast: bool,
 }
 
@@ -321,7 +667,8 @@ struct ChainDriverProfilesFile {
 }
 
 fn chain_driver_profile_is_mainnet(profile: &ChainDriverProfile) -> bool {
-    profile.name.to_lowercase().contains("mainnet") || profile.family.to_lowercase().contains("mainnet")
+    profile.name.to_lowercase().contains("mainnet")
+        || profile.family.to_lowercase().contains("mainnet")
 }
 
 /// Load `<state>/chain-profiles.json`. A missing file means no non-EVM
@@ -438,6 +785,8 @@ impl DaemonPetalHost {
             petal_key_state_root: None,
             petal_key_lock: tokio::sync::Mutex::new(()),
             petal_signing_state_root: None,
+            chain_action_outbox: None,
+            chain_broadcast_release: false,
             petal_signing_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -467,6 +816,19 @@ impl DaemonPetalHost {
 
     fn with_petal_signing_state_root(mut self, root: PathBuf) -> Self {
         self.petal_signing_state_root = Some(root);
+        self
+    }
+
+    fn with_chain_action_outbox(mut self, root: PathBuf) -> Self {
+        self.chain_action_outbox = Some(Arc::new(
+            bloom_chain_action::ChainActionOutbox::new(root)
+                .expect("chain-action outbox root is creatable"),
+        ));
+        self
+    }
+
+    fn with_chain_broadcast_release(mut self, released: bool) -> Self {
+        self.chain_broadcast_release = released;
         self
     }
 
@@ -1342,6 +1704,10 @@ impl PetalHost for DaemonPetalHost {
                 HostError::Backend("installer provenance catalog is not configured".into())
             })?;
             let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog);
+            // Chain actions (Solana and future families): stage the durable
+            // action before the Broker edge so both outcomes — approval
+            // preparation and signing — operate on the same frozen envelope.
+            let chain_action_document = self.stage_chain_action(context, &req, &request_id)?;
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer
                 .sign_or_prepare_petal(
@@ -1387,6 +1753,14 @@ impl PetalHost for DaemonPetalHost {
                     }))
                 }
                 bloom_vfs::ExactPayloadOutcome::Signed(bytes) => {
+                    // Record the chain-action artifact in the same step that
+                    // marks this request signed: the staged template applied
+                    // to the returned signature.
+                    self.record_signed_chain_action(
+                        &request_id,
+                        &bytes,
+                        chain_action_document.as_ref(),
+                    )?;
                     Self::write_petal_signing_projection(
                         &owner_projection_path,
                         &PetalSigningRequestProjection {
@@ -1964,10 +2338,17 @@ impl PetalHost for DaemonPetalHost {
         // families) — additive; neither registry's names are expected to
         // collide, but EVM wins on a collision to preserve prior behavior.
         if let Some(chain) = service.chains.get(&req.chain) {
-            let result_json = daemon_petal_chain_read(&chain, &req.method, &req.params_json).await?;
+            let result_json =
+                daemon_petal_chain_read(&chain, &req.method, &req.params_json).await?;
             return Ok(ChainResponse { result_json });
         }
         if let Some(profile) = service.chain_drivers.get(&req.chain) {
+            if profile.broadcast_method.as_deref() == Some(req.method.as_str()) {
+                let result_json = self
+                    .chain_driver_broadcast(profile, &req.method, &req.params_json)
+                    .await?;
+                return Ok(ChainResponse { result_json });
+            }
             let result_json = daemon_petal_chain_driver_read(
                 &self.http,
                 &service.chain_drivers,
@@ -1980,6 +2361,10 @@ impl PetalHost for DaemonPetalHost {
         }
         Err(HostError::NotFound(format!("chain {}", req.chain)))
     }
+}
+
+fn backend_outbox_err(e: bloom_chain_action::OutboxError) -> HostError {
+    HostError::Backend(format!("chain-action outbox: {e}"))
 }
 
 /// Response cap for a chain-driver JSON-RPC read, mirroring the EVM path's
@@ -2013,8 +2398,13 @@ async fn daemon_petal_chain_driver_read(
     // permanently lock a profile out once it recovers.
     let already_verified = registry.genesis_verified.lock().contains(&profile.name);
     if !already_verified {
-        let observed = chain_driver_rpc_call(http, &profile.http_endpoint, "getGenesisHash", &serde_json::Value::Array(vec![]))
-            .await?;
+        let observed = chain_driver_rpc_call(
+            http,
+            &profile.http_endpoint,
+            "getGenesisHash",
+            &serde_json::Value::Array(vec![]),
+        )
+        .await?;
         let observed = observed.as_str().unwrap_or_default();
         if observed != profile.expected_genesis_hex {
             return Err(HostError::Denied(format!(
@@ -2022,7 +2412,10 @@ async fn daemon_petal_chain_driver_read(
                 profile.name, profile.expected_genesis_hex
             )));
         }
-        registry.genesis_verified.lock().insert(profile.name.clone());
+        registry
+            .genesis_verified
+            .lock()
+            .insert(profile.name.clone());
     }
 
     let result = chain_driver_rpc_call(http, &profile.http_endpoint, method, &params).await?;
@@ -2037,29 +2430,62 @@ async fn chain_driver_rpc_call(
     method: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, HostError> {
-    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-    let response = http
-        .post(endpoint)
-        .json(&body)
-        .send()
+    chain_driver_rpc_call_classified(http, endpoint, method, params)
         .await
-        .map_err(|e| HostError::Backend(format!("chain rpc transport: {e}")))?;
+        .map_err(|e| HostError::Backend(format!("chain rpc transport: {e}")))
+}
+
+/// Why a chain-driver JSON-RPC call failed. `Timeout` means the effect is
+/// unknown (a post-dispatch timeout is `Ambiguous`); `Other` is a
+/// definitive failure.
+#[derive(Debug, Clone)]
+enum ChainDriverRpcFailure {
+    Timeout,
+    Other(String),
+}
+
+impl std::fmt::Display for ChainDriverRpcFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("chain rpc timeout"),
+            Self::Other(reason) => write!(f, "chain rpc: {reason}"),
+        }
+    }
+}
+
+async fn chain_driver_rpc_call_classified(
+    http: &reqwest::Client,
+    endpoint: &str,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, ChainDriverRpcFailure> {
+    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    let response = http.post(endpoint).json(&body).send().await.map_err(|e| {
+        if e.is_timeout() {
+            ChainDriverRpcFailure::Timeout
+        } else {
+            ChainDriverRpcFailure::Other(format!("chain rpc transport: {e}"))
+        }
+    })?;
     let bytes = response
         .bytes()
         .await
-        .map_err(|e| HostError::Backend(format!("chain rpc transport: {e}")))?;
+        .map_err(|e| ChainDriverRpcFailure::Other(format!("chain rpc transport: {e}")))?;
     if bytes.len() > CHAIN_DRIVER_MAX_RESPONSE_BYTES {
-        return Err(HostError::Backend(format!(
+        return Err(ChainDriverRpcFailure::Other(format!(
             "chain rpc response of {} bytes exceeds the {CHAIN_DRIVER_MAX_RESPONSE_BYTES}-byte cap",
             bytes.len()
         )));
     }
     let payload: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| HostError::Backend(format!("chain rpc decode: {e}")))?;
+        .map_err(|e| ChainDriverRpcFailure::Other(format!("chain rpc decode: {e}")))?;
     if let Some(error) = payload.get("error") {
-        return Err(HostError::Backend(format!("chain rpc error: {error}")));
+        return Err(ChainDriverRpcFailure::Other(format!("{error}")));
     }
-    Ok(payload.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    Ok(payload
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 #[derive(serde::Deserialize)]
@@ -3145,8 +3571,7 @@ impl Daemon {
         // `~/.bloom/chain-drivers/chain-profiles.json`. Absent that file
         // this is an empty registry: chain_read for a name neither the EVM
         // ChainRegistry nor this registry knows simply returns NotFound.
-        let chain_driver_profiles =
-            load_chain_driver_profiles(&home.root().join("chain-drivers"))?;
+        let chain_driver_profiles = load_chain_driver_profiles(&home.root().join("chain-drivers"))?;
         let chain_drivers = Arc::new(ChainDriverRegistry::new(chain_driver_profiles));
 
         let petal_app_host = DaemonPetalHost::new(petal_vfs_host.clone(), audit_arc.clone())
@@ -3154,6 +3579,11 @@ impl Daemon {
             .with_provenance_catalog(provenance_catalog.clone())
             .with_petal_key_state_root(home.cache_dir().join("petal-key-requests"))
             .with_petal_signing_state_root(home.cache_dir().join("petal-signing-requests"))
+            .with_chain_action_outbox(home.root().join("chain-actions"))
+            .with_chain_broadcast_release(
+                std::env::var_os("BLOOM_CHAIN_BROADCAST_RELEASE").as_deref()
+                    == Some(std::ffi::OsStr::new("1")),
+            )
             .with_tx_outbox(PetalTxOutbox {
                 tx_engine: tx_engine.clone(),
                 chains: chains.clone(),
@@ -5370,7 +5800,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_petal_chain_read_dispatches_non_evm_families_through_the_generic_driver_registry()
-    {
+     {
         // A tiny real HTTP JSON-RPC stub standing in for a Solana RPC
         // endpoint: it answers exactly the calls this test makes and
         // nothing else, so this test exercises the real reqwest-based
@@ -5390,7 +5820,10 @@ mod tests {
                         let n = socket.read(&mut buf).await.unwrap_or(0);
                         let request = String::from_utf8_lossy(&buf[..n]);
                         let body = if request.contains("getGenesisHash") {
-                            format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{}"}}"#, "ab".repeat(32))
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":1,"result":"{}"}}"#,
+                                "ab".repeat(32)
+                            )
                         } else if request.contains("getHealth") {
                             r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#.to_string()
                         } else {
@@ -5419,6 +5852,7 @@ mod tests {
             expected_genesis_hex: "ab".repeat(32),
             http_endpoint: endpoint,
             allowed_read_methods: vec!["getHealth".into()],
+            broadcast_method: None,
             allow_broadcast: false,
         };
         let chain_drivers = Arc::new(ChainDriverRegistry::new(vec![profile]));
@@ -5498,6 +5932,215 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(missing, HostError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn chain_action_sign_stage_record_and_gated_broadcast() {
+        // The stub answers genesis, sendTransaction, and nothing else.
+        async fn spawn_stub_json_rpc() -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = vec![0u8; 8192];
+                        let n = socket.read(&mut buf).await.unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buf[..n]);
+                        let body = if request.contains("getGenesisHash") {
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":1,"result":"{}"}}"#,
+                                "ab".repeat(32)
+                            )
+                        } else if request.contains("sendTransaction") {
+                            r#"{"jsonrpc":"2.0","id":1,"result":"4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4TdSXKZT9HYqjs"}"#
+                                .to_string()
+                        } else {
+                            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#
+                                .to_string()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            format!("http://{addr}/")
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+        let endpoint = spawn_stub_json_rpc().await;
+        let profile = ChainDriverProfile {
+            name: "solana-devnet".into(),
+            family: "solana".into(),
+            expected_genesis_hex: "ab".repeat(32),
+            http_endpoint: endpoint,
+            allowed_read_methods: vec![],
+            broadcast_method: Some("sendTransaction".into()),
+            allow_broadcast: true,
+        };
+        let outbox_root = dir.path().join("chain-actions");
+
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone())
+            .with_tx_outbox(PetalTxOutbox {
+                tx_engine: daemon.tx_engine.clone(),
+                chains: daemon.chains.clone(),
+                chain_drivers: Arc::new(ChainDriverRegistry::new(vec![profile])),
+                wallet_projections: daemon.wallet_projections.clone(),
+                address_book: daemon.address_book.clone(),
+                write_permit: daemon.home_write_permit.clone(),
+            })
+            .with_chain_action_outbox(outbox_root.clone())
+            .with_chain_broadcast_release(true);
+        let context = PetalRouteContext {
+            petal_root: "solana-driver".into(),
+            package_hash: "c".repeat(64),
+            route_id: "r000003".into(),
+            op: "write".into(),
+            path: "/transfer.confirm.json".into(),
+            params: vec![],
+            actor: None,
+        };
+
+        // The Solana legacy artifact template: [0x01, signature(0), message].
+        let message = b"solana-message-bytes".to_vec();
+        let action_document = serde_json::json!({
+            "chain": {
+                "family": "solana",
+                "profile": "solana-devnet",
+                "claimed_caip2": "solana:devnet",
+            },
+            "artifact_template": {
+                "segments": [
+                    { "kind": "literal", "bytes_hex": "01" },
+                    { "kind": "signature", "index": 0 },
+                    { "kind": "literal", "bytes_hex": hex::encode(&message) },
+                ],
+            },
+        });
+        let request = bloom_petals::PayloadSignRequest {
+            wallet: "wallet-1".into(),
+            preimage: message.clone(),
+            claimed_hash: [0x42; 32],
+            signature_algorithm: "ed25519-message".into(),
+            operation_class: "solana.native-transfer".into(),
+            petal_use_claim_jcs: serde_jcs::to_vec(&serde_json::json!({
+                "package_hash": "c".repeat(64),
+            }))
+            .unwrap(),
+            claim_assurance_evidence: None,
+            approval_hint: None,
+            action: Some(serde_json::to_vec(&action_document).unwrap()),
+            advisory: None,
+            selector: bloom_broker_api::PetalSignSelector::Exact,
+            key_ref: None,
+            context: Some(context),
+        };
+
+        // Staging: the request id is deterministic but private to the sign
+        // path; reproduce it the same way petal_signing_paths does.
+        let outbox = host.chain_action_outbox.as_ref().unwrap();
+        assert_eq!(outbox.list().unwrap().len(), 0);
+        // Invoke the staging hook directly (the Broker edge is covered by
+        // the exact-signing tests; this test pins the outbox semantics).
+        let staged = host
+            .stage_chain_action(
+                request.context.as_ref().unwrap(),
+                &request,
+                &format!("{:064x}", 7u8),
+            )
+            .unwrap()
+            .expect("template-bearing action stages");
+        let operation_id = format!("{:064x}", 7u8);
+        let action = outbox.load(&operation_id).unwrap();
+        assert_eq!(action.state, bloom_chain_action::ActionState::Staged);
+        assert_eq!(action.envelope.chain.profile, "solana-devnet");
+        assert_eq!(action.envelope.payload_hex, hex::encode(&message));
+        assert_eq!(staged.chain.claimed_caip2, "solana:devnet");
+
+        // Recording: template-apply + record_signed in the Signed step.
+        let signature = vec![0x11u8; 64];
+        host.record_signed_chain_action(&operation_id, &signature, Some(&staged))
+            .unwrap();
+        let action = outbox.load(&operation_id).unwrap();
+        assert_eq!(action.state, bloom_chain_action::ActionState::Signed);
+        let artifact = action.artifact.as_ref().unwrap().artifact.clone();
+        let mut expected = vec![0x01u8];
+        expected.extend_from_slice(&signature);
+        expected.extend_from_slice(&message);
+        assert_eq!(artifact, expected);
+
+        // Broadcast gates: byte-equality first — wrong bytes are refused and
+        // audited, the outbox stays Signed.
+        use base64::Engine as _;
+        let wrong = base64::engine::general_purpose::STANDARD.encode(vec![0xff, 0xff]);
+        let refused = host
+            .chain_driver_broadcast(
+                host.tx_outbox
+                    .as_ref()
+                    .unwrap()
+                    .chain_drivers
+                    .get("solana-devnet")
+                    .unwrap(),
+                "sendTransaction",
+                &format!(r#"["{wrong}"]"#),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, HostError::Denied(_)), "{refused}");
+        assert_eq!(
+            outbox.load(&operation_id).unwrap().state,
+            bloom_chain_action::ActionState::Signed
+        );
+
+        // The exact artifact dispatches, records the attempt as Accepted,
+        // and returns the provider's signature.
+        let sent = base64::engine::general_purpose::STANDARD.encode(&artifact);
+        let result = host
+            .chain_driver_broadcast(
+                host.tx_outbox
+                    .as_ref()
+                    .unwrap()
+                    .chain_drivers
+                    .get("solana-devnet")
+                    .unwrap(),
+                "sendTransaction",
+                &format!(r#"["{sent}", {{"encoding": "base64"}}]"#),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4TdSXKZT9HYqjs"));
+        let action = outbox.load(&operation_id).unwrap();
+        assert_eq!(action.state, bloom_chain_action::ActionState::Sent);
+        assert_eq!(action.attempts.len(), 1);
+        assert!(action.attempts[0].outcome.is_some());
+
+        // The release flag gates the whole path: without it, even the
+        // recorded artifact is refused.
+        let host_locked = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone())
+            .with_chain_action_outbox(outbox_root.clone())
+            .with_chain_broadcast_release(false);
+        let locked = host_locked
+            .chain_driver_broadcast(
+                host.tx_outbox
+                    .as_ref()
+                    .unwrap()
+                    .chain_drivers
+                    .get("solana-devnet")
+                    .unwrap(),
+                "sendTransaction",
+                &format!(r#"["{sent}"]"#),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(locked, HostError::Denied(_)), "{locked}");
     }
 
     #[tokio::test]
