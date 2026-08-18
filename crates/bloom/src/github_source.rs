@@ -99,6 +99,24 @@ const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
     default_eligible: false,
 };
 
+// Fixture-authority posture (docs/plans/2026-08-14-solana-support.md): the
+// driver never signs or broadcasts real value yet, so this is not
+// default_eligible — an operator opts in explicitly via `bloom petal
+// install solana-driver` or `[petals] preinstalled` config, same as
+// gasless/privacy-pools/venice-x402 before their own authority swaps.
+const PREINSTALLED_SOLANA_DRIVER: PreinstalledPetal = PreinstalledPetal {
+    name: "solana-driver",
+    repository: "https://github.com/bloom-directory/bloom-petal-solana",
+    commit: "182e466a8e8e58ba17ec36e67b717665ae34b2de",
+    release_tag: "v0.1.1",
+    archive: "solana-driver-v0.1.1.petal.tar.gz",
+    expected_hash: Some("4f80cbf62fff178990c32e665fbeb24ceada138034b2acfe17fe493afc2b8cd7"),
+    archive_sha256: "b5a358176b1aa7658d550566b6881eed7ee25e794af9f255c1463b6c18812052",
+    tooling_commit: "61938d0c127cfe03c7e3e55baed0ba1439bc5ca2",
+    petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+    default_eligible: false,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitHubRepo {
     pub owner: String,
@@ -780,6 +798,7 @@ fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
         "gasless" => Some(&PREINSTALLED_GASLESS),
         "privacy-pools" => Some(&PREINSTALLED_PRIVACY_POOLS),
         "venice-x402" => Some(&PREINSTALLED_VENICE_X402),
+        "solana-driver" => Some(&PREINSTALLED_SOLANA_DRIVER),
         _ => None,
     }
 }
