@@ -2760,6 +2760,7 @@ dependencies = [
  "bloom-tx",
  "bloom-update",
  "bloom-watch",
+ "bs58",
  "fs2",
  "hex",
  "lru 0.12.5",

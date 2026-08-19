@@ -22,6 +22,29 @@ use crate::{assemble_transaction, build_transfer_message};
 /// Default approval/signing TTL for a staged transfer (ms).
 const SIGN_TTL_MS: u64 = 60_000;
 
+/// A native SOL transfer intent as supplied by the write surface
+/// (`wallets/<wallet>/chains/<chain>/outbox/new.tx`).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SolanaTransferIntent {
+    /// Destination public key, base58.
+    pub destination: String,
+    /// Native SOL debit in lamports.
+    pub lamports: u64,
+}
+
+impl SolanaTransferIntent {
+    /// The destination as its raw 32-byte public key.
+    pub fn destination_bytes(&self) -> Result<[u8; 32], String> {
+        let bytes = bs58::decode(&self.destination)
+            .into_vec()
+            .map_err(|e| e.to_string())?;
+        bytes
+            .try_into()
+            .map_err(|_| "destination must be a 32-byte base58 public key".to_string())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("outbox: {0}")]
