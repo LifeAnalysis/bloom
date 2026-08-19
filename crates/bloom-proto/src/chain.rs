@@ -200,6 +200,27 @@ impl ChainSpec {
     }
 }
 
+/// Operator configuration for one Solana cluster — the Solana analogue of
+/// [`ChainSpec`]. Chain-neutral endpoint config is reused from
+/// [`EndpointSpec`]; the Solana-specific fields (genesis binding, broadcast
+/// posture) live here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SolanaSpec {
+    /// Filesystem-friendly name, e.g. `"solana-devnet"`.
+    pub name: String,
+    /// Configured RPC endpoints, in preference order.
+    #[serde(default)]
+    pub endpoints: Vec<EndpointSpec>,
+    /// Expected genesis hash (base58). When set, the client refuses to talk
+    /// to a node whose `getGenesisHash` differs — the Solana analogue of
+    /// EVM's chain-id binding (a message carries a blockhash, not a chain id).
+    #[serde(default)]
+    pub expected_genesis_hex: Option<String>,
+    /// Whether broadcasting is enabled on this cluster.
+    #[serde(default)]
+    pub allow_broadcast: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

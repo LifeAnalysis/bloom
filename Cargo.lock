@@ -2219,6 +2219,8 @@ dependencies = [
  "bloom-prices",
  "bloom-proto",
  "bloom-revert",
+ "bloom-solana",
+ "bloom-solana-tx",
  "bloom-tools",
  "bloom-tx",
  "bloom-update",

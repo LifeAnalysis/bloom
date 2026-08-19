@@ -54,7 +54,7 @@ impl SolanaRpcClient {
     /// [`SolanaRpcError::NoEndpoints`] when no usable endpoint is configured.
     pub fn build(spec: &crate::SolanaSpec) -> Result<Self, SolanaRpcError> {
         let mut endpoints = Vec::new();
-        for ep in spec.endpoints() {
+        for ep in &spec.endpoints {
             if ep.url.starts_with("ws://") || ep.url.starts_with("wss://") {
                 continue; // read client is HTTP-only for now
             }

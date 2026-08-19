@@ -2650,6 +2650,45 @@ impl Daemon {
             debug!("daemon.ens_resolver_skipped: no ENS-capable chain configured");
         }
 
+        // Solana chains: construct a transfer engine per configured Solana
+        // cluster, dispatching the same `chains/<chain>/outbox/...` route
+        // family as EVM. The engine needs the Broker + provenance catalog
+        // (the exact-signing seam); without them, Solana chains are not routed.
+        let mut solana_engines: std::collections::BTreeMap<
+            String,
+            Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+        > = std::collections::BTreeMap::new();
+        if let (Some(broker), Some(catalog)) = (&broker, &provenance_catalog) {
+            for (name, spec) in &config.solana_chains {
+                let client = match bloom_solana::SolanaClient::build(spec) {
+                    Ok(client) => client,
+                    Err(e) => {
+                        warn!(chain = %name, error = %e, "daemon.solana_chain_skipped");
+                        continue;
+                    }
+                };
+                let signer = match bloom_solana_tx::signing::SolanaTransferSigner::from_catalog(
+                    broker.clone(),
+                    catalog,
+                ) {
+                    Ok(signer) => signer,
+                    Err(e) => {
+                        warn!(chain = %name, error = %e, "daemon.solana_signer_skipped");
+                        continue;
+                    }
+                };
+                let outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.outbox_dir())
+                    .map_err(|e| DaemonError::Outbox(e.to_string()))?;
+                let engine = bloom_solana_tx::engine::SolanaTransferEngine::new(
+                    outbox,
+                    client,
+                    signer,
+                    name.clone(),
+                );
+                solana_engines.insert(name.clone(), Arc::new(engine));
+            }
+        }
+
         let address_book_path = home.root().join("addressbook.toml");
         let address_book = match AddressBook::load(&address_book_path) {
             Ok(b) => {
@@ -3024,7 +3063,8 @@ impl Daemon {
         let wallets_handler = wallets_handler
             .with_broker(broker.clone())
             .with_home_write_permit_opt(home_write_permit.clone())
-            .with_mempool_indexes(mempool_indexes.clone());
+            .with_mempool_indexes(mempool_indexes.clone())
+            .with_solana(solana_engines);
 
         vfs_builder = vfs_builder
             .mount("wallets", Arc::new(wallets_handler) as _)

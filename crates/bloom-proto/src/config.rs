@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::chain::ChainSpec;
+use crate::chain::SolanaSpec;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -40,6 +41,9 @@ pub struct Config {
     /// Map of chain name -> spec.
     #[serde(default)]
     pub chains: BTreeMap<String, ChainSpec>,
+    /// Map of Solana chain name -> spec.
+    #[serde(default)]
+    pub solana_chains: BTreeMap<String, SolanaSpec>,
     #[serde(default)]
     pub etherscan: Option<EtherscanConfig>,
     #[serde(default)]
@@ -410,6 +414,7 @@ impl Config {
             default_chain: default_chain_name(),
             stage_ttl: default_stage_ttl(),
             chains,
+            solana_chains: BTreeMap::new(),
             etherscan: None,
             enso: None,
             petals: PetalsConfig::default(),
