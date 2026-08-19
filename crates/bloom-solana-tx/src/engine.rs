@@ -55,6 +55,8 @@ pub enum EngineError {
     Signer(String),
     #[error("invalid transfer: {0}")]
     Invalid(String),
+    #[error("broadcasting is disabled for chain '{0}' (operator release posture)")]
+    BroadcastDisabled(String),
 }
 
 /// Orchestrates the native SOL transfer lifecycle.
@@ -193,6 +195,9 @@ impl SolanaTransferEngine {
         id: &str,
         now_ms: u128,
     ) -> Result<String, EngineError> {
+        if !self.client.allow_broadcast() {
+            return Err(EngineError::BroadcastDisabled(self.chain.clone()));
+        }
         let entry = self
             .outbox
             .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Sent)?;

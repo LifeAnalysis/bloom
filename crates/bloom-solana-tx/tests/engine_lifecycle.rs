@@ -284,3 +284,43 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
             .exists()
     );
 }
+
+#[tokio::test]
+async fn broadcast_refuses_when_operator_disables_it() {
+    let endpoint = spawn_node().await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let mut spec = SolanaSpec {
+        name: "solana-devnet".into(),
+        endpoints: vec![EndpointSpec {
+            url: endpoint,
+            weight: 100,
+            cu_per_sec: None,
+            max_rps: None,
+            http_only: false,
+        }],
+        expected_genesis_hex: None,
+        allow_broadcast: false,
+    };
+    spec.allow_broadcast = false;
+    let client = SolanaClient::build(&spec).unwrap();
+    let engine = SolanaTransferEngine::new(outbox, client, signer, "solana-devnet");
+
+    // The broadcast gate is the operator's release posture: it fires before
+    // any outbox lookup, so even a valid path is refused.
+    let err = engine
+        .broadcast("wallet", "0001-00001", 1_000)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            bloom_solana_tx::engine::EngineError::BroadcastDisabled(_)
+        ),
+        "{err}"
+    );
+}

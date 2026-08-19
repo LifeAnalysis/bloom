@@ -105,6 +105,7 @@ pub struct SolanaClient {
 struct Inner {
     rpc: Arc<SolanaRpcClient>,
     expected_genesis_hex: Option<String>,
+    allow_broadcast: bool,
 }
 
 impl SolanaClient {
@@ -115,8 +116,15 @@ impl SolanaClient {
             inner: Arc::new(Inner {
                 rpc,
                 expected_genesis_hex: spec.expected_genesis_hex.clone(),
+                allow_broadcast: spec.allow_broadcast,
             }),
         })
+    }
+
+    /// Whether broadcasting is enabled for this cluster (the operator's
+    /// release posture). The transaction engine refuses to submit without it.
+    pub fn allow_broadcast(&self) -> bool {
+        self.inner.allow_broadcast
     }
 
     /// The underlying transport's endpoint-health snapshot.

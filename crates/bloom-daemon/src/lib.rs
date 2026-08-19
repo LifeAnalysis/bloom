@@ -2660,6 +2660,14 @@ impl Daemon {
         > = std::collections::BTreeMap::new();
         if let (Some(broker), Some(catalog)) = (&broker, &provenance_catalog) {
             for (name, spec) in &config.solana_chains {
+                // Mainnet-shaped clusters are refused at construction in this
+                // release posture (broadcast is never enabled for them), so a
+                // stray mainnet entry cannot silently become a broadcastable
+                // chain.
+                if name.to_lowercase().contains("mainnet") {
+                    warn!(chain = %name, "daemon.solana_mainnet_refused");
+                    continue;
+                }
                 let client = match bloom_solana::SolanaClient::build(spec) {
                     Ok(client) => client,
                     Err(e) => {
