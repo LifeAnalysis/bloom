@@ -76,9 +76,8 @@ impl SolanaOutboxState {
     }
 
     /// Parse an on-disk directory name back into a state (used by the VFS
-    /// projection once the outbox is exposed).
-    #[allow(dead_code)]
-    fn parse(s: &str) -> Option<Self> {
+    /// projection).
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),
             "sent" => Some(Self::Sent),

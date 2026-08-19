@@ -13,7 +13,6 @@ pub mod petal_signing_requests;
 pub mod prices;
 pub mod requests;
 pub mod simulate;
-pub mod solana_outbox;
 pub mod status;
 pub mod tools;
 pub mod wallets;
@@ -33,7 +32,6 @@ pub use petal_signing_requests::{
 pub use prices::PricesHandler;
 pub use requests::RequestsHandler;
 pub use simulate::SimulateHandler;
-pub use solana_outbox::SolanaOutboxHandler;
 pub use status::StatusHandler;
 pub use tools::ToolsHandler;
 pub use wallets::WalletsHandler;

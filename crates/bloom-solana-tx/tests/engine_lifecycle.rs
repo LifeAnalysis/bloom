@@ -6,10 +6,10 @@ use std::sync::Arc;
 use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalPrepareState, Base64UrlBytes, CryptoSuite, DecimalU64,
     Digest32, KeyPublic, KeyRef, KeyRequest, KeyRole, KeySpec, MachineBrokerRequest,
-    MachineBrokerResponse, MachineBrokerService, NormalizedSignature,
-    ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceOperationClass,
-    ProvenanceRecord, ProvenanceSubject, SealedApprovalPrepareResponse, ServiceFuture,
-    SigningPayloads, SigningResult, Token, WalletPublic, WalletRequest,
+    MachineBrokerResponse, MachineBrokerService, NormalizedSignature, ProtocolError,
+    ProtocolErrorCode, ProvenanceCatalog, ProvenanceOperationClass, ProvenanceRecord,
+    ProvenanceSubject, SealedApprovalPrepareResponse, ServiceFuture, SigningPayloads,
+    SigningResult, Token, WalletPublic, WalletRequest,
 };
 use bloom_machine_client::MachineBrokerClient;
 use bloom_solana::{EndpointSpec, SolanaClient, SolanaSpec};

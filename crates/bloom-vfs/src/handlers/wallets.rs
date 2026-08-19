@@ -149,6 +149,11 @@ pub struct WalletsHandler {
     pub wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     /// Machine-owned workflow projections; never a Broker or Signer state root.
     policy_projection_root: std::path::PathBuf,
+    /// Solana transfer engines keyed by chain name, dispatching the same
+    /// `chains/<chain>/outbox/...` route family as EVM for Solana chains.
+    solana: Option<
+        Arc<std::collections::BTreeMap<String, Arc<bloom_solana_tx::engine::SolanaTransferEngine>>>,
+    >,
 }
 
 impl WalletsHandler {
@@ -168,7 +173,31 @@ impl WalletsHandler {
             broker: None,
             wallet_projections: Some(wallet_projections),
             policy_projection_root: policy_projection_root.into(),
+            solana: None,
         }
+    }
+
+    /// Attach the Solana transfer engines (keyed by chain name). When set,
+    /// `chains/<chain>/outbox/...` dispatches Solana chains through their own
+    /// engine instead of the EVM `TxEngine`.
+    pub fn with_solana(
+        mut self,
+        engines: std::collections::BTreeMap<
+            String,
+            Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+        >,
+    ) -> Self {
+        self.solana = Some(Arc::new(engines));
+        self
+    }
+
+    fn solana_engine(
+        &self,
+        chain: &str,
+    ) -> Option<Arc<bloom_solana_tx::engine::SolanaTransferEngine>> {
+        self.solana
+            .as_ref()
+            .and_then(|engines| engines.get(chain).cloned())
     }
 
     pub fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
@@ -1832,6 +1861,17 @@ fn parse_state_seg(s: &str) -> Result<OutboxState, HandlerError> {
     OutboxState::parse(s).ok_or_else(|| HandlerError::not_found(format!("outbox state '{}'", s)))
 }
 
+fn solana_state(s: &str) -> Option<bloom_solana_tx::outbox::SolanaOutboxState> {
+    bloom_solana_tx::outbox::SolanaOutboxState::parse(s)
+}
+
+fn solana_outbox_err(e: bloom_solana_tx::outbox::OutboxError) -> HandlerError {
+    match e {
+        bloom_solana_tx::outbox::OutboxError::NotFound(id) => HandlerError::not_found(id),
+        other => HandlerError::backend(other.to_string()),
+    }
+}
+
 fn open_regular_outbox_artifact(dir: &Path, fname: &str) -> Result<std::fs::File, HandlerError> {
     let path = dir.join(fname);
     let descriptor = rustix::fs::open(
@@ -2477,10 +2517,13 @@ impl WalletsHandler {
 impl WalletsHandler {
     async fn lookup_chain(
         &self,
-        _wallet: &str,
+        wallet: &str,
         chain: &str,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
+        if let Some(engine) = self.solana_engine(chain) {
+            return self.lookup_solana_chain(wallet, chain, rest, &engine).await;
+        }
         let _client = self
             .chains
             .get(chain)
@@ -2494,7 +2537,42 @@ impl WalletsHandler {
                 Ok(Entry::file(s))
             }
             [s] if s == "outbox" => Ok(Entry::dir("outbox")),
-            [s, ..] if s == "outbox" => self.lookup_outbox(_wallet, chain, &rest[1..]).await,
+            [s, ..] if s == "outbox" => self.lookup_outbox(wallet, chain, &rest[1..]).await,
+            _ => Err(HandlerError::not_found(rest.join("/"))),
+        }
+    }
+
+    async fn lookup_solana_chain(
+        &self,
+        wallet: &str,
+        chain: &str,
+        rest: &[String],
+        engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+    ) -> Result<Entry, HandlerError> {
+        match rest {
+            [] => Ok(Entry::dir(chain)),
+            [s] if s == "outbox" => Ok(Entry::dir("outbox")),
+            [s, state] if s == "outbox" && solana_state(state).is_some() => Ok(Entry::dir(state)),
+            [s, state, id] if s == "outbox" && solana_state(state).is_some() => {
+                let entry = engine
+                    .outbox()
+                    .read_in_state(wallet, chain, id, solana_state(state).unwrap())
+                    .map_err(solana_outbox_err)?;
+                Ok(Entry::dir(id).with_modified_ms(entry.staged.created_ms))
+            }
+            [s, state, id, fname] if s == "outbox" && solana_state(state).is_some() => {
+                let entry = engine
+                    .outbox()
+                    .read_in_state(wallet, chain, id, solana_state(state).unwrap())
+                    .map_err(solana_outbox_err)?;
+                let fpath = entry.dir.join(fname);
+                if !fpath.exists() {
+                    return Err(HandlerError::not_found(format!(
+                        "/{wallet}/chains/{chain}/outbox/{state}/{id}/{fname}"
+                    )));
+                }
+                Ok(Entry::file(fname).with_modified_ms(entry.staged.created_ms))
+            }
             _ => Err(HandlerError::not_found(rest.join("/"))),
         }
     }
@@ -2612,6 +2690,9 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
+        if let Some(engine) = self.solana_engine(chain) {
+            return self.read_solana_chain(wallet, chain, rest, &engine).await;
+        }
         // Read-only chain leaves (balance/nonce): never gated on policy sig.
         let address: alloy::primitives::Address = self
             .wallet_projection(wallet)
@@ -2767,12 +2848,87 @@ impl WalletsHandler {
         }
     }
 
+    async fn read_solana_chain(
+        &self,
+        wallet: &str,
+        chain: &str,
+        rest: &[String],
+        engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+    ) -> Result<Vec<u8>, HandlerError> {
+        match rest {
+            [s, state, id, fname] if s == "outbox" => {
+                let st = solana_state(state)
+                    .ok_or_else(|| HandlerError::not_found(format!("outbox state '{state}'")))?;
+                let entry = engine
+                    .outbox()
+                    .read_in_state(wallet, chain, id, st)
+                    .map_err(solana_outbox_err)?;
+                let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                Ok(bytes)
+            }
+            _ => Err(HandlerError::NotAFile(rest.join("/"))),
+        }
+    }
+
+    async fn list_solana_chain(
+        &self,
+        wallet: &str,
+        chain: &str,
+        rest: &[String],
+        engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
+    ) -> Result<Vec<Entry>, HandlerError> {
+        match rest {
+            [] => Ok(vec![Entry::dir("outbox")]),
+            [s] if s == "outbox" => Ok(vec![
+                Entry::dir("pending"),
+                Entry::dir("sent"),
+                Entry::dir("failed"),
+            ]),
+            [s, state] if s == "outbox" => {
+                let st = solana_state(state)
+                    .ok_or_else(|| HandlerError::not_found(format!("outbox state '{state}'")))?;
+                let ids = engine
+                    .outbox()
+                    .list(wallet, chain, st)
+                    .map_err(solana_outbox_err)?;
+                Ok(ids.into_iter().map(|id| Entry::dir(&id)).collect())
+            }
+            [s, state, id] if s == "outbox" => {
+                let st = solana_state(state)
+                    .ok_or_else(|| HandlerError::not_found(format!("outbox state '{state}'")))?;
+                let entry = engine
+                    .outbox()
+                    .read_in_state(wallet, chain, id, st)
+                    .map_err(solana_outbox_err)?;
+                let mut entries: Vec<Entry> = Vec::new();
+                for file in [
+                    "intent.json",
+                    "plan.md",
+                    "receipt.json",
+                    "broadcast_attempted.json",
+                ] {
+                    let fpath = entry.dir.join(file);
+                    if fpath.exists() {
+                        entries.push(Entry::file(file));
+                    }
+                }
+                Ok(entries)
+            }
+            _ => Err(HandlerError::NotADir(rest.join("/"))),
+        }
+    }
+
     async fn list_chain(
         &self,
         wallet: &str,
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
+        if let Some(engine) = self.solana_engine(chain) {
+            return self.list_solana_chain(wallet, chain, rest, &engine).await;
+        }
         let _projection = self.wallet_projection(wallet).await?;
         let _client = self
             .chains
@@ -3557,6 +3713,149 @@ mod tests {
             wallet_name: "alice".to_string(),
             wallet_addr,
         }
+    }
+
+    /// A stub Broker service: the Solana outbox read path never reaches it,
+    /// so every method is a catch-all error.
+    struct StubBroker;
+    impl bloom_broker_api::MachineBrokerService for StubBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: bloom_broker_api::MachineBrokerRequest,
+        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
+            Box::pin(async move {
+                Err(bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::UnknownMethod,
+                    format!("unhandled {request:?}"),
+                ))
+            })
+        }
+    }
+
+    fn solana_engine_fixture(
+        tmp: &tempfile::TempDir,
+    ) -> (
+        bloom_solana_tx::engine::SolanaTransferEngine,
+        bloom_solana_tx::outbox::SolanaOutbox,
+    ) {
+        let outbox =
+            bloom_solana_tx::outbox::SolanaOutbox::new(tmp.path().join("solana-outbox")).unwrap();
+        // A dead endpoint: the read path never touches the client.
+        let client = bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
+            name: "solana-devnet".into(),
+            endpoints: vec![bloom_solana::EndpointSpec {
+                url: "http://127.0.0.1:1".into(),
+                weight: 100,
+                cu_per_sec: None,
+                max_rps: None,
+                http_only: false,
+            }],
+            expected_genesis_hex: None,
+            allow_broadcast: true,
+        })
+        .unwrap();
+        let broker =
+            bloom_machine_client::MachineBrokerClient::new(std::sync::Arc::new(StubBroker));
+        let catalog = bloom_broker_api::ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![bloom_broker_api::ProvenanceRecord {
+                subject: bloom_broker_api::ProvenanceSubject::System {
+                    component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+                    operation_class: bloom_broker_api::Token::new("solana.transfer.confirm")
+                        .unwrap(),
+                },
+                publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
+                petal_lineage: None,
+                operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    operation_class: bloom_broker_api::Token::new("solana.native-transfer")
+                        .unwrap(),
+                    fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
+                        chain: bloom_broker_api::Token::new("solana").unwrap(),
+                        asset: "native".into(),
+                    }),
+                }],
+                installer_key_id: bloom_broker_api::Token::new("installer-key").unwrap(),
+                installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
+            }],
+        };
+        let signer =
+            bloom_solana_tx::signing::SolanaTransferSigner::from_catalog(broker, &catalog).unwrap();
+        let engine = bloom_solana_tx::engine::SolanaTransferEngine::new(
+            outbox.clone(),
+            client,
+            signer,
+            "solana-devnet",
+        );
+        (engine, outbox)
+    }
+
+    #[tokio::test]
+    async fn solana_chain_outbox_dispatches_through_the_solana_engine() {
+        let f = make_handler_with_chain(true);
+        let solana_tmp = tempfile::tempdir().unwrap();
+        let (engine, outbox) = solana_engine_fixture(&solana_tmp);
+        let staged = bloom_solana_tx::types::StagedSolanaTransfer {
+            id: "0001-00001".into(),
+            wallet: "alice".into(),
+            chain: "solana-devnet".into(),
+            fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
+            destination: "DEST111111111111111111111111111111111111111".into(),
+            lamports: 1_000_000,
+            blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
+            last_valid_block_height: 100,
+            message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),
+            payload_digest_hex: "ab".repeat(32),
+            signature: None,
+            created_ms: 1,
+            expires_ms: 0,
+            status: bloom_solana_tx::types::SolanaTxStatus::Pending,
+            action_id: None,
+        };
+        outbox.write_pending(&staged, "plan").unwrap();
+
+        let handler = f.handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+
+        // The Solana chain's outbox routes through the Solana engine, not the
+        // EVM one: the intent is Solana-typed and read from the Solana outbox.
+        let intent = handler
+            .read(
+                &VfsPath::parse(
+                    "/alice/chains/solana-devnet/outbox/pending/0001-00001/intent.json",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&intent).unwrap();
+        assert_eq!(parsed["lamports"], 1_000_000);
+        assert_eq!(parsed["chain"], "solana-devnet");
+
+        let listed = handler
+            .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox/pending").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "0001-00001");
+
+        // The EVM chain is untouched: anvil still resolves through the EVM
+        // registry (a Solana chain name does not shadow it).
+        assert!(
+            handler
+                .lookup(&VfsPath::parse("/alice/chains/anvil/outbox").unwrap())
+                .await
+                .is_ok()
+        );
+        // An unknown Solana chain is still routed to the EVM registry and
+        // NotFound there.
+        assert!(
+            handler
+                .lookup(&VfsPath::parse("/alice/chains/solana-mainnet/outbox").unwrap())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
