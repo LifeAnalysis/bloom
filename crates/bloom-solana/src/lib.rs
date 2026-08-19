@@ -257,6 +257,16 @@ impl SolanaClient {
             .map_err(|e| SolanaRpcError::Decode(format!("simulateTransaction: {e}")))
     }
 
+    /// Submit a signed transaction (base64) to the cluster. Returns the
+    /// transaction signature. This is the write path the transaction engine
+    /// gates — the read client itself performs no gating beyond the transport.
+    pub async fn send_transaction(&self, tx_b64: &str) -> Result<String, SolanaRpcError> {
+        self.inner
+            .rpc
+            .call("sendTransaction", &json!([tx_b64]))
+            .await
+    }
+
     /// Confirmation status for a list of transaction signatures. The outer
     /// `Option` mirrors the node's `null` entries (signature not seen).
     pub async fn get_signature_statuses(

@@ -25,6 +25,7 @@ solana-transaction = { version = "4.2.0", features = ["verify", "wincode"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+wincode = "0.6"
 
 [dev-dependencies]
 async-trait.workspace = true

@@ -14,6 +14,8 @@ use thiserror::Error;
 pub enum MessageError {
     #[error("lamports amount is zero")]
     ZeroLamports,
+    #[error("message is not a canonical legacy message: {0}")]
+    MalformedMessage(String),
 }
 
 /// Build the canonical legacy single-signer System Program transfer message:
@@ -52,6 +54,24 @@ pub fn verify_signature(fee_payer: &[u8; 32], message_bytes: &[u8], signature: &
     };
     key.verify(message_bytes, &Signature::from_bytes(signature))
         .is_ok()
+}
+
+/// Assemble the signed transaction — `[signature] || message` in the Solana
+/// wire format (`sendTransaction`'s expected input). The message must be the
+/// canonical legacy message the constructor produced.
+pub fn assemble_transaction(
+    message_bytes: &[u8],
+    signature: &[u8; 64],
+) -> Result<Vec<u8>, MessageError> {
+    use solana_message::Message;
+    use solana_transaction::{Signature, Transaction};
+    let message: Message = wincode::deserialize(message_bytes)
+        .map_err(|e| MessageError::MalformedMessage(e.to_string()))?;
+    let transaction = Transaction {
+        signatures: vec![Signature::from(*signature)],
+        message,
+    };
+    wincode::serialize(&transaction).map_err(|e| MessageError::MalformedMessage(e.to_string()))
 }
 
 #[cfg(test)]
@@ -127,6 +147,24 @@ mod tests {
         };
         tx.verify()
             .expect("golden signature must verify against the Anza reference");
+    }
+
+    #[test]
+    fn assembles_signed_transaction_that_verifies() {
+        let tx_bytes = assemble_transaction(&message_bytes(), &signature()).unwrap();
+        // The wire form `sendTransaction` accepts: a short-vec signature
+        // count, the 64-byte signature, then the message.
+        let transaction: solana_transaction::Transaction = wincode::deserialize(&tx_bytes).unwrap();
+        transaction
+            .verify()
+            .expect("assembled transaction must verify");
+        assert_eq!(transaction.signatures.len(), 1);
+        assert_eq!(tx_bytes[0], 1, "single-signer signature count prefix");
+        assert_eq!(
+            &tx_bytes[1..65],
+            &signature(),
+            "signature follows the count"
+        );
     }
 
     #[test]
