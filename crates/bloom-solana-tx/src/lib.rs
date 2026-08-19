@@ -14,12 +14,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod engine;
 pub mod message;
 pub mod outbox;
 pub mod reconcile;
 pub mod signing;
 pub mod types;
 
+pub use engine::{EngineError, SolanaTransferEngine};
 pub use message::{MessageError, assemble_transaction, build_transfer_message, verify_signature};
 pub use outbox::{OutboxError, SolanaOutbox, SolanaOutboxState};
 pub use reconcile::SolanaReconciler;

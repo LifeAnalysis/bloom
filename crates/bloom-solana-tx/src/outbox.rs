@@ -448,6 +448,30 @@ impl SolanaOutbox {
         Ok(Some(serde_json::from_slice(&fs::read(&path)?)?))
     }
 
+    /// Record the transaction signature on a still-pending entry (the signing
+    /// step), rewriting `intent.json` so the signature is durable before the
+    /// entry transitions to `sent`.
+    pub fn record_signature(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+        signature: &str,
+    ) -> Result<SolanaOutboxEntry, OutboxError> {
+        let entry = self.read_in_state(wallet, chain, id, SolanaOutboxState::Pending)?;
+        let mut staged = entry.staged.clone();
+        staged.signature = Some(signature.to_string());
+        fs::write(
+            entry.dir.join("intent.json"),
+            serde_json::to_vec_pretty(&staged)?,
+        )?;
+        Ok(SolanaOutboxEntry {
+            state: entry.state,
+            staged,
+            dir: entry.dir,
+        })
+    }
+
     /// Cancel a still-pending entry (Solana: only legal before signing).
     pub fn cancel(&self, wallet: &str, chain: &str, id: &str) -> Result<(), OutboxError> {
         let entry = self.read_in_state(wallet, chain, id, SolanaOutboxState::Pending)?;
