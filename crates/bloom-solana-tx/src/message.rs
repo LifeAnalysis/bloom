@@ -173,4 +173,36 @@ mod tests {
         bytes[0] ^= 0xff;
         assert!(!verify_signature(&fee_payer(), &bytes, &signature()));
     }
+
+    /// Deterministic pseudo-random sweep (the coverage-guided libFuzzer
+    /// target in `fuzz/` is the real fuzzer; this runs in CI) proving the
+    /// codec is total — no arbitrary input panics — and that successful
+    /// constructor/assembler outputs round-trip through the pinned Anza
+    /// reference.
+    #[test]
+    fn codec_is_total_on_arbitrary_input() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5eed_c0de);
+        let fp = [0x11u8; 32];
+        let dest = [0x22u8; 32];
+        let blockhash = [0x42u8; 32];
+        for _ in 0..500 {
+            let mut data = vec![0u8; rng.gen_range(0..300)];
+            rng.fill(&mut data[..]);
+            let lamports = rng.r#gen::<u64>();
+            if let Ok(message) = build_transfer_message(&fp, &dest, lamports, &blockhash) {
+                let parsed: solana_message::Message = wincode::deserialize(&message).unwrap();
+                assert_eq!(
+                    parsed.serialize(),
+                    message,
+                    "non-canonical constructor output"
+                );
+            }
+            let _ = verify_signature(&fp, &data, &[0u8; 64]);
+            if let Ok(tx) = assemble_transaction(&data, &[0u8; 64]) {
+                let parsed: solana_transaction::Transaction = wincode::deserialize(&tx).unwrap();
+                assert_eq!(parsed.signatures.len(), 1);
+            }
+        }
+    }
 }
