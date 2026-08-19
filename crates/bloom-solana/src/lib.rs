@@ -248,6 +248,19 @@ impl SolanaClient {
             .await
     }
 
+    /// Request a faucet airdrop to a base58 account (local/devnet only). The
+    /// returned value is the airdrop transaction signature.
+    pub async fn request_airdrop(
+        &self,
+        account: &str,
+        lamports: u64,
+    ) -> Result<String, SolanaRpcError> {
+        self.inner
+            .rpc
+            .call("requestAirdrop", &json!([account, lamports]))
+            .await
+    }
+
     /// Confirmation status for a list of transaction signatures. The outer
     /// `Option` mirrors the node's `null` entries (signature not seen).
     pub async fn get_signature_statuses(
