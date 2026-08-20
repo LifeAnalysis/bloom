@@ -14,7 +14,7 @@ use bloom_solana::{SolanaClient, SolanaRpcError};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::outbox::{OutboxError, SolanaOutbox, SolanaOutboxState};
+use crate::outbox::{OutboxError, SolanaOutbox, SolanaOutboxEntry, SolanaOutboxState};
 use crate::signing::{SolanaSignOutcome, SolanaTransferSigner};
 use crate::types::{SolanaTxStatus, StagedSolanaTransfer};
 use crate::{assemble_transaction, build_transfer_message};
@@ -141,7 +141,12 @@ impl SolanaTransferEngine {
     }
 
     /// Confirm and sign a staged transfer. On `Signed` the signature is
-    /// recorded in the outbox and the entry transitions to `sent`. On
+    /// recorded in the outbox, but the entry **stays `pending`** — it only
+    /// moves to `sent` once [`Self::broadcast`] actually succeeds. A signed
+    /// message with no broadcast attempt yet is still exactly as
+    /// retryable/cancellable as an unsigned one (mirrors `bloom-tx`'s EVM
+    /// `confirm` path, which gates its `Sent` transition on the broadcast
+    /// RPC call itself succeeding, never on signing alone). On
     /// `ApprovalRequired` the ceremony details are returned and the entry
     /// stays pending for a retry with the returned `approval_id`.
     pub async fn sign(
@@ -178,16 +183,21 @@ impl SolanaTransferEngine {
 
         if let SolanaSignOutcome::Signed { signature } = &outcome {
             let signature_b58 = bs58::encode(signature).into_string();
-            let updated = self
-                .outbox
+            self.outbox
                 .record_signature(wallet, &self.chain, id, &signature_b58)?;
-            self.outbox.transition(&updated, SolanaOutboxState::Sent)?;
         }
         Ok(outcome)
     }
 
-    /// Broadcast a signed transfer: assemble the transaction from the recorded
-    /// signature + message, submit it, and record the broadcast attempt.
+    /// Broadcast a signed transfer: assemble the transaction from the
+    /// recorded signature + message and submit it. The entry transitions
+    /// `pending` → `sent` only *after* the broadcast RPC call actually
+    /// succeeds — if `send_transaction` fails (RPC timeout, node error, a
+    /// normal and expected failure mode), the entry is left exactly where
+    /// it was, still `pending` and so still retryable (call `sign`+
+    /// `broadcast` again — signing is idempotent, it just re-records the
+    /// same signature) or cancellable, never permanently stranded in a
+    /// `sent` state that reflects a broadcast that never happened.
     /// Returns the transaction signature.
     pub async fn broadcast(
         &self,
@@ -200,7 +210,7 @@ impl SolanaTransferEngine {
         }
         let entry = self
             .outbox
-            .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Sent)?;
+            .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)?;
         let signature_b58 = entry
             .staged
             .signature
@@ -218,9 +228,20 @@ impl SolanaTransferEngine {
             .map_err(|e| EngineError::Invalid(e.to_string()))?;
         let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
 
+        // Broadcast first, while the entry is still `pending`: on failure
+        // it must stay exactly there, never move to `sent` for a broadcast
+        // that never actually happened.
         let submitted = self.client.send_transaction(&tx_b64).await?;
+
+        // Only a confirmed-successful broadcast earns the `sent` transition.
+        let sent_dir = self.outbox.transition(&entry, SolanaOutboxState::Sent)?;
+        let sent_entry = SolanaOutboxEntry {
+            state: SolanaOutboxState::Sent,
+            staged: entry.staged,
+            dir: sent_dir,
+        };
         self.outbox
-            .write_broadcast_attempt(&entry, &submitted, &tx_bytes, now_ms)?;
+            .write_broadcast_attempt(&sent_entry, &submitted, &tx_bytes, now_ms)?;
         Ok(submitted)
     }
 }

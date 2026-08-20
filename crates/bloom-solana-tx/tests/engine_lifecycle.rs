@@ -252,7 +252,10 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
             .is_ok()
     );
 
-    // Retry with the approval id: signs and moves to sent.
+    // Retry with the approval id: signs, but stays pending — the entry only
+    // moves to `sent` once `broadcast` actually succeeds (Fix C,
+    // PLAN-SOLANA-PR-FIXES.md: signing alone must never strand an entry in
+    // `sent` for a broadcast that hasn't happened yet).
     let signed = engine
         .sign("wallet", &staged.id, &fee_payer, Some(approval_id), 1_200)
         .await
@@ -261,6 +264,23 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
         signed,
         bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. }
     ));
+    let still_pending = outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &staged.id,
+            SolanaOutboxState::Pending,
+        )
+        .unwrap();
+    assert!(still_pending.staged.signature.is_some());
+
+    // Broadcast: submits the assembled transaction, *then* transitions to
+    // sent and records the attempt.
+    let signature = engine.broadcast("wallet", &staged.id, 1_300).await.unwrap();
+    assert_eq!(
+        signature,
+        "4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4TdSXKZT9HYqjs"
+    );
     let sent = outbox
         .read_in_state(
             "wallet",
@@ -269,20 +289,195 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
             SolanaOutboxState::Sent,
         )
         .unwrap();
-    assert!(sent.staged.signature.is_some());
-
-    // Broadcast: submits the assembled transaction and records the attempt.
-    let signature = engine.broadcast("wallet", &staged.id, 1_300).await.unwrap();
-    assert_eq!(
-        signature,
-        "4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4TdSXKZT9HYqjs"
-    );
     // The broadcast attempt marker is recorded next to the sent entry.
     assert!(
         sent.dir
             .join(bloom_solana_tx::outbox::BROADCAST_ATTEMPT_FILE)
             .exists()
     );
+}
+
+/// A stub node whose `sendTransaction` answers with a non-retryable
+/// JSON-RPC error `fail_times` times before succeeding, and otherwise
+/// behaves like [`spawn_node`]. Used to exercise the "broadcast RPC call
+/// fails after a successful `sign()`" window (Fix C,
+/// PLAN-SOLANA-PR-FIXES.md).
+async fn spawn_node_with_flaky_broadcast(fail_times: Arc<std::sync::atomic::AtomicU64>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let fail_times = fail_times.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                let method = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
+                    .unwrap_or_default();
+                let payload = match method.as_str() {
+                    "getLatestBlockhash" => {
+                        let blockhash = bs58::encode([0x42u8; 32]).into_string();
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":1}},"value":{{"blockhash":"{blockhash}","lastValidBlockHeight":100}}}}}}"#
+                        )
+                    }
+                    "sendTransaction" => {
+                        let remaining = fail_times.fetch_update(
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                            |n| n.checked_sub(1),
+                        );
+                        if remaining.is_ok_and(|n| n > 0) {
+                            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"simulated broadcast failure"}}"#.to_string()
+                        } else {
+                            r#"{"jsonrpc":"2.0","id":1,"result":"4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4TdSXKZT9HYqjs"}"#.to_string()
+                        }
+                    }
+                    _ => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#.to_string(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+/// Stage + sign (through the two-step approval ceremony) a transfer and
+/// return once it's signed and pending, ready for `broadcast`.
+async fn stage_and_sign(
+    engine: &SolanaTransferEngine,
+    broker: &BrokerFixture,
+) -> bloom_solana_tx::types::StagedSolanaTransfer {
+    let fee_payer = broker.child_pubkey();
+    let destination = ed25519_dalek::SigningKey::from_bytes(&[0xbb; 32])
+        .verifying_key()
+        .to_bytes();
+    let staged = engine
+        .stage("wallet", &fee_payer, &destination, 1_000_000, 1_000)
+        .await
+        .unwrap();
+    let first = engine
+        .sign("wallet", &staged.id, &fee_payer, None, 1_100)
+        .await
+        .unwrap();
+    let approval_id = match first {
+        bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired { approval_id, .. } => {
+            approval_id
+        }
+        other => panic!("expected ApprovalRequired, got {other:?}"),
+    };
+    let signed = engine
+        .sign("wallet", &staged.id, &fee_payer, Some(approval_id), 1_200)
+        .await
+        .unwrap();
+    assert!(matches!(
+        signed,
+        bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. }
+    ));
+    staged
+}
+
+// Fix C (PLAN-SOLANA-PR-FIXES.md): a broadcast RPC failure after a
+// successful `sign()` must never permanently strand the entry — it must
+// stay `pending`, exactly as retryable and cancellable as before signing.
+#[tokio::test]
+async fn broadcast_failure_leaves_entry_pending_and_retry_succeeds() {
+    let fail_times = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let endpoint = spawn_node_with_flaky_broadcast(fail_times).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+
+    let staged = stage_and_sign(&engine, &broker).await;
+
+    // First broadcast attempt: the node returns a hard RPC error. The entry
+    // must not have moved to `sent` for a broadcast that never happened.
+    let first_attempt = engine.broadcast("wallet", &staged.id, 1_300).await;
+    assert!(first_attempt.is_err(), "expected the first broadcast to fail");
+    let entry = outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &staged.id,
+            SolanaOutboxState::Pending,
+        )
+        .expect("entry must remain pending after a failed broadcast, not stuck in sent");
+    assert!(
+        entry.staged.signature.is_some(),
+        "the recorded signature from sign() survives the failed broadcast attempt"
+    );
+
+    // Retry: the node now accepts the same call. No re-signing needed —
+    // broadcast reads the already-recorded signature straight from the
+    // still-pending entry.
+    let signature = engine
+        .broadcast("wallet", &staged.id, 1_400)
+        .await
+        .expect("retried broadcast must succeed");
+    assert_eq!(
+        signature,
+        "4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4TdSXKZT9HYqjs"
+    );
+    outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &staged.id,
+            SolanaOutboxState::Sent,
+        )
+        .expect("entry moves to sent once the retried broadcast actually succeeds");
+}
+
+#[tokio::test]
+async fn broadcast_failure_leaves_entry_cancellable() {
+    // Never recovers: every `sendTransaction` call fails.
+    let fail_times = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let endpoint = spawn_node_with_flaky_broadcast(fail_times).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+
+    let staged = stage_and_sign(&engine, &broker).await;
+    assert!(engine.broadcast("wallet", &staged.id, 1_300).await.is_err());
+
+    // The VFS write handler only permits `pending/<id>/cancel` on a Pending
+    // entry (see `bloom-vfs`'s wallets handler) — this is exactly the path
+    // that was unreachable before the fix, since the entry was already
+    // stuck in `sent`.
+    outbox
+        .cancel("wallet", "solana-devnet", &staged.id)
+        .expect("a signed-but-not-broadcast entry must still be cancellable");
+    let cancelled = outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &staged.id,
+            SolanaOutboxState::Failed,
+        )
+        .unwrap();
+    assert_eq!(cancelled.staged.status, SolanaTxStatus::Cancelled);
 }
 
 #[tokio::test]
