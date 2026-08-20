@@ -11,5 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod health;
+pub mod retry;
 
 pub use health::{CooldownDecision, EndpointHealth, EndpointHealthSnapshot, HealthRegistry};
+pub use retry::{RetrySignal, should_retry};

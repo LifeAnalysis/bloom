@@ -514,6 +514,17 @@ impl Config {
                 )));
             }
         }
+        // A name configured in both `chains` (EVM) and `solana_chains` is
+        // ambiguous: per the wallets VFS dispatch order (Solana checked
+        // first), it would silently make the EVM chain of that name
+        // completely unreachable, with no error anywhere else.
+        for name in self.solana_chains.keys() {
+            if self.chains.contains_key(name) {
+                return Err(ConfigError::Invalid(format!(
+                    "chain name '{name}' is configured in both chains and solana_chains"
+                )));
+            }
+        }
         for (app_name, app) in &self.petals.runtime {
             validate_petal_runtime_name("app", app_name)?;
             for (binding, origin) in &app.endpoints {
@@ -670,6 +681,48 @@ mod tests {
     #[test]
     fn local_default_validates() {
         Config::local_default().validate().unwrap();
+    }
+
+    // Fix G (PLAN-SOLANA-PR-FIXES.md): a name configured in both `chains`
+    // and `solana_chains` silently made the EVM chain of that name
+    // unreachable (Solana is checked first in the wallets VFS dispatch
+    // order), with no error at config load and no error at runtime.
+    #[test]
+    fn colliding_solana_and_evm_chain_names_are_refused() {
+        let mut cfg = Config::local_default();
+        assert!(
+            cfg.chains.contains_key("ethereum"),
+            "test assumes the default config has an 'ethereum' EVM chain"
+        );
+        cfg.solana_chains.insert(
+            "ethereum".into(),
+            SolanaSpec {
+                name: "ethereum".into(),
+                endpoints: vec![],
+                expected_genesis_hex: None,
+                allow_broadcast: false,
+            },
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("ethereum"),
+            "error should name the colliding chain: {err}"
+        );
+    }
+
+    #[test]
+    fn non_colliding_solana_chain_name_still_validates() {
+        let mut cfg = Config::local_default();
+        cfg.solana_chains.insert(
+            "solana-devnet".into(),
+            SolanaSpec {
+                name: "solana-devnet".into(),
+                endpoints: vec![],
+                expected_genesis_hex: None,
+                allow_broadcast: false,
+            },
+        );
+        cfg.validate().unwrap();
     }
 
     #[test]

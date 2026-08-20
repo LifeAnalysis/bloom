@@ -2457,12 +2457,20 @@ impl WalletsHandler {
         let _projection = self.wallet_projection(wallet).await?;
         match segs.len() {
             1 => Ok(Self::wallet_dir_entries()),
-            2 if segs[1] == "chains" => Ok(self
-                .chains
-                .list_names()
-                .into_iter()
-                .map(|n| Entry::dir(&n))
-                .collect()),
+            2 if segs[1] == "chains" => {
+                // Solana chains dispatch through their own engine map
+                // (`self.solana`), not the EVM `ChainRegistry` — list both.
+                // A `BTreeSet` both de-dupes (defensive: `Config::validate`
+                // refuses a name colliding across the two, but listing
+                // shouldn't double-list even if that were ever bypassed)
+                // and keeps a stable sorted order.
+                let mut names: std::collections::BTreeSet<String> =
+                    self.chains.list_names().into_iter().collect();
+                if let Some(solana) = &self.solana {
+                    names.extend(solana.keys().cloned());
+                }
+                Ok(names.into_iter().map(|n| Entry::dir(&n)).collect())
+            }
             2 if segs[1] == "sealed-approvals" => {
                 let mut entries = vec![
                     Entry::writable_file("new.json"),
@@ -4204,6 +4212,33 @@ mod tests {
                 .lookup(&VfsPath::parse("/alice/chains/solana-mainnet/outbox").unwrap())
                 .await
                 .is_err()
+        );
+    }
+
+    // Fix F (PLAN-SOLANA-PR-FIXES.md): `wallets/<wallet>/chains` listing
+    // only ever enumerated the EVM chain registry — Solana chains are
+    // reachable by direct path (see the dispatch test above) but never
+    // showed up when someone enumerated available chains.
+    #[tokio::test]
+    async fn chains_listing_includes_both_evm_and_solana_chains() {
+        let f = make_handler_with_chain(true);
+        let solana_tmp = tempfile::tempdir().unwrap();
+        let (engine, _outbox) = solana_engine_fixture(&solana_tmp);
+        let handler = f.handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+
+        let listed = handler
+            .list(&VfsPath::parse("/alice/chains").unwrap())
+            .await
+            .unwrap();
+        let names: std::collections::BTreeSet<&str> =
+            listed.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains("anvil"), "EVM chain must still be listed");
+        assert!(
+            names.contains("solana-devnet"),
+            "Solana chain must be listed alongside EVM ones, not just reachable by direct path"
         );
     }
 
