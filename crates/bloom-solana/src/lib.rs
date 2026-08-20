@@ -12,12 +12,14 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod mainnet_guard;
 pub mod retry;
 pub mod transport;
 
 use std::sync::Arc;
 
 pub use error::SolanaRpcError;
+pub use mainnet_guard::{MAINNET_BETA_GENESIS_HASH, is_mainnet_beta_blocking};
 pub use transport::SolanaRpcClient;
 
 use serde::{Deserialize, Serialize};
@@ -221,7 +223,7 @@ impl SolanaClient {
         let result: Value = self
             .inner
             .rpc
-            .call("getFeeForMessage", &json!([message_b64]))
+            .call("getFeeForMessage", &json!([message_b64, { "encoding": "base64" }]))
             .await?;
         Ok(result.get("value").and_then(|v| v.as_u64()))
     }
@@ -231,7 +233,7 @@ impl SolanaClient {
         let result: Value = self
             .inner
             .rpc
-            .call("simulateTransaction", &json!([tx_b64]))
+            .call("simulateTransaction", &json!([tx_b64, { "encoding": "base64" }]))
             .await?;
         let value = result.get("value").cloned().unwrap_or(Value::Null);
         serde_json::from_value::<Simulation>(value)
@@ -244,7 +246,7 @@ impl SolanaClient {
     pub async fn send_transaction(&self, tx_b64: &str) -> Result<String, SolanaRpcError> {
         self.inner
             .rpc
-            .call("sendTransaction", &json!([tx_b64]))
+            .call("sendTransaction", &json!([tx_b64, { "encoding": "base64" }]))
             .await
     }
 

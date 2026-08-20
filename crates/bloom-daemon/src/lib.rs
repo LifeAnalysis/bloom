@@ -2392,6 +2392,39 @@ pub struct Daemon {
     pub wallet_projection_refresh_started: Arc<AtomicBool>,
 }
 
+/// Whether a configured Solana chain should be admitted (its transfer
+/// engine constructed) at daemon boot.
+///
+/// The config key's name is operator-chosen and proves nothing about the
+/// cluster its endpoints actually talk to — an operator who names a real
+/// mainnet endpoint anything without "mainnet" in it (a typo,
+/// `"solana-prod"`) would sail past a name-only check with
+/// `allow_broadcast: true`. The name is logged here purely as an
+/// operator-visible signal, never as a gate in either direction: a name
+/// that happens to contain "mainnet" but is genuinely devnet/testnet must
+/// not be refused on the name alone either — only live genesis identity
+/// decides.
+///
+/// Fails closed: if identity can't be determined (every endpoint
+/// unreachable), that's treated the same as "confirmed mainnet" and
+/// refused too, exactly like `Ok(true)`.
+fn admit_solana_chain(name: &str, spec: &bloom_proto::SolanaSpec) -> bool {
+    if name.to_lowercase().contains("mainnet") {
+        debug!(chain = %name, "daemon.solana_chain_name_mentions_mainnet");
+    }
+    match bloom_solana::is_mainnet_beta_blocking(spec) {
+        Ok(false) => true,
+        Ok(true) => {
+            warn!(chain = %name, "daemon.solana_mainnet_refused_by_genesis");
+            false
+        }
+        Err(e) => {
+            warn!(chain = %name, error = %e, "daemon.solana_genesis_check_failed");
+            false
+        }
+    }
+}
+
 impl Daemon {
     /// Build the narrow Machine-local batch execution service used by the CLI
     /// IPC endpoint. No custody, approval verifier, or private signing object
@@ -2660,12 +2693,7 @@ impl Daemon {
         > = std::collections::BTreeMap::new();
         if let (Some(broker), Some(catalog)) = (&broker, &provenance_catalog) {
             for (name, spec) in &config.solana_chains {
-                // Mainnet-shaped clusters are refused at construction in this
-                // release posture (broadcast is never enabled for them), so a
-                // stray mainnet entry cannot silently become a broadcastable
-                // chain.
-                if name.to_lowercase().contains("mainnet") {
-                    warn!(chain = %name, "daemon.solana_mainnet_refused");
+                if !admit_solana_chain(name, spec) {
                     continue;
                 }
                 let client = match bloom_solana::SolanaClient::build(spec) {
@@ -5438,6 +5466,98 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), d.shutdown())
             .await
             .expect("shutdown timed out");
+    }
+
+    /// A minimal loopback JSON-RPC stub answering `getGenesisHash` with a
+    /// fixed value, standing in for a Solana node during the mainnet-guard
+    /// tests below. Mirrors `bloom-solana`'s own test stub.
+    async fn spawn_genesis_stub(hash: impl Into<String>) -> String {
+        let hash = hash.into();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let hash = hash.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let _ = socket.read(&mut buf).await.unwrap_or(0);
+                    let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{hash}"}}"#);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    fn solana_spec_at(name: &str, endpoint: &str) -> bloom_proto::SolanaSpec {
+        bloom_proto::SolanaSpec {
+            name: name.to_string(),
+            endpoints: vec![bloom_solana::EndpointSpec {
+                url: endpoint.to_string(),
+                weight: 100,
+                cu_per_sec: None,
+                max_rps: None,
+                http_only: false,
+            }],
+            expected_genesis_hex: None,
+            allow_broadcast: true,
+        }
+    }
+
+    // Fix A (PLAN-SOLANA-PR-FIXES.md): the mainnet-broadcast guard must be
+    // the live genesis identity, not a substring match on the operator's
+    // config key name.
+    // `flavor = "multi_thread"`: `admit_solana_chain` blocks its calling
+    // worker thread by design. Under the default single-threaded test
+    // runtime that worker is also the only thread driving the stub
+    // server's `tokio::spawn`ed accept loop, which would starve it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admit_solana_chain_refuses_real_mainnet_genesis_under_an_innocuous_name() {
+        let mainnet_endpoint = spawn_genesis_stub(bloom_solana::MAINNET_BETA_GENESIS_HASH).await;
+        // Deliberately no "mainnet" substring anywhere in the name — this is
+        // exactly the bypass the substring-only check used to miss.
+        let spec = solana_spec_at("solana-prod", &mainnet_endpoint);
+        assert!(
+            !admit_solana_chain("solana-prod", &spec),
+            "a cluster whose live genesis hash is Solana mainnet-beta's must be refused \
+             regardless of what its config key is named"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admit_solana_chain_does_not_over_trust_a_mainnet_shaped_name() {
+        // A cluster that genuinely is NOT mainnet must not be refused just
+        // because someone named/mislabeled it with "mainnet" in the key —
+        // the fix must not over-trust the name string in the refusing
+        // direction either.
+        let devnet_endpoint = spawn_genesis_stub("D".repeat(32)).await;
+        let spec = solana_spec_at("mainnet-typo-devnet", &devnet_endpoint);
+        assert!(
+            admit_solana_chain("mainnet-typo-devnet", &spec),
+            "a genuinely non-mainnet cluster must be admitted even when its name \
+             contains \"mainnet\""
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_solana_chain_fails_closed_when_identity_cannot_be_determined() {
+        // Every endpoint unreachable: identity can't be verified at all.
+        // Must be refused exactly like a confirmed-mainnet cluster, not
+        // silently admitted.
+        let spec = solana_spec_at("solana-devnet", "http://127.0.0.1:1");
+        assert!(
+            !admit_solana_chain("solana-devnet", &spec),
+            "an unverifiable cluster must fail closed, not be admitted by default"
+        );
     }
 
     #[test]
