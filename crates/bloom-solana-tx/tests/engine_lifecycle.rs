@@ -428,6 +428,16 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
             .join(bloom_solana_tx::outbox::BROADCAST_ATTEMPT_FILE)
             .exists()
     );
+    // `intent.json`'s persisted status must agree with the directory it now
+    // lives in — broadcast() derives the transition target from
+    // `SolanaOutboxState::from_status(&staged.status)` (the previously
+    // dead-code mapping the plan asked to wire in) and rewrites
+    // `intent.json` accordingly, rather than leaving it stale at Pending.
+    assert_eq!(sent.staged.status, SolanaTxStatus::Sent);
+    assert_eq!(
+        bloom_solana_tx::outbox::SolanaOutboxState::from_status(&sent.staged.status),
+        SolanaOutboxState::Sent
+    );
 }
 
 /// A stub node whose `sendTransaction` answers with a non-retryable

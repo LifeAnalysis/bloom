@@ -195,3 +195,31 @@ fn sweep_expired_removes_only_expired() {
             .is_ok()
     );
 }
+
+// Fix C's related dead-code cleanup (PLAN-SOLANA-PR-FIXES.md): from_status
+// was marked #[allow(dead_code)] with no real caller — pin the mapping it
+// defines now that the engine's broadcast() actually derives its
+// transition target from it.
+#[test]
+fn from_status_maps_every_status_to_its_outbox_state() {
+    assert_eq!(
+        SolanaOutboxState::from_status(&SolanaTxStatus::Pending),
+        SolanaOutboxState::Pending
+    );
+    assert_eq!(
+        SolanaOutboxState::from_status(&SolanaTxStatus::Sent),
+        SolanaOutboxState::Sent
+    );
+    assert_eq!(
+        SolanaOutboxState::from_status(&SolanaTxStatus::Success),
+        SolanaOutboxState::Sent
+    );
+    assert_eq!(
+        SolanaOutboxState::from_status(&SolanaTxStatus::Failed),
+        SolanaOutboxState::Failed
+    );
+    assert_eq!(
+        SolanaOutboxState::from_status(&SolanaTxStatus::Cancelled),
+        SolanaOutboxState::Failed
+    );
+}

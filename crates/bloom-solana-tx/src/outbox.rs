@@ -64,9 +64,11 @@ impl SolanaOutboxState {
         }
     }
 
-    /// Map a status to its on-disk state (used by the stage/confirm paths
-    /// once the transaction engine lands; see the plan).
-    #[allow(dead_code)]
+    /// Map a status to its on-disk state — the single source of truth the
+    /// engine's transition points derive their target state from (see
+    /// `SolanaTransferEngine::broadcast`), rather than each call site
+    /// hardcoding a state literal that could drift from the `status` field
+    /// it's paired with.
     pub fn from_status(s: &SolanaTxStatus) -> Self {
         match s {
             SolanaTxStatus::Pending => Self::Pending,
@@ -263,6 +265,18 @@ impl SolanaOutbox {
             let _ = fs::remove_file(target.join(BROADCAST_RAW_TX));
         }
         Ok(target)
+    }
+
+    /// Overwrite `intent.json` for an already-located entry in place (same
+    /// directory, updated payload) — used to keep the persisted `status`
+    /// field in sync with the entry's actual on-disk state after a
+    /// transition, e.g. once a broadcast succeeds.
+    pub fn rewrite_intent(&self, entry: &SolanaOutboxEntry) -> Result<(), OutboxError> {
+        fs::write(
+            entry.dir.join("intent.json"),
+            serde_json::to_vec_pretty(&entry.staged)?,
+        )?;
+        Ok(())
     }
 
     /// Search for `id` across pending/sent/failed, returning the first hit.

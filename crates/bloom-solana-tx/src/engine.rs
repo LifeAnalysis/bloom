@@ -268,12 +268,19 @@ impl SolanaTransferEngine {
         let submitted = self.client.send_transaction(&tx_b64).await?;
 
         // Only a confirmed-successful broadcast earns the `sent` transition.
-        let sent_dir = self.outbox.transition(&entry, SolanaOutboxState::Sent)?;
+        // `staged.status` and the on-disk directory must agree, so derive
+        // the target state from the status via `from_status` rather than
+        // hardcoding a state literal that could drift from it.
+        let mut staged = entry.staged.clone();
+        staged.status = SolanaTxStatus::Sent;
+        let target_state = SolanaOutboxState::from_status(&staged.status);
+        let sent_dir = self.outbox.transition(&entry, target_state)?;
         let sent_entry = SolanaOutboxEntry {
-            state: SolanaOutboxState::Sent,
-            staged: entry.staged,
+            state: target_state,
+            staged,
             dir: sent_dir,
         };
+        self.outbox.rewrite_intent(&sent_entry)?;
         self.outbox
             .write_broadcast_attempt(&sent_entry, &submitted, &tx_bytes, now_ms)?;
         Ok(submitted)
