@@ -121,9 +121,17 @@ impl SolanaRpcClient {
     /// `alloy`-`FallbackLayer` behaviour (dispatches to all endpoints, only
     /// fails once every one does), which this module's doc comment already
     /// claims but previously didn't implement.
+    ///
+    /// A *retryable* error from every endpoint is worth one more pass:
+    /// the whole endpoint list is tried again up to `MAX_ATTEMPTS` times.
+    /// A non-retryable error from any endpoint is deterministic — rotating
+    /// endpoints or retrying the same one won't change the answer, so the
+    /// call fails immediately rather than wasting the budget on retries
+    /// that can't succeed.
     pub async fn call_raw(&self, method: &str, params: &Value) -> Result<Value, SolanaRpcError> {
         let mut last: Option<SolanaRpcError> = None;
         for attempt in 0..MAX_ATTEMPTS {
+            let mut had_non_retryable = false;
             for (idx, endpoint) in self.endpoints.iter().enumerate() {
                 let started = Instant::now();
                 match self.post(endpoint, method, params).await {
@@ -138,10 +146,20 @@ impl SolanaRpcClient {
                         // of retryability — only exhausting every endpoint
                         // (across all attempt passes) gives up.
                         last = Some(failure.error);
+                        if !failure.retryable {
+                            had_non_retryable = true;
+                        }
                     }
                 }
             }
-            // Every endpoint failed this pass; pause before the next pass.
+            // A deterministic failure is a capability or argument error, not
+            // a transient blip. Retrying won't change the answer; bail now
+            // rather than burning the rest of the budget on identical calls.
+            if had_non_retryable {
+                break;
+            }
+            // Every endpoint failed with retryable errors; pause before the
+            // next pass.
             if attempt + 1 < MAX_ATTEMPTS {
                 tokio::time::sleep(backoff_for(attempt)).await;
             }
