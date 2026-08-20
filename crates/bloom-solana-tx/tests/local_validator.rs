@@ -194,20 +194,44 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
 
     let fee_payer = broker.child_pubkey();
     let fee_payer_b58 = bs58::encode(fee_payer).into_string();
+    let airdrop_lamports = std::env::var("SOLANA_AIRDROP_LAMPORTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2_000_000_000);
+    let transfer_lamports = std::env::var("SOLANA_TRANSFER_LAMPORTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1_000_000_000);
+    assert!(transfer_lamports > 0);
+    assert!(airdrop_lamports > transfer_lamports + 5_000);
 
     // Fund the derived child and wait for the balance to land.
-    client
-        .request_airdrop(&fee_payer_b58, 2_000_000_000)
-        .await
-        .expect("airdrop to the derived child");
+    let mut airdrop_result = None;
+    for attempt in 0..3 {
+        match client
+            .request_airdrop(&fee_payer_b58, airdrop_lamports)
+            .await
+        {
+            Ok(signature) => {
+                airdrop_result = Some(signature);
+                break;
+            }
+            Err(error) if attempt < 2 => {
+                eprintln!("airdrop attempt {} failed: {error}", attempt + 1);
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(error) => panic!("airdrop to the derived child: {error}"),
+        }
+    }
+    assert!(airdrop_result.is_some());
     for _ in 0..30 {
-        if client.get_balance(&fee_payer_b58).await.unwrap_or(0) >= 2_000_000_000 {
+        if client.get_balance(&fee_payer_b58).await.unwrap_or(0) >= airdrop_lamports {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     assert!(
-        client.get_balance(&fee_payer_b58).await.unwrap_or(0) >= 2_000_000_000,
+        client.get_balance(&fee_payer_b58).await.unwrap_or(0) >= airdrop_lamports,
         "airdrop must fund the derived child"
     );
 
@@ -216,7 +240,13 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
         .to_bytes();
 
     let staged = engine
-        .stage("wallet", &fee_payer, &destination, 1_000_000_000, now_ms())
+        .stage(
+            "wallet",
+            &fee_payer,
+            &destination,
+            transfer_lamports,
+            now_ms(),
+        )
         .await
         .expect("stage against the local validator");
 
