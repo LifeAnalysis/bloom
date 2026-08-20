@@ -2219,6 +2219,14 @@ process can pre-empt or take over the listener; failure of that negative test
 is an E-05 go/no-go failure for that platform, exactly like the state-isolation
 tests.
 
+Authenticated Unix endpoints are different: on Linux the service principal
+must create its own listener after activation so `SO_PEERCRED` identifies that
+principal in both directions. A root-created systemd Unix listener reports the
+launch manager as the peer to a connecting client and therefore cannot satisfy
+the UID-plus-application-key authentication rule. Packaging may use a separate
+path or demand trigger, but it must not pass a root-created authenticated Unix
+listener to Broker or Signer.
+
 Distinct effective principals or mandatory sandbox identities must prevent a
 compromised Machine from:
 
