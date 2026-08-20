@@ -20,15 +20,17 @@ use libfuzzer_sys::fuzz_target;
 
 fn slice32(data: &[u8], offset: usize) -> [u8; 32] {
     let mut out = [0u8; 32];
-    let n = data.len().saturating_sub(offset).min(32);
-    out[..n].copy_from_slice(&data[offset..offset + n]);
+    if let Some(rest) = data.get(offset..) {
+        let n = rest.len().min(32);
+        out[..n].copy_from_slice(&rest[..n]);
+    }
     out
 }
 
 fuzz_target!(|data: &[u8]| {
     let lamports = u64::from_le_bytes(
         data.get(..8)
-            .copied()
+            .map(<[u8]>::to_vec)
             .unwrap_or_default()
             .try_into()
             .unwrap_or([0u8; 8]),
@@ -38,7 +40,7 @@ fuzz_target!(|data: &[u8]| {
     let blockhash = slice32(data, 64);
     let signature: [u8; 64] = data
         .get(64..128)
-        .copied()
+        .map(<[u8]>::to_vec)
         .unwrap_or_default()
         .try_into()
         .unwrap_or([0u8; 64]);
