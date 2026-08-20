@@ -1745,19 +1745,19 @@ struct Cli {
 enum InitInternal {
     #[cfg(feature = "triad-dev-harness")]
     #[command(name = "triad-render-developer-enrollment", hide = true)]
-    TriadRenderDeveloperEnrollment {
+    DeveloperEnrollment {
         template_dir: PathBuf,
         output_dir: PathBuf,
         release_digest: String,
     },
     #[cfg(feature = "triad-dev-harness")]
     #[command(name = "triad-enroll-developer-petal-provenance", hide = true)]
-    TriadEnrollDeveloperPetalProvenance {
+    EnrollDeveloperPetalProvenance {
         config_dir: PathBuf,
         petal_dir: PathBuf,
     },
     #[command(name = "triad-render-macos-enrollment", hide = true)]
-    TriadRenderMacosEnrollment {
+    MacosEnrollment {
         template_dir: PathBuf,
         output_dir: PathBuf,
         login_uid: u32,
@@ -1767,7 +1767,7 @@ enum InitInternal {
         release_digest: String,
     },
     #[command(name = "triad-render-linux-enrollment", hide = true)]
-    TriadRenderLinuxEnrollment {
+    LinuxEnrollment {
         template_dir: PathBuf,
         output_dir: PathBuf,
         login_uid: u32,
@@ -1777,7 +1777,7 @@ enum InitInternal {
         release_digest: String,
     },
     #[command(name = "triad-render-macos-identity-rotation", hide = true)]
-    TriadRenderMacosIdentityRotation {
+    MacosIdentityRotation {
         current_identity: PathBuf,
         replacement_identity: PathBuf,
     },
@@ -2438,7 +2438,7 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(internal) = internal {
                 return match internal {
                     #[cfg(feature = "triad-dev-harness")]
-                    InitInternal::TriadRenderDeveloperEnrollment {
+                    InitInternal::DeveloperEnrollment {
                         template_dir,
                         output_dir,
                         release_digest,
@@ -2447,12 +2447,12 @@ async fn run(cli: Cli) -> Result<()> {
                             .context("Bloom developer triad enrollment generation failed")
                     }
                     #[cfg(feature = "triad-dev-harness")]
-                    InitInternal::TriadEnrollDeveloperPetalProvenance {
+                    InitInternal::EnrollDeveloperPetalProvenance {
                         config_dir,
                         petal_dir,
                     } => triad_enrollment::run_developer_petal_provenance(&config_dir, &petal_dir)
                         .context("Bloom developer Petal provenance enrollment failed"),
-                    InitInternal::TriadRenderMacosEnrollment {
+                    InitInternal::MacosEnrollment {
                         template_dir,
                         output_dir,
                         login_uid,
@@ -2470,7 +2470,7 @@ async fn run(cli: Cli) -> Result<()> {
                         release_digest,
                     )
                     .context("Bloom macOS enrollment generation failed"),
-                    InitInternal::TriadRenderLinuxEnrollment {
+                    InitInternal::LinuxEnrollment {
                         template_dir,
                         output_dir,
                         login_uid,
@@ -2488,7 +2488,7 @@ async fn run(cli: Cli) -> Result<()> {
                         release_digest,
                     )
                     .context("Bloom Linux enrollment generation failed"),
-                    InitInternal::TriadRenderMacosIdentityRotation {
+                    InitInternal::MacosIdentityRotation {
                         current_identity,
                         replacement_identity,
                     } => triad_enrollment::run_identity_rotation(
