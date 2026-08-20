@@ -16,10 +16,13 @@ files form two deliberately non-transitive data-plane groups:
 The separate `bloom-revoke-1000` group reaches only the two control sockets.
 It grants no access to either data-plane socket.
 
-All five Unix sockets and the canonical `127.0.0.1:18734` listener are owned by
-systemd. The installer enables every socket instance before exposing the
-Machine client. The service processes consume the named descriptors and have
-no self-bind fallback. A canonical-listener conflict therefore fails the
+Broker and Signer own their four authenticated Unix sockets so Linux
+`SO_PEERCRED` reports the actual security-service UID in both directions.
+Systemd owns only the canonical `127.0.0.1:18734` ceremony listener, where Unix
+peer credentials are unavailable, and passes that TCP listener to Broker. The
+authenticated login-session sentinel owns its Unix socket while the user's
+systemd session is active. A path unit starts Broker and Signer only after that
+session socket exists. A canonical-listener conflict therefore fails the
 `bloom-broker-ceremony@UID.socket` unit and never selects another port.
 
 State roots and service configuration live below principal-owned mode-0700

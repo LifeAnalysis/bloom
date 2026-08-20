@@ -44,7 +44,7 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     archive_sha256: "7f3bcc5b762f7750c2fa9c445491f7be32ffdf233d3f371481e8dc3d0a8116d0",
     tooling_commit: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
-    default_eligible: true,
+    default_eligible: false,
 };
 
 const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
@@ -57,7 +57,7 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     archive_sha256: "16abd73df768b5f9aba45f20b5c56a50c064368d25bf5e8efa31d3564608422e",
     tooling_commit: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
-    default_eligible: true,
+    default_eligible: false,
 };
 
 const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
@@ -1394,7 +1394,13 @@ mod tests {
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
         assert_eq!(enso.archive, "enso-v0.1.2.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
-        for name in ["gasless", "privacy-pools", "venice-x402"] {
+        for name in [
+            "near-intents",
+            "enso",
+            "gasless",
+            "privacy-pools",
+            "venice-x402",
+        ] {
             let entry = preinstalled_petal(name).unwrap();
             assert_eq!(entry.name, name);
             assert_eq!(entry.commit.len(), 40);

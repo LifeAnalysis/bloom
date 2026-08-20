@@ -158,13 +158,16 @@ else
     edge-manifest.json \
     broker.json \
     signer.json \
+    machine-identity.json \
     broker-identity.json \
-    signer-identity.json
+    signer-identity.json \
+    revoke-identity.json \
+    session-identity.json \
+    installer-identity.json \
+    provenance-catalog.json
   do
     printf '{}\n' > "$install_payload/config/$config"
   done
-  printf 'time.cloudflare.com\ntime.nist.gov\n' \
-    > "$install_payload/config/nts-servers.conf"
   mkdir -p "$work/linux-root"
   "$install_payload/installer/release/install-linux.sh" \
     install "$work/linux-root" 1000 releaseuser "$install_payload"

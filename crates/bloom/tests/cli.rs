@@ -937,6 +937,12 @@ fn docs_petals_discovers_installed_package_from_manifest() {
     let _daemon = RunningBloom::start(home.path());
 
     bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("app=petals/demo/"));
+
+    bloom_cmd(home.path())
         .args(["vfs", "cat", "/docs/petals.md"])
         .assert()
         .success()

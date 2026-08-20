@@ -1,5 +1,5 @@
-//! Root-only generation of per-login macOS triad identities and signing
-//! material from public release templates.
+//! Root-only generation of per-login triad identities and signing material
+//! from public release templates.
 
 use std::{
     collections::BTreeMap,
@@ -42,6 +42,32 @@ pub fn run(
     }
     if std::env::consts::OS != "macos" {
         bail!("macOS enrollment material generation requires Darwin");
+    }
+    generate(&EnrollmentPlan {
+        template_dir,
+        output_dir,
+        login_uid,
+        broker_uid,
+        signer_uid,
+        session_socket_gid,
+        release_digest,
+    })
+}
+
+pub fn run_linux(
+    template_dir: PathBuf,
+    output_dir: PathBuf,
+    login_uid: u32,
+    broker_uid: u32,
+    signer_uid: u32,
+    session_socket_gid: u32,
+    release_digest: String,
+) -> Result<()> {
+    if rustix::process::geteuid().as_raw() != 0 {
+        bail!("Linux enrollment material generation requires root");
+    }
+    if std::env::consts::OS != "linux" {
+        bail!("Linux enrollment material generation requires Linux");
     }
     generate(&EnrollmentPlan {
         template_dir,
@@ -557,7 +583,7 @@ fn validate_plan(plan: &EnrollmentPlan, expected_owner: u32) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
-        bail!("macOS enrollment generation plan has invalid IDs or release digest");
+        bail!("triad enrollment generation plan has invalid IDs or release digest");
     }
     require_empty_private_output(&plan.output_dir, expected_owner)?;
     for name in PUBLIC_TEMPLATE_FILES

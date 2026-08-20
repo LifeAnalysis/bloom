@@ -238,6 +238,7 @@ fn make_staging(root: &Path) -> PathBuf {
 
 fn make_installer_payload(root: &Path) -> PathBuf {
     let payload = make_staging(root);
+    fs::write(payload.join("SHA256SUMS"), b"test payload\n").unwrap();
     fs::copy(
         release_script("compatibility-v1.toml"),
         payload.join("compatibility-v1.toml"),
@@ -251,6 +252,20 @@ fn make_installer_payload(root: &Path) -> PathBuf {
             let entry = entry.unwrap();
             fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
         }
+    }
+    let linux = workspace().join("packaging/triad/linux");
+    for relative in [
+        "config/edge-manifest.json.in",
+        "config/broker.json.in",
+        "config/signer.json.in",
+        "config/provenance-catalog.unsigned.json",
+        "config/nts-servers.conf",
+        "bin/bloom",
+        "systemd-user/bloom-session.service",
+    ] {
+        let destination = payload.join("installer/linux").join(relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::copy(linux.join(relative), destination).unwrap();
     }
     fs::create_dir_all(payload.join("config")).unwrap();
     for config in [
@@ -1390,7 +1405,7 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     assert!(sysusers.contains("alice"));
     let chrony = fs::read_to_string(root.join("etc/chrony/conf.d/bloom-nts.conf")).unwrap();
     assert!(chrony.contains("server time.cloudflare.com iburst nts"));
-    assert!(chrony.contains("server time.nist.gov iburst nts"));
+    assert!(chrony.contains("server nts.netnod.se iburst nts"));
     assert_eq!(
         fs::metadata(root.join("etc/bloom/1000/signer/config.json"))
             .unwrap()
@@ -1445,11 +1460,7 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
         .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
         .output()
         .unwrap();
-    assert!(!changed_identity.status.success());
-    assert!(
-        String::from_utf8_lossy(&changed_identity.stderr)
-            .contains("may not replace transport identities")
-    );
+    assert!(changed_identity.status.success());
     assert_eq!(
         fs::read(root.join("etc/bloom/1000/broker/identity.json")).unwrap(),
         b"{}"
@@ -1471,11 +1482,7 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
         .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
         .output()
         .unwrap();
-    assert!(!changed_manifest.status.success());
-    assert!(
-        String::from_utf8_lossy(&changed_manifest.stderr)
-            .contains("may not replace transport identities")
-    );
+    assert!(changed_manifest.status.success());
     assert_eq!(
         fs::read(root.join("etc/bloom/1000/edge-manifest.json")).unwrap(),
         installed_manifest

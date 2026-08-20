@@ -1766,6 +1766,16 @@ enum InitInternal {
         session_socket_gid: u32,
         release_digest: String,
     },
+    #[command(name = "triad-render-linux-enrollment", hide = true)]
+    TriadRenderLinuxEnrollment {
+        template_dir: PathBuf,
+        output_dir: PathBuf,
+        login_uid: u32,
+        broker_uid: u32,
+        signer_uid: u32,
+        session_socket_gid: u32,
+        release_digest: String,
+    },
     #[command(name = "triad-render-macos-identity-rotation", hide = true)]
     TriadRenderMacosIdentityRotation {
         current_identity: PathBuf,
@@ -1914,9 +1924,9 @@ enum VfsCmd {
 
 #[derive(Subcommand, Debug)]
 enum PetalsCmd {
-    /// Install a Petal package directory, `.petal.tar`, or trusted GitHub source repository.
+    /// Install a Petal package directory, `.petal.tar`, `.petal.tar.gz`, or trusted GitHub source repository.
     Install {
-        /// Path to a package directory, `.petal.tar`, or trusted GitHub source repository URL.
+        /// Path to a package directory, `.petal.tar`, `.petal.tar.gz`, or trusted GitHub source repository URL.
         path: String,
         /// Git tag, branch, or commit SHA to install from a GitHub source repository.
         #[arg(long = "ref", value_name = "TAG_OR_SHA")]
@@ -2460,6 +2470,24 @@ async fn run(cli: Cli) -> Result<()> {
                         release_digest,
                     )
                     .context("Bloom macOS enrollment generation failed"),
+                    InitInternal::TriadRenderLinuxEnrollment {
+                        template_dir,
+                        output_dir,
+                        login_uid,
+                        broker_uid,
+                        signer_uid,
+                        session_socket_gid,
+                        release_digest,
+                    } => triad_enrollment::run_linux(
+                        template_dir,
+                        output_dir,
+                        login_uid,
+                        broker_uid,
+                        signer_uid,
+                        session_socket_gid,
+                        release_digest,
+                    )
+                    .context("Bloom Linux enrollment generation failed"),
                     InitInternal::TriadRenderMacosIdentityRotation {
                         current_identity,
                         replacement_identity,
