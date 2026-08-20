@@ -41,7 +41,11 @@ jobs:
           curl -sSL -o /tmp/agave-install.sh https://release.anza.xyz/v3.0.0/install
           echo "7d588d188cb9ea550434cabc62a9927cf75de22e1aeb2a87f2352071812944fb  /tmp/agave-install.sh" | sha256sum -c -
           sh /tmp/agave-install.sh v3.0.0
+          # $GITHUB_PATH only takes effect in *subsequent* steps, not the
+          # rest of this one — export inline too so the sanity-check call
+          # below (and this step alone) can find the binary immediately.
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
           solana-test-validator --version
       - name: Start local validator
         run: |

@@ -5693,9 +5693,7 @@ mod tests {
                         "getGenesisHash" => {
                             format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{genesis_hash}"}}"#)
                         }
-                        "getSignatureStatuses" => format!(
-                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":5}},"value":[{{"slot":5,"confirmations":null,"err":null,"confirmationStatus":"finalized"}}]}}}}"#
-                        ),
+                        "getSignatureStatuses" => r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":5},"value":[{"slot":5,"confirmations":null,"err":null,"confirmationStatus":"finalized"}]}}"#.to_string(),
                         _ => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#.to_string(),
                     };
                     let response = format!(

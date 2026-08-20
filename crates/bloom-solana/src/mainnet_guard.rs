@@ -216,14 +216,14 @@ mod tests {
         // deadlock (this is exactly the context `bloom-daemon` calls it
         // from — its own boot path is synchronous but may run under an
         // already-active tokio runtime in production).
-        assert_eq!(is_mainnet_beta_blocking(&spec).unwrap(), true);
+        assert!(is_mainnet_beta_blocking(&spec).unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn does_not_confirm_mainnet_for_a_different_genesis() {
         let endpoint = spawn_genesis_stub("D".repeat(32)).await;
         let spec = spec_with_endpoint(&endpoint);
-        assert_eq!(is_mainnet_beta_blocking(&spec).unwrap(), false);
+        assert!(!is_mainnet_beta_blocking(&spec).unwrap());
     }
 
     #[test]
