@@ -191,7 +191,10 @@ async fn spawn_node() -> String {
 /// `lastValidBlockHeight`) and `getBlockHeight` (with a configurable
 /// current height), for the `stage()` expiry tests below (Fix D,
 /// PLAN-SOLANA-PR-FIXES.md).
-async fn spawn_node_with_heights(current_block_height: u64, last_valid_block_height: u64) -> String {
+async fn spawn_node_with_heights(
+    current_block_height: u64,
+    last_valid_block_height: u64,
+) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -271,7 +274,10 @@ async fn stage_with_an_already_stale_blockhash_is_reaped_by_the_sweep() {
     );
 
     let swept = outbox.sweep_expired(now_ms).unwrap();
-    assert_eq!(swept, 1, "the daemon sweep must reap an abandoned stale stage");
+    assert_eq!(
+        swept, 1,
+        "the daemon sweep must reap an abandoned stale stage"
+    );
     outbox
         .read_in_state(
             "wallet",
@@ -537,7 +543,10 @@ async fn broadcast_failure_leaves_entry_pending_and_retry_succeeds() {
     // First broadcast attempt: the node returns a hard RPC error. The entry
     // must not have moved to `sent` for a broadcast that never happened.
     let first_attempt = engine.broadcast("wallet", &staged.id, 1_300).await;
-    assert!(first_attempt.is_err(), "expected the first broadcast to fail");
+    assert!(
+        first_attempt.is_err(),
+        "expected the first broadcast to fail"
+    );
     let entry = outbox
         .read_in_state(
             "wallet",

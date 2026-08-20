@@ -3686,7 +3686,9 @@ fn run_solana_expiry_sweep_once(
             prev: String::new(),
             digest: String::new(),
         })
-        .map_err(|error| format!("Machine audit unavailable before Solana expiry sweep: {error}"))?;
+        .map_err(|error| {
+            format!("Machine audit unavailable before Solana expiry sweep: {error}")
+        })?;
     let swept = outbox.sweep_expired(now_ms);
     let result = match &swept {
         Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
@@ -6163,8 +6165,7 @@ ws_url = "wss://example.invalid"
         let home = HomeDir::at(dir.path());
         let d = Daemon::from_home(home.clone()).unwrap();
 
-        let solana_outbox =
-            bloom_solana_tx::outbox::SolanaOutbox::new(home.outbox_dir()).unwrap();
+        let solana_outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.outbox_dir()).unwrap();
         let staged = bloom_solana_tx::types::StagedSolanaTransfer {
             id: "0001-test".into(),
             wallet: "alice".into(),

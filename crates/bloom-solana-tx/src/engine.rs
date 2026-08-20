@@ -242,9 +242,9 @@ impl SolanaTransferEngine {
         if !self.client.allow_broadcast() {
             return Err(EngineError::BroadcastDisabled(self.chain.clone()));
         }
-        let entry = self
-            .outbox
-            .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)?;
+        let entry =
+            self.outbox
+                .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)?;
         let signature_b58 = entry
             .staged
             .signature
