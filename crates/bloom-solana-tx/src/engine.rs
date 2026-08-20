@@ -22,6 +22,16 @@ use crate::{assemble_transaction, build_transfer_message};
 /// Default approval/signing TTL for a staged transfer (ms).
 const SIGN_TTL_MS: u64 = 60_000;
 
+/// Conservative estimate of Solana's per-slot duration, used only to turn a
+/// block-height-denominated blockhash validity window into a wall-clock
+/// expiry. Solana's target slot time; real slot times are frequently at or
+/// above this under load, so converting at this rate slightly
+/// *underestimates* how long the blockhash actually stays valid — erring
+/// toward reaping a stage a little early rather than letting one that has
+/// truly gone stale linger, which was the actual bug (Fix D,
+/// PLAN-SOLANA-PR-FIXES.md).
+const APPROX_SLOT_MS: u128 = 400;
+
 /// A native SOL transfer intent as supplied by the write surface
 /// (`wallets/<wallet>/chains/<chain>/outbox/new.tx`).
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -90,6 +100,27 @@ impl SolanaTransferEngine {
         &self.chain
     }
 
+    /// Turn a fetched blockhash's `last_valid_block_height` into a
+    /// wall-clock expiry, so a staged-but-abandoned transfer is eventually
+    /// reaped by the sweep guard instead of lingering forever
+    /// (`stage()` previously hardcoded `expires_ms: 0`, which the sweep's
+    /// `!= 0` guard treats as "never expires").
+    ///
+    /// Best-effort: if the current block height can't be fetched (a
+    /// transient RPC hiccup right after the blockhash call that just
+    /// succeeded), falls back to the full nominal validity window
+    /// (`MAX_RECENT_BLOCKHASHES` worth of slots) from now rather than
+    /// leaving the entry unexpirable again.
+    async fn blockhash_expiry_ms(&self, last_valid_block_height: u64, now_ms: u128) -> u128 {
+        // Solana's standard blockhash validity window.
+        const NOMINAL_VALID_BLOCKS: u64 = 150;
+        let blocks_remaining = match self.client.get_block_height().await {
+            Ok(current_height) => last_valid_block_height.saturating_sub(current_height),
+            Err(_) => NOMINAL_VALID_BLOCKS,
+        };
+        now_ms + u128::from(blocks_remaining) * APPROX_SLOT_MS
+    }
+
     /// Stage a native transfer: fetch a recent blockhash, build the canonical
     /// legacy message, and persist the write-once intent in `pending/<id>/`.
     pub async fn stage(
@@ -110,6 +141,9 @@ impl SolanaTransferEngine {
             .map_err(|e| EngineError::Invalid(e.to_string()))?;
         let payload_digest_hex = hex::encode(Sha256::digest(&message));
         let id = self.outbox.allocate_id();
+        let expires_ms = self
+            .blockhash_expiry_ms(blockhash.last_valid_block_height, now_ms)
+            .await;
         let staged = StagedSolanaTransfer {
             id,
             wallet: wallet.to_string(),
@@ -123,7 +157,7 @@ impl SolanaTransferEngine {
             payload_digest_hex,
             signature: None,
             created_ms: now_ms,
-            expires_ms: 0,
+            expires_ms,
             status: SolanaTxStatus::Pending,
             action_id: None,
         };

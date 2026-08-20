@@ -187,6 +187,133 @@ async fn spawn_node() -> String {
     format!("http://{addr}/")
 }
 
+/// A stub node answering `getLatestBlockhash` (with a configurable
+/// `lastValidBlockHeight`) and `getBlockHeight` (with a configurable
+/// current height), for the `stage()` expiry tests below (Fix D,
+/// PLAN-SOLANA-PR-FIXES.md).
+async fn spawn_node_with_heights(current_block_height: u64, last_valid_block_height: u64) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                let method = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
+                    .unwrap_or_default();
+                let result = match method.as_str() {
+                    "getLatestBlockhash" => {
+                        let blockhash = bs58::encode([0x42u8; 32]).into_string();
+                        format!(
+                            r#"{{"context":{{"slot":{current_block_height}}},"value":{{"blockhash":"{blockhash}","lastValidBlockHeight":{last_valid_block_height}}}}}"#
+                        )
+                    }
+                    "getBlockHeight" => current_block_height.to_string(),
+                    _ => r#"{"code":-32601,"message":"method not found"}"#.to_string(),
+                };
+                let payload = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+// Fix D (PLAN-SOLANA-PR-FIXES.md): stage() hardcoded expires_ms: 0, which
+// sweep_expired's `!= 0` guard treats as "never expires". A staged transfer
+// whose blockhash has already gone (or is about to go) stale must get a
+// real, reapable expiry instead.
+#[tokio::test]
+async fn stage_with_an_already_stale_blockhash_is_reaped_by_the_sweep() {
+    // The blockhash's last-valid height is already behind the current
+    // height: it's stale the moment it's staged.
+    let endpoint = spawn_node_with_heights(/* current */ 500, /* last_valid */ 350).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+
+    let fee_payer = broker.child_pubkey();
+    let destination = ed25519_dalek::SigningKey::from_bytes(&[0xbb; 32])
+        .verifying_key()
+        .to_bytes();
+    let now_ms = 1_000_000u128;
+    let staged = engine
+        .stage("wallet", &fee_payer, &destination, 1_000_000, now_ms)
+        .await
+        .unwrap();
+    assert!(
+        staged.expires_ms != 0,
+        "a real expiry must be set, not the old hardcoded 0 placeholder"
+    );
+    assert!(
+        staged.expires_ms <= now_ms,
+        "a blockhash that's already past its last-valid height must expire immediately, \
+         got expires_ms={} for now_ms={now_ms}",
+        staged.expires_ms
+    );
+
+    let swept = outbox.sweep_expired(now_ms).unwrap();
+    assert_eq!(swept, 1, "the daemon sweep must reap an abandoned stale stage");
+    outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &staged.id,
+            SolanaOutboxState::Failed,
+        )
+        .expect("swept entry moves to failed, matching EVM's abandoned-stage behavior");
+}
+
+#[tokio::test]
+async fn stage_with_a_fresh_blockhash_is_not_reaped_immediately() {
+    // Plenty of blocks remain before the blockhash goes stale.
+    let endpoint = spawn_node_with_heights(/* current */ 500, /* last_valid */ 650).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+
+    let fee_payer = broker.child_pubkey();
+    let destination = ed25519_dalek::SigningKey::from_bytes(&[0xbb; 32])
+        .verifying_key()
+        .to_bytes();
+    let now_ms = 1_000_000u128;
+    let staged = engine
+        .stage("wallet", &fee_payer, &destination, 1_000_000, now_ms)
+        .await
+        .unwrap();
+    assert!(
+        staged.expires_ms > now_ms,
+        "a fresh blockhash must expire well after now, got expires_ms={} for now_ms={now_ms}",
+        staged.expires_ms
+    );
+
+    let swept = outbox.sweep_expired(now_ms).unwrap();
+    assert_eq!(swept, 0, "a not-yet-stale stage must survive a sweep pass");
+}
+
 fn client(endpoint: &str) -> SolanaClient {
     SolanaClient::build(&SolanaSpec {
         name: "solana-devnet".into(),

@@ -3477,6 +3477,20 @@ impl Daemon {
 
         let outbox = self.tx_engine.outbox.clone();
         let audit = self.audit.clone();
+        // Solana staged transfers live in their own outbox root (same
+        // directory tree, disjoint chain subdirectories) — `bloom_tx::Outbox`
+        // above only ever walks EVM's. Best-effort construct a handle to it
+        // here too, so a real (non-zero, see Fix D's `stage()` change)
+        // Solana expiry actually gets swept instead of only ever being
+        // computed and never acted on.
+        let solana_outbox = match bloom_solana_tx::outbox::SolanaOutbox::new(self.home.outbox_dir())
+        {
+            Ok(o) => Some(o),
+            Err(e) => {
+                warn!(error = %e, "daemon.solana_outbox_sweep_unavailable");
+                None
+            }
+        };
         let (tx, mut rx) = watch::channel(false);
         let interval = Duration::from_secs(60);
         let handle = tokio::spawn(async move {
@@ -3496,6 +3510,13 @@ impl Daemon {
                             Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
                             Err(e) => warn!(error = %e, "outbox.sweep_expired_failed"),
+                        }
+                        if let Some(solana_outbox) = &solana_outbox {
+                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms) {
+                                Ok(0) => tracing::trace!("solana_outbox.sweep_expired.empty"),
+                                Ok(n) => info!(swept = n, "solana_outbox.sweep_expired"),
+                                Err(e) => warn!(error = %e, "solana_outbox.sweep_expired_failed"),
+                            }
                         }
                     }
                     _ = rx.changed() => {
@@ -3632,6 +3653,60 @@ fn run_expiry_sweep_once(
             digest: String::new(),
         })
         .map_err(|error| format!("Machine audit unavailable after expiry sweep: {error}"))?;
+    swept.map_err(|error| error.to_string())
+}
+
+/// Solana sibling of [`run_expiry_sweep_once`]: same audit-wrapped shape,
+/// over `bloom_solana_tx::outbox::SolanaOutbox` instead of EVM's
+/// `bloom_tx::outbox::Outbox` (Fix D, PLAN-SOLANA-PR-FIXES.md).
+fn run_solana_expiry_sweep_once(
+    outbox: &bloom_solana_tx::outbox::SolanaOutbox,
+    audit: &AuditLog,
+    now_ms: u128,
+) -> Result<usize, String> {
+    let intent = serde_json::json!({
+        "operation": "solana_tx.outbox.sweep_expired",
+        "cutoff_ms": now_ms.to_string(),
+        "scope": "all_pending_machine_solana_outbox_entries",
+    });
+    let operation_id =
+        bloom_tools::sha256_hex(&serde_jcs::to_vec(&intent).map_err(|error| error.to_string())?);
+    let correlation_id = format!("{operation_id}:{}", audit.sequence() + 1);
+    audit
+        .append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.intent".into(),
+            wallet: None,
+            chain: None,
+            data: serde_json::json!({
+                "operation_id": operation_id,
+                "correlation_id": correlation_id,
+                "details": intent,
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })
+        .map_err(|error| format!("Machine audit unavailable before Solana expiry sweep: {error}"))?;
+    let swept = outbox.sweep_expired(now_ms);
+    let result = match &swept {
+        Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
+        Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
+    };
+    audit
+        .append(AuditRecord {
+            ts_ms: 0,
+            kind: "machine.effect.result".into(),
+            wallet: None,
+            chain: None,
+            data: serde_json::json!({
+                "operation": "solana_tx.outbox.sweep_expired",
+                "correlation_id": correlation_id,
+                "result": result,
+            }),
+            prev: String::new(),
+            digest: String::new(),
+        })
+        .map_err(|error| format!("Machine audit unavailable after Solana expiry sweep: {error}"))?;
     swept.map_err(|error| error.to_string())
 }
 
@@ -6073,6 +6148,61 @@ ws_url = "wss://example.invalid"
         tokio::time::timeout(std::time::Duration::from_secs(2), tasks.shutdown())
             .await
             .expect("background task did not honour shutdown signal");
+    }
+
+    // Fix D (PLAN-SOLANA-PR-FIXES.md): the periodic sweep task only ever
+    // knew about the EVM outbox — `solana_engines`' outbox root was never
+    // passed to it at all, so even a correctly-set Solana expiry wouldn't
+    // get swept. Same pattern as `sweep_background_task_handles_shutdown`
+    // above: call the sweep function directly rather than waiting on the
+    // real 60s tick, but exercise the exact outbox root
+    // `spawn_background_tasks` itself constructs (`home.outbox_dir()`).
+    #[tokio::test]
+    async fn solana_sweep_reaps_an_expired_staged_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(dir.path());
+        let d = Daemon::from_home(home.clone()).unwrap();
+
+        let solana_outbox =
+            bloom_solana_tx::outbox::SolanaOutbox::new(home.outbox_dir()).unwrap();
+        let staged = bloom_solana_tx::types::StagedSolanaTransfer {
+            id: "0001-test".into(),
+            wallet: "alice".into(),
+            chain: "solana-devnet".into(),
+            fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
+            destination: "DEST111111111111111111111111111111111111111".into(),
+            lamports: 1_000_000,
+            blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
+            last_valid_block_height: 100,
+            message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),
+            payload_digest_hex: "ab".repeat(32),
+            signature: None,
+            created_ms: 0,
+            expires_ms: 1,
+            status: bloom_solana_tx::types::SolanaTxStatus::Pending,
+            action_id: None,
+        };
+        solana_outbox.write_pending(&staged, "plan").unwrap();
+
+        let n = run_solana_expiry_sweep_once(&solana_outbox, &d.audit, 2).unwrap();
+        assert_eq!(n, 1, "an abandoned, expired Solana stage must be reaped");
+        let records = d.audit.tail(2).unwrap();
+        assert_eq!(records[0].kind, "machine.effect.intent");
+        assert_eq!(
+            records[0].data["details"]["operation"],
+            "solana_tx.outbox.sweep_expired"
+        );
+        assert_eq!(records[1].kind, "machine.effect.result");
+        assert_eq!(records[1].data["result"]["swept"], 1);
+
+        solana_outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                &staged.id,
+                bloom_solana_tx::outbox::SolanaOutboxState::Failed,
+            )
+            .expect("swept entry moves to failed");
     }
 
     #[test]
