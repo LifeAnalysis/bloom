@@ -113,6 +113,14 @@ impl SolanaRpcClient {
     }
 
     /// One JSON-RPC call with retry + failover, returning the raw `result`.
+    ///
+    /// A non-retryable error from one endpoint (e.g. "method not
+    /// supported") says nothing about any *other* configured endpoint, so
+    /// it must not short-circuit the whole call — every endpoint gets
+    /// tried in this pass before giving up, matching EVM's
+    /// `alloy`-`FallbackLayer` behaviour (dispatches to all endpoints, only
+    /// fails once every one does), which this module's doc comment already
+    /// claims but previously didn't implement.
     pub async fn call_raw(&self, method: &str, params: &Value) -> Result<Value, SolanaRpcError> {
         let mut last: Option<SolanaRpcError> = None;
         for attempt in 0..MAX_ATTEMPTS {
@@ -126,15 +134,14 @@ impl SolanaRpcClient {
                     Err(failure) => {
                         let backoff = failure.retryable.then(|| backoff_for(attempt));
                         self.health.record_failure(idx, failure.retryable, backoff);
-                        if !failure.retryable {
-                            return Err(failure.error);
-                        }
+                        // Record and move on to the next endpoint regardless
+                        // of retryability — only exhausting every endpoint
+                        // (across all attempt passes) gives up.
                         last = Some(failure.error);
                     }
                 }
             }
-            // Every endpoint failed this pass with a transient error; pause
-            // before the next pass.
+            // Every endpoint failed this pass; pause before the next pass.
             if attempt + 1 < MAX_ATTEMPTS {
                 tokio::time::sleep(backoff_for(attempt)).await;
             }

@@ -149,6 +149,60 @@ async fn fails_over_across_endpoints() {
     assert_eq!(client.get_slot().await.unwrap(), 12345);
 }
 
+/// A stub that always answers a specific method with a non-retryable
+/// JSON-RPC error (`-32601`, method-not-found — per `should_retry`, never
+/// retryable).
+async fn spawn_non_retryable_stub(method_name: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await.unwrap_or(0);
+                let body = format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":-32601,"message":"the method {method_name} does not exist/is not available"}}}}"#
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+// Fix E (PLAN-SOLANA-PR-FIXES.md): `call_raw` used to return immediately on
+// a non-retryable error from the first endpoint, without trying any
+// configured backup — despite this module's own doc comment claiming
+// EVM-equivalent failover behaviour.
+#[tokio::test]
+async fn fails_over_to_backup_after_a_non_retryable_error_on_the_primary() {
+    let primary = spawn_non_retryable_stub("getSlot").await;
+    let backup = spawn_stub().await;
+    let mut spec = spec(&primary);
+    spec.endpoints[0].weight = 100; // primary preferred
+    spec.endpoints.push(EndpointSpec {
+        url: backup,
+        weight: 50,
+        cu_per_sec: None,
+        max_rps: None,
+        http_only: false,
+    });
+    let client = SolanaClient::build(&spec).unwrap();
+    // The primary's -32601 is deterministic and non-retryable — the call
+    // must still succeed by falling through to the healthy backup, not
+    // fail on the primary's answer alone.
+    assert_eq!(client.get_slot().await.unwrap(), 12345);
+}
+
 #[test]
 fn empty_endpoint_list_is_refused() {
     let spec = SolanaSpec {
