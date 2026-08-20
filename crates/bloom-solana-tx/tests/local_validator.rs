@@ -194,6 +194,7 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
 
     let fee_payer = broker.child_pubkey();
     let fee_payer_b58 = bs58::encode(fee_payer).into_string();
+    println!("fee_payer={fee_payer_b58}");
     let airdrop_lamports = std::env::var("SOLANA_AIRDROP_LAMPORTS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -291,4 +292,9 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
         .expect("reconciler writes a receipt");
     assert_eq!(receipt.signature, signature);
     assert_eq!(receipt.outcome, "success");
+    println!(
+        "confirmed_signature={} destination={} lamports={transfer_lamports}",
+        receipt.signature,
+        bs58::encode(destination).into_string()
+    );
 }
