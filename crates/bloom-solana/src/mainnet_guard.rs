@@ -79,7 +79,9 @@ fn observed_genesis_hash_blocking(spec: &SolanaSpec) -> Result<String, SolanaRpc
         })
 }
 
-fn observed_genesis_hash_blocking_on_this_thread(spec: &SolanaSpec) -> Result<String, SolanaRpcError> {
+fn observed_genesis_hash_blocking_on_this_thread(
+    spec: &SolanaSpec,
+) -> Result<String, SolanaRpcError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -122,9 +124,7 @@ fn observed_genesis_hash_blocking_on_this_thread(spec: &SolanaSpec) -> Result<St
                     .get("result")
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
-                    .ok_or_else(|| {
-                        SolanaRpcError::Decode(format!("getGenesisHash: {payload}"))
-                    })
+                    .ok_or_else(|| SolanaRpcError::Decode(format!("getGenesisHash: {payload}")))
             });
         match attempt {
             Ok(hash) => return Ok(hash),

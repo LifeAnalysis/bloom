@@ -223,7 +223,10 @@ impl SolanaClient {
         let result: Value = self
             .inner
             .rpc
-            .call("getFeeForMessage", &json!([message_b64, { "encoding": "base64" }]))
+            .call(
+                "getFeeForMessage",
+                &json!([message_b64, { "encoding": "base64" }]),
+            )
             .await?;
         Ok(result.get("value").and_then(|v| v.as_u64()))
     }
@@ -233,7 +236,10 @@ impl SolanaClient {
         let result: Value = self
             .inner
             .rpc
-            .call("simulateTransaction", &json!([tx_b64, { "encoding": "base64" }]))
+            .call(
+                "simulateTransaction",
+                &json!([tx_b64, { "encoding": "base64" }]),
+            )
             .await?;
         let value = result.get("value").cloned().unwrap_or(Value::Null);
         serde_json::from_value::<Simulation>(value)
@@ -246,7 +252,10 @@ impl SolanaClient {
     pub async fn send_transaction(&self, tx_b64: &str) -> Result<String, SolanaRpcError> {
         self.inner
             .rpc
-            .call("sendTransaction", &json!([tx_b64, { "encoding": "base64" }]))
+            .call(
+                "sendTransaction",
+                &json!([tx_b64, { "encoding": "base64" }]),
+            )
             .await
     }
 

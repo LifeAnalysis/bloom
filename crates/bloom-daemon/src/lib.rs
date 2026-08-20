@@ -2691,6 +2691,11 @@ impl Daemon {
             String,
             Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
         > = std::collections::BTreeMap::new();
+        // Mirrors EVM's `chains` registry: fed alongside `solana_engines` so
+        // the reconciler spawned below (and anything else that needs a
+        // read-only handle per Solana chain) doesn't have to reach back
+        // through an engine to get one.
+        let solana_chain_registry = bloom_solana::SolanaChainRegistry::new();
         if let (Some(broker), Some(catalog)) = (&broker, &provenance_catalog) {
             for (name, spec) in &config.solana_chains {
                 if !admit_solana_chain(name, spec) {
@@ -2715,6 +2720,7 @@ impl Daemon {
                 };
                 let outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.outbox_dir())
                     .map_err(|e| DaemonError::Outbox(e.to_string()))?;
+                solana_chain_registry.add(client.clone());
                 let engine = bloom_solana_tx::engine::SolanaTransferEngine::new(
                     outbox,
                     client,
@@ -2724,6 +2730,9 @@ impl Daemon {
                 solana_engines.insert(name.clone(), Arc::new(engine));
             }
         }
+        // `solana_engines` itself is moved into the wallets handler below;
+        // capture whether there's anything to reconcile before that happens.
+        let has_solana_chains = !solana_engines.is_empty();
 
         let address_book_path = home.root().join("addressbook.toml");
         let address_book = match AddressBook::load(&address_book_path) {
@@ -3264,6 +3273,24 @@ impl Daemon {
             ));
             bump_shutdown.push(reconciler.spawn());
             debug!("daemon.reconciler_spawned");
+        }
+
+        // Spawn the Solana receipt reconciler, mirroring the EVM one above:
+        // without this, a broadcast Solana transfer moves to `sent/` and
+        // nothing ever polls `getSignatureStatuses` or writes `receipt.json`
+        // for it — it stays "unconfirmed" from Bloom's perspective even
+        // after it finalizes on-chain. Only spawned when at least one
+        // Solana chain was actually admitted (mirrors the bump scanner's
+        // `!mempool_indexes.is_empty()` gate above).
+        if has_solana_chains && tokio::runtime::Handle::try_current().is_ok() {
+            let solana_outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.outbox_dir())
+                .map_err(|e| DaemonError::Outbox(e.to_string()))?;
+            let solana_reconciler = Arc::new(bloom_solana_tx::reconcile::SolanaReconciler::new(
+                solana_outbox,
+                solana_chain_registry.clone(),
+            ));
+            bump_shutdown.push(solana_reconciler.spawn());
+            debug!("daemon.solana_reconciler_spawned");
         }
 
         // Spawn the backends probe task. Every 60s it:
@@ -5558,6 +5585,221 @@ mod tests {
             !admit_solana_chain("solana-devnet", &spec),
             "an unverifiable cluster must fail closed, not be admitted by default"
         );
+    }
+
+    /// A minimal loopback JSON-RPC stub answering just enough Solana RPC
+    /// methods to exercise a real daemon boot: `getGenesisHash` (so
+    /// `admit_solana_chain` admits it as non-mainnet) and
+    /// `getSignatureStatuses` (so the spawned reconciler can mine whatever
+    /// signature it asks about — this stub answers "finalized" for any of
+    /// them, since the caller controls which signature is actually staged).
+    async fn spawn_solana_node_stub(genesis_hash: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let genesis_hash = genesis_hash.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let req_body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                    let method = serde_json::from_str::<serde_json::Value>(req_body)
+                        .ok()
+                        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
+                        .unwrap_or_default();
+                    let body = match method.as_str() {
+                        "getGenesisHash" => {
+                            format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{genesis_hash}"}}"#)
+                        }
+                        "getSignatureStatuses" => format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":5}},"value":[{{"slot":5,"confirmations":null,"err":null,"confirmationStatus":"finalized"}}]}}}}"#
+                        ),
+                        _ => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#.to_string(),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    struct DaemonTestBroker;
+    impl bloom_broker_api::MachineBrokerService for DaemonTestBroker {
+        fn dispatch<'a>(
+            &'a self,
+            request: bloom_broker_api::MachineBrokerRequest,
+        ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse> {
+            Box::pin(async move {
+                Err(bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::UnknownMethod,
+                    format!("unhandled {request:?}"),
+                ))
+            })
+        }
+    }
+
+    /// A provenance catalog authorizing both the EVM triad-signing seam
+    /// (`transaction.confirm`, required unconditionally whenever a broker +
+    /// catalog are supplied — see `from_home_inner`) and the Solana one
+    /// (`solana.transfer.confirm`), so `from_home_with_permit_and_broker`
+    /// actually reaches the Solana engine/reconciler construction path.
+    fn solana_and_evm_catalog() -> bloom_broker_api::ProvenanceCatalog {
+        bloom_broker_api::ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![
+                bloom_broker_api::ProvenanceRecord {
+                    subject: bloom_broker_api::ProvenanceSubject::System {
+                        component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+                        operation_class: bloom_broker_api::Token::new("transaction.confirm")
+                            .unwrap(),
+                    },
+                    publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
+                    petal_lineage: None,
+                    operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        operation_class: bloom_broker_api::Token::new("transaction.confirm")
+                            .unwrap(),
+                        fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
+                            chain: bloom_broker_api::Token::new("ethereum").unwrap(),
+                            asset: "native".into(),
+                        }),
+                    }],
+                    installer_key_id: bloom_broker_api::Token::new("installer-key").unwrap(),
+                    installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
+                },
+                bloom_broker_api::ProvenanceRecord {
+                    subject: bloom_broker_api::ProvenanceSubject::System {
+                        component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+                        operation_class: bloom_broker_api::Token::new("solana.transfer.confirm")
+                            .unwrap(),
+                    },
+                    publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
+                    petal_lineage: None,
+                    operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        operation_class: bloom_broker_api::Token::new("solana.native-transfer")
+                            .unwrap(),
+                        fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
+                            chain: bloom_broker_api::Token::new("solana").unwrap(),
+                            asset: "native".into(),
+                        }),
+                    }],
+                    installer_key_id: bloom_broker_api::Token::new("installer-key").unwrap(),
+                    installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[11; 64]),
+                },
+            ],
+        }
+    }
+
+    // Fix B (PLAN-SOLANA-PR-FIXES.md): SolanaReconciler is built and
+    // unit-tested in `bloom-solana-tx` but was never constructed or spawned
+    // by `bloom-daemon` — a broadcast Solana transfer's `receipt.json` never
+    // populated. This is a daemon-level test, not a direct
+    // `SolanaReconciler` invocation: it boots a real `Daemon` and asserts on
+    // the effect the *running daemon* produces on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_spawns_solana_reconciler_and_it_populates_receipt_json() {
+        let genesis_hash = "D".repeat(32);
+        let signature = "sig-0001".to_string();
+        let rpc_endpoint = spawn_solana_node_stub(genesis_hash).await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = HomeDir::at(tmp.path());
+        home.ensure().unwrap();
+        let config_toml = format!(
+            r#"
+default_chain = "ethereum"
+
+[chains.ethereum]
+name = "ethereum"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:1"]
+native_symbol = "ETH"
+native_decimals = 18
+
+[solana_chains.solana-devnet]
+name = "solana-devnet"
+allow_broadcast = true
+[[solana_chains.solana-devnet.endpoints]]
+url = "{rpc_endpoint}"
+weight = 100
+"#
+        );
+        std::fs::write(home.config_path(), config_toml).unwrap();
+
+        // Seed a broadcast-but-unreconciled entry directly in the outbox
+        // the daemon's Solana engine (and reconciler) will be constructed
+        // over — written *before* boot so it's already there for the
+        // reconciler's first tick (which, per `tokio::time::interval`
+        // semantics, fires immediately on spawn, not after the interval).
+        let outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.outbox_dir()).unwrap();
+        let staged = bloom_solana_tx::types::StagedSolanaTransfer {
+            id: "0001-00001".into(),
+            wallet: "alice".into(),
+            chain: "solana-devnet".into(),
+            fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
+            destination: "DEST111111111111111111111111111111111111111".into(),
+            lamports: 1_000_000,
+            blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
+            last_valid_block_height: 100,
+            message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),
+            payload_digest_hex: "ab".repeat(32),
+            signature: None,
+            created_ms: 1,
+            expires_ms: 0,
+            status: bloom_solana_tx::types::SolanaTxStatus::Pending,
+            action_id: None,
+        };
+        outbox.write_pending(&staged, "plan").unwrap();
+        let entry = outbox
+            .record_signature("alice", "solana-devnet", &staged.id, &signature)
+            .unwrap();
+        outbox
+            .transition(&entry, bloom_solana_tx::outbox::SolanaOutboxState::Sent)
+            .unwrap();
+
+        let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
+        let broker = MachineBrokerClient::new(Arc::new(DaemonTestBroker));
+        let daemon = Daemon::from_home_with_permit_and_broker(
+            home.clone(),
+            permit,
+            broker,
+            solana_and_evm_catalog(),
+        )
+        .expect("daemon boots");
+
+        let receipt_path = home
+            .outbox_dir()
+            .join("alice")
+            .join("solana-devnet")
+            .join("sent")
+            .join(&staged.id)
+            .join("receipt.json");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !receipt_path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            receipt_path.exists(),
+            "the running daemon's spawned SolanaReconciler must write receipt.json \
+             for a broadcast, unreconciled transfer — not just a directly-invoked one"
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        assert_eq!(receipt["outcome"], "success");
+        assert_eq!(receipt["signature"], signature);
+
+        tokio::time::timeout(Duration::from_secs(2), daemon.shutdown())
+            .await
+            .expect("shutdown timed out");
     }
 
     #[test]
