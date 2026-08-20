@@ -69,7 +69,10 @@ For one candidate payload `C`, the disposable evidence matrix is:
 
 The signer refuses a mixture of evidence from different candidates.
 
-`triad-release-gate.sh` rejects modified or untracked release inputs, runs
+`triad-release-gate.sh` rejects modified or untracked release inputs, requires
+`cargo-audit`, denies reachable RustSec vulnerabilities and memory-unsound
+warnings in all three lockfiles (exact disabled-optional-feature advisories are
+documented inline), runs
 locked fmt, clippy, and tests in all three sibling workspaces, builds release
 binaries, assembles the bundle twice, verifies both, requires byte-identical
 archives, matches the signed source revisions back to the three clean
@@ -104,19 +107,22 @@ post-extraction rerun is bound to the exact clean source revisions recorded in
 the signed bundle; process/artifact acceptance additionally executes and
 inspects the extracted production binaries.
 
-Linux instance configuration fixtures are site-specific security inputs and
-are deliberately not reusable release credentials. Test-only staged
-installer fixtures use the following `config/` layout beside the extracted binaries:
-`edge-manifest.json`, `broker.json`, `signer.json`,
-`machine-identity.json`, `broker-identity.json`, `signer-identity.json`,
-`revoke-identity.json`, `session-identity.json`, `installer-identity.json`,
-and `provenance-catalog.json`. The macOS W0 bundle deliberately contains none
-of these private files: its guarded live installer uses the same fresh
-root-owned identity-generation path as the production Unix-principal claim.
-On Linux,
-`nts-servers.conf`. The last file contains at least two distinct reviewed NTS
-host names, one per line. AWS credentials and `aws-kms-ip-allow.conf` are an
-optional paired site overlay.
+Legacy Linux dry-root test fixtures may contain pre-rendered configuration,
+but a live production Linux install never accepts release-bundled identities.
+It verifies the signed payload against a separately pinned root-owned release
+key, creates the service principals, and generates every private identity on
+the destination host. Linux site input is limited to `nts-servers.conf` (at
+least two distinct reviewed NTS host names, one per line) and the optional
+paired AWS credential plus `aws-kms-ip-allow.conf` overlay.
+
+The root-only Linux enrollment command publishes the complete per-login
+configuration with one same-filesystem directory rename. A durable journal is
+written and synced first; sockets remain disabled until publication completes.
+An interrupted uncommitted transaction disables the instance and removes the
+published candidate on the next run. A committed transaction is retained and
+only its journal is retired. The release gate SIGKILLs an instrumented copy at
+the journal-write, prepared, published, activated, and committed boundaries and
+then proves recovery plus the complete file/ownership set.
 
 Production macOS enrollment does not accept that private fixture layout. Its
 installed Machine binary generates fresh per-login Machine, Broker, Signer,

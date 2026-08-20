@@ -5784,7 +5784,7 @@ mod tests {
     async fn daemon_spawns_solana_reconciler_and_it_populates_receipt_json() {
         let genesis_hash = "D".repeat(32);
         let signature = "sig-0001".to_string();
-        let rpc_endpoint = spawn_solana_node_stub(genesis_hash).await;
+        let rpc_endpoint = spawn_solana_node_stub(genesis_hash.clone()).await;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let home = HomeDir::at(tmp.path());
@@ -5803,6 +5803,7 @@ native_decimals = 18
 [solana_chains.solana-devnet]
 name = "solana-devnet"
 allow_broadcast = true
+expected_genesis_hex = "{genesis_hash}"
 [[solana_chains.solana-devnet.endpoints]]
 url = "{rpc_endpoint}"
 weight = 100
@@ -5823,6 +5824,7 @@ weight = 100
             fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
             destination: "DEST111111111111111111111111111111111111111".into(),
             lamports: 1_000_000,
+            genesis_hash,
             blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
             last_valid_block_height: 100,
             message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),
@@ -6171,6 +6173,7 @@ ws_url = "wss://example.invalid"
             fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
             destination: "DEST111111111111111111111111111111111111111".into(),
             lamports: 1_000_000,
+            genesis_hash: "GENESIS111111111111111111111111111111111111".into(),
             blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
             last_valid_block_height: 100,
             message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),

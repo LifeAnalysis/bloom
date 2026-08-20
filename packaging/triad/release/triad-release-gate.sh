@@ -49,6 +49,14 @@ done
 for root in "$main_root" "$broker_root" "$signer_root"; do
   (
     cd "$root"
+    # cargo-audit scans a few optional lockfile entries that Cargo proves are
+    # absent from every resolved target graph. Only those exact advisories are
+    # ignored; reachable vulnerabilities and memory-unsound warnings remain
+    # release-blocking. Other warnings remain visible for review.
+    cargo audit --deny unsound \
+      --ignore RUSTSEC-2026-0235 \
+      --ignore RUSTSEC-2025-0055 \
+      --ignore RUSTSEC-2026-0205
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --locked -- -D warnings
   )
@@ -57,6 +65,10 @@ done
 cargo build --manifest-path "$main_root/Cargo.toml" --release -p bloom --locked
 cargo build --manifest-path "$broker_root/Cargo.toml" --release -p bloom-broker --locked
 cargo build --manifest-path "$signer_root/Cargo.toml" --release -p bloom-signer --locked
+if [[ "$(uname -s)" == Linux ]]; then
+  BLOOM_LINUX_TEST_BINARY="$main_root/target/release/bloom" \
+    "$main_root/packaging/triad/linux/tests/enrollment-crash.sh"
+fi
 
 work="$(mktemp -d)"
 trap 'find "$work" -depth -delete' EXIT

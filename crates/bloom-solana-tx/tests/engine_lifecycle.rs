@@ -163,6 +163,7 @@ async fn spawn_node() -> String {
                     .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
                     .unwrap_or_default();
                 let result = match method.as_str() {
+                    "getGenesisHash" => r#""test-genesis""#.to_string(),
                     "getLatestBlockhash" => {
                         let blockhash = bs58::encode([0x42u8; 32]).into_string();
                         format!(
@@ -213,6 +214,7 @@ async fn spawn_node_with_heights(
                     .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
                     .unwrap_or_default();
                 let result = match method.as_str() {
+                    "getGenesisHash" => r#""test-genesis""#.to_string(),
                     "getLatestBlockhash" => {
                         let blockhash = bs58::encode([0x42u8; 32]).into_string();
                         format!(
@@ -330,7 +332,7 @@ fn client(endpoint: &str) -> SolanaClient {
             max_rps: None,
             http_only: false,
         }],
-        expected_genesis_hex: None,
+        expected_genesis_hex: Some("test-genesis".into()),
         allow_broadcast: true,
     })
     .unwrap()
@@ -465,6 +467,9 @@ async fn spawn_node_with_flaky_broadcast(fail_times: Arc<std::sync::atomic::Atom
                     .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
                     .unwrap_or_default();
                 let payload = match method.as_str() {
+                    "getGenesisHash" => {
+                        r#"{"jsonrpc":"2.0","id":1,"result":"test-genesis"}"#.to_string()
+                    }
                     "getLatestBlockhash" => {
                         let blockhash = bs58::encode([0x42u8; 32]).into_string();
                         format!(

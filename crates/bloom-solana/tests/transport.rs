@@ -216,3 +216,17 @@ fn empty_endpoint_list_is_refused() {
         Err(SolanaRpcError::NoEndpoints(_))
     ));
 }
+
+#[test]
+fn broadcast_requires_an_expected_genesis_hash() {
+    let mut spec = spec("http://127.0.0.1:1");
+    spec.expected_genesis_hex = None;
+    spec.allow_broadcast = true;
+    let error = SolanaClient::build(&spec).err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("without an expected genesis hash"),
+        "{error}"
+    );
+}

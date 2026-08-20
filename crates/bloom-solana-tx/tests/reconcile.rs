@@ -68,6 +68,7 @@ fn sent_entry(id: &str) -> StagedSolanaTransfer {
         fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
         destination: "DEST111111111111111111111111111111111111111".into(),
         lamports: 1,
+        genesis_hash: "GENESIS111111111111111111111111111111111111".into(),
         blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
         last_valid_block_height: 1,
         message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),

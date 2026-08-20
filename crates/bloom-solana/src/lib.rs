@@ -113,6 +113,17 @@ struct Inner {
 impl SolanaClient {
     /// Build a client over `spec`. Fails on an empty endpoint list.
     pub fn build(spec: &SolanaSpec) -> Result<Self, SolanaRpcError> {
+        if spec.allow_broadcast
+            && spec
+                .expected_genesis_hex
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err(SolanaRpcError::Invalid(format!(
+                "chain '{}' enables broadcast without an expected genesis hash",
+                spec.name
+            )));
+        }
         let rpc = Arc::new(SolanaRpcClient::build(spec)?);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -139,8 +150,9 @@ impl SolanaClient {
         self.inner.rpc.chain_name()
     }
 
-    /// Verify the node's genesis hash matches the spec, at most once per
-    /// client (result cached). A mismatch is a hard refusal.
+    /// Verify the node's current genesis hash matches the spec. This is a
+    /// live check on every call; callers use it at stage and broadcast so an
+    /// endpoint or DNS change cannot silently cross clusters.
     pub async fn verify_genesis(&self) -> Result<String, SolanaRpcError> {
         let observed = self.get_genesis_hash().await?;
         if let Some(expected) = &self.inner.expected_genesis_hex

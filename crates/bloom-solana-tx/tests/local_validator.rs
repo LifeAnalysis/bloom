@@ -157,16 +157,28 @@ fn now_ms() -> u128 {
 async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
     let endpoint =
         std::env::var("SOLANA_VALIDATOR_HTTP").unwrap_or_else(|_| "http://127.0.0.1:8899".into());
+    let endpoint_spec = EndpointSpec {
+        url: endpoint,
+        weight: 100,
+        cu_per_sec: None,
+        max_rps: None,
+        http_only: false,
+    };
+    let discovery_client = SolanaClient::build(&SolanaSpec {
+        name: "solana-local-discovery".into(),
+        endpoints: vec![endpoint_spec.clone()],
+        expected_genesis_hex: None,
+        allow_broadcast: false,
+    })
+    .unwrap();
+    let genesis = discovery_client
+        .verify_genesis()
+        .await
+        .expect("discover local validator genesis");
     let client = SolanaClient::build(&SolanaSpec {
         name: "solana-local".into(),
-        endpoints: vec![EndpointSpec {
-            url: endpoint,
-            weight: 100,
-            cu_per_sec: None,
-            max_rps: None,
-            http_only: false,
-        }],
-        expected_genesis_hex: None,
+        endpoints: vec![endpoint_spec],
+        expected_genesis_hex: Some(genesis),
         allow_broadcast: true,
     })
     .unwrap();

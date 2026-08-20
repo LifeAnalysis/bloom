@@ -220,9 +220,9 @@ for identity in \
 do
   binary="${identity%%:*}"
   expected="${identity#*:}"
-  actual="$("$staging/bin/$binary" --version | awk '{print $2}')"
-  [[ "$actual" == "$expected" ]] || {
-    echo "$binary version $actual is outside the compatibility matrix ($expected)" >&2
+  version_line="$("$staging/bin/$binary" --version | sed -n '1p')"
+  [[ "$version_line" == "$binary $expected" ]] || {
+    echo "$binary version line '$version_line' is outside the compatibility matrix ($expected)" >&2
     exit 65
   }
 done
@@ -291,7 +291,10 @@ esac
 printf '%s\n' "$platform_claim" > "$payload/PLATFORM_CLAIM"
 install -m 0644 "$script_dir/compatibility-v1.toml" "$payload/compatibility-v1.toml"
 mkdir -p "$payload/installer/release"
-cp -R "$script_dir/../linux" "$payload/installer/linux"
+mkdir -p "$payload/installer/linux"
+for linux_input in README.md chrony config systemd sysusers.d tmpfiles.d; do
+  cp -R "$script_dir/../linux/$linux_input" "$payload/installer/linux/"
+done
 mkdir -p "$payload/installer/macos"
 # W0 is source-tree conformance tooling, not an installed product component.
 # Copy the reviewed installer inputs individually so debug drivers, hostile
@@ -302,6 +305,7 @@ for macos_input in "$script_dir"/../macos/*; do
   cp -R "$macos_input" "$payload/installer/macos/"
 done
 install -m 0755 \
+  "$script_dir/enroll-linux.sh" \
   "$script_dir/install-linux.sh" \
   "$script_dir/install-macos.sh" \
   "$script_dir/macos-conformance-subject.sh" \
@@ -400,15 +404,21 @@ mkdir -p "$(dirname "$output")"
 output_dir="$(cd "$(dirname "$output")" && pwd -P)"
 output="$output_dir/$(basename "$output")"
 archive_tmp="$work/archive.tar"
+tar_version="$($tar_command --version 2>&1)" || {
+  echo "failed to inspect release tar implementation: $tar_command" >&2
+  exit 69
+}
+grep -F 'GNU tar' <<<"$tar_version" >/dev/null || {
+  echo "release bundle creation requires GNU tar for deterministic metadata" >&2
+  exit 69
+}
 (
   cd "$work"
   find bloom-triad -print | LC_ALL=C sort > archive-files
   "$tar_command" \
   --format=ustar \
-  --uid=0 \
-  --gid=0 \
-  --uname=root \
-  --gname=root \
+  --owner=root \
+  --group=root \
   --no-recursion \
   -cf "$archive_tmp" \
   -T archive-files

@@ -33,6 +33,9 @@ pub struct StagedSolanaTransfer {
     pub destination: String,
     /// Native SOL debit in lamports.
     pub lamports: u64,
+    /// Genesis hash observed and policy-checked when the message was staged.
+    /// Broadcast re-checks the live RPC cluster against this immutable value.
+    pub genesis_hash: String,
     /// Recent blockhash, base58 — the freshness anchor.
     pub blockhash: String,
     /// The block height at which `blockhash` stops being valid.

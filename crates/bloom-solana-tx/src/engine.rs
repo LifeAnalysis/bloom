@@ -131,6 +131,10 @@ impl SolanaTransferEngine {
         lamports: u64,
         now_ms: u128,
     ) -> Result<StagedSolanaTransfer, EngineError> {
+        // Establish cluster identity before fetching the blockhash. Keeping
+        // both observations on the same client makes endpoint failover safe:
+        // every endpoint must identify as the configured cluster.
+        let genesis_hash = self.client.verify_genesis().await?;
         let blockhash = self.client.get_latest_blockhash().await?;
         let blockhash_bytes: [u8; 32] = bs58::decode(&blockhash.blockhash)
             .into_vec()
@@ -151,6 +155,7 @@ impl SolanaTransferEngine {
             fee_payer: bs58::encode(fee_payer).into_string(),
             destination: bs58::encode(destination).into_string(),
             lamports,
+            genesis_hash,
             blockhash: blockhash.blockhash,
             last_valid_block_height: blockhash.last_valid_block_height,
             message_b64: base64::engine::general_purpose::STANDARD.encode(&message),
@@ -197,6 +202,7 @@ impl SolanaTransferEngine {
         let message = base64::engine::general_purpose::STANDARD
             .decode(&entry.staged.message_b64)
             .map_err(|e| EngineError::Invalid(format!("message base64: {e}")))?;
+        validate_staged_message(&entry.staged, fee_payer, &message)?;
         let canonical_plan_facts = serde_jcs::to_vec(&entry.staged)
             .map_err(|e| EngineError::Invalid(format!("canonical plan facts: {e}")))?;
         let plan_facts_digest = Digest32::from_bytes(Sha256::digest(&canonical_plan_facts).into());
@@ -245,6 +251,13 @@ impl SolanaTransferEngine {
         let entry =
             self.outbox
                 .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)?;
+        let observed_genesis = self.client.verify_genesis().await?;
+        if observed_genesis != entry.staged.genesis_hash {
+            return Err(EngineError::Invalid(format!(
+                "live cluster genesis {} differs from staged genesis {}",
+                observed_genesis, entry.staged.genesis_hash
+            )));
+        }
         let signature_b58 = entry
             .staged
             .signature
@@ -258,6 +271,12 @@ impl SolanaTransferEngine {
         let message = base64::engine::general_purpose::STANDARD
             .decode(&entry.staged.message_b64)
             .map_err(|e| EngineError::Invalid(format!("message base64: {e}")))?;
+        let fee_payer: [u8; 32] = bs58::decode(&entry.staged.fee_payer)
+            .into_vec()
+            .map_err(|e| EngineError::Invalid(format!("fee payer base58: {e}")))?
+            .try_into()
+            .map_err(|_| EngineError::Invalid("fee payer must be 32 bytes".into()))?;
+        validate_staged_message(&entry.staged, &fee_payer, &message)?;
         let tx_bytes = assemble_transaction(&message, &signature)
             .map_err(|e| EngineError::Invalid(e.to_string()))?;
         let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
@@ -284,5 +303,96 @@ impl SolanaTransferEngine {
         self.outbox
             .write_broadcast_attempt(&sent_entry, &submitted, &tx_bytes, now_ms)?;
         Ok(submitted)
+    }
+}
+
+fn validate_staged_message(
+    staged: &StagedSolanaTransfer,
+    expected_fee_payer: &[u8; 32],
+    message: &[u8],
+) -> Result<(), EngineError> {
+    let stored_fee_payer: [u8; 32] = bs58::decode(&staged.fee_payer)
+        .into_vec()
+        .map_err(|e| EngineError::Invalid(format!("fee payer base58: {e}")))?
+        .try_into()
+        .map_err(|_| EngineError::Invalid("fee payer must be 32 bytes".into()))?;
+    if &stored_fee_payer != expected_fee_payer {
+        return Err(EngineError::Invalid(
+            "resolved signing key differs from the staged fee payer".into(),
+        ));
+    }
+    let destination: [u8; 32] = bs58::decode(&staged.destination)
+        .into_vec()
+        .map_err(|e| EngineError::Invalid(format!("destination base58: {e}")))?
+        .try_into()
+        .map_err(|_| EngineError::Invalid("destination must be 32 bytes".into()))?;
+    let blockhash: [u8; 32] = bs58::decode(&staged.blockhash)
+        .into_vec()
+        .map_err(|e| EngineError::Invalid(format!("blockhash base58: {e}")))?
+        .try_into()
+        .map_err(|_| EngineError::Invalid("blockhash must be 32 bytes".into()))?;
+    let expected =
+        build_transfer_message(&stored_fee_payer, &destination, staged.lamports, &blockhash)
+            .map_err(|e| EngineError::Invalid(e.to_string()))?;
+    if expected != message {
+        return Err(EngineError::Invalid(
+            "serialized message differs from immutable staged transfer facts".into(),
+        ));
+    }
+    let digest = hex::encode(Sha256::digest(message));
+    if digest != staged.payload_digest_hex {
+        return Err(EngineError::Invalid(
+            "serialized message digest differs from staged payload digest".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn staged_fixture() -> (StagedSolanaTransfer, [u8; 32], Vec<u8>) {
+        let payer = [0x11; 32];
+        let destination = [0x22; 32];
+        let blockhash = [0x42; 32];
+        let message = build_transfer_message(&payer, &destination, 1_000_000, &blockhash).unwrap();
+        let staged = StagedSolanaTransfer {
+            id: "0001-test".into(),
+            wallet: "wallet".into(),
+            chain: "solana-devnet".into(),
+            fee_payer: bs58::encode(payer).into_string(),
+            destination: bs58::encode(destination).into_string(),
+            lamports: 1_000_000,
+            genesis_hash: "test-genesis".into(),
+            blockhash: bs58::encode(blockhash).into_string(),
+            last_valid_block_height: 100,
+            message_b64: base64::engine::general_purpose::STANDARD.encode(&message),
+            payload_digest_hex: hex::encode(Sha256::digest(&message)),
+            signature: None,
+            created_ms: 1,
+            expires_ms: 2,
+            status: SolanaTxStatus::Pending,
+            action_id: None,
+        };
+        (staged, payer, message)
+    }
+
+    #[test]
+    fn staged_message_validation_binds_economic_and_freshness_facts() {
+        let (staged, payer, message) = staged_fixture();
+        validate_staged_message(&staged, &payer, &message).unwrap();
+
+        let mut changed_amount = staged.clone();
+        changed_amount.lamports += 1;
+        assert!(validate_staged_message(&changed_amount, &payer, &message).is_err());
+
+        let mut changed_blockhash = staged.clone();
+        changed_blockhash.blockhash = bs58::encode([0x43; 32]).into_string();
+        assert!(validate_staged_message(&changed_blockhash, &payer, &message).is_err());
+
+        let mut changed_digest = staged;
+        changed_digest.payload_digest_hex = "00".repeat(32);
+        assert!(validate_staged_message(&changed_digest, &payer, &message).is_err());
     }
 }
