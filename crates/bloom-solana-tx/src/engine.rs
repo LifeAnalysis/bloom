@@ -143,6 +143,14 @@ impl SolanaTransferEngine {
             .map_err(|_| EngineError::Invalid("blockhash must be 32 bytes".into()))?;
         let message = build_transfer_message(fee_payer, destination, lamports, &blockhash_bytes)
             .map_err(|e| EngineError::Invalid(e.to_string()))?;
+        let message_b64 = base64::engine::general_purpose::STANDARD.encode(&message);
+        let fee_lamports = self
+            .client
+            .get_fee_for_message(&message_b64)
+            .await?
+            .ok_or_else(|| {
+                EngineError::Invalid("RPC could not quote the exact message fee".into())
+            })?;
         let payload_digest_hex = hex::encode(Sha256::digest(&message));
         let id = self.outbox.allocate_id();
         let expires_ms = self
@@ -155,10 +163,11 @@ impl SolanaTransferEngine {
             fee_payer: bs58::encode(fee_payer).into_string(),
             destination: bs58::encode(destination).into_string(),
             lamports,
+            fee_lamports,
             genesis_hash,
             blockhash: blockhash.blockhash,
             last_valid_block_height: blockhash.last_valid_block_height,
-            message_b64: base64::engine::general_purpose::STANDARD.encode(&message),
+            message_b64,
             payload_digest_hex,
             signature: None,
             created_ms: now_ms,
@@ -213,6 +222,12 @@ impl SolanaTransferEngine {
                 wallet,
                 fee_payer,
                 &message,
+                &entry.staged.destination,
+                entry.staged.lamports,
+                entry.staged.fee_lamports,
+                &entry.staged.genesis_hash,
+                &entry.staged.blockhash,
+                entry.staged.last_valid_block_height,
                 approval_id,
                 now_ms.min(u128::from(u64::MAX)) as u64,
                 (now_ms + u128::from(SIGN_TTL_MS)).min(u128::from(u64::MAX)) as u64,
@@ -364,6 +379,7 @@ mod tests {
             fee_payer: bs58::encode(payer).into_string(),
             destination: bs58::encode(destination).into_string(),
             lamports: 1_000_000,
+            fee_lamports: 5_000,
             genesis_hash: "test-genesis".into(),
             blockhash: bs58::encode(blockhash).into_string(),
             last_valid_block_height: 100,

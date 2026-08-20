@@ -76,6 +76,28 @@ impl SolanaBrokerFixture {
                 "expected single payload",
             ));
         };
+        let claim = request.system_use_claim.as_ref().ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "native Solana signing omitted its system claim",
+            )
+        })?;
+        let evidence = request.claim_assurance_evidence.as_ref().ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "native Solana signing omitted semantic verifier evidence",
+            )
+        })?;
+        if evidence.decode() != payload.decode()
+            || claim.payload_digest != Digest32::from_bytes(Sha256::digest(payload.decode()).into())
+            || claim.action_class.as_str() != "solana.transfer.confirm"
+            || claim.operation_class.as_str() != "solana.native-transfer"
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "native Solana claim does not bind its exact evidence",
+            ));
+        }
         use ed25519_dalek::Signer as _;
         let signature = self.child_signing_key.sign(payload.decode().as_slice());
         Ok(NormalizedSignature {
@@ -193,6 +215,12 @@ async fn derived_child_signs_transfer_and_signature_verifies() {
             "wallet",
             &fee_payer,
             &message,
+            &bs58::encode(destination).into_string(),
+            1_000_000,
+            5_000,
+            "test-genesis",
+            &bs58::encode([0x42; 32]).into_string(),
+            100,
             Some(digest(7)), // already-approved: sign directly
             now,
             now + 60_000,
@@ -229,13 +257,20 @@ async fn first_attempt_returns_approval_required() {
     let signer = SolanaTransferSigner::from_catalog(broker, &catalog()).unwrap();
 
     let fee_payer = fixture.child_pubkey();
-    let message = build_transfer_message(&fee_payer, &[0xcc; 32], 1, &[0x42; 32]).unwrap();
+    let destination = [0xcc; 32];
+    let message = build_transfer_message(&fee_payer, &destination, 1, &[0x42; 32]).unwrap();
 
     let outcome = signer
         .sign_transfer(
             "wallet",
             &fee_payer,
             &message,
+            &bs58::encode(destination).into_string(),
+            1,
+            5_000,
+            "test-genesis",
+            &bs58::encode([0x42; 32]).into_string(),
+            100,
             None, // no approval yet: prepare the ceremony
             1,
             60_000,

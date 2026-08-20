@@ -10,8 +10,10 @@
 //! bytes than the ones the verifier later sees.
 
 use bloom_broker_api::{
-    CryptoSuite, DecimalU64, Digest32, OperationId, ProvenanceCatalog, ProvenanceSubject,
-    RequestNonce, Token,
+    AssetId, ClaimAssurance, CryptoSuite, DecimalU64, DecimalU256, DeclaredDebit,
+    DeclaredDestination, DeclaredFee, Digest32, OperationId, ProvenanceCatalog, ProvenanceSubject,
+    RequestNonce, SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES, SOLANA_SYSTEM_TRANSFER_VERIFIER_ID,
+    SystemChainContext, SystemUseClaim, Token,
 };
 use bloom_machine_client::{ExactPayloadSignOutcome, ExactPayloadSignRequest, MachineBrokerClient};
 use sha2::{Digest as _, Sha256};
@@ -82,6 +84,12 @@ impl SolanaTransferSigner {
         wallet_id: &str,
         fee_payer: &[u8; 32],
         message_bytes: &[u8],
+        destination: &str,
+        lamports: u64,
+        fee_lamports: u64,
+        genesis_hash: &str,
+        recent_blockhash: &str,
+        last_valid_block_height: u64,
         approval_id: Option<Digest32>,
         issued_at_ms: u64,
         expires_at_ms: u64,
@@ -89,6 +97,44 @@ impl SolanaTransferSigner {
     ) -> Result<SolanaSignOutcome, String> {
         let preimage = message_bytes.to_vec();
         let claimed_hash = Digest32::from_bytes(Sha256::digest(&preimage).into());
+        let request_nonce = random_request_nonce();
+        let system_use_claim = SystemUseClaim {
+            component_id: Token::new("bloom-machine").map_err(|e| e.to_string())?,
+            action_class: Token::new(SOLANA_CONFIRM_ACTION_CLASS).map_err(|e| e.to_string())?,
+            operation_class: Token::new("solana.native-transfer").map_err(|e| e.to_string())?,
+            crypto_suite: CryptoSuite::Ed25519Message,
+            payload_digest: claimed_hash.clone(),
+            ordered_hashes: vec![claimed_hash.clone()],
+            declared_debits: vec![DeclaredDebit {
+                asset: AssetId {
+                    chain: Token::new("solana").map_err(|e| e.to_string())?,
+                    asset: "native".into(),
+                },
+                amount: DecimalU256::parse(lamports.to_string()).map_err(|e| e.to_string())?,
+            }],
+            declared_destinations: vec![DeclaredDestination {
+                chain: Token::new("solana").map_err(|e| e.to_string())?,
+                destination: destination.to_owned(),
+            }],
+            declared_fee: DeclaredFee::Fee {
+                chain: Token::new("solana").map_err(|e| e.to_string())?,
+                asset: "native".into(),
+                amount: DecimalU256::parse(fee_lamports.to_string()).map_err(|e| e.to_string())?,
+            },
+            nonce: request_nonce.clone(),
+            chain_context: SystemChainContext {
+                chain_family: Token::new("solana").map_err(|e| e.to_string())?,
+                genesis_hash: genesis_hash.to_owned(),
+                recent_blockhash: recent_blockhash.to_owned(),
+                last_valid_block_height: DecimalU64::new(last_valid_block_height),
+            },
+            claim_assurance: ClaimAssurance::ProofVerified {
+                verifier_id: Token::new(SOLANA_SYSTEM_TRANSFER_VERIFIER_ID)
+                    .map_err(|e| e.to_string())?,
+                verifier_digest: Digest32::from_bytes(SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES),
+                proof_digest: claimed_hash.clone(),
+            },
+        };
         let request = ExactPayloadSignRequest {
             wallet_id: Token::new(wallet_id).map_err(|e| e.to_string())?,
             preimage,
@@ -99,13 +145,14 @@ impl SolanaTransferSigner {
             activation_mode: None,
             approval_operation_id: random_operation_id(),
             signing_operation_id: random_operation_id(),
-            request_nonce: random_request_nonce(),
+            request_nonce,
             issued_at_ms: DecimalU64::new(issued_at_ms),
             expires_at_ms: DecimalU64::new(expires_at_ms),
             canonical_plan_facts_digest,
             approval_id,
             petal_use_claim: None,
-            claim_assurance_evidence: None,
+            system_use_claim: Some(system_use_claim),
+            claim_assurance_evidence: Some(message_bytes.to_vec()),
         };
         match self
             .broker

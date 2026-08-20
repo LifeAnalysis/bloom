@@ -539,6 +539,9 @@ impl IpcOperationContext {
 pub enum MachineCustodyKind {
     New,
     Import,
+    ImportMnemonic,
+    Export,
+    Recovery,
     Rebind,
     Delete,
 }
@@ -593,6 +596,10 @@ pub enum MachineCommand {
     WalletAccountAllocate {
         name: String,
         profile: String,
+    },
+    WalletAccountRetire {
+        name: String,
+        fingerprint: String,
     },
     WalletAddress {
         name: String,

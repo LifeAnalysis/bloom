@@ -12,6 +12,7 @@ fn staged(id: &str) -> StagedSolanaTransfer {
         fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
         destination: "DEST111111111111111111111111111111111111111".into(),
         lamports: 1_000_000,
+        fee_lamports: 5_000,
         genesis_hash: "GENESIS111111111111111111111111111111111111".into(),
         blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
         last_valid_block_height: 123456,

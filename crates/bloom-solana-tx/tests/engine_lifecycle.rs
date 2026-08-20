@@ -170,6 +170,7 @@ async fn spawn_node() -> String {
                             r#"{{"context":{{"slot":1}},"value":{{"blockhash":"{blockhash}","lastValidBlockHeight":100}}}}"#
                         )
                     }
+                    "getFeeForMessage" => r#"{"context":{"slot":1},"value":5000}"#.to_string(),
                     "sendTransaction" => {
                         r#""4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4TdSXKZT9HYqjs""#.to_string()
                     }
@@ -222,6 +223,9 @@ async fn spawn_node_with_heights(
                         )
                     }
                     "getBlockHeight" => current_block_height.to_string(),
+                    "getFeeForMessage" => {
+                        format!(r#"{{"context":{{"slot":{current_block_height}}},"value":5000}}"#)
+                    }
                     _ => r#"{"code":-32601,"message":"method not found"}"#.to_string(),
                 };
                 let payload = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#);
@@ -475,6 +479,9 @@ async fn spawn_node_with_flaky_broadcast(fail_times: Arc<std::sync::atomic::Atom
                         format!(
                             r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":1}},"value":{{"blockhash":"{blockhash}","lastValidBlockHeight":100}}}}}}"#
                         )
+                    }
+                    "getFeeForMessage" => {
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":5000}}"#.to_string()
                     }
                     "sendTransaction" => {
                         let remaining = fail_times.fetch_update(
