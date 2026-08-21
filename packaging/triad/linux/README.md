@@ -3,15 +3,6 @@
 This directory is source input for the privileged installer. It is not
 installed directly from a source checkout.
 
-Fresh enrollment is performed by the signed payload's root-only
-`installer/release/enroll-linux.sh`. It generates the Machine, Broker, Signer,
-revoke-client, session, and installer identities locally; renders the edge
-manifest and service configs; signs the provenance catalog; assigns final
-owners while still staged; and publishes `/etc/bloom/UID` with one rename.
-The durable transaction record under `/etc/bloom/.transactions` makes every
-pre-commit crash recoverable without exposing a mixed identity set. Existing
-complete enrollments are validated and never regenerated implicitly.
-
 The installer creates one system-owned instance for each interactive login UID
 that has Bloom enabled. For login UID `1000`, the effective principals are
 `bloom-broker-1000` and `bloom-signer-1000`; the Machine continues to run as

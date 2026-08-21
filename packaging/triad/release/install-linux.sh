@@ -54,54 +54,6 @@ case "$action" in
       echo "bundle is not approved for Linux installation" >&2
       exit 65
     fi
-    if [[ "$root" == "/" && "$platform_claim" == "linux" ]]; then
-      for required in SHA256SUMS RELEASE_PUBLIC_KEY.pem RELEASE_SIGNATURE; do
-        [[ -f "$payload/$required" && ! -L "$payload/$required" ]] || {
-          echo "payload is missing signed release metadata: $required" >&2
-          exit 66
-        }
-      done
-      pinned_release_key="${BLOOM_RELEASE_PUBLIC_KEY:-}"
-      [[ -f "$pinned_release_key" && ! -L "$pinned_release_key" ]] || {
-        echo "BLOOM_RELEASE_PUBLIC_KEY must name the pinned local release key" >&2
-        exit 66
-      }
-      [[ "$(stat -c %u "$pinned_release_key")" == 0 ]] &&
-        (( (8#$(stat -c %a "$pinned_release_key") & 022) == 0 )) || {
-          echo "pinned release key must be root-owned and not group/world-writable" >&2
-          exit 65
-        }
-      cmp -s "$pinned_release_key" "$payload/RELEASE_PUBLIC_KEY.pem" || {
-        echo "payload release key does not match the pinned local key" >&2
-        exit 65
-      }
-      if find "$payload" -type l -print -quit | grep . >/dev/null; then
-        echo "signed Linux payload may not contain symbolic links" >&2
-        exit 65
-      fi
-      while IFS= read -r payload_path; do
-        [[ "$(stat -c %u "$payload_path")" == 0 ]] &&
-          (( (8#$(stat -c %a "$payload_path") & 022) == 0 )) || {
-            echo "signed Linux payload is not root-owned and immutable to product principals" >&2
-            exit 65
-          }
-      done < <(find "$payload" -print)
-      read -r key_type key_body extra <"$pinned_release_key"
-      [[ "$key_type" == ssh-ed25519 && -n "$key_body" && -z "${extra:-}" ]] || {
-        echo "pinned Linux release key is malformed" >&2
-        exit 65
-      }
-      allowed_signers="$(mktemp)"
-      trap 'rm -f -- "$allowed_signers"' EXIT
-      printf 'bloom-release %s %s\n' "$key_type" "$key_body" >"$allowed_signers"
-      chmod 0600 "$allowed_signers"
-      ssh-keygen -Y verify -f "$allowed_signers" -I bloom-release \
-        -n bloom-release-payload-v1 -s "$payload/RELEASE_SIGNATURE" \
-        <"$payload/SHA256SUMS" >/dev/null
-      (cd "$payload" && sha256sum -c SHA256SUMS >/dev/null)
-      rm -f -- "$allowed_signers"
-      trap - EXIT
-    fi
     [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || {
       echo "LOGIN_USER is not a safe account name" >&2
       exit 64
@@ -111,6 +63,11 @@ case "$action" in
       bin/bloom-broker \
       bin/bloom-signer \
       bin/bloom-signer-migrate \
+      config/edge-manifest.json \
+      config/broker.json \
+      config/signer.json \
+      config/broker-identity.json \
+      config/signer-identity.json \
       config/nts-servers.conf
     do
       test -f "$payload/$required" || {
@@ -119,15 +76,7 @@ case "$action" in
       }
     done
     installed_config_root="$root/etc/bloom/$login_uid"
-    if [[ -e "$installed_config_root" &&
-      ! -e "$installed_config_root/edge-manifest.json" ]]
-    then
-      echo "installed Linux enrollment is incomplete; refusing implicit repair" >&2
-      exit 65
-    fi
-    if [[ -e "$installed_config_root/edge-manifest.json" ]] &&
-      [[ -f "$payload/config/edge-manifest.json" ]]
-    then
+    if [[ -e "$installed_config_root/edge-manifest.json" ]]; then
       for identity_pair in \
         "edge-manifest.json:edge-manifest.json" \
         "broker/identity.json:broker-identity.json" \
@@ -178,9 +127,7 @@ case "$action" in
       "$script_dir/linux/sysusers.d/bloom-login.conf.in" > "$sysusers.new"
     chmod 0644 "$sysusers.new"
     mv -f "$sysusers.new" "$sysusers"
-    sed \
-      -e "s/@LOGIN_UID@/$login_uid/g" \
-      -e "s/@LOGIN_USER@/$login_user/g" \
+    sed -e "s/@LOGIN_UID@/$login_uid/g" \
       "$script_dir/linux/tmpfiles.d/bloom-login.conf.in" > "$tmpfiles.new"
     chmod 0644 "$tmpfiles.new"
     mv -f "$tmpfiles.new" "$tmpfiles"
@@ -225,44 +172,17 @@ case "$action" in
     mv -f "$chrony_target.new" "$chrony_target"
 
     config_root="$root/etc/bloom/$login_uid"
-    fresh_enrollment=false
-    managed_enrollment=false
-    if [[ "$root" == "/" ]]; then
-      systemd-sysusers "$sysusers"
-      systemd-tmpfiles --create --exclude-prefix="$config_root" "$tmpfiles"
-      if [[ ! -e "$config_root" ]]; then
-        fresh_enrollment=true
-      fi
-      enrollment_command="$payload/installer/release/enroll-linux.sh"
-      [[ -x "$enrollment_command" && ! -L "$enrollment_command" ]] || {
-        echo "payload is missing the Linux enrollment command" >&2
-        exit 66
-      }
-      "$enrollment_command" "$login_uid" "$login_user" "$payload"
-      systemd-tmpfiles --create "$tmpfiles"
-      managed_enrollment=true
-    fi
-    if [[ "$managed_enrollment" == false ]]; then
-      for required in edge-manifest.json broker.json signer.json \
-        broker-identity.json signer-identity.json
-      do
-        [[ -f "$payload/config/$required" ]] || {
-          echo "payload is missing legacy upgrade input config/$required" >&2
-          exit 66
-        }
-      done
-      mkdir -p "$config_root/broker" "$config_root/signer"
-      chmod 0711 "$config_root"
-      chmod 0700 "$config_root/broker" "$config_root/signer"
-      atomic_install "$payload/config/edge-manifest.json" "$config_root/edge-manifest.json" 0644
-    fi
+    mkdir -p "$config_root/broker" "$config_root/signer"
+    chmod 0711 "$config_root"
+    chmod 0700 "$config_root/broker" "$config_root/signer"
+    atomic_install "$payload/config/edge-manifest.json" "$config_root/edge-manifest.json" 0644
     machine_audit_history_source="$config_root/.machine-audit-history.source.$$"
     printf '%s\n' \
       '{' \
       '  "schema": "bloom.machine-audit-trust.v1",' \
       '  "predecessors": []' \
       '}' > "$machine_audit_history_source"
-    if [[ "$managed_enrollment" == false && ! -e "$config_root/machine-audit-history.json" ]]; then
+    if [[ ! -e "$config_root/machine-audit-history.json" ]]; then
       atomic_install \
         "$machine_audit_history_source" \
         "$config_root/machine-audit-history.json" \
@@ -276,26 +196,26 @@ case "$action" in
       '  "historical_keys": [],' \
       '  "handovers": []' \
       '}' > "$authority_edge_history_source"
-    if [[ "$managed_enrollment" == false && ! -e "$config_root/authority-edge-history.json" ]]; then
+    if [[ ! -e "$config_root/authority-edge-history.json" ]]; then
       atomic_install \
         "$authority_edge_history_source" \
         "$config_root/authority-edge-history.json" \
         0644
     fi
     rm -f -- "$authority_edge_history_source"
-    if [[ "$managed_enrollment" == false ]]; then
-      atomic_install "$payload/config/broker.json" "$config_root/broker/config.json" 0600
-      atomic_install "$payload/config/signer.json" "$config_root/signer/config.json" 0600
-      atomic_install \
-        "$payload/config/broker-identity.json" \
-        "$config_root/broker/identity.json" \
-        0600
-      atomic_install \
-        "$payload/config/signer-identity.json" \
-        "$config_root/signer/identity.json" \
-        0600
-    fi
-    if [[ "$root" == "/" && "$managed_enrollment" == false ]]; then
+    atomic_install "$payload/config/broker.json" "$config_root/broker/config.json" 0600
+    atomic_install "$payload/config/signer.json" "$config_root/signer/config.json" 0600
+    atomic_install \
+      "$payload/config/broker-identity.json" \
+      "$config_root/broker/identity.json" \
+      0600
+    atomic_install \
+      "$payload/config/signer-identity.json" \
+      "$config_root/signer/identity.json" \
+      0600
+    if [[ "$root" == "/" ]]; then
+      systemd-sysusers "$sysusers"
+      systemd-tmpfiles --create "$tmpfiles"
       chown "bloom-broker-$login_uid:bloom-broker-$login_uid" \
         "$config_root/broker/config.json" \
         "$config_root/broker/identity.json"
@@ -353,14 +273,12 @@ case "$action" in
 
     if [[ "$root" == "/" ]]; then
       systemctl daemon-reload
-      if [[ "$fresh_enrollment" == false ]]; then
-        systemctl enable --now \
-          "bloom-signer-rpc@$login_uid.socket" \
-          "bloom-signer-control@$login_uid.socket" \
-          "bloom-broker-rpc@$login_uid.socket" \
-          "bloom-broker-control@$login_uid.socket" \
-          "bloom-broker-ceremony@$login_uid.socket"
-      fi
+      systemctl enable --now \
+        "bloom-signer-rpc@$login_uid.socket" \
+        "bloom-signer-control@$login_uid.socket" \
+        "bloom-broker-rpc@$login_uid.socket" \
+        "bloom-broker-control@$login_uid.socket" \
+        "bloom-broker-ceremony@$login_uid.socket"
       if [[ ${#active_units[@]} -gt 0 ]]; then
         systemctl start "${active_units[@]}"
       fi

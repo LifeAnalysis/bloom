@@ -172,16 +172,10 @@ fn configured_raw_broker_client_with_activation(
     allow_activating: bool,
 ) -> Result<bloom_machine_client::MachineBrokerClient> {
     let installed = installed_macos_triad_paths_with_activation(allow_activating)?;
-    let login_uid = rustix::process::geteuid().as_raw();
     let broker_socket = std::env::var_os("BLOOM_BROKER_SOCKET")
         .map(std::path::PathBuf::from)
         .or_else(|| installed.as_ref().map(|paths| paths.broker_socket.clone()))
-        .unwrap_or_else(|| {
-            #[cfg(target_os = "linux")]
-            return std::path::PathBuf::from(format!("/run/bloom/{login_uid}/broker.sock"));
-            #[cfg(not(target_os = "linux"))]
-            std::path::PathBuf::from("/var/run/bloom/broker.sock")
-        });
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/run/bloom/broker.sock"));
     let machine_identity = std::env::var_os("BLOOM_MACHINE_IDENTITY")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -189,23 +183,11 @@ fn configured_raw_broker_client_with_activation(
                 .as_ref()
                 .map(|paths| paths.machine_identity.clone())
         })
-        .unwrap_or_else(|| {
-            #[cfg(target_os = "linux")]
-            return std::path::PathBuf::from(format!(
-                "/etc/bloom/{login_uid}/machine/identity.json"
-            ));
-            #[cfg(not(target_os = "linux"))]
-            std::path::PathBuf::from("/var/run/bloom/machine-identity.json")
-        });
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/run/bloom/machine-identity.json"));
     let edge_manifest = std::env::var_os("BLOOM_EDGE_MANIFEST")
         .map(std::path::PathBuf::from)
         .or_else(|| installed.as_ref().map(|paths| paths.edge_manifest.clone()))
-        .unwrap_or_else(|| {
-            #[cfg(target_os = "linux")]
-            return std::path::PathBuf::from(format!("/etc/bloom/{login_uid}/edge-manifest.json"));
-            #[cfg(not(target_os = "linux"))]
-            std::path::PathBuf::from("/etc/bloom/edge-manifest.json")
-        });
+        .unwrap_or_else(|| std::path::PathBuf::from("/etc/bloom/edge-manifest.json"));
     #[cfg(feature = "triad-dev-harness")]
     let client = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
         Some(root) => bloom_machine_client::MachineBrokerClient::connect_unix_from_developer_files(
@@ -282,7 +264,6 @@ fn configured_broker_connection(
     // AuditLog instance it owns before any RPC can be dispatched.
     let broker = configured_raw_broker_client_with_activation(false)?;
     let installed = installed_macos_triad_paths()?;
-    let login_uid = rustix::process::geteuid().as_raw();
     let provenance_catalog = std::env::var_os("BLOOM_PROVENANCE_CATALOG")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -290,14 +271,7 @@ fn configured_broker_connection(
                 .as_ref()
                 .map(|paths| paths.provenance_catalog.clone())
         })
-        .unwrap_or_else(|| {
-            #[cfg(target_os = "linux")]
-            return std::path::PathBuf::from(format!(
-                "/etc/bloom/{login_uid}/provenance-catalog.json"
-            ));
-            #[cfg(not(target_os = "linux"))]
-            std::path::PathBuf::from("/etc/bloom/provenance-catalog.json")
-        });
+        .unwrap_or_else(|| std::path::PathBuf::from("/etc/bloom/provenance-catalog.json"));
     #[cfg(feature = "triad-dev-harness")]
     let catalog = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
         Some(root) => {
@@ -2066,16 +2040,6 @@ enum InitInternal {
         session_socket_gid: u32,
         release_digest: String,
     },
-    #[command(name = "triad-render-linux-enrollment", hide = true)]
-    LinuxEnrollment {
-        template_dir: PathBuf,
-        output_dir: PathBuf,
-        login_uid: u32,
-        broker_uid: u32,
-        signer_uid: u32,
-        session_socket_gid: u32,
-        release_digest: String,
-    },
     #[command(name = "triad-render-macos-identity-rotation", hide = true)]
     IdentityRotation {
         current_identity: PathBuf,
@@ -2787,7 +2751,7 @@ async fn run(cli: Cli) -> Result<()> {
                         signer_uid,
                         session_socket_gid,
                         release_digest,
-                    } => triad_enrollment::run_macos(
+                    } => triad_enrollment::run(
                         template_dir,
                         output_dir,
                         login_uid,
@@ -2797,24 +2761,6 @@ async fn run(cli: Cli) -> Result<()> {
                         release_digest,
                     )
                     .context("Bloom macOS enrollment generation failed"),
-                    InitInternal::LinuxEnrollment {
-                        template_dir,
-                        output_dir,
-                        login_uid,
-                        broker_uid,
-                        signer_uid,
-                        session_socket_gid,
-                        release_digest,
-                    } => triad_enrollment::run_linux(
-                        template_dir,
-                        output_dir,
-                        login_uid,
-                        broker_uid,
-                        signer_uid,
-                        session_socket_gid,
-                        release_digest,
-                    )
-                    .context("Bloom Linux enrollment generation failed"),
                     InitInternal::IdentityRotation {
                         current_identity,
                         replacement_identity,
