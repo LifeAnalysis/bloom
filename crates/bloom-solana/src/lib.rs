@@ -45,7 +45,7 @@ pub struct SignatureStatus {
     pub confirmations: Option<u64>,
     #[serde(default)]
     pub err: Option<Value>,
-    #[serde(default)]
+    #[serde(default, alias = "confirmationStatus")]
     pub confirmation_status: Option<String>,
 }
 
@@ -293,7 +293,12 @@ impl SolanaClient {
         let result: Value = self
             .inner
             .rpc
-            .call("getSignatureStatuses", &json!([signatures]))
+            // Ask the node for terminal status directly. Reconciliation
+            // writes durable receipts only from finalized observations.
+            .call(
+                "getSignatureStatuses",
+                &json!([signatures, {"commitment": "finalized"}]),
+            )
             .await?;
         let values = result
             .get("value")
