@@ -704,6 +704,11 @@ fn configured_machine_audit_history_path_with_activation(
     )))
 }
 
+struct CustodyLaunchOptions {
+    wallet_seed_profile: Option<bloom_broker_api::WalletSeedProfile>,
+    legacy_migration: Option<LegacyMigrationLaunch>,
+}
+
 async fn launch_custody_ceremony(
     home: &HomeDir,
     requested_name: &str,
@@ -711,8 +716,7 @@ async fn launch_custody_ceremony(
     ceremony_kind: bloom_broker_api::CeremonyKind,
     wallet_id: Option<bloom_broker_api::Token>,
     expected_input_class: &str,
-    wallet_seed_profile: Option<bloom_broker_api::WalletSeedProfile>,
-    legacy_migration: Option<LegacyMigrationLaunch>,
+    options: CustodyLaunchOptions,
 ) -> Result<String> {
     use rand::RngCore as _;
     use sha2::Digest as _;
@@ -737,7 +741,7 @@ async fn launch_custody_ceremony(
         )
     })?;
     let (operation_id, exact_terms_digest, legacy_passkey_migration) =
-        if let Some(migration) = legacy_migration {
+        if let Some(migration) = options.legacy_migration {
             (
                 migration.operation_id,
                 migration.exact_terms_digest,
@@ -778,7 +782,7 @@ async fn launch_custody_ceremony(
                 browser_output_recipient_key: None,
                 petal_key_scope: None,
                 legacy_passkey_migration,
-                wallet_seed_profile,
+                wallet_seed_profile: options.wallet_seed_profile,
                 derivation_request: None,
                 account_terms: None,
             },
@@ -1429,8 +1433,10 @@ async fn execute_machine_command(
                     ceremony_kind,
                     wallet_id,
                     input_class,
-                    wallet_seed_profile,
-                    None,
+                    CustodyLaunchOptions {
+                        wallet_seed_profile,
+                        legacy_migration: None,
+                    },
                 )
                 .await?
             }
@@ -1446,8 +1452,10 @@ async fn execute_machine_command(
                 bloom_broker_api::CeremonyKind::WalletImport,
                 None,
                 "legacy_passkey_v1_prf",
-                None,
-                Some(migration),
+                CustodyLaunchOptions {
+                    wallet_seed_profile: None,
+                    legacy_migration: Some(migration),
+                },
             )
             .await?
         }
