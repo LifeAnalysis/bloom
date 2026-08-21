@@ -13,9 +13,11 @@ cp /tested-bloom /payload/bin/bloom
 cp -R /source/packaging/triad/linux/config /payload/installer/linux/config
 cp /source/packaging/triad/release/enroll-linux.sh /payload/installer/release/enroll-linux.sh
 printf '%s\n' fixture > /payload/SHA256SUMS
-printf '#!/bin/sh\nexit 0\n' >/fake-bin/systemctl
-printf '#!/bin/sh\nexit 0\n' >/fake-bin/runuser
-chmod 0755 /fake-bin/systemctl /fake-bin/runuser /payload/installer/release/enroll-linux.sh
+for command in systemctl runuser systemd-sysusers systemd-tmpfiles; do
+  printf '#!/bin/sh\nexit 0\n' >"/fake-bin/$command"
+done
+chmod 0755 /fake-bin/systemctl /fake-bin/runuser /fake-bin/systemd-sysusers \
+  /fake-bin/systemd-tmpfiles /payload/installer/release/enroll-linux.sh
 export PATH="/fake-bin:$PATH"
 
 case "$BOUNDARY" in

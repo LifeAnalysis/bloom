@@ -15,9 +15,10 @@ chmod 0755 /payload/installer/release/enroll-linux.sh
 printf '%s\n' linux >/payload/PLATFORM_CLAIM
 printf '%s\n' fixture >/payload/SHA256SUMS
 printf 'time.cloudflare.com\ntime.nist.gov\n' >/payload/config/nts-servers.conf
-printf '#!/bin/sh\nexit 0\n' >/fake-bin/systemctl
-printf '#!/bin/sh\nexit 0\n' >/fake-bin/runuser
-chmod 0755 /fake-bin/systemctl /fake-bin/runuser
+for command in systemctl runuser systemd-sysusers systemd-tmpfiles; do
+  printf '#!/bin/sh\nexit 0\n' >"/fake-bin/$command"
+done
+chmod 0755 /fake-bin/systemctl /fake-bin/runuser /fake-bin/systemd-sysusers /fake-bin/systemd-tmpfiles
 export PATH="/fake-bin:$PATH"
 export BLOOM_ALLOW_TEST_UNCLAIMED=true
 
