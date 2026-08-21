@@ -84,9 +84,9 @@ for support_edge in signer_control session; do
   require_compat_value "protocols.$support_edge" minor_min 0
   require_compat_value "protocols.$support_edge" minor_max 1
 done
-require_compat_value revisions broker_commit '"2a1c9c090c06f7a95bd8f82cb984e22347896ba0"'
-require_compat_value revisions signer_commit '"59c12e15438e436979eb30a27b2e9534a3f97615"'
-require_compat_value revisions service_runtime_commit '"19d0465d53b279e6e1c98bac533510a1e7eb8f44"'
+require_compat_value revisions broker_commit '"81dba5ab62acfabf105eed9a7c6cffde75e93836"'
+require_compat_value revisions signer_commit '"03f398c57fa0d7ea90a1cd9ac4843cef311427a4"'
+require_compat_value revisions service_runtime_commit '"155560173e65fa6635cc87a43986f4fa6ea9c4e0"'
 require_compat_value revisions petal_contract_commit '"61938d0c127cfe03c7e3e55baed0ba1439bc5ca2"'
 for state_owner in machine broker signer; do
   require_compat_value "state.$state_owner" current 1
