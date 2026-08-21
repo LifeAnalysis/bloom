@@ -164,6 +164,11 @@ impl SolanaClient {
                 observed,
             });
         }
+        if self.inner.allow_broadcast && observed == crate::MAINNET_BETA_GENESIS_HASH {
+            return Err(SolanaRpcError::Invalid(
+                "broadcast to Solana mainnet-beta is disabled".into(),
+            ));
+        }
         Ok(observed)
     }
 

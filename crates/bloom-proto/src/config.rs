@@ -525,6 +525,16 @@ impl Config {
                 )));
             }
         }
+        for (name, spec) in &self.solana_chains {
+            if spec.allow_broadcast
+                && spec.expected_genesis_hex.as_deref()
+                    == Some(crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "solana chain '{name}' cannot enable broadcast for mainnet-beta"
+                )));
+            }
+        }
         for (app_name, app) in &self.petals.runtime {
             validate_petal_runtime_name("app", app_name)?;
             for (binding, origin) in &app.endpoints {
@@ -1047,6 +1057,31 @@ allow_broadcast = true
         assert!(!cfg.broadcast_permitted(&ethereum));
         ethereum.allow_broadcast = true;
         assert!(cfg.broadcast_permitted(&ethereum));
+    }
+
+    #[test]
+    fn solana_broadcast_rejects_pinned_mainnet_genesis() {
+        let mut cfg = Config::local_default();
+        cfg.solana_chains.insert(
+            "solana-mainnet".into(),
+            SolanaSpec {
+                name: "solana-mainnet".into(),
+                endpoints: vec![crate::EndpointSpec {
+                    url: "https://example.invalid".into(),
+                    weight: 100,
+                    cu_per_sec: None,
+                    max_rps: None,
+                    http_only: false,
+                }],
+                expected_genesis_hex: Some(crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH.into()),
+                allow_broadcast: true,
+            },
+        );
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("cannot enable broadcast for mainnet-beta"),
+            "{error}"
+        );
     }
 
     #[test]

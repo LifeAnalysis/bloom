@@ -5669,8 +5669,8 @@ mod tests {
     #[tokio::test]
     async fn admit_solana_chain_admits_unreachable_endpoint_for_degraded_readiness() {
         // Reachability is transient runtime state, not deterministic config.
-        // The daemon must remain bootable so readiness can report the degraded
-        // chain without taking unrelated EVM chains down.
+        // The daemon remains bootable, while the engine's live genesis check
+        // still refuses mainnet before any stage or broadcast.
         let spec = solana_spec_at("solana-devnet", "http://127.0.0.1:1");
         assert!(
             admit_solana_chain("solana-devnet", &spec),

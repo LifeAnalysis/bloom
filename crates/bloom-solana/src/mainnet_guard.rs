@@ -38,7 +38,7 @@ use crate::error::SolanaRpcError;
 /// against a live node and the reference client source — this constant is
 /// the sole gate standing between a misconfigured chain and a real mainnet
 /// broadcast.
-pub const MAINNET_BETA_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+pub const MAINNET_BETA_GENESIS_HASH: &str = bloom_proto::SOLANA_MAINNET_BETA_GENESIS_HASH;
 
 /// Whether the cluster reachable at `spec`'s endpoints is confirmed to be
 /// Solana mainnet-beta, checked via a live, blocking `getGenesisHash` call.
@@ -53,8 +53,9 @@ pub const MAINNET_BETA_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc
 /// - `Ok(false)` — confirmed to be a different cluster (genesis hash
 ///   observed and it does not match).
 /// - `Err(_)` — no configured endpoint could be reached to determine the
-///   cluster's identity at all. Callers must fail closed here exactly as
-///   on `Ok(true)`: an unverifiable cluster is not a verified-safe one.
+///   cluster's identity at all. Boot callers may keep the read-only engine
+///   available for degraded readiness, but stage/broadcast must still fail
+///   closed until a live identity check succeeds.
 pub fn is_mainnet_beta_blocking(spec: &SolanaSpec) -> Result<bool, SolanaRpcError> {
     let observed = observed_genesis_hash_blocking(spec)?;
     Ok(observed == MAINNET_BETA_GENESIS_HASH)
@@ -224,6 +225,21 @@ mod tests {
         let endpoint = spawn_genesis_stub("D".repeat(32)).await;
         let spec = spec_with_endpoint(&endpoint);
         assert!(!is_mainnet_beta_blocking(&spec).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn broadcast_client_refuses_mainnet_even_after_boot_admission() {
+        let endpoint = spawn_genesis_stub(MAINNET_BETA_GENESIS_HASH.to_string()).await;
+        let mut spec = spec_with_endpoint(&endpoint);
+        spec.expected_genesis_hex = Some(MAINNET_BETA_GENESIS_HASH.to_string());
+        spec.allow_broadcast = true;
+        let client = crate::SolanaClient::build(&spec).unwrap();
+        let error = client.verify_genesis().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("broadcast to Solana mainnet-beta is disabled")
+        );
     }
 
     #[test]

@@ -221,6 +221,10 @@ pub struct SolanaSpec {
     pub allow_broadcast: bool,
 }
 
+/// Solana mainnet-beta's immutable genesis hash. Kept in the config crate so
+/// config validation and the runtime client share the same gate.
+pub const SOLANA_MAINNET_BETA_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+
 #[cfg(test)]
 mod tests {
     use super::*;
