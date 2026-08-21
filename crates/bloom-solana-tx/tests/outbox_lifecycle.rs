@@ -198,6 +198,28 @@ fn sweep_expired_removes_only_expired() {
     );
 }
 
+#[test]
+fn sweep_does_not_reap_signed_pending_entry() {
+    let (_dir, outbox) = outbox();
+    let mut signed = staged("0001-signed");
+    signed.expires_ms = 500;
+    signed.signature =
+        Some("SIG1111111111111111111111111111111111111111111111111111111111111".into());
+    outbox.write_pending(&signed, "plan").unwrap();
+
+    assert_eq!(outbox.sweep_expired(1000).unwrap(), 0);
+    assert!(
+        outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "0001-signed",
+                SolanaOutboxState::Pending,
+            )
+            .is_ok()
+    );
+}
+
 // Fix C's related dead-code cleanup (PLAN-SOLANA-PR-FIXES.md): from_status
 // was marked #[allow(dead_code)] with no real caller — pin the mapping it
 // defines now that the engine's broadcast() actually derives its

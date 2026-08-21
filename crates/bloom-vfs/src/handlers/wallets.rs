@@ -2572,6 +2572,7 @@ impl WalletsHandler {
         match rest {
             [] => Ok(Entry::dir(chain)),
             [s] if s == "outbox" => Ok(Entry::dir("outbox")),
+            [s, fname] if s == "outbox" && fname == "new.tx" => Ok(Entry::writable_file("new.tx")),
             [s, state] if s == "outbox" && solana_state(state).is_some() => Ok(Entry::dir(state)),
             [s, state, id] if s == "outbox" && solana_state(state).is_some() => {
                 let entry = engine
@@ -2585,6 +2586,13 @@ impl WalletsHandler {
                     .outbox()
                     .read_in_state(wallet, chain, id, solana_state(state).unwrap())
                     .map_err(solana_outbox_err)?;
+                if solana_state(state) == Some(bloom_solana_tx::outbox::SolanaOutboxState::Pending)
+                    && matches!(fname.as_str(), "confirm" | "cancel")
+                {
+                    return Ok(
+                        Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms)
+                    );
+                }
                 let fpath = entry.dir.join(fname);
                 if !fpath.exists() {
                     return Err(HandlerError::not_found(format!(
@@ -2875,6 +2883,9 @@ impl WalletsHandler {
         rest: &[String],
         engine: &Arc<bloom_solana_tx::engine::SolanaTransferEngine>,
     ) -> Result<Vec<u8>, HandlerError> {
+        // IPC reads bypass lookup, so Solana must enforce the same wallet
+        // projection availability gate as the EVM read path.
+        let _projection = self.wallet_projection(wallet).await?;
         match rest {
             [s, state, id, fname] if s == "outbox" => {
                 let st = solana_state(state)
@@ -2902,6 +2913,7 @@ impl WalletsHandler {
         match rest {
             [] => Ok(vec![Entry::dir("outbox")]),
             [s] if s == "outbox" => Ok(vec![
+                Entry::writable_file("new.tx"),
                 Entry::dir("pending"),
                 Entry::dir("sent"),
                 Entry::dir("failed"),
@@ -2932,6 +2944,11 @@ impl WalletsHandler {
                     let fpath = entry.dir.join(file);
                     if fpath.exists() {
                         entries.push(Entry::file(file));
+                    }
+                }
+                if st == bloom_solana_tx::outbox::SolanaOutboxState::Pending {
+                    for control in ["confirm", "cancel"] {
+                        entries.push(Entry::writable_file(control));
                     }
                 }
                 Ok(entries)
@@ -4179,6 +4196,17 @@ mod tests {
             std::sync::Arc::new(engine),
         )]));
 
+        let new_tx = handler
+            .lookup(&VfsPath::parse("/alice/chains/solana-devnet/outbox/new.tx").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(new_tx.mode, 0o644);
+        let outbox_entries = handler
+            .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox").unwrap())
+            .await
+            .unwrap();
+        assert!(outbox_entries.iter().any(|entry| entry.name == "new.tx"));
+
         // The Solana chain's outbox routes through the Solana engine, not the
         // EVM one: the intent is Solana-typed and read from the Solana outbox.
         let intent = handler
@@ -4193,6 +4221,20 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&intent).unwrap();
         assert_eq!(parsed["lamports"], 1_000_000);
         assert_eq!(parsed["chain"], "solana-devnet");
+
+        for control in ["confirm", "cancel"] {
+            assert!(
+                handler
+                    .lookup(
+                        &VfsPath::parse(&format!(
+                            "/alice/chains/solana-devnet/outbox/pending/0001-00001/{control}"
+                        ))
+                        .unwrap()
+                    )
+                    .await
+                    .is_ok()
+            );
+        }
 
         let listed = handler
             .list(&VfsPath::parse("/alice/chains/solana-devnet/outbox/pending").unwrap())

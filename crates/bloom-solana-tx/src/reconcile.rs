@@ -106,6 +106,12 @@ async fn reconcile_one(
         return Ok(None);
     };
 
+    // `processed` and `confirmed` are forkable observations. A durable
+    // receipt is terminal state, so wait until the cluster reports finality.
+    if status.confirmation_status.as_deref() != Some("finalized") {
+        return Ok(None);
+    }
+
     let outcome = if status.err.is_some() {
         "failed"
     } else {

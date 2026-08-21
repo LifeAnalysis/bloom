@@ -8,7 +8,7 @@ use bloom_solana_tx::types::{SolanaTxStatus, StagedSolanaTransfer};
 use serde_json::json;
 use tempfile::TempDir;
 
-async fn spawn_status_stub(confirmations: Option<u64>, err: bool) -> String {
+async fn spawn_status_stub(confirmations: Option<u64>, err: bool, finalized: bool) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -33,7 +33,13 @@ async fn spawn_status_stub(confirmations: Option<u64>, err: bool) -> String {
                                 "slot": 42,
                                 "confirmations": c,
                                 "err": if err { json!({"InstructionError": [0, "Custom"]}) } else { serde_json::Value::Null },
-                                "confirmation_status": if c == 0 { serde_json::Value::Null } else { json!("confirmed") },
+                                "confirmation_status": if c == 0 {
+                                    serde_json::Value::Null
+                                } else if finalized {
+                                    json!("finalized")
+                                } else {
+                                    json!("processed")
+                                },
                             })
                         } else {
                             serde_json::Value::Null
@@ -100,7 +106,7 @@ fn client(endpoint: &str) -> SolanaClient {
 
 #[tokio::test]
 async fn reconciles_success_to_receipt() {
-    let endpoint = spawn_status_stub(Some(1), false).await;
+    let endpoint = spawn_status_stub(Some(1), false, true).await;
     let dir = TempDir::new().unwrap();
     let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
     let s = sent_entry("0001-00001");
@@ -126,7 +132,7 @@ async fn reconciles_success_to_receipt() {
 
 #[tokio::test]
 async fn reconciles_failure_to_receipt() {
-    let endpoint = spawn_status_stub(Some(1), true).await;
+    let endpoint = spawn_status_stub(Some(1), true, true).await;
     let dir = TempDir::new().unwrap();
     let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
     let s = sent_entry("0001-00001");
@@ -150,7 +156,29 @@ async fn reconciles_failure_to_receipt() {
 #[tokio::test]
 async fn unseen_signature_stays_unreconciled() {
     // The node returns a null entry: signature not observed yet.
-    let endpoint = spawn_status_stub(None, false).await;
+    let endpoint = spawn_status_stub(None, false, true).await;
+    let dir = TempDir::new().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let s = sent_entry("0001-00001");
+    outbox.write_pending(&s, "plan").unwrap();
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
+
+    let registry = SolanaChainRegistry::new();
+    registry.add(client(&endpoint));
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry);
+    assert_eq!(reconciler.tick().await, 0);
+    assert!(
+        outbox
+            .read_receipt("alice", "solana-devnet", "0001-00001")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn processed_signature_stays_unreconciled() {
+    let endpoint = spawn_status_stub(Some(1), false, false).await;
     let dir = TempDir::new().unwrap();
     let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
     let s = sent_entry("0001-00001");

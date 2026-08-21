@@ -532,7 +532,13 @@ impl SolanaOutbox {
                     }
                     let staged: StagedSolanaTransfer =
                         serde_json::from_slice(&fs::read(&intent_path)?)?;
-                    if staged.expires_ms != 0 && now_ms >= staged.expires_ms {
+                    // A signed pending entry may represent a broadcast whose
+                    // RPC response was lost. Keep it retryable and visible;
+                    // expiry alone must not turn it into a false failure.
+                    if staged.signature.is_none()
+                        && staged.expires_ms != 0
+                        && now_ms >= staged.expires_ms
+                    {
                         let entry = SolanaOutboxEntry {
                             state: SolanaOutboxState::Pending,
                             staged,
