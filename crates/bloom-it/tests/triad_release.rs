@@ -1560,6 +1560,17 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
 }
 
 #[test]
+fn linux_installer_accepts_the_native_or_portable_sha256_tool() {
+    let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    assert!(installer.contains("command -v sha256sum"));
+    assert!(installer.contains("sha256sum \"$input\" | awk '{print $1}'"));
+    assert!(installer.contains("command -v shasum"));
+    assert!(installer.contains("shasum -a 256 \"$input\" | awk '{print $1}'"));
+    assert!(installer.contains("release_digest=\"$(sha256_digest \"$payload/SHA256SUMS\")\""));
+    assert!(installer.contains("Linux installation requires sha256sum or shasum"));
+}
+
+#[test]
 fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
