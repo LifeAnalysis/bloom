@@ -297,7 +297,13 @@ impl SolanaClient {
             // writes durable receipts only from finalized observations.
             .call(
                 "getSignatureStatuses",
-                &json!([signatures, {"commitment": "finalized"}]),
+                &json!([
+                    signatures,
+                    {
+                        "commitment": "finalized",
+                        "searchTransactionHistory": true
+                    }
+                ]),
             )
             .await?;
         let values = result
