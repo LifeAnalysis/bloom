@@ -40,6 +40,18 @@ atomic_install() {
   mv -f "$temporary" "$destination"
 }
 
+sha256_file() {
+  file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    echo "Linux installation requires sha256sum or shasum" >&2
+    exit 69
+  fi
+}
+
 case "$action" in
   install)
     [[ $# -eq 4 ]] || usage
@@ -207,7 +219,7 @@ case "$action" in
             exit 65
           }
         done
-        release_digest="$(shasum -a 256 "$payload/SHA256SUMS" | awk '{print $1}')"
+        release_digest="$(sha256_file "$payload/SHA256SUMS")"
         [[ "$release_digest" =~ ^[0-9a-f]{64}$ ]] || {
           echo "signed payload release digest is invalid" >&2
           exit 65
