@@ -1,5 +1,5 @@
-//! Root-only generation of per-login macOS triad identities and signing
-//! material from public release templates.
+//! Root-only generation of per-login triad identities and signing material
+//! from platform-specific public release templates.
 
 use std::{
     collections::BTreeMap,
@@ -31,7 +31,7 @@ const MAX_TEMPLATE_BYTES: u64 = 1024 * 1024;
 const PUBLIC_TEMPLATE_FILES: [&str; 3] =
     ["edge-manifest.json.in", "broker.json.in", "signer.json.in"];
 
-pub fn run(
+pub fn run_macos(
     template_dir: PathBuf,
     output_dir: PathBuf,
     login_uid: u32,
@@ -45,6 +45,32 @@ pub fn run(
     }
     if std::env::consts::OS != "macos" {
         bail!("macOS enrollment material generation requires Darwin");
+    }
+    generate(&EnrollmentPlan {
+        template_dir,
+        output_dir,
+        login_uid,
+        broker_uid,
+        signer_uid,
+        session_socket_gid,
+        release_digest,
+    })
+}
+
+pub fn run_linux(
+    template_dir: PathBuf,
+    output_dir: PathBuf,
+    login_uid: u32,
+    broker_uid: u32,
+    signer_uid: u32,
+    session_socket_gid: u32,
+    release_digest: String,
+) -> Result<()> {
+    if rustix::process::geteuid().as_raw() != 0 {
+        bail!("Linux enrollment material generation requires root");
+    }
+    if std::env::consts::OS != "linux" {
+        bail!("Linux enrollment material generation requires Linux");
     }
     generate(&EnrollmentPlan {
         template_dir,
@@ -484,10 +510,10 @@ fn rewrite_private_json(path: &Path, value: &serde_json::Value) -> Result<()> {
 
 pub fn run_identity_rotation(current_identity: &Path, replacement_identity: &Path) -> Result<()> {
     if rustix::process::geteuid().as_raw() != 0 {
-        bail!("macOS identity rotation generation requires root");
+        bail!("identity rotation generation requires root");
     }
-    if std::env::consts::OS != "macos" {
-        bail!("macOS identity rotation generation requires Darwin");
+    if !matches!(std::env::consts::OS, "linux" | "macos") {
+        bail!("identity rotation generation requires Linux or Darwin");
     }
     generate_identity_rotation_for_owner(current_identity, replacement_identity, 0)
 }
@@ -758,7 +784,7 @@ fn validate_plan(plan: &EnrollmentPlan, expected_owner: u32) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
-        bail!("macOS enrollment generation plan has invalid IDs or release digest");
+        bail!("enrollment generation plan has invalid IDs or release digest");
     }
     require_empty_private_output(&plan.output_dir, expected_owner)?;
     for name in PUBLIC_TEMPLATE_FILES
@@ -1010,6 +1036,57 @@ mod tests {
             .and_then(Path::parent)
             .unwrap()
             .join("packaging/triad/macos/config")
+    }
+
+    fn linux_template_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("packaging/triad/linux/config")
+    }
+
+    #[test]
+    fn linux_material_uses_fhs_paths_and_kernel_enforced_containment() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("output");
+        fs::create_dir(&output).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        let plan = EnrollmentPlan {
+            template_dir: linux_template_dir(),
+            output_dir: output.clone(),
+            login_uid: 1000,
+            broker_uid: 250_001,
+            signer_uid: 250_002,
+            session_socket_gid: 260_001,
+            release_digest: "22".repeat(32),
+        };
+        generate_for_owner(&plan, rustix::process::geteuid().as_raw()).unwrap();
+
+        let edge: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("edge-manifest.json")).unwrap()).unwrap();
+        let broker: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("broker.json")).unwrap()).unwrap();
+        let signer: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("signer.json")).unwrap()).unwrap();
+        assert_eq!(edge["trusted_time_source"], "linux-chrony-nts");
+        assert_eq!(edge["machine"]["effective_uid"], 1000);
+        assert_eq!(edge["broker"]["effective_uid"], 250_001);
+        assert_eq!(edge["signer"]["effective_uid"], 250_002);
+        assert_eq!(broker["signer_socket_path"], "/run/bloom/1000/signer.sock");
+        assert_eq!(
+            broker["provenance_catalog_path"],
+            "/etc/bloom/1000/provenance-catalog.json"
+        );
+        assert_eq!(
+            signer["database_path"],
+            "/var/lib/bloom/1000/signer/signer.db"
+        );
+        assert!(broker["network_containment"].is_null());
+        assert!(signer["network_containment"].is_null());
+        for name in ["edge-manifest.json", "broker.json", "signer.json"] {
+            assert!(!fs::read_to_string(output.join(name)).unwrap().contains('@'));
+        }
     }
 
     #[test]

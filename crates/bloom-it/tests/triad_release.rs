@@ -166,7 +166,14 @@ fn make_staging(root: &Path) -> PathBuf {
     ] {
         let path = staging.join("bin").join(binary);
         let version = if binary == "bloom" { "0.1.3" } else { "0.1.0" };
-        fs::write(&path, format!("#!/bin/sh\necho {binary} {version}\n")).unwrap();
+        let script = if binary == "bloom" {
+            format!(
+                "#!/bin/sh\nprintf '{binary} {version}\\nbloom-daemon unavailable\\nbloom-ipc 1 (not negotiated)\\n'\n"
+            )
+        } else {
+            format!("#!/bin/sh\necho {binary} {version}\n")
+        };
+        fs::write(&path, script).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     fs::write(staging.join("PLATFORM_CLAIM"), b"test-unclaimed\n").unwrap();
@@ -234,6 +241,11 @@ fn make_installer_payload(root: &Path) -> PathBuf {
 }
 
 fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
+    let tar = if cfg!(target_os = "macos") {
+        "gtar"
+    } else {
+        "/usr/bin/tar"
+    };
     Command::new(release_script("build-bundle.sh"))
         .args([staging.as_os_str(), output.as_os_str(), key.as_os_str()])
         .arg("1700000000")
@@ -241,8 +253,24 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         .env("BLOOM_BROKER_SHA", "2222222")
         .env("BLOOM_SIGNER_SHA", "3333333")
         .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("TAR", tar)
         .output()
         .unwrap()
+}
+
+#[test]
+fn release_bundle_accepts_the_machine_multiline_version_report() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    let key = directory.path().join("release-key");
+    generate_ed25519_key(&key);
+
+    let built = build(&staging, &directory.path().join("bundle.tar.gz"), &key);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
 }
 
 #[test]
