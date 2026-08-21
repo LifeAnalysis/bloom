@@ -662,13 +662,14 @@ impl MachineBrokerClient {
                     )
                 }
                 (None, None) => {
-                    if matches!(
-                        request.provenance,
-                        ProvenanceSubject::Petal { .. } | ProvenanceSubject::System { .. }
-                    ) {
+                    // Petal execution has always required a package-scoped claim.
+                    // Native system operations may remain at the existing baseline
+                    // unless their chain path supplies a stronger SystemUseClaim
+                    // (as the Solana signer does below this API).
+                    if matches!(request.provenance, ProvenanceSubject::Petal { .. }) {
                         return Err(ProtocolError::new(
                             ProtocolErrorCode::ProvenanceMismatch,
-                            "trusted Petal or System exact signing requires its matching use claim",
+                            "trusted Petal exact signing requires a PetalUseClaim",
                         ));
                     }
                     if request.claim_assurance_evidence.is_some() {
