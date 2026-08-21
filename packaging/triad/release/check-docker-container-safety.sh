@@ -20,7 +20,8 @@ readarray -t values < <(jq -r '.[0] | [
   (.HostConfig.IpcMode // ""),
   (.HostConfig.NetworkMode // ""),
   ((.Config.Cmd // []) | join(" ")),
-  ((.Mounts // []) | map([.Source // "", .Destination // "", (.RW // false | tostring)] | @tsv) | .[])
+  ((.Mounts // []) | map([.Source // "", .Destination // "", (.RW // false | tostring)] | @tsv) | .[]),
+  ((.HostConfig.Devices // []) | map([.PathOnHost // "", .PathInContainer // ""] | @tsv) | .[])
 ] | .[]' <<<"$inspect")
 
 status=${values[0]}
