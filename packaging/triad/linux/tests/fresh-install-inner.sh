@@ -15,10 +15,23 @@ chmod 0755 /payload/installer/release/enroll-linux.sh
 printf '%s\n' linux >/payload/PLATFORM_CLAIM
 printf '%s\n' fixture >/payload/SHA256SUMS
 printf 'time.cloudflare.com\ntime.nist.gov\n' >/payload/config/nts-servers.conf
-for command in systemctl runuser systemd-sysusers systemd-tmpfiles; do
-  printf '#!/bin/sh\nexit 0\n' >"/fake-bin/$command"
-done
-chmod 0755 /fake-bin/systemctl /fake-bin/runuser /fake-bin/systemd-sysusers /fake-bin/systemd-tmpfiles
+printf '#!/bin/sh\nexit 0\n' >/fake-bin/systemctl
+printf '#!/bin/sh\nexit 0\n' >/fake-bin/runuser
+cat >/fake-bin/systemd-sysusers <<'EOF'
+#!/bin/sh
+set -eu
+getent group bloom-machine-broker-1000 >/dev/null || groupadd -g 31001 bloom-machine-broker-1000
+getent group bloom-broker-signer-1000 >/dev/null || groupadd -g 31002 bloom-broker-signer-1000
+getent group bloom-revoke-1000 >/dev/null || groupadd -g 31003 bloom-revoke-1000
+id bloom-broker-1000 >/dev/null 2>&1 || useradd -u 30001 -g users bloom-broker-1000
+id bloom-signer-1000 >/dev/null 2>&1 || useradd -u 30002 -g users bloom-signer-1000
+usermod -a -G bloom-machine-broker-1000,bloom-revoke-1000 alice
+usermod -a -G bloom-machine-broker-1000,bloom-broker-signer-1000 bloom-broker-1000
+usermod -a -G bloom-broker-signer-1000 bloom-signer-1000
+EOF
+printf '#!/bin/sh\nexit 0\n' >/fake-bin/systemd-tmpfiles
+chmod 0755 /fake-bin/systemctl /fake-bin/runuser /fake-bin/systemd-sysusers \
+  /fake-bin/systemd-tmpfiles
 export PATH="/fake-bin:$PATH"
 export BLOOM_ALLOW_TEST_UNCLAIMED=true
 
