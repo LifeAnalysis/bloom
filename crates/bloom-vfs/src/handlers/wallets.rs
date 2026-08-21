@@ -3973,6 +3973,7 @@ mod tests {
                                 r#"{{"context":{{"slot":1}},"value":{{"blockhash":"{blockhash}","lastValidBlockHeight":100}}}}"#
                             )
                         }
+                        "getFeeForMessage" => r#"{"context":{"slot":1},"value":5000}"#.to_string(),
                         _ => r#"{"code":-32601,"message":"method not found"}"#.to_string(),
                     };
                     let payload = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#);
@@ -4159,6 +4160,7 @@ mod tests {
             fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
             destination: "DEST111111111111111111111111111111111111111".into(),
             lamports: 1_000_000,
+            fee_lamports: 5_000,
             genesis_hash: "GENESIS111111111111111111111111111111111111".into(),
             blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
             last_valid_block_height: 100,
@@ -4894,6 +4896,8 @@ mod tests {
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
+            petal_use_claim: None,
+            system_use_claim: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -4938,6 +4942,8 @@ mod tests {
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
+                petal_use_claim: None,
+                system_use_claim: None,
             };
             let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
             f.handler
@@ -4967,6 +4973,8 @@ mod tests {
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
+            petal_use_claim: None,
+            system_use_claim: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -4995,6 +5003,8 @@ mod tests {
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
+            petal_use_claim: None,
+            system_use_claim: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
 
