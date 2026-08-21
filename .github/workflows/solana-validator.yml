@@ -7,6 +7,9 @@ on:
       - ".github/workflows/solana-validator.yml"
       - "crates/bloom-solana/**"
       - "crates/bloom-solana-tx/**"
+      - "crates/bloom-vfs/**"
+      - "crates/bloom-daemon/**"
+      - "crates/bloom-it/**"
       - "Cargo.toml"
       - "Cargo.lock"
 

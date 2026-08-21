@@ -208,6 +208,8 @@ pub enum DaemonError {
     Config(#[from] bloom_proto::ConfigError),
     #[error("chain: {0}")]
     Chain(#[from] bloom_evm::ChainError),
+    #[error("solana config: {0}")]
+    SolanaConfig(String),
     #[error("outbox: {0}")]
     Outbox(String),
     #[error("audit: {0}")]
@@ -2405,9 +2407,9 @@ pub struct Daemon {
 /// not be refused on the name alone either — only live genesis identity
 /// decides.
 ///
-/// Fails closed: if identity can't be determined (every endpoint
-/// unreachable), that's treated the same as "confirmed mainnet" and
-/// refused too, exactly like `Ok(true)`.
+/// An unreachable endpoint is not a configuration error. Keep the chain
+/// admitted so the daemon can boot and expose a degraded/readiness-visible
+/// chain rather than taking unrelated EVM service down with it.
 fn admit_solana_chain(name: &str, spec: &bloom_proto::SolanaSpec) -> bool {
     if name.to_lowercase().contains("mainnet") {
         debug!(chain = %name, "daemon.solana_chain_name_mentions_mainnet");
@@ -2419,8 +2421,8 @@ fn admit_solana_chain(name: &str, spec: &bloom_proto::SolanaSpec) -> bool {
             false
         }
         Err(e) => {
-            warn!(chain = %name, error = %e, "daemon.solana_genesis_check_failed");
-            false
+            warn!(chain = %name, error = %e, "daemon.solana_genesis_check_degraded");
+            true
         }
     }
 }
@@ -2508,6 +2510,14 @@ impl Daemon {
         provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     ) -> Result<Self, DaemonError> {
         home.ensure()?;
+        let migrated_solana = bloom_solana_tx::outbox::SolanaOutbox::migrate_legacy_root(
+            home.outbox_dir(),
+            home.solana_outbox_dir(),
+        )
+        .map_err(|e| DaemonError::Outbox(format!("Solana outbox migration: {e}")))?;
+        if migrated_solana > 0 {
+            info!(entries = migrated_solana, "daemon.solana_outbox_migrated");
+        }
         let config_path = home.config_path();
         let config_existed = config_path.exists();
         let config = Config::load_or_init(&config_path)?;
@@ -2703,8 +2713,11 @@ impl Daemon {
                 }
                 let client = match bloom_solana::SolanaClient::build(spec) {
                     Ok(client) => client,
+                    Err(bloom_solana::SolanaRpcError::Invalid(error)) => {
+                        return Err(DaemonError::SolanaConfig(error));
+                    }
                     Err(e) => {
-                        warn!(chain = %name, error = %e, "daemon.solana_chain_skipped");
+                        warn!(chain = %name, error = %e, "daemon.solana_chain_degraded");
                         continue;
                     }
                 };
@@ -2718,7 +2731,7 @@ impl Daemon {
                         continue;
                     }
                 };
-                let outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.outbox_dir())
+                let outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir())
                     .map_err(|e| DaemonError::Outbox(e.to_string()))?;
                 solana_chain_registry.add(client.clone());
                 let engine = bloom_solana_tx::engine::SolanaTransferEngine::new(
@@ -3283,8 +3296,9 @@ impl Daemon {
         // Solana chain was actually admitted (mirrors the bump scanner's
         // `!mempool_indexes.is_empty()` gate above).
         if has_solana_chains && tokio::runtime::Handle::try_current().is_ok() {
-            let solana_outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.outbox_dir())
-                .map_err(|e| DaemonError::Outbox(e.to_string()))?;
+            let solana_outbox =
+                bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir())
+                    .map_err(|e| DaemonError::Outbox(e.to_string()))?;
             let solana_reconciler = Arc::new(bloom_solana_tx::reconcile::SolanaReconciler::new(
                 solana_outbox,
                 solana_chain_registry.clone(),
@@ -3483,14 +3497,14 @@ impl Daemon {
         // here too, so a real (non-zero, see Fix D's `stage()` change)
         // Solana expiry actually gets swept instead of only ever being
         // computed and never acted on.
-        let solana_outbox = match bloom_solana_tx::outbox::SolanaOutbox::new(self.home.outbox_dir())
-        {
-            Ok(o) => Some(o),
-            Err(e) => {
-                warn!(error = %e, "daemon.solana_outbox_sweep_unavailable");
-                None
-            }
-        };
+        let solana_outbox =
+            match bloom_solana_tx::outbox::SolanaOutbox::new(self.home.solana_outbox_dir()) {
+                Ok(o) => Some(o),
+                Err(e) => {
+                    warn!(error = %e, "daemon.solana_outbox_sweep_unavailable");
+                    None
+                }
+            };
         let (tx, mut rx) = watch::channel(false);
         let interval = Duration::from_secs(60);
         let handle = tokio::spawn(async move {
@@ -5653,14 +5667,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admit_solana_chain_fails_closed_when_identity_cannot_be_determined() {
-        // Every endpoint unreachable: identity can't be verified at all.
-        // Must be refused exactly like a confirmed-mainnet cluster, not
-        // silently admitted.
+    async fn admit_solana_chain_admits_unreachable_endpoint_for_degraded_readiness() {
+        // Reachability is transient runtime state, not deterministic config.
+        // The daemon must remain bootable so readiness can report the degraded
+        // chain without taking unrelated EVM chains down.
         let spec = solana_spec_at("solana-devnet", "http://127.0.0.1:1");
         assert!(
-            !admit_solana_chain("solana-devnet", &spec),
-            "an unverifiable cluster must fail closed, not be admitted by default"
+            admit_solana_chain("solana-devnet", &spec),
+            "an unreachable endpoint must not make the whole daemon unbootable"
         );
     }
 
@@ -5816,7 +5830,7 @@ weight = 100
         // over — written *before* boot so it's already there for the
         // reconciler's first tick (which, per `tokio::time::interval`
         // semantics, fires immediately on spawn, not after the interval).
-        let outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.outbox_dir()).unwrap();
+        let outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir()).unwrap();
         let staged = bloom_solana_tx::types::StagedSolanaTransfer {
             id: "0001-00001".into(),
             wallet: "alice".into(),
@@ -5855,7 +5869,7 @@ weight = 100
         .expect("daemon boots");
 
         let receipt_path = home
-            .outbox_dir()
+            .solana_outbox_dir()
             .join("alice")
             .join("solana-devnet")
             .join("sent")
@@ -6166,7 +6180,8 @@ ws_url = "wss://example.invalid"
         let home = HomeDir::at(dir.path());
         let d = Daemon::from_home(home.clone()).unwrap();
 
-        let solana_outbox = bloom_solana_tx::outbox::SolanaOutbox::new(home.outbox_dir()).unwrap();
+        let solana_outbox =
+            bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir()).unwrap();
         let staged = bloom_solana_tx::types::StagedSolanaTransfer {
             id: "0001-test".into(),
             wallet: "alice".into(),
