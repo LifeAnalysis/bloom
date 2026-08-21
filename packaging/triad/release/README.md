@@ -1,5 +1,22 @@
 # Bloom triad release package
 
+## Desktop-host safety
+
+The real triad lifecycle requires a disposable VM or CI runner. Do not boot a
+systemd triad container on an active desktop, and never combine `/sbin/init`,
+`--privileged`, `--cgroupns=host`, or a host `/sys/fs/cgroup` mount. For any
+Docker container created on a desktop host, run the safety check before
+starting it:
+
+```sh
+packaging/triad/release/check-docker-container-safety.sh CONTAINER
+```
+
+The check rejects privileged mode, host namespaces, host cgroup mounts, host
+TTY exposure, and systemd as PID 1. It is a pre-start guard, not permission to
+run the real triad on the desktop; that workflow belongs in a disposable VM or
+CI runner.
+
 `compatibility-v1.toml` is the closed v1 service matrix. It declares each edge
 independently: the Machine–Broker and Broker–Signer authority APIs require
 exactly 1.3, while Signer control and login-session liveness accept 1.0–1.1.
