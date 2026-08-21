@@ -218,6 +218,28 @@ jobs:
             "$unit_dir/bloom-signer@1000.service"
       - name: Run Linux packaging assertions
         run: cargo test -p bloom-it --test linux_packaging --locked
+
+  linux_enrollment_recovery:
+    name: Linux enrollment recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - name: Build production Machine binary
+        run: cargo build -p bloom --locked
+      - name: Pull plain test image
+        run: docker pull debian:13-slim
+      - name: Run SIGKILL recovery matrix
+        env:
+          BLOOM_LINUX_TEST_BINARY: ${{ github.workspace }}/target/debug/bloom
+          BLOOM_LINUX_TEST_IMAGE: debian:13-slim
+        run: packaging/triad/linux/tests/enrollment-crash.sh
   e2e_tests:
     name: external e2e tests
     runs-on: ubuntu-latest

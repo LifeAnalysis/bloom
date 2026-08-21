@@ -2,7 +2,9 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd -P)"
-image="${BLOOM_LINUX_TEST_IMAGE:-agentsmith-hermes-debian13-systemd-test:latest}"
+# This is deliberately a plain userland container. The test injects SIGKILL
+# into the installer process; it does not boot systemd or need host privileges.
+image="${BLOOM_LINUX_TEST_IMAGE:-debian:13-slim}"
 binary="${BLOOM_LINUX_TEST_BINARY:-$repo/target/debug/bloom}"
 [[ -x "$binary" ]] || {
   echo "build bloom or set BLOOM_LINUX_TEST_BINARY before running the crash test" >&2
