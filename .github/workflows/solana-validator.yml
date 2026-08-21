@@ -73,6 +73,9 @@ jobs:
         run: |
           SOLANA_VALIDATOR_HTTP=http://127.0.0.1:8899 \
             cargo test -p bloom-solana-tx --test local_validator -- --ignored --nocapture
+      - name: Run the daemon/VFS workflow E2E
+        run: |
+          cargo test -p bloom-it --test solana_workflow -- --ignored --nocapture
       - name: Validator log
         if: always()
         run: cat "$RUNNER_TEMP/validator.log" || true
