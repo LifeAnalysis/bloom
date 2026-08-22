@@ -15,8 +15,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 COMPAT = ROOT / "packaging/triad/release/compatibility-v1.toml"
 FULL = re.compile(r"^[0-9a-f]{40}$")
 EXPECTED = {
-    "broker_commit": ("bloom-directory/bloom-broker", "33450e3b7fbdf661161b486b00599c4c9e8c3c8f"),
-    "signer_commit": ("bloom-directory/bloom-signer", "dc24d20f084ea595b1fa8d0c06bd52dd2aabe4d4"),
+    "broker_commit": ("bloom-directory/bloom-broker", "b2ac5bd256ea48b67730cac69d3bcd6d635f5347"),
+    "signer_commit": ("bloom-directory/bloom-signer", "59c12e15438e436979eb30a27b2e9534a3f97615"),
     "service_runtime_commit": ("bloom-directory/bloom-service-runtime", "19d0465d53b279e6e1c98bac533510a1e7eb8f44"),
     "petal_contract_commit": ("bloom-directory/petal", "61938d0c127cfe03c7e3e55baed0ba1439bc5ca2"),
 }
