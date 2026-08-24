@@ -261,6 +261,7 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "config/provenance-catalog.unsigned.json",
         "config/nts-servers.conf",
         "bin/bloom",
+        "bin/bloom-uninstall",
         "systemd-user/bloom-session.service",
     ] {
         let destination = payload.join("installer/linux").join(relative);
@@ -1450,6 +1451,62 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .exists()
     );
 
+    let custody = root.join("var/lib/bloom/1000/signer/wallet-custody");
+    fs::create_dir_all(custody.parent().unwrap()).unwrap();
+    fs::write(&custody, b"retain me").unwrap();
+    fs::write(
+        root.join("etc/bloom/enrollments/2000.json"),
+        b"{\"state\":\"active\"}",
+    )
+    .unwrap();
+    assert!(
+        Command::new(&installer)
+            .args(["uninstall", "--retain-custody"])
+            .arg(&root)
+            .arg("1000")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(root.join("etc/bloom/1000/edge-manifest.json").is_file());
+    assert_eq!(fs::read(&custody).unwrap(), b"retain me");
+    assert!(!root.join("etc/bloom/enrollments/1000.json").exists());
+    assert!(root.join("etc/bloom/retained/1000.json").is_file());
+    assert!(root.join("usr/bin/bloom").is_file());
+
+    fs::remove_file(root.join("etc/bloom/enrollments/2000.json")).unwrap();
+    assert!(
+        Command::new(&installer)
+            .args(["uninstall", "--retain-custody"])
+            .arg(&root)
+            .arg("1000")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!root.join("usr/bin/bloom").exists());
+    assert!(root.join("usr/bin/bloom-uninstall").is_file());
+    assert!(
+        root.join("usr/libexec/bloom/bloom-linux-maintenance")
+            .is_file()
+    );
+
+    assert!(
+        Command::new(&installer)
+            .args(["install"])
+            .arg(&root)
+            .args(["1000", "alice"])
+            .arg(&payload)
+            .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::read(&custody).unwrap(), b"retain me");
+    assert!(root.join("etc/bloom/enrollments/1000.json").is_file());
+    assert!(!root.join("etc/bloom/retained/1000.json").exists());
+    assert!(root.join("usr/bin/bloom").is_file());
+
     fs::write(
         payload.join("config/broker-identity.json"),
         b"{\"changed\":true}",
@@ -1554,12 +1611,19 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .success()
     );
     assert!(!root.join("etc/bloom/1000").exists());
+    assert!(!root.join("var/lib/bloom/1000").exists());
+    assert!(!root.join("usr/bin/bloom-uninstall").exists());
+    assert!(
+        !root
+            .join("usr/libexec/bloom/bloom-linux-maintenance")
+            .exists()
+    );
     assert!(
         !root
             .join("usr/lib/systemd/system/bloom-signer@1000.service.d")
             .exists()
     );
-    assert!(root.join("usr/libexec/bloom/bloom-broker").exists());
+    assert!(!root.join("usr/libexec/bloom/bloom-broker").exists());
 }
 
 #[test]
@@ -1577,6 +1641,29 @@ fn linux_installer_uses_the_resolved_numeric_primary_gid() {
     let readme = fs::read_to_string(workspace().join("packaging/triad/release/README.md")).unwrap();
     assert!(readme.contains("generates a complete fresh per-login enrollment"));
     assert!(!readme.contains("does not yet generate a complete per-login enrollment"));
+}
+
+#[test]
+fn linux_uninstaller_defaults_to_retaining_custody_and_requires_explicit_purge() {
+    let wrapper =
+        fs::read_to_string(workspace().join("packaging/triad/linux/bin/bloom-uninstall")).unwrap();
+    for required in [
+        "--retain-custody",
+        "--purge",
+        "delete-bloom-login-LOGIN_UID",
+        "${SUDO_UID:-}",
+        "/usr/libexec/bloom/bloom-linux-maintenance",
+    ] {
+        assert!(wrapper.contains(required), "uninstaller omits {required}");
+    }
+    assert!(wrapper.contains("mode=\"retain\""));
+
+    let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    assert!(installer.contains("uninstall --retain-custody ROOT LOGIN_UID"));
+    assert!(installer.contains("retained_custody=false"));
+    assert!(installer.contains("$root/etc/bloom/retained/$login_uid.json"));
+    assert!(installer.contains("userdel \"$service_user\""));
+    assert!(installer.contains("groupdel \"$service_group\""));
 }
 
 #[test]

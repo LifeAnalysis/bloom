@@ -6,6 +6,7 @@ usage() {
 usage:
   install-linux.sh install ROOT LOGIN_UID LOGIN_USER PAYLOAD_DIR
   install-linux.sh rotate-config ROOT LOGIN_UID PRINCIPAL CONFIG_JSON
+  install-linux.sh uninstall --retain-custody ROOT LOGIN_UID
   install-linux.sh uninstall ROOT LOGIN_UID CONFIRM_TOKEN
 EOF
   exit 64
@@ -105,6 +106,7 @@ case "$action" in
       installer/linux/config/provenance-catalog.unsigned.json \
       installer/linux/config/nts-servers.conf \
       installer/linux/bin/bloom \
+      installer/linux/bin/bloom-uninstall \
       installer/linux/systemd-user/bloom-session.service
     do
       test -f "$payload/$required" || {
@@ -146,6 +148,14 @@ case "$action" in
       atomic_install "$payload/bin/$binary" "$binary_root/$binary" 0755
     done
     atomic_install "$payload/installer/linux/bin/bloom" "$root/usr/bin/bloom" 0755
+    atomic_install \
+      "$payload/installer/linux/bin/bloom-uninstall" \
+      "$root/usr/bin/bloom-uninstall" \
+      0755
+    atomic_install \
+      "$script_dir/release/install-linux.sh" \
+      "$binary_root/bloom-linux-maintenance" \
+      0755
 
     sysusers="$root/usr/lib/sysusers.d/bloom-$login_uid.conf"
     tmpfiles="$root/usr/lib/tmpfiles.d/bloom-$login_uid.conf"
@@ -222,6 +232,14 @@ case "$action" in
     enrollment_scratch=""
     trap 'if [[ -n "${enrollment_scratch:-}" && -d "$enrollment_scratch" ]]; then find "$enrollment_scratch" -depth -delete; fi' EXIT
     source_config=""
+    release_digest="test-unclaimed"
+    if [[ "$root" == "/" ]]; then
+      release_digest="$(sha256_digest "$payload/SHA256SUMS")"
+      [[ "$release_digest" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "signed payload release digest is invalid" >&2
+        exit 65
+      }
+    fi
     if [[ "$root" == "/" ]]; then
       systemd-sysusers "$sysusers"
       systemd-tmpfiles --create "$tmpfiles"
@@ -237,11 +255,6 @@ case "$action" in
             exit 65
           }
         done
-        release_digest="$(sha256_digest "$payload/SHA256SUMS")"
-        [[ "$release_digest" =~ ^[0-9a-f]{64}$ ]] || {
-          echo "signed payload release digest is invalid" >&2
-          exit 65
-        }
         enrollment_scratch="$(mktemp -d /var/tmp/bloom-linux-enrollment.XXXXXX)"
         chmod 0700 "$enrollment_scratch"
         mkdir -m 0700 "$enrollment_scratch/templates" "$enrollment_scratch/material"
@@ -303,15 +316,17 @@ case "$action" in
       atomic_install "$source_config/session-identity.json" "$config_root/session/identity.json" 0600
       atomic_install "$source_config/installer-identity.json" "$config_root/installer-identity.json" 0600
       atomic_install "$source_config/provenance-catalog.json" "$config_root/provenance-catalog.json" 0644
-      enrollment_root="$root/etc/bloom/enrollments"
-      mkdir -p "$enrollment_root"
-      chmod 0755 "$enrollment_root"
-      enrollment_source="$config_root/.enrollment.source.$$"
-      printf '{"schema":"bloom.linux-enrollment.1","state":"active","login_uid":%s,"login_user":"%s","release_digest":"%s"}\n' \
-        "$login_uid" "$login_user" "${release_digest:-test-unclaimed}" > "$enrollment_source"
-      atomic_install "$enrollment_source" "$enrollment_root/$login_uid.json" 0644
-      rm -f -- "$enrollment_source"
     fi
+    enrollment_root="$root/etc/bloom/enrollments"
+    mkdir -p "$enrollment_root"
+    chmod 0755 "$enrollment_root"
+    enrollment_source="$config_root/.enrollment.source.$$"
+    printf '{"schema":"bloom.linux-enrollment.1","state":"active","login_uid":%s,"login_user":"%s","release_digest":"%s"}\n' \
+      "$login_uid" "$login_user" "$release_digest" > "$enrollment_source"
+    atomic_install "$enrollment_source" "$enrollment_root/$login_uid.json" 0644
+    rm -f -- \
+      "$enrollment_source" \
+      "$root/etc/bloom/retained/$login_uid.json"
     machine_audit_history_source="$config_root/.machine-audit-history.source.$$"
     printf '%s\n' \
       '{' \
@@ -491,15 +506,35 @@ PY
     fi
     ;;
   uninstall)
-    [[ $# -eq 3 ]] || usage
+    retain_custody=false
+    if [[ "${1:-}" == "--retain-custody" ]]; then
+      retain_custody=true
+      shift
+      [[ $# -eq 2 ]] || usage
+    else
+      [[ $# -eq 3 ]] || usage
+    fi
     validate_root_uid "$1" "$2"
-    expected="delete-bloom-login-$login_uid"
-    [[ "$3" == "$expected" ]] || {
-      echo "uninstall confirmation must equal $expected" >&2
-      exit 64
+    if [[ "$retain_custody" == false ]]; then
+      expected="delete-bloom-login-$login_uid"
+      [[ "$3" == "$expected" ]] || {
+        echo "uninstall confirmation must equal $expected" >&2
+        exit 64
+      }
+    fi
+    config_target="$root/etc/bloom/$login_uid"
+    state_target="$root/var/lib/bloom/$login_uid"
+    run_target="$root/run/bloom/$login_uid"
+    [[ -d "$config_target" || -d "$state_target" || \
+      -f "$root/etc/bloom/enrollments/$login_uid.json" || \
+      -f "$root/etc/bloom/retained/$login_uid.json" ]] || {
+      echo "Bloom enrollment $login_uid is not installed" >&2
+      exit 66
     }
     if [[ "$root" == "/" ]]; then
-      login_user="$(getent passwd "$login_uid" | cut -d: -f1)"
+      login_record="$(getent passwd "$login_uid" || true)"
+      login_user="$(printf '%s\n' "$login_record" | cut -d: -f1)"
+      login_home="$(printf '%s\n' "$login_record" | cut -d: -f6)"
       user_runtime="/run/user/$login_uid"
       if [[ -n "$login_user" && -S "$user_runtime/bus" ]]; then
         runuser -u "$login_user" -- env \
@@ -507,17 +542,33 @@ PY
           DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
           systemctl --user disable --now bloom-session.service
       fi
-      systemctl stop \
+      if [[ -n "$login_user" && "$login_home" == /* && "$login_home" != "/" ]]; then
+        runuser -u "$login_user" -- rm -f -- \
+          "$login_home/.config/systemd/user/default.target.wants/bloom-session.service"
+      fi
+      systemctl disable --now \
         "bloom-broker@$login_uid.service" \
-        "bloom-signer@$login_uid.service"
+        "bloom-signer@$login_uid.service" \
+        2>/dev/null || true
       systemctl disable --now \
         "bloom-broker-ceremony@$login_uid.socket" \
-        "bloom-session@$login_uid.path"
+        "bloom-session@$login_uid.path" \
+        2>/dev/null || true
     fi
-    config_target="$root/etc/bloom/$login_uid"
-    state_target="$root/var/lib/bloom/$login_uid"
-    run_target="$root/run/bloom/$login_uid"
-    rm -rf -- "$config_target" "$state_target" "$run_target"
+    rm -rf -- "$run_target"
+    if [[ "$retain_custody" == true ]]; then
+      retained_root="$root/etc/bloom/retained"
+      mkdir -p "$retained_root"
+      chmod 0755 "$retained_root"
+      retained_source="$retained_root/.retained-$login_uid.$$"
+      printf '{"schema":"bloom.linux-enrollment.1","state":"retained","login_uid":%s}\n' \
+        "$login_uid" > "$retained_source"
+      atomic_install "$retained_source" "$retained_root/$login_uid.json" 0644
+      rm -f -- "$retained_source"
+    else
+      rm -rf -- "$config_target" "$state_target"
+      rm -f -- "$root/etc/bloom/retained/$login_uid.json"
+    fi
     rm -f -- \
       "$root/etc/bloom/enrollments/$login_uid.json" \
       "$root/usr/lib/sysusers.d/bloom-$login_uid.conf" \
@@ -525,6 +576,71 @@ PY
       "$root/usr/lib/systemd/system/bloom-signer@$login_uid.service.d/50-aws-kms.conf"
     rmdir "$root/usr/lib/systemd/system/bloom-signer@$login_uid.service.d" \
       2>/dev/null || true
+    rmdir "$root/etc/bloom/enrollments" "$root/etc/bloom/retained" \
+      2>/dev/null || true
+
+    if [[ "$root" == "/" && "$retain_custody" == false ]]; then
+      if command -v userdel >/dev/null 2>&1; then
+        for service_user in "bloom-broker-$login_uid" "bloom-signer-$login_uid"; do
+          if getent passwd "$service_user" >/dev/null; then
+            userdel "$service_user" 2>/dev/null || \
+              echo "warning: could not remove service user $service_user" >&2
+          fi
+        done
+      fi
+      if command -v groupdel >/dev/null 2>&1; then
+        for service_group in \
+          "bloom-broker-$login_uid" \
+          "bloom-signer-$login_uid" \
+          "bloom-machine-broker-$login_uid" \
+          "bloom-broker-signer-$login_uid" \
+          "bloom-revoke-$login_uid" \
+          "bloom-session-$login_uid"
+        do
+          if getent group "$service_group" >/dev/null; then
+            groupdel "$service_group" 2>/dev/null || \
+              echo "warning: could not remove service group $service_group" >&2
+          fi
+        done
+      fi
+    fi
+
+    active_enrollment=false
+    for enrollment in "$root"/etc/bloom/enrollments/*.json; do
+      if [[ -f "$enrollment" ]]; then
+        active_enrollment=true
+        break
+      fi
+    done
+    if [[ "$active_enrollment" == false ]]; then
+      rm -f -- \
+        "$root/usr/bin/bloom" \
+        "$root/usr/libexec/bloom/bloom" \
+        "$root/usr/libexec/bloom/bloom-broker" \
+        "$root/usr/libexec/bloom/bloom-signer" \
+        "$root/usr/libexec/bloom/bloom-signer-migrate" \
+        "$root/usr/lib/systemd/system/bloom-broker@.service" \
+        "$root/usr/lib/systemd/system/bloom-signer@.service" \
+        "$root/usr/lib/systemd/system/bloom-broker-ceremony@.socket" \
+        "$root/usr/lib/systemd/system/bloom-session@.path" \
+        "$root/usr/lib/systemd/user/bloom-session.service" \
+        "$root/etc/chrony/conf.d/bloom-nts.conf"
+    fi
+
+    retained_custody=false
+    for retained in "$root"/etc/bloom/retained/*.json; do
+      if [[ -f "$retained" ]]; then
+        retained_custody=true
+        break
+      fi
+    done
+    if [[ "$active_enrollment" == false && "$retained_custody" == false ]]; then
+      rm -f -- \
+        "$root/usr/bin/bloom-uninstall" \
+        "$root/usr/libexec/bloom/bloom-linux-maintenance"
+      rmdir "$root/usr/libexec/bloom" "$root/etc/bloom" \
+        2>/dev/null || true
+    fi
     if [[ "$root" == "/" ]]; then
       systemctl daemon-reload
     fi

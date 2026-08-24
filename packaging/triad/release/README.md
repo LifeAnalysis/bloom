@@ -144,6 +144,19 @@ the Linux release lane does not yet prove live installed systemd health on a
 disposable host. The website must remain pinned to v0.1.3 until that acceptance
 lane lands.
 
+Linux installs provide `bloom-uninstall`. Its default `--retain-custody` mode
+stops and disables the selected enrollment, removes runtime integration, and
+preserves its private configuration and Signer state for reinstall. Permanent
+purge requires `--purge` and the exact `delete-bloom-login-LOGIN_UID`
+confirmation. Shared runtime files are removed only after the last active
+enrollment, while the uninstaller remains available until all retained custody
+has also been purged.
+
+```sh
+sudo bloom-uninstall
+sudo bloom-uninstall --purge "delete-bloom-login-$(id -u)"
+```
+
 Production macOS enrollment does not accept that private fixture layout. Its
 installed Machine binary generates fresh per-login Machine, Broker, Signer,
 revoke-client, session, installer, audit, review, ceremony, and revocation

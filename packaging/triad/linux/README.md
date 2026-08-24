@@ -39,6 +39,20 @@ The templates use `@...@` placeholders where packaging must supply an absolute
 binary path, login identity, or reviewed egress list. `%i` is the systemd
 instance specifier and is intentionally left for systemd.
 
+The installer publishes `/usr/bin/bloom-uninstall`. Running it through `sudo`
+without `--purge` removes runtime integration but retains the selected login's
+configuration and custody state. `--purge` additionally requires the exact
+`delete-bloom-login-LOGIN_UID` token before deleting that material. Shared
+runtime files remain while any active enrollment needs them, and the
+uninstaller remains while retained custody is present.
+
+For the login account that invoked `sudo`, the commands are:
+
+```sh
+sudo bloom-uninstall
+sudo bloom-uninstall --purge "delete-bloom-login-$(id -u)"
+```
+
 The root-owned edge manifest pins `trusted_time_source` to
 `linux-chrony-nts`. The installer renders `chrony/bloom-nts.conf.in` with at
 least two independently operated NTS servers and refuses an unauthenticated
