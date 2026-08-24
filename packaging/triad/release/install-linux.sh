@@ -200,7 +200,6 @@ case "$action" in
     } > "$chrony_target.new"
     chmod 0644 "$chrony_target.new"
     mv -f "$chrony_target.new" "$chrony_target"
-
     enrollment_scratch=""
     trap 'if [[ -n "${enrollment_scratch:-}" && -d "$enrollment_scratch" ]]; then find "$enrollment_scratch" -depth -delete; fi' EXIT
     source_config=""

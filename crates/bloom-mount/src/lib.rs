@@ -282,6 +282,10 @@ mod tests {
             !joined.contains("mountport="),
             "linux opts must avoid nfs2/nfs3 mountport= on nfs4: {joined}"
         );
+        assert!(
+            !joined.contains("soft") && !joined.contains("retrans="),
+            "side-effecting VFS writes must retain hard-mount semantics: {joined}"
+        );
     }
 
     #[cfg(target_os = "macos")]
