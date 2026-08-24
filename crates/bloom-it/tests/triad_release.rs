@@ -1403,6 +1403,9 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     let sysusers = fs::read_to_string(root.join("usr/lib/sysusers.d/bloom-1000.conf")).unwrap();
     assert!(sysusers.contains("bloom-broker-1000"));
     assert!(sysusers.contains("alice"));
+    let tmpfiles = fs::read_to_string(root.join("usr/lib/tmpfiles.d/bloom-1000.conf")).unwrap();
+    assert!(tmpfiles.contains("/var/lib/bloom/1000/machine 0700 1000 1000"));
+    assert!(!tmpfiles.contains("@LOGIN_"));
     let chrony = fs::read_to_string(root.join("etc/chrony/conf.d/bloom-nts.conf")).unwrap();
     assert!(chrony.contains("server time.cloudflare.com iburst nts"));
     assert!(chrony.contains("server nts.netnod.se iburst nts"));
@@ -1557,6 +1560,23 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .exists()
     );
     assert!(root.join("usr/libexec/bloom/bloom-broker").exists());
+}
+
+#[test]
+fn linux_installer_uses_the_resolved_numeric_primary_gid() {
+    let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    let identity_validation = installer.find("actual_login_uid=\"$(id -u").unwrap();
+    let first_installed_path = installer.find("installed_config_root=").unwrap();
+    assert!(identity_validation < first_installed_path);
+    assert!(installer.contains("[[ \"$actual_login_uid\" == \"$login_uid\" ]]"));
+    assert!(installer.contains("LOGIN_USER does not match LOGIN_UID"));
+    assert!(installer.contains("login_gid=\"$(id -g -- \"$login_user\""));
+    assert!(installer.contains("s/@LOGIN_GID@/$login_gid/g"));
+    assert!(installer.contains("chown \"$login_uid:$login_gid\""));
+
+    let readme = fs::read_to_string(workspace().join("packaging/triad/release/README.md")).unwrap();
+    assert!(readme.contains("generates a complete fresh per-login enrollment"));
+    assert!(!readme.contains("does not yet generate a complete per-login enrollment"));
 }
 
 #[test]

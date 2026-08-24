@@ -82,6 +82,10 @@ fn principals_groups_state_and_socket_acls_are_non_transitive() {
     );
 
     let temporary_paths = source("tmpfiles.d/bloom-login.conf.in");
+    assert!(
+        !temporary_paths.contains("@LOGIN_USER@"),
+        "tmpfiles ownership must not assume a same-named login group"
+    );
     for principal in ["broker", "signer"] {
         assert!(
             temporary_paths.contains(&format!(
@@ -110,16 +114,16 @@ fn principals_groups_state_and_socket_acls_are_non_transitive() {
 #[test]
 fn login_session_sentinel_is_installed_with_persistent_machine_paths() {
     let temporary_paths = source("tmpfiles.d/bloom-login.conf.in");
-    assert!(temporary_paths.contains(
-        "d /run/bloom/@LOGIN_UID@/session 0710 @LOGIN_USER@ bloom-session-@LOGIN_UID@ -"
-    ));
     assert!(
-        temporary_paths
-            .contains("d /etc/bloom/@LOGIN_UID@/machine 0700 @LOGIN_USER@ @LOGIN_USER@ -")
+        temporary_paths.contains(
+            "d /run/bloom/@LOGIN_UID@/session 0710 @LOGIN_UID@ bloom-session-@LOGIN_UID@ -"
+        )
     );
     assert!(
-        temporary_paths
-            .contains("d /etc/bloom/@LOGIN_UID@/session 0700 @LOGIN_USER@ @LOGIN_USER@ -")
+        temporary_paths.contains("d /etc/bloom/@LOGIN_UID@/machine 0700 @LOGIN_UID@ @LOGIN_GID@ -")
+    );
+    assert!(
+        temporary_paths.contains("d /etc/bloom/@LOGIN_UID@/session 0700 @LOGIN_UID@ @LOGIN_GID@ -")
     );
 
     let sentinel = source("systemd-user/bloom-session.service");
@@ -242,6 +246,6 @@ fn audit_checkpoint_roots_are_principal_private_and_explicitly_wired() {
         assert!(!service.contains("../"));
     }
     assert!(temporary_paths.contains(
-        "d /var/lib/bloom/@LOGIN_UID@/machine/audit-checkpoints 0700 @LOGIN_USER@ @LOGIN_USER@ -"
+        "d /var/lib/bloom/@LOGIN_UID@/machine/audit-checkpoints 0700 @LOGIN_UID@ @LOGIN_GID@ -"
     ));
 }

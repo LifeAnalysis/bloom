@@ -74,6 +74,25 @@ case "$action" in
       echo "LOGIN_USER is not a safe account name" >&2
       exit 64
     }
+    login_gid="$login_uid"
+    if [[ "$root" == "/" ]]; then
+      actual_login_uid="$(id -u -- "$login_user" 2>/dev/null)" || {
+        echo "LOGIN_USER does not resolve to a local account" >&2
+        exit 65
+      }
+      [[ "$actual_login_uid" == "$login_uid" ]] || {
+        echo "LOGIN_USER does not match LOGIN_UID" >&2
+        exit 65
+      }
+      login_gid="$(id -g -- "$login_user" 2>/dev/null)" || {
+        echo "LOGIN_USER primary group cannot be resolved" >&2
+        exit 65
+      }
+      [[ "$login_gid" =~ ^[0-9]+$ ]] || {
+        echo "LOGIN_USER primary GID is invalid" >&2
+        exit 65
+      }
+    fi
     for required in \
       bin/bloom \
       bin/bloom-broker \
@@ -139,7 +158,7 @@ case "$action" in
     mv -f "$sysusers.new" "$sysusers"
     sed \
       -e "s/@LOGIN_UID@/$login_uid/g" \
-      -e "s/@LOGIN_USER@/$login_user/g" \
+      -e "s/@LOGIN_GID@/$login_gid/g" \
       "$script_dir/linux/tmpfiles.d/bloom-login.conf.in" > "$tmpfiles.new"
     chmod 0644 "$tmpfiles.new"
     mv -f "$tmpfiles.new" "$tmpfiles"
@@ -327,7 +346,7 @@ case "$action" in
       chown "bloom-signer-$login_uid:bloom-signer-$login_uid" \
         "$config_root/signer/config.json" \
         "$config_root/signer/identity.json"
-      chown "$login_user:$login_user" \
+      chown "$login_uid:$login_gid" \
         "$config_root/machine/identity.json" \
         "$config_root/machine/revoke-identity.json" \
         "$config_root/session/identity.json"

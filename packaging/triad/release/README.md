@@ -133,16 +133,16 @@ installer fixtures use the following `config/` layout beside the extracted binar
 and `provenance-catalog.json`. The macOS W0 bundle deliberately contains none
 of these private files: its guarded live installer uses the same fresh
 root-owned identity-generation path as the production Unix-principal claim.
-On Linux,
-`nts-servers.conf`. The last file contains at least two distinct reviewed NTS
-host names, one per line. AWS credentials and `aws-kms-ip-allow.conf` are an
-optional paired site overlay.
+On Linux, the packaged `nts-servers.conf` contains at least two distinct
+reviewed NTS host names, one per line. AWS credentials and
+`aws-kms-ip-allow.conf` are an optional paired site overlay.
 
-The v0.1.4 Linux archive is an operator-integration prerelease, not yet a
-public fresh-install package. The low-level Linux installer requires those
-site-specific inputs and does not yet generate a complete per-login enrollment
-or prove live systemd health. The website must remain pinned to v0.1.3 until a
-self-contained Linux enrollment path and disposable-host acceptance lane land.
+The v0.1.4 Linux archive generates a complete fresh per-login enrollment from
+packaged public templates and the host CSPRNG; it does not require site-specific
+private identity inputs. It remains an operator-integration prerelease because
+the Linux release lane does not yet prove live installed systemd health on a
+disposable host. The website must remain pinned to v0.1.3 until that acceptance
+lane lands.
 
 Production macOS enrollment does not accept that private fixture layout. Its
 installed Machine binary generates fresh per-login Machine, Broker, Signer,
