@@ -1,6 +1,6 @@
 //! Outbox lifecycle and reconciliation tests driven by fixtures (no network).
 
-use bloom_solana_tx::outbox::{SolanaOutbox, SolanaOutboxState};
+use bloom_solana_tx::outbox::{OutboxError, SolanaOutbox, SolanaOutboxState};
 use bloom_solana_tx::types::{SolanaTxStatus, StagedSolanaTransfer};
 use tempfile::TempDir;
 
@@ -176,16 +176,15 @@ fn sweep_expired_removes_only_expired() {
 
     let removed = outbox.sweep_expired(1000).unwrap();
     assert_eq!(removed, 1);
-    assert!(
-        outbox
-            .read_in_state(
-                "alice",
-                "solana-devnet",
-                "0001-00001",
-                SolanaOutboxState::Failed
-            )
-            .is_ok()
-    );
+    let expired = outbox
+        .read_in_state(
+            "alice",
+            "solana-devnet",
+            "0001-00001",
+            SolanaOutboxState::Failed,
+        )
+        .unwrap();
+    assert_eq!(expired.staged.status, SolanaTxStatus::Expired);
     assert!(
         outbox
             .read_in_state(
@@ -246,4 +245,109 @@ fn from_status_maps_every_status_to_its_outbox_state() {
         SolanaOutboxState::from_status(&SolanaTxStatus::Cancelled),
         SolanaOutboxState::Failed
     );
+    assert_eq!(
+        SolanaOutboxState::from_status(&SolanaTxStatus::Expired),
+        SolanaOutboxState::Failed
+    );
+}
+
+#[test]
+fn allocated_ids_do_not_depend_on_process_local_restart_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("outbox");
+    let first = SolanaOutbox::new(&root).unwrap().allocate_id();
+    let second = SolanaOutbox::new(&root).unwrap().allocate_id();
+
+    assert!(first.starts_with("sol-"), "unexpected id {first}");
+    assert!(second.starts_with("sol-"), "unexpected id {second}");
+    assert_ne!(first, second, "reopening the outbox reused an identity");
+}
+
+#[test]
+fn duplicate_stage_is_rejected_without_overwriting_the_original() {
+    let (_dir, outbox) = outbox();
+    let original = staged("same-id");
+    outbox.write_pending(&original, "original plan").unwrap();
+
+    let mut replacement = original.clone();
+    replacement.lamports = 999;
+    let error = outbox
+        .write_pending(&replacement, "replacement plan")
+        .unwrap_err();
+    assert!(matches!(error, OutboxError::TargetExists(_)));
+    assert_eq!(
+        outbox
+            .read("alice", "solana-devnet", "same-id")
+            .unwrap()
+            .staged
+            .lamports,
+        original.lamports
+    );
+}
+
+#[test]
+fn transition_collision_preserves_both_entries() {
+    let (_dir, outbox) = outbox();
+    let original = staged("same-id");
+    outbox.write_pending(&original, "pending plan").unwrap();
+    let pending = outbox.read("alice", "solana-devnet", "same-id").unwrap();
+    let target = outbox.root().join("alice/solana-devnet/sent/same-id");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("sentinel"), b"must survive").unwrap();
+
+    let error = outbox
+        .transition(&pending, SolanaOutboxState::Sent)
+        .unwrap_err();
+    assert!(matches!(error, OutboxError::TargetExists(_)));
+    assert_eq!(
+        std::fs::read(target.join("sentinel")).unwrap(),
+        b"must survive"
+    );
+    assert!(pending.dir.join("intent.json").exists());
+}
+
+#[test]
+fn recorded_signature_is_private_and_absent_from_public_intent() {
+    let (_dir, outbox) = outbox();
+    let mut unsigned = staged("private-signature");
+    unsigned.signature = None;
+    outbox.write_pending(&unsigned, "plan").unwrap();
+    let entry = outbox
+        .record_signature(
+            "alice",
+            "solana-devnet",
+            "private-signature",
+            "replayable-signature",
+        )
+        .unwrap();
+    outbox
+        .write_approval(&entry, b"private approval resume state")
+        .unwrap();
+
+    let public = std::fs::read_to_string(entry.dir.join("intent.json")).unwrap();
+    assert!(!public.contains("replayable-signature"));
+    assert_eq!(
+        outbox.recorded_signature(&entry).unwrap().as_deref(),
+        Some("replayable-signature")
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(entry.dir.join(".signature"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(entry.dir.join("approval.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 }

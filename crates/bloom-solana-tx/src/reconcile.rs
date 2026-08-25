@@ -102,8 +102,30 @@ async fn reconcile_one(
         .await
         .map_err(|e| OutboxError::Other(e.to_string()))?;
     let Some(Some(status)) = statuses.into_iter().next() else {
-        // `None` (or a null entry): the node has not observed the signature.
-        return Ok(None);
+        // Once the validity window has closed, a signature absent even from
+        // transaction history cannot newly land. Record that terminal fact
+        // instead of leaving the outbox in `sent` forever.
+        let current_height = chain
+            .get_block_height()
+            .await
+            .map_err(|error| OutboxError::Other(error.to_string()))?;
+        if current_height <= entry.last_valid_block_height {
+            return Ok(None);
+        }
+        let receipt = SolanaReceipt {
+            outcome: "failed".to_string(),
+            signature: entry.signature.clone(),
+            slot: None,
+            err: Some(serde_json::json!({
+                "kind": "blockhash_expired_unseen",
+                "last_valid_block_height": entry.last_valid_block_height,
+                "observed_block_height": current_height,
+            })),
+            confirmation_status: None,
+        };
+        let bytes = serde_json::to_vec_pretty(&receipt)?;
+        outbox.write_sent_sibling(entry, RECEIPT_FILE, &bytes)?;
+        return Ok(Some(receipt));
     };
 
     // `processed` and `confirmed` are forkable observations. A durable

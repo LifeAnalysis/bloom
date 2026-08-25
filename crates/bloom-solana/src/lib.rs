@@ -56,9 +56,9 @@ pub struct Simulation {
     pub err: Option<Value>,
     #[serde(default)]
     pub logs: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, alias = "unitsConsumed")]
     pub units_consumed: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "returnData")]
     pub return_data: Option<Value>,
 }
 
@@ -255,7 +255,15 @@ impl SolanaClient {
             .rpc
             .call(
                 "simulateTransaction",
-                &json!([tx_b64, { "encoding": "base64" }]),
+                &json!([
+                    tx_b64,
+                    {
+                        "encoding": "base64",
+                        "sigVerify": true,
+                        "replaceRecentBlockhash": false,
+                        "commitment": "processed"
+                    }
+                ]),
             )
             .await?;
         let value = result.get("value").cloned().unwrap_or(Value::Null);

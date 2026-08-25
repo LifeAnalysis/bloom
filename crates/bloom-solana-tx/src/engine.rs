@@ -1,4 +1,4 @@
-//! The Solana transfer engine: stage → simulate-free confirm/sign → broadcast,
+//! The Solana transfer engine: stage → confirm/sign → verified simulation → broadcast,
 //! mirroring `bloom-tx`'s `TxEngine` shape for the native-transfer MVP.
 //!
 //! The engine owns the orchestration: it fetches the recent blockhash, builds
@@ -17,7 +17,20 @@ use thiserror::Error;
 use crate::outbox::{OutboxError, SolanaOutbox, SolanaOutboxEntry, SolanaOutboxState};
 use crate::signing::{SolanaSignOutcome, SolanaTransferSigner};
 use crate::types::{SolanaTxStatus, StagedSolanaTransfer};
-use crate::{assemble_transaction, build_transfer_message};
+use crate::{assemble_transaction, build_transfer_message, verify_signature};
+
+const SIMULATION_SCHEMA: &str = "bloom.solana-simulation/1";
+
+#[derive(serde::Serialize)]
+struct SimulationArtifact<'a> {
+    schema: &'static str,
+    block_height: u64,
+    last_valid_block_height: u64,
+    success: bool,
+    error: &'a Option<serde_json::Value>,
+    units_consumed: Option<u64>,
+    logs: &'a Option<Vec<String>>,
+}
 
 /// Default approval/signing TTL for a staged transfer (ms).
 const SIGN_TTL_MS: u64 = 60_000;
@@ -100,25 +113,37 @@ impl SolanaTransferEngine {
         &self.chain
     }
 
+    async fn require_fresh_blockhash(
+        &self,
+        last_valid_block_height: u64,
+    ) -> Result<u64, EngineError> {
+        let current = self.client.get_block_height().await?;
+        if current > last_valid_block_height {
+            return Err(EngineError::Invalid(format!(
+                "staged blockhash expired at block height {last_valid_block_height}; current block height is {current}; restage the transfer"
+            )));
+        }
+        Ok(current)
+    }
+
     /// Turn a fetched blockhash's `last_valid_block_height` into a
     /// wall-clock expiry, so a staged-but-abandoned transfer is eventually
     /// reaped by the sweep guard instead of lingering forever
     /// (`stage()` previously hardcoded `expires_ms: 0`, which the sweep's
     /// `!= 0` guard treats as "never expires").
     ///
-    /// Best-effort: if the current block height can't be fetched (a
-    /// transient RPC hiccup right after the blockhash call that just
-    /// succeeded), falls back to the full nominal validity window
-    /// (`MAX_RECENT_BLOCKHASHES` worth of slots) from now rather than
-    /// leaving the entry unexpirable again.
-    async fn blockhash_expiry_ms(&self, last_valid_block_height: u64, now_ms: u128) -> u128 {
-        // Solana's standard blockhash validity window.
-        const NOMINAL_VALID_BLOCKS: u64 = 150;
-        let blocks_remaining = match self.client.get_block_height().await {
-            Ok(current_height) => last_valid_block_height.saturating_sub(current_height),
-            Err(_) => NOMINAL_VALID_BLOCKS,
-        };
-        now_ms + u128::from(blocks_remaining) * APPROX_SLOT_MS
+    /// Fetching the current height is part of staging's fail-closed freshness
+    /// check; Bloom never persists an RPC's already-expired "latest" hash.
+    async fn blockhash_expiry_ms(
+        &self,
+        last_valid_block_height: u64,
+        now_ms: u128,
+    ) -> Result<u128, EngineError> {
+        let current_height = self
+            .require_fresh_blockhash(last_valid_block_height)
+            .await?;
+        Ok(now_ms
+            + u128::from(last_valid_block_height.saturating_sub(current_height)) * APPROX_SLOT_MS)
     }
 
     /// Stage a native transfer: fetch a recent blockhash, build the canonical
@@ -155,7 +180,7 @@ impl SolanaTransferEngine {
         let id = self.outbox.allocate_id();
         let expires_ms = self
             .blockhash_expiry_ms(blockhash.last_valid_block_height, now_ms)
-            .await;
+            .await?;
         let staged = StagedSolanaTransfer {
             id,
             wallet: wallet.to_string(),
@@ -188,6 +213,85 @@ impl SolanaTransferEngine {
         Ok(staged)
     }
 
+    /// Replace an expired pending transfer with the same economic intent and
+    /// a fresh blockhash/fee quote. This is deliberately explicit: the old
+    /// message cannot be mutated after approval, and its approval/signature
+    /// are never reused for the replacement.
+    pub async fn restage_expired(
+        &self,
+        wallet: &str,
+        id: &str,
+        fee_payer: &[u8; 32],
+        now_ms: u128,
+    ) -> Result<StagedSolanaTransfer, EngineError> {
+        let entry =
+            match self
+                .outbox
+                .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)
+            {
+                Ok(entry) => entry,
+                Err(_) => {
+                    let failed = self.outbox.read_in_state(
+                        wallet,
+                        &self.chain,
+                        id,
+                        SolanaOutboxState::Failed,
+                    )?;
+                    if failed.staged.status != SolanaTxStatus::Expired {
+                        return Err(EngineError::Invalid(
+                            "only an expired failed transfer can be restaged".into(),
+                        ));
+                    }
+                    failed
+                }
+            };
+        let current = self.client.get_block_height().await?;
+        if current <= entry.staged.last_valid_block_height {
+            return Err(EngineError::Invalid(format!(
+                "staged blockhash remains valid through block {}; current block height is {current}",
+                entry.staged.last_valid_block_height
+            )));
+        }
+        let stored_fee_payer: [u8; 32] = bs58::decode(&entry.staged.fee_payer)
+            .into_vec()
+            .map_err(|error| EngineError::Invalid(format!("fee payer base58: {error}")))?
+            .try_into()
+            .map_err(|_| EngineError::Invalid("fee payer must be 32 bytes".into()))?;
+        if stored_fee_payer != *fee_payer {
+            return Err(EngineError::Invalid(
+                "resolved signing key differs from the staged fee payer".into(),
+            ));
+        }
+        let destination: [u8; 32] = bs58::decode(&entry.staged.destination)
+            .into_vec()
+            .map_err(|error| EngineError::Invalid(format!("destination base58: {error}")))?
+            .try_into()
+            .map_err(|_| EngineError::Invalid("destination must be 32 bytes".into()))?;
+        let replacement = self
+            .stage(
+                wallet,
+                fee_payer,
+                &destination,
+                entry.staged.lamports,
+                now_ms,
+            )
+            .await?;
+
+        let mut expired = entry;
+        expired.staged.status = SolanaTxStatus::Expired;
+        if expired.state == SolanaOutboxState::Pending {
+            let old_dir = self
+                .outbox
+                .transition(&expired, SolanaOutboxState::Failed)?;
+            expired.state = SolanaOutboxState::Failed;
+            expired.dir = old_dir;
+        }
+        self.outbox.rewrite_intent(&expired)?;
+        self.outbox
+            .write_restage_advice(&expired, &replacement.id)?;
+        Ok(replacement)
+    }
+
     /// Confirm and sign a staged transfer. On `Signed` the signature is
     /// recorded in the outbox, but the entry **stays `pending`** — it only
     /// moves to `sent` once [`Self::broadcast`] actually succeeds. A signed
@@ -208,6 +312,8 @@ impl SolanaTransferEngine {
         let entry =
             self.outbox
                 .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)?;
+        self.require_fresh_blockhash(entry.staged.last_valid_block_height)
+            .await?;
         let message = base64::engine::general_purpose::STANDARD
             .decode(&entry.staged.message_b64)
             .map_err(|e| EngineError::Invalid(format!("message base64: {e}")))?;
@@ -273,12 +379,11 @@ impl SolanaTransferEngine {
                 observed_genesis, entry.staged.genesis_hash
             )));
         }
-        let signature_b58 = entry
-            .staged
-            .signature
-            .as_ref()
+        let signature_b58 = self
+            .outbox
+            .recorded_signature(&entry)?
             .ok_or_else(|| EngineError::Invalid("entry has no recorded signature".into()))?;
-        let signature: [u8; 64] = bs58::decode(signature_b58)
+        let signature: [u8; 64] = bs58::decode(&signature_b58)
             .into_vec()
             .map_err(|e| EngineError::Invalid(format!("signature base58: {e}")))?
             .try_into()
@@ -292,14 +397,48 @@ impl SolanaTransferEngine {
             .try_into()
             .map_err(|_| EngineError::Invalid("fee payer must be 32 bytes".into()))?;
         validate_staged_message(&entry.staged, &fee_payer, &message)?;
+        if !verify_signature(&fee_payer, &message, &signature) {
+            return Err(EngineError::Invalid(
+                "recorded signature does not verify over the staged message".into(),
+            ));
+        }
+        let block_height = self
+            .require_fresh_blockhash(entry.staged.last_valid_block_height)
+            .await?;
         let tx_bytes = assemble_transaction(&message, &signature)
             .map_err(|e| EngineError::Invalid(e.to_string()))?;
         let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+
+        // Run an explicit signature-verifying preflight over the exact bytes
+        // that will be submitted and persist only its public diagnostics.
+        let simulation = self.client.simulate_transaction(&tx_b64).await?;
+        let artifact = SimulationArtifact {
+            schema: SIMULATION_SCHEMA,
+            block_height,
+            last_valid_block_height: entry.staged.last_valid_block_height,
+            success: simulation.err.is_none(),
+            error: &simulation.err,
+            units_consumed: simulation.units_consumed,
+            logs: &simulation.logs,
+        };
+        let artifact_bytes = serde_json::to_vec_pretty(&artifact)
+            .map_err(|error| EngineError::Invalid(format!("simulation artifact: {error}")))?;
+        self.outbox.write_simulation(&entry, &artifact_bytes)?;
+        if let Some(error) = simulation.err {
+            return Err(EngineError::Invalid(format!(
+                "signed transaction simulation failed: {error}"
+            )));
+        }
 
         // Broadcast first, while the entry is still `pending`: on failure
         // it must stay exactly there, never move to `sent` for a broadcast
         // that never actually happened.
         let submitted = self.client.send_transaction(&tx_b64).await?;
+        if submitted != signature_b58 {
+            return Err(EngineError::Invalid(format!(
+                "RPC returned transaction signature {submitted}, but Bloom submitted {signature_b58}"
+            )));
+        }
 
         // Only a confirmed-successful broadcast earns the `sent` transition.
         // `staged.status` and the on-disk directory must agree, so derive

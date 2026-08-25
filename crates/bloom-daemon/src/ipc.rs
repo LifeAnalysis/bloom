@@ -603,6 +603,10 @@ pub enum MachineCommand {
     },
     WalletAddress {
         name: String,
+        /// Optional derived-account family (`evm` or `solana`). Absent keeps
+        /// the legacy primary-address behavior.
+        #[serde(default)]
+        profile: Option<String>,
     },
     WalletUnlock {
         name: String,

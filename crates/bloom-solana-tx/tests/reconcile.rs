@@ -8,7 +8,12 @@ use bloom_solana_tx::types::{SolanaTxStatus, StagedSolanaTransfer};
 use serde_json::json;
 use tempfile::TempDir;
 
-async fn spawn_status_stub(confirmations: Option<u64>, err: bool, finalized: bool) -> String {
+async fn spawn_status_stub(
+    confirmations: Option<u64>,
+    err: bool,
+    finalized: bool,
+    block_height: u64,
+) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -18,9 +23,33 @@ async fn spawn_status_stub(confirmations: Option<u64>, err: bool, finalized: boo
             };
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = vec![0u8; 8192];
-                let n = socket.read(&mut buf).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let mut buf = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let Some(header_end) = buf.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf).to_string();
                 let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
                 let method = serde_json::from_str::<serde_json::Value>(body)
                     .ok()
@@ -46,14 +75,16 @@ async fn spawn_status_stub(confirmations: Option<u64>, err: bool, finalized: boo
                         };
                         json!({ "context": {"slot": 42}, "value": [status] }).to_string()
                     }
+                    "getBlockHeight" => block_height.to_string(),
                     _ => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#
                         .to_string(),
                 };
-                let payload = if method == "getSignatureStatuses" {
-                    format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#)
-                } else {
-                    result
-                };
+                let payload =
+                    if matches!(method.as_str(), "getSignatureStatuses" | "getBlockHeight") {
+                        format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#)
+                    } else {
+                        result
+                    };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     payload.len(),
@@ -106,7 +137,7 @@ fn client(endpoint: &str) -> SolanaClient {
 
 #[tokio::test]
 async fn reconciles_success_to_receipt() {
-    let endpoint = spawn_status_stub(Some(1), false, true).await;
+    let endpoint = spawn_status_stub(Some(1), false, true, 1).await;
     let dir = TempDir::new().unwrap();
     let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
     let s = sent_entry("0001-00001");
@@ -132,7 +163,7 @@ async fn reconciles_success_to_receipt() {
 
 #[tokio::test]
 async fn reconciles_failure_to_receipt() {
-    let endpoint = spawn_status_stub(Some(1), true, true).await;
+    let endpoint = spawn_status_stub(Some(1), true, true, 1).await;
     let dir = TempDir::new().unwrap();
     let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
     let s = sent_entry("0001-00001");
@@ -156,7 +187,7 @@ async fn reconciles_failure_to_receipt() {
 #[tokio::test]
 async fn unseen_signature_stays_unreconciled() {
     // The node returns a null entry: signature not observed yet.
-    let endpoint = spawn_status_stub(None, false, true).await;
+    let endpoint = spawn_status_stub(None, false, true, 1).await;
     let dir = TempDir::new().unwrap();
     let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
     let s = sent_entry("0001-00001");
@@ -178,7 +209,7 @@ async fn unseen_signature_stays_unreconciled() {
 
 #[tokio::test]
 async fn processed_signature_stays_unreconciled() {
-    let endpoint = spawn_status_stub(Some(1), false, false).await;
+    let endpoint = spawn_status_stub(Some(1), false, false, 2).await;
     let dir = TempDir::new().unwrap();
     let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
     let s = sent_entry("0001-00001");
@@ -196,4 +227,27 @@ async fn processed_signature_stays_unreconciled() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn unseen_signature_becomes_terminal_after_blockhash_expiry() {
+    let endpoint = spawn_status_stub(None, false, true, 2).await;
+    let dir = TempDir::new().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let s = sent_entry("0001-00001");
+    outbox.write_pending(&s, "plan").unwrap();
+    let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
+
+    let registry = SolanaChainRegistry::new();
+    registry.add(client(&endpoint));
+    let reconciler = SolanaReconciler::new(outbox.clone(), registry);
+    assert_eq!(reconciler.tick().await, 1);
+    let receipt = outbox
+        .read_receipt("alice", "solana-devnet", "0001-00001")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.outcome, "failed");
+    assert_eq!(receipt.slot, None);
+    assert_eq!(receipt.err.unwrap()["kind"], "blockhash_expired_unseen");
 }

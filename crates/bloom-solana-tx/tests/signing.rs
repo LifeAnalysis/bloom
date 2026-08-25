@@ -19,6 +19,7 @@ use sha2::{Digest as _, Sha256};
 struct SolanaBrokerFixture {
     child_signing_key: ed25519_dalek::SigningKey,
     child_key_ref: KeyRef,
+    prepared_claim: std::sync::Mutex<Option<bloom_broker_api::SystemUseClaim>>,
 }
 
 fn token(s: &str) -> Token {
@@ -47,6 +48,7 @@ impl SolanaBrokerFixture {
         Self {
             child_signing_key,
             child_key_ref,
+            prepared_claim: std::sync::Mutex::new(None),
         }
     }
 
@@ -136,6 +138,14 @@ impl MachineBrokerService for SolanaBrokerFixture {
                     }))
                 }
                 MachineBrokerRequest::SigningSign(sign_request) => {
+                    if let Some(prepared) = self.prepared_claim.lock().unwrap().as_ref() {
+                        if sign_request.system_use_claim.as_ref() != Some(prepared) {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::ClaimInvalid,
+                                "ceremony retry changed the reviewed Solana claim",
+                            ));
+                        }
+                    }
                     let signature = self.sign_payload(&sign_request)?;
                     Ok(MachineBrokerResponse::SigningSign(SigningResult {
                         operation_id: sign_request.operation_id,
@@ -147,16 +157,23 @@ impl MachineBrokerService for SolanaBrokerFixture {
                 }
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
                     terms,
+                    system_use_claim,
                     ..
-                }) => Ok(MachineBrokerResponse::SealedApprovalPrepare(
-                    SealedApprovalPrepareResponse {
-                        approval_id: terms.approval_id().unwrap_or_else(|_| digest(7)),
-                        state: ApprovalPrepareState::AwaitingCeremony,
-                        ceremony_url: "http://localhost:18734/ceremony".into(),
-                        ceremony_expires_at_ms: terms.expires_at_ms,
-                        review_manifest_digest: digest(92),
-                    },
-                )),
+                }) => {
+                    assert_eq!(terms.limits.value_limits.len(), 1);
+                    assert_eq!(terms.limits.value_limits[0].asset.chain.as_str(), "solana");
+                    assert_eq!(terms.limits.value_limits[0].asset.asset, "native");
+                    *self.prepared_claim.lock().unwrap() = system_use_claim;
+                    Ok(MachineBrokerResponse::SealedApprovalPrepare(
+                        SealedApprovalPrepareResponse {
+                            approval_id: terms.approval_id().unwrap_or_else(|_| digest(7)),
+                            state: ApprovalPrepareState::AwaitingCeremony,
+                            ceremony_url: "http://localhost:18734/ceremony".into(),
+                            ceremony_expires_at_ms: terms.expires_at_ms,
+                            review_manifest_digest: digest(92),
+                        },
+                    ))
+                }
                 other => Err(ProtocolError::new(
                     ProtocolErrorCode::UnknownMethod,
                     format!("unhandled {other:?}"),
@@ -283,6 +300,57 @@ async fn first_attempt_returns_approval_required() {
         outcome,
         SolanaSignOutcome::ApprovalRequired { .. }
     ));
+}
+
+#[tokio::test]
+async fn ceremony_retry_preserves_claim_and_authority_identity() {
+    let fixture = std::sync::Arc::new(SolanaBrokerFixture::new());
+    let broker = MachineBrokerClient::new(fixture.clone());
+    let signer = SolanaTransferSigner::from_catalog(broker, &catalog()).unwrap();
+    let fee_payer = fixture.child_pubkey();
+    let destination = [0xdd; 32];
+    let message = build_transfer_message(&fee_payer, &destination, 50, &[0x43; 32]).unwrap();
+
+    let first = signer
+        .sign_transfer(
+            "wallet",
+            &fee_payer,
+            &message,
+            &bs58::encode(destination).into_string(),
+            50,
+            5_000,
+            "test-genesis",
+            &bs58::encode([0x43; 32]).into_string(),
+            100,
+            None,
+            1,
+            60_000,
+            plan_facts_digest(),
+        )
+        .await
+        .unwrap();
+    let SolanaSignOutcome::ApprovalRequired { approval_id, .. } = first else {
+        panic!("expected approval preparation");
+    };
+    let second = signer
+        .sign_transfer(
+            "wallet",
+            &fee_payer,
+            &message,
+            &bs58::encode(destination).into_string(),
+            50,
+            5_000,
+            "test-genesis",
+            &bs58::encode([0x43; 32]).into_string(),
+            100,
+            Some(approval_id),
+            1,
+            60_000,
+            plan_facts_digest(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(second, SolanaSignOutcome::Signed { .. }));
 }
 
 #[tokio::test]

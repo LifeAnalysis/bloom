@@ -1,6 +1,6 @@
 # Solana Native Integration
 
-**Status:** architecture decision; triad-aligned
+**Status:** implemented for local/devnet use; mainnet broadcast blocked
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 ## The decision
@@ -36,8 +36,11 @@ chain Bloom talks to directly.
 - **Crate shape, not custody mechanism.** `bloom-solana` (read-only chain
   client) and `bloom-solana-tx` (transfer engine, outbox, reconciliation)
   mirror `bloom-evm` and `bloom-tx`'s shape and directory conventions
-  exactly: `<home>/outbox/<wallet>/<chain>/{pending,sent,failed}/<id>/...`,
-  write-once `intent.json`, a `receipt.json` sibling once mined. EVM's own
+  exactly: `<home>/.solana-outbox/<wallet>/<chain>/{pending,sent,failed}/<id>/...`,
+  a public `intent.json` atomically updated on state transitions, and a
+  `receipt.json` sibling once finalized. Pre-broadcast signatures and approval
+  resume state are private host sidecars and are not projected through VFS.
+  EVM's own
   crates are `alloy`-typed throughout with no chain-agnostic trait to
   implement against, so this is a parallel crate family, not a shared
   abstraction over EVM's — see `crates/bloom-solana-tx/src/outbox.rs` vs
@@ -67,24 +70,25 @@ chain Bloom talks to directly.
   for the dispatch point, and `docs/examples-domain/01-chains.md` for the
   general (currently EVM-focused) walkthrough of that surface's read side.
 
-## Registered semantic verifier: not yet on the native signing path
+## Registered semantic verifier: authoritative on the native signing path
 
 Broker contains the Anza-based, golden-vector-pinned
 `solana-system-transfer-v1` verifier carried forward from the parked Petal
-work. That verifier is currently invoked only for a Petal claim. The native
-Solana engine signs under `ProvenanceSubject::System` with
-`petal_use_claim: None`, so Broker treats the request as
-`ClaimAssurance::MachineAsserted`; the verifier is not authoritative on the
-real native signing path. EVM's current exact-signing path has the same
-baseline limitation.
+work. The native engine sends a `SystemUseClaim` with `ProofVerified`
+assurance and the serialized message as assurance evidence. Broker checks the
+evidence digest, selects the digest-pinned compiled verifier, independently
+re-parses the message, and requires it to establish the destination, debit,
+payload digest, and recent blockhash before policy can authorize signing.
+Genesis and last-valid height remain explicit claim context and are rechecked
+against the live RPC by Machine; the verifier does not pretend those facts are
+encoded in a Solana message. Machine-asserted claims, mismatched evidence, incomplete
+verifier results, and destinations outside policy fail closed. Broker
+integration tests exercise this complete `authority.authorize()` path.
 
-This is a release blocker, not a realized security property. Before mainnet,
-the protocol must put an independently established, exact Solana transfer
-claim on the real signing path and have Broker invoke the verifier for it. The
-claim must bind the economic facts, message digest, intended genesis, and
-blockhash; cluster and blockhash provenance cannot rely only on
-Machine-supplied assertions. See Release Blocker #1 in the production-readiness
-ledger at the workspace root.
+Machine then rechecks the locally recorded Ed25519 signature, current
+blockheight, and live cluster genesis; runs signature-verifying simulation over
+the exact transaction bytes; and requires `sendTransaction` to return the
+same signature before advancing durable state.
 
 ## Provenance and operator configuration
 
@@ -97,7 +101,7 @@ config where a chain name is configured in both.
 
 ## Mainnet posture
 
-This release posture never talks to Solana mainnet at all. The gate is the
+This release posture never broadcasts to Solana mainnet. The gate is the
 cluster's live genesis hash (`bloom_solana::is_mainnet_beta_blocking`),
 checked against the known mainnet-beta hash at chain construction — never
 the operator's config-key name, which proves nothing about a cluster's real
@@ -109,7 +113,7 @@ Not everything from PR #166 was Petal-hosting machinery with nothing left
 to host once the shape changed. Reused directly:
 
 - The Anza-based semantic verifier (`solana-system-transfer-v1`) described
-  above, retained but not yet authoritative on the native signing path.
+  above, now authoritative on the native signing path.
 - BIP-39 SLIP-10 Ed25519 derivation — never Petal-shaped; it's the same
   derivation infrastructure EVM's HD wallets use.
 - CAIP-2 chain-identity mapping and golden test vectors.

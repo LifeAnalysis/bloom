@@ -143,6 +143,16 @@ fn catalog() -> ProvenanceCatalog {
     }
 }
 
+fn submitted_transaction_signature(request: &serde_json::Value) -> String {
+    let tx_b64 = request["params"][0]
+        .as_str()
+        .expect("transaction parameter");
+    let tx = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, tx_b64)
+        .expect("base64 transaction");
+    assert_eq!(tx.first(), Some(&1), "expected one transaction signature");
+    bs58::encode(&tx[1..65]).into_string()
+}
+
 /// A stub Solana JSON-RPC node answering blockhash + sendTransaction.
 async fn spawn_node() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -158,9 +168,12 @@ async fn spawn_node() -> String {
                 let n = socket.read(&mut buf).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-                let method = serde_json::from_str::<serde_json::Value>(body)
-                    .ok()
-                    .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
+                let request_json = serde_json::from_str::<serde_json::Value>(body)
+                    .unwrap_or(serde_json::Value::Null);
+                let method = request_json
+                    .get("method")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
                     .unwrap_or_default();
                 let result = match method.as_str() {
                     "getGenesisHash" => r#""test-genesis""#.to_string(),
@@ -170,10 +183,13 @@ async fn spawn_node() -> String {
                             r#"{{"context":{{"slot":1}},"value":{{"blockhash":"{blockhash}","lastValidBlockHeight":100}}}}"#
                         )
                     }
+                    "getBlockHeight" => "1".to_string(),
                     "getFeeForMessage" => r#"{"context":{"slot":1},"value":5000}"#.to_string(),
-                    "sendTransaction" => {
-                        r#""4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4TdSXKZT9HYqjs""#.to_string()
-                    }
+                    "simulateTransaction" => r#"{"context":{"slot":1},"value":{"err":null,"logs":["Program 11111111111111111111111111111111 success"],"unitsConsumed":150}}"#.to_string(),
+                    "sendTransaction" => serde_json::to_string(
+                        &submitted_transaction_signature(&request_json),
+                    )
+                    .unwrap(),
                     _ => r#"{"code":-32601,"message":"method not found"}"#.to_string(),
                 };
                 let payload = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#);
@@ -210,9 +226,12 @@ async fn spawn_node_with_heights(
                 let n = socket.read(&mut buf).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-                let method = serde_json::from_str::<serde_json::Value>(body)
-                    .ok()
-                    .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
+                let request_json = serde_json::from_str::<serde_json::Value>(body)
+                    .unwrap_or(serde_json::Value::Null);
+                let method = request_json
+                    .get("method")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
                     .unwrap_or_default();
                 let result = match method.as_str() {
                     "getGenesisHash" => r#""test-genesis""#.to_string(),
@@ -246,7 +265,7 @@ async fn spawn_node_with_heights(
 // whose blockhash has already gone (or is about to go) stale must get a
 // real, reapable expiry instead.
 #[tokio::test]
-async fn stage_with_an_already_stale_blockhash_is_reaped_by_the_sweep() {
+async fn stage_refuses_an_already_stale_latest_blockhash() {
     // The blockhash's last-valid height is already behind the current
     // height: it's stale the moment it's staged.
     let endpoint = spawn_node_with_heights(/* current */ 500, /* last_valid */ 350).await;
@@ -264,34 +283,18 @@ async fn stage_with_an_already_stale_blockhash_is_reaped_by_the_sweep() {
         .verifying_key()
         .to_bytes();
     let now_ms = 1_000_000u128;
-    let staged = engine
+    let error = engine
         .stage("wallet", &fee_payer, &destination, 1_000_000, now_ms)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(error.to_string().contains("staged blockhash expired"));
     assert!(
-        staged.expires_ms != 0,
-        "a real expiry must be set, not the old hardcoded 0 placeholder"
+        outbox
+            .list("wallet", "solana-devnet", SolanaOutboxState::Pending)
+            .unwrap()
+            .is_empty(),
+        "an RPC's stale latest blockhash must never reach durable state"
     );
-    assert!(
-        staged.expires_ms <= now_ms,
-        "a blockhash that's already past its last-valid height must expire immediately, \
-         got expires_ms={} for now_ms={now_ms}",
-        staged.expires_ms
-    );
-
-    let swept = outbox.sweep_expired(now_ms).unwrap();
-    assert_eq!(
-        swept, 1,
-        "the daemon sweep must reap an abandoned stale stage"
-    );
-    outbox
-        .read_in_state(
-            "wallet",
-            "solana-devnet",
-            &staged.id,
-            SolanaOutboxState::Failed,
-        )
-        .expect("swept entry moves to failed, matching EVM's abandoned-stage behavior");
 }
 
 #[tokio::test]
@@ -411,15 +414,15 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
             SolanaOutboxState::Pending,
         )
         .unwrap();
-    assert!(still_pending.staged.signature.is_some());
+    let expected_signature = outbox
+        .recorded_signature(&still_pending)
+        .unwrap()
+        .expect("signed entry");
 
     // Broadcast: submits the assembled transaction, *then* transitions to
     // sent and records the attempt.
     let signature = engine.broadcast("wallet", &staged.id, 1_300).await.unwrap();
-    assert_eq!(
-        signature,
-        "4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4TdSXKZT9HYqjs"
-    );
+    assert_eq!(signature, expected_signature);
     let sent = outbox
         .read_in_state(
             "wallet",
@@ -440,6 +443,11 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
     // dead-code mapping the plan asked to wire in) and rewrites
     // `intent.json` accordingly, rather than leaving it stale at Pending.
     assert_eq!(sent.staged.status, SolanaTxStatus::Sent);
+    let simulation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sent.dir.join("simulation.json")).unwrap()).unwrap();
+    assert_eq!(simulation["success"], true);
+    assert_eq!(simulation["units_consumed"], 150);
+    assert!(simulation.get("signature").is_none());
     assert_eq!(
         bloom_solana_tx::outbox::SolanaOutboxState::from_status(&sent.staged.status),
         SolanaOutboxState::Sent
@@ -466,9 +474,12 @@ async fn spawn_node_with_flaky_broadcast(fail_times: Arc<std::sync::atomic::Atom
                 let n = socket.read(&mut buf).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-                let method = serde_json::from_str::<serde_json::Value>(body)
-                    .ok()
-                    .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
+                let request_json = serde_json::from_str::<serde_json::Value>(body)
+                    .unwrap_or(serde_json::Value::Null);
+                let method = request_json
+                    .get("method")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
                     .unwrap_or_default();
                 let payload = match method.as_str() {
                     "getGenesisHash" => {
@@ -480,8 +491,14 @@ async fn spawn_node_with_flaky_broadcast(fail_times: Arc<std::sync::atomic::Atom
                             r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":1}},"value":{{"blockhash":"{blockhash}","lastValidBlockHeight":100}}}}}}"#
                         )
                     }
+                    "getBlockHeight" => {
+                        r#"{"jsonrpc":"2.0","id":1,"result":1}"#.to_string()
+                    }
                     "getFeeForMessage" => {
                         r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":5000}}"#.to_string()
+                    }
+                    "simulateTransaction" => {
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"err":null,"logs":[],"unitsConsumed":150}}}"#.to_string()
                     }
                     "sendTransaction" => {
                         let remaining = fail_times.fetch_update(
@@ -492,11 +509,92 @@ async fn spawn_node_with_flaky_broadcast(fail_times: Arc<std::sync::atomic::Atom
                         if remaining.is_ok_and(|n| n > 0) {
                             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"simulated broadcast failure"}}"#.to_string()
                         } else {
-                            r#"{"jsonrpc":"2.0","id":1,"result":"4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4TdSXKZT9HYqjs"}"#.to_string()
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":1,"result":{}}}"#,
+                                serde_json::to_string(&submitted_transaction_signature(&request_json)).unwrap()
+                            )
                         }
                     }
                     _ => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#.to_string(),
                 };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+async fn spawn_node_with_controls(
+    block_height: Arc<std::sync::atomic::AtomicU64>,
+    simulation_fails: bool,
+    mismatched_signature: bool,
+    requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let block_height = block_height.clone();
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                let request_json = serde_json::from_str::<serde_json::Value>(body)
+                    .unwrap_or(serde_json::Value::Null);
+                requests.lock().unwrap().push(request_json.clone());
+                let method = request_json["method"].as_str().unwrap_or_default();
+                let result = match method {
+                    "getGenesisHash" => serde_json::json!("test-genesis"),
+                    "getLatestBlockhash" => {
+                        let height = block_height.load(std::sync::atomic::Ordering::SeqCst);
+                        serde_json::json!({
+                            "context": { "slot": height },
+                            "value": {
+                                "blockhash": bs58::encode([((height % 250) + 1) as u8; 32]).into_string(),
+                                "lastValidBlockHeight": height + 100
+                            }
+                        })
+                    }
+                    "getBlockHeight" => {
+                        serde_json::json!(block_height.load(std::sync::atomic::Ordering::SeqCst))
+                    }
+                    "getFeeForMessage" => serde_json::json!({
+                        "context": { "slot": 1 }, "value": 5_000
+                    }),
+                    "simulateTransaction" => serde_json::json!({
+                        "context": { "slot": 1 },
+                        "value": {
+                            "err": simulation_fails.then(|| serde_json::json!({
+                                "InstructionError": [0, "InsufficientFunds"]
+                            })),
+                            "logs": ["Program log: preflight"],
+                            "unitsConsumed": 321
+                        }
+                    }),
+                    "sendTransaction" => {
+                        if mismatched_signature {
+                            serde_json::json!(bs58::encode([9u8; 64]).into_string())
+                        } else {
+                            serde_json::json!(submitted_transaction_signature(&request_json))
+                        }
+                    }
+                    _ => serde_json::Value::Null,
+                };
+                let payload = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "result": result
+                })
+                .to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     payload.len(),
@@ -561,6 +659,19 @@ async fn broadcast_failure_leaves_entry_pending_and_retry_succeeds() {
         SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
 
     let staged = stage_and_sign(&engine, &broker).await;
+    let expected_signature = outbox
+        .recorded_signature(
+            &outbox
+                .read_in_state(
+                    "wallet",
+                    "solana-devnet",
+                    &staged.id,
+                    SolanaOutboxState::Pending,
+                )
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
 
     // First broadcast attempt: the node returns a hard RPC error. The entry
     // must not have moved to `sent` for a broadcast that never happened.
@@ -578,7 +689,7 @@ async fn broadcast_failure_leaves_entry_pending_and_retry_succeeds() {
         )
         .expect("entry must remain pending after a failed broadcast, not stuck in sent");
     assert!(
-        entry.staged.signature.is_some(),
+        outbox.recorded_signature(&entry).unwrap().is_some(),
         "the recorded signature from sign() survives the failed broadcast attempt"
     );
 
@@ -589,10 +700,7 @@ async fn broadcast_failure_leaves_entry_pending_and_retry_succeeds() {
         .broadcast("wallet", &staged.id, 1_400)
         .await
         .expect("retried broadcast must succeed");
-    assert_eq!(
-        signature,
-        "4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4TdSXKZT9HYqjs"
-    );
+    assert_eq!(signature, expected_signature);
     outbox
         .read_in_state(
             "wallet",
@@ -636,6 +744,265 @@ async fn broadcast_failure_leaves_entry_cancellable() {
         )
         .unwrap();
     assert_eq!(cancelled.staged.status, SolanaTxStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn signing_and_broadcast_both_refuse_an_expired_blockhash() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_node_with_controls(height.clone(), false, false, requests.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let destination = ed25519_dalek::SigningKey::from_bytes(&[0xbb; 32])
+        .verifying_key()
+        .to_bytes();
+
+    let unsigned = engine
+        .stage(
+            "wallet",
+            &broker.child_pubkey(),
+            &destination,
+            1_000_000,
+            1_000,
+        )
+        .await
+        .unwrap();
+    height.store(102, std::sync::atomic::Ordering::SeqCst);
+    let sign_error = engine
+        .sign("wallet", &unsigned.id, &broker.child_pubkey(), None, 1_100)
+        .await
+        .unwrap_err();
+    assert!(sign_error.to_string().contains("restage the transfer"));
+
+    height.store(1, std::sync::atomic::Ordering::SeqCst);
+    let signed = stage_and_sign(&engine, &broker).await;
+    height.store(102, std::sync::atomic::Ordering::SeqCst);
+    let broadcast_error = engine
+        .broadcast("wallet", &signed.id, 1_300)
+        .await
+        .unwrap_err();
+    assert!(broadcast_error.to_string().contains("restage the transfer"));
+    outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &signed.id,
+            SolanaOutboxState::Pending,
+        )
+        .expect("expired signed transfer remains pending for explicit restaging");
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| { r["method"] == "sendTransaction" })
+    );
+}
+
+#[tokio::test]
+async fn expired_transfer_restages_with_fresh_facts_and_no_reused_authority() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_node_with_controls(height.clone(), false, false, requests).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let destination = ed25519_dalek::SigningKey::from_bytes(&[0xbb; 32])
+        .verifying_key()
+        .to_bytes();
+    let original = engine
+        .stage(
+            "wallet",
+            &broker.child_pubkey(),
+            &destination,
+            1_000_000,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+    let too_early = engine
+        .restage_expired("wallet", &original.id, &broker.child_pubkey(), 1_250)
+        .await
+        .unwrap_err();
+    assert!(too_early.to_string().contains("remains valid"));
+
+    assert_eq!(outbox.sweep_expired(u128::MAX).unwrap(), 1);
+    outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &original.id,
+            SolanaOutboxState::Failed,
+        )
+        .expect("the sweeper moves stale entries to failed before users can restage them");
+
+    height.store(102, std::sync::atomic::Ordering::SeqCst);
+    let replacement = engine
+        .restage_expired("wallet", &original.id, &broker.child_pubkey(), 1_300)
+        .await
+        .unwrap();
+    assert_ne!(replacement.id, original.id);
+    assert_ne!(replacement.blockhash, original.blockhash);
+    assert_eq!(replacement.destination, original.destination);
+    assert_eq!(replacement.lamports, original.lamports);
+    assert_eq!(replacement.status, SolanaTxStatus::Pending);
+
+    let expired = outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &original.id,
+            SolanaOutboxState::Failed,
+        )
+        .unwrap();
+    assert_eq!(expired.staged.status, SolanaTxStatus::Expired);
+    assert!(!expired.dir.join(".signature").exists());
+    let advice: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(expired.dir.join("restage_advice.json")).unwrap())
+            .unwrap();
+    assert_eq!(advice["replacement_id"], replacement.id);
+
+    let pending = outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &replacement.id,
+            SolanaOutboxState::Pending,
+        )
+        .unwrap();
+    assert!(outbox.recorded_signature(&pending).unwrap().is_none());
+    assert!(!pending.dir.join("approval.json").exists());
+}
+
+#[tokio::test]
+async fn failed_signature_verifying_simulation_is_persisted_and_blocks_broadcast() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_node_with_controls(height, true, false, requests.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let staged = stage_and_sign(&engine, &broker).await;
+
+    let error = engine
+        .broadcast("wallet", &staged.id, 1_300)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("simulation failed"));
+    let pending = outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &staged.id,
+            SolanaOutboxState::Pending,
+        )
+        .unwrap();
+    let artifact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(pending.dir.join("simulation.json")).unwrap())
+            .unwrap();
+    assert_eq!(artifact["success"], false);
+    assert_eq!(artifact["units_consumed"], 321);
+    assert!(artifact.get("signature").is_none());
+
+    let requests = requests.lock().unwrap();
+    let simulation = requests
+        .iter()
+        .find(|request| request["method"] == "simulateTransaction")
+        .expect("simulation request");
+    assert_eq!(simulation["params"][1]["sigVerify"], true);
+    assert_eq!(simulation["params"][1]["replaceRecentBlockhash"], false);
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request["method"] == "sendTransaction")
+    );
+}
+
+#[tokio::test]
+async fn mismatched_rpc_signature_never_marks_the_entry_sent() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_node_with_controls(height, false, true, requests).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let staged = stage_and_sign(&engine, &broker).await;
+
+    let error = engine
+        .broadcast("wallet", &staged.id, 1_300)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("RPC returned transaction signature")
+    );
+    outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &staged.id,
+            SolanaOutboxState::Pending,
+        )
+        .expect("an untrusted RPC response cannot advance durable state");
+}
+
+#[tokio::test]
+async fn tampered_private_signature_is_reverified_before_rpc_submission() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_node_with_controls(height, false, false, requests.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let staged = stage_and_sign(&engine, &broker).await;
+    outbox
+        .record_signature(
+            "wallet",
+            "solana-devnet",
+            &staged.id,
+            &bs58::encode([9u8; 64]).into_string(),
+        )
+        .unwrap();
+
+    let error = engine
+        .broadcast("wallet", &staged.id, 1_300)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("does not verify"));
+    assert!(!requests.lock().unwrap().iter().any(|request| {
+        matches!(
+            request["method"].as_str(),
+            Some("simulateTransaction" | "sendTransaction")
+        )
+    }));
 }
 
 #[tokio::test]

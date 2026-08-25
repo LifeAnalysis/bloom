@@ -1,7 +1,7 @@
 # Solana confirmation and fee advisory (the `BumpScanner` analogue)
 
-**Status:** design (implementation lands with the broadcast path, after the
-bip39 §4 signing wiring)
+**Status:** core expiry handling implemented; early dwell/congestion advisory
+remains deferred.
 
 **Mirrors:** `bloom-tx/src/bump_scanner.rs` in role only — the *mechanism* is
 designed from Solana's actual fee and freshness model, not EVM's.
@@ -81,14 +81,20 @@ Solana's actual price signal. If `getRecentPrioritizationFees` is unavailable
 or the node is a local validator, the advisor omits the price component and
 reports only the blockhash/dwell trigger.
 
-### Freshness expiry sweep
+### Implemented freshness and restaging behavior
 
-Independently of the advisor, `SolanaOutbox::sweep_expired` already moves
-pending entries past `expires_ms` to `failed`. The advisor's blockhash-expiry
-detection is the *sent*-side counterpart: a sent-but-unconfirmed tx whose
-`lastValidBlockHeight` has passed is provably a non-effect (its blockhash is
-spent) and the entry can be reconciled to a `failed` receipt with
-`reason: blockhash_expired` rather than lingering in `sent/` forever.
+`SolanaOutbox::sweep_expired` moves unsigned pending entries past `expires_ms`
+to `failed` with status `expired`. Signed pending entries remain visible so a
+lost RPC response cannot be misreported as failure. Signing and broadcast
+also query the current blockheight and refuse an expired message.
+
+For an expired pending entry, writing non-empty content to `restage` creates a
+new immutable stage with the same destination and lamports but a fresh
+blockhash and fee quote. The old entry becomes `failed/expired` and links to
+the replacement through `restage_advice.json`; approval and signature state
+are not reused. A sent-but-unobserved signature is reconciled to a terminal
+failed receipt once current height exceeds `lastValidBlockHeight`, rather than
+remaining unreconciled forever.
 
 ## Trigger thresholds (frozen defaults, operator-tunable)
 
@@ -100,7 +106,7 @@ spent) and the entry can be reconciled to a `failed` receipt with
 
 ## Out of scope / deferred
 
-- Auto-restage or auto-approve (impossible without a new signature; would
+- Auto-restage or auto-approve (a new message requires a new signature and
   violate the "construction code cannot change destination/amount without
   invalidating the signature" invariant).
 - Durable nonce accounts / offline signing (the v1 message is legacy,

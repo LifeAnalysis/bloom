@@ -328,6 +328,7 @@ impl BrokerExactPayloadSigner {
             system_use_claim: None,
             claim_assurance_evidence: petal_claim
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
+            approval_value_limits: Vec::new(),
         };
         let mut response = self.broker.sign_exact_payload(request.clone()).await;
         if response

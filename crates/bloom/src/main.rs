@@ -1328,15 +1328,78 @@ async fn execute_machine_command(
             let prepared = launch_account_retirement(daemon, &wallet_id, &fingerprint).await?;
             format!("{}\n", serde_json::to_string_pretty(&prepared)?)
         }
-        MachineCommand::WalletAddress { name } => {
+        MachineCommand::WalletAddress { name, profile } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
-            let projection = daemon
-                .wallet_projections
-                .get_wallet(&wallet_id)
-                .await
-                .map_err(machine_wallet_lookup_error)?;
-            let address: alloy::primitives::Address = projection.primary_address()?.parse()?;
-            bloom_proto::checksum_address(&address)
+            if let Some(profile) = profile {
+                let (derivation_profile, allocation_profile) = match profile.as_str() {
+                    "evm" | "bip44-evm-secp256k1-v1" => (
+                        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                        "bip44-evm-secp256k1-v1",
+                    ),
+                    "solana" | "bip44-solana-slip10-ed25519-v1" => (
+                        bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                        "bip44-solana-slip10-ed25519-v1",
+                    ),
+                    other => {
+                        return Err(machine_error(
+                            MachineErrorKind::InvalidParams,
+                            format!(
+                                "unknown wallet address profile '{other}'; expected evm or solana"
+                            ),
+                        )
+                        .into());
+                    }
+                };
+                let client = configured_broker_client(&daemon.home).map_err(|error| {
+                    machine_error(
+                        MachineErrorKind::Unavailable,
+                        format!(
+                            "wallet address requires the authenticated Machine-to-Broker edge: {error:#}"
+                        ),
+                    )
+                })?;
+                let accounts = client
+                    .wallet_accounts(wallet_id.clone())
+                    .await
+                    .map_err(machine_wallet_lookup_error)?;
+                let account = accounts
+                    .accounts
+                    .iter()
+                    .find(|account| {
+                        account.derivation_profile == derivation_profile
+                            && account.lifecycle
+                                == bloom_broker_api::AccountLifecycleState::Active
+                    })
+                    .ok_or_else(|| {
+                        machine_error(
+                            MachineErrorKind::NotFound,
+                            format!(
+                                "wallet '{}' has no active {profile} derived account; allocate one with `bloom wallet account-allocate {} --profile {}`",
+                                wallet_id.as_str(),
+                                wallet_id.as_str(),
+                                allocation_profile,
+                            ),
+                        )
+                    })?;
+                let projection = account.chain_projections.first().ok_or_else(|| {
+                    machine_error(
+                        MachineErrorKind::NotFound,
+                        format!(
+                            "wallet '{}' has an active {profile} key but Broker returned no chain address projection",
+                            wallet_id.as_str()
+                        ),
+                    )
+                })?;
+                projection.address.clone()
+            } else {
+                let projection = daemon
+                    .wallet_projections
+                    .get_wallet(&wallet_id)
+                    .await
+                    .map_err(machine_wallet_lookup_error)?;
+                let address: alloy::primitives::Address = projection.primary_address()?.parse()?;
+                bloom_proto::checksum_address(&address)
+            }
         }
         MachineCommand::WalletUnlock { name } => {
             return Err(machine_error(
@@ -2276,7 +2339,7 @@ enum WalletCmd {
         name: String,
         /// Root material profile: `imported-secp256k1-scalar` or
         /// `bip39-multicurve-v1`.
-        #[arg(long, default_value = "imported-secp256k1-scalar")]
+        #[arg(long, default_value = "bip39-multicurve-v1")]
         profile: String,
     },
     /// Export wallet recovery material through the Broker-hosted ceremony.
@@ -2315,6 +2378,10 @@ enum WalletCmd {
     /// and `--qr-out <path>` writes a scannable SVG of the address to a file.
     Address {
         name: String,
+        /// Address family. `solana` prints the active BIP-44/SLIP-10 Ed25519
+        /// account; omit it for the wallet's legacy primary EVM address.
+        #[arg(long, value_parser = ["evm", "solana"])]
+        profile: Option<String>,
         #[arg(long)]
         qr: bool,
         /// Write a scannable SVG QR of the deposit address to this path.
@@ -3064,9 +3131,17 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Cmd::Wallet(WalletCmd::Address { name, qr, qr_out }) => {
-            let result =
-                machine_command(&client_endpoint, MachineCommand::WalletAddress { name }).await?;
+        Cmd::Wallet(WalletCmd::Address {
+            name,
+            profile,
+            qr,
+            qr_out,
+        }) => {
+            let result = machine_command(
+                &client_endpoint,
+                MachineCommand::WalletAddress { name, profile },
+            )
+            .await?;
             let address = result.stdout;
             if let Some(path) = qr_out {
                 match commands::qr::render_qr_svg(&address) {
@@ -4493,6 +4568,34 @@ mod tests {
             Cli::try_parse_from(["bloom", "wallet", "sign-policy", "wallet"]).is_err(),
             "the legacy direct policy-signing path must stay removed"
         );
+    }
+
+    #[test]
+    fn wallet_import_defaults_to_bip39_and_address_accepts_solana_profile() {
+        let imported = Cli::try_parse_from(["bloom", "wallet", "import", "wallet"]).unwrap();
+        assert!(matches!(
+            imported.cmd,
+            Some(Cmd::Wallet(WalletCmd::Import { name, profile }))
+                if name == "wallet" && profile == "bip39-multicurve-v1"
+        ));
+
+        let address = Cli::try_parse_from([
+            "bloom",
+            "wallet",
+            "address",
+            "wallet",
+            "--profile",
+            "solana",
+        ])
+        .unwrap();
+        assert!(matches!(
+            address.cmd,
+            Some(Cmd::Wallet(WalletCmd::Address {
+                name,
+                profile: Some(profile),
+                ..
+            })) if name == "wallet" && profile == "solana"
+        ));
     }
 
     #[test]

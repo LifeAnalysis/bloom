@@ -3,8 +3,9 @@
 //! Layout (identical to `bloom-tx`'s outbox):
 //! `<home>/.solana-outbox/<wallet>/<chain>/{pending,sent,failed}/<id>/...`
 //!
-//! `intent.json` is write-once; the mined-outcome sibling is `receipt.json`,
-//! written only by the reconciliation loop. Broadcast attempts carry a marker
+//! `intent.json` contains only public transfer facts and is atomically updated
+//! when state changes; the mined-outcome sibling is `receipt.json`, written
+//! only by the reconciliation loop. Broadcast attempts carry a marker
 //! (`broadcast_attempted.json`) plus a `raw_tx` blob whose hash is bound into
 //! the marker, so a retry can never substitute different bytes.
 
@@ -12,9 +13,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
-use parking_lot::RwLock;
+use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -44,6 +44,8 @@ pub enum OutboxError {
     InvalidChain(String),
     #[error("raw transaction bytes do not match the recorded hash")]
     RawTxHashMismatch,
+    #[error("outbox target already exists: {0}")]
+    TargetExists(String),
     #[error("{0}")]
     Other(String),
 }
@@ -73,7 +75,9 @@ impl SolanaOutboxState {
         match s {
             SolanaTxStatus::Pending => Self::Pending,
             SolanaTxStatus::Sent | SolanaTxStatus::Success => Self::Sent,
-            SolanaTxStatus::Failed | SolanaTxStatus::Cancelled => Self::Failed,
+            SolanaTxStatus::Failed | SolanaTxStatus::Cancelled | SolanaTxStatus::Expired => {
+                Self::Failed
+            }
         }
     }
 
@@ -114,6 +118,8 @@ pub struct SolanaBroadcastAttempt {
 
 pub const BROADCAST_ATTEMPT_FILE: &str = "broadcast_attempted.json";
 pub const BROADCAST_RAW_TX: &str = "raw_tx";
+const PRIVATE_SIGNATURE_FILE: &str = ".signature";
+const PRIVATE_APPROVAL_FILE: &str = "approval.json";
 const BROADCAST_SCHEMA: &str = "bloom.solana-broadcast-attempt/1";
 
 #[derive(Clone)]
@@ -123,7 +129,6 @@ pub struct SolanaOutbox {
 
 struct OutboxInner {
     root: PathBuf,
-    next_id: RwLock<u64>,
 }
 
 impl SolanaOutbox {
@@ -131,10 +136,7 @@ impl SolanaOutbox {
         let root = root.into();
         fs::create_dir_all(&root)?;
         Ok(Self {
-            inner: Arc::new(OutboxInner {
-                root,
-                next_id: RwLock::new(1),
-            }),
+            inner: Arc::new(OutboxInner { root }),
         })
     }
 
@@ -228,31 +230,46 @@ impl SolanaOutbox {
         Ok(self.wallet_chain_dir(wallet, chain)?.join(state.dirname()))
     }
 
-    /// Allocate a fresh id like `0001-12345` (mirrors `bloom-tx`).
+    /// Allocate a collision-resistant id. It carries no process-local counter,
+    /// so a daemon restart cannot reuse an existing outbox identity.
     pub fn allocate_id(&self) -> String {
-        let mut g = self.inner.next_id.write();
-        let id = *g;
-        *g = id.wrapping_add(1);
-        let suffix = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() % 100_000)
-            .unwrap_or(0);
-        format!("{id:04}-{suffix:05}")
+        let mut bytes = [0_u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        format!("sol-{}", hex::encode(bytes))
     }
 
     /// Persist a staged transfer in `pending/<id>/` along with its plan file.
-    /// `intent.json` is write-once; `plan.md` is caller-owned.
+    /// `intent.json` excludes the private pre-broadcast signature;
+    /// `plan.md` is caller-owned.
     pub fn write_pending(
         &self,
         staged: &StagedSolanaTransfer,
         plan_md: &str,
     ) -> Result<PathBuf, OutboxError> {
-        let dir = self
-            .state_dir(&staged.wallet, &staged.chain, SolanaOutboxState::Pending)?
-            .join(&staged.id);
-        fs::create_dir_all(&dir)?;
-        fs::write(dir.join("intent.json"), serde_json::to_vec_pretty(staged)?)?;
-        fs::write(dir.join("plan.md"), plan_md.as_bytes())?;
+        Self::validate_segment(&staged.id)
+            .map_err(|_| OutboxError::InvalidId(staged.id.clone()))?;
+        let parent = self.state_dir(&staged.wallet, &staged.chain, SolanaOutboxState::Pending)?;
+        fs::create_dir_all(&parent)?;
+        let dir = parent.join(&staged.id);
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(OutboxError::TargetExists(dir.display().to_string()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let mut public = staged.clone();
+        let legacy_signature = public.signature.take();
+        write_atomic(
+            &dir.join("intent.json"),
+            &serde_json::to_vec_pretty(&public)?,
+        )?;
+        write_atomic(&dir.join("plan.md"), plan_md.as_bytes())?;
+        if let Some(signature) = legacy_signature {
+            write_private_atomic(&dir.join(PRIVATE_SIGNATURE_FILE), signature.as_bytes())?;
+        }
+        sync_dir(&dir)?;
+        sync_dir(&parent)?;
         Ok(dir)
     }
 
@@ -277,9 +294,9 @@ impl SolanaOutbox {
             blockhash: entry.staged.blockhash.clone(),
             created_ms,
         };
-        fs::write(
+        write_atomic(
             entry.dir.join(BROADCAST_ATTEMPT_FILE),
-            serde_json::to_vec_pretty(&attempt)?,
+            &serde_json::to_vec_pretty(&attempt)?,
         )?;
         let path = entry.dir.join(BROADCAST_RAW_TX);
         let mut opts = fs::OpenOptions::new();
@@ -291,6 +308,9 @@ impl SolanaOutbox {
         }
         let mut file = opts.open(path)?;
         file.write_all(raw_tx)?;
+        file.sync_all()?;
+        let _ = fs::remove_file(entry.dir.join(PRIVATE_SIGNATURE_FILE));
+        sync_dir(&entry.dir)?;
         Ok(())
     }
 
@@ -319,7 +339,7 @@ impl SolanaOutbox {
         fs::create_dir_all(&target_parent)?;
         let target = target_parent.join(&entry.staged.id);
         if target.exists() {
-            fs::remove_dir_all(&target)?;
+            return Err(OutboxError::TargetExists(target.display().to_string()));
         }
         fs::rename(&entry.dir, &target)?;
         if matches!(
@@ -327,7 +347,10 @@ impl SolanaOutbox {
             SolanaOutboxState::Sent | SolanaOutboxState::Failed
         ) {
             let _ = fs::remove_file(target.join(BROADCAST_RAW_TX));
+            let _ = fs::remove_file(target.join(PRIVATE_SIGNATURE_FILE));
+            let _ = fs::remove_file(target.join(PRIVATE_APPROVAL_FILE));
         }
+        sync_dir(&target_parent)?;
         Ok(target)
     }
 
@@ -336,9 +359,11 @@ impl SolanaOutbox {
     /// field in sync with the entry's actual on-disk state after a
     /// transition, e.g. once a broadcast succeeds.
     pub fn rewrite_intent(&self, entry: &SolanaOutboxEntry) -> Result<(), OutboxError> {
-        fs::write(
-            entry.dir.join("intent.json"),
-            serde_json::to_vec_pretty(&entry.staged)?,
+        let mut public = entry.staged.clone();
+        public.signature = None;
+        write_atomic(
+            &entry.dir.join("intent.json"),
+            &serde_json::to_vec_pretty(&public)?,
         )?;
         Ok(())
     }
@@ -502,7 +527,7 @@ impl SolanaOutbox {
         if name.contains('/') || name.contains('\\') {
             return Err(OutboxError::InvalidId(name.into()));
         }
-        fs::write(dir.join(name), body)?;
+        write_atomic(&dir.join(name), body)?;
         Ok(())
     }
 
@@ -525,9 +550,9 @@ impl SolanaOutbox {
         Ok(Some(serde_json::from_slice(&fs::read(&path)?)?))
     }
 
-    /// Record the transaction signature on a still-pending entry (the signing
-    /// step), rewriting `intent.json` so the signature is durable before the
-    /// entry transitions to `sent`.
+    /// Record the transaction signature on a still-pending entry. The
+    /// replayable signature stays in a private sidecar until broadcast
+    /// succeeds; it is never projected through public `intent.json`.
     pub fn record_signature(
         &self,
         wallet: &str,
@@ -536,20 +561,93 @@ impl SolanaOutbox {
         signature: &str,
     ) -> Result<SolanaOutboxEntry, OutboxError> {
         let entry = self.read_in_state(wallet, chain, id, SolanaOutboxState::Pending)?;
-        let mut staged = entry.staged.clone();
-        staged.signature = Some(signature.to_string());
-        fs::write(
-            entry.dir.join("intent.json"),
-            serde_json::to_vec_pretty(&staged)?,
+        write_private_atomic(
+            &entry.dir.join(PRIVATE_SIGNATURE_FILE),
+            signature.as_bytes(),
         )?;
-        Ok(SolanaOutboxEntry {
-            state: entry.state,
-            staged,
-            dir: entry.dir,
-        })
+        Ok(entry)
     }
 
-    /// Cancel a still-pending entry (Solana: only legal before signing).
+    /// Read the private pre-broadcast signature, with a compatibility fallback
+    /// for entries written by the pre-sidecar format.
+    pub fn recorded_signature(
+        &self,
+        entry: &SolanaOutboxEntry,
+    ) -> Result<Option<String>, OutboxError> {
+        let path = entry.dir.join(PRIVATE_SIGNATURE_FILE);
+        if path.exists() {
+            return Ok(Some(String::from_utf8(fs::read(path)?).map_err(|_| {
+                OutboxError::Other("recorded signature is not UTF-8".into())
+            })?));
+        }
+        Ok(entry.staged.signature.clone())
+    }
+
+    /// Atomically persist the sanitized, public preflight result next to a
+    /// pending entry. It follows the entry across a successful transition.
+    pub fn write_simulation(
+        &self,
+        entry: &SolanaOutboxEntry,
+        body: &[u8],
+    ) -> Result<(), OutboxError> {
+        if entry.state != SolanaOutboxState::Pending {
+            return Err(OutboxError::StateMismatch {
+                id: entry.staged.id.clone(),
+                expected: SolanaOutboxState::Pending.dirname(),
+                actual: entry.state.dirname(),
+            });
+        }
+        self.write_artefact(&entry.dir, "simulation.json", body)
+    }
+
+    /// Atomically persist the approval-resume projection as a private host
+    /// artifact. The wallet VFS never exposes this file.
+    pub fn write_approval(
+        &self,
+        entry: &SolanaOutboxEntry,
+        body: &[u8],
+    ) -> Result<(), OutboxError> {
+        if entry.state != SolanaOutboxState::Pending {
+            return Err(OutboxError::StateMismatch {
+                id: entry.staged.id.clone(),
+                expected: SolanaOutboxState::Pending.dirname(),
+                actual: entry.state.dirname(),
+            });
+        }
+        write_private_atomic(&entry.dir.join(PRIVATE_APPROVAL_FILE), body)
+    }
+
+    /// Link an expired entry to its freshly staged successor without copying
+    /// any private approval or signing material into public artifacts.
+    pub fn write_restage_advice(
+        &self,
+        entry: &SolanaOutboxEntry,
+        replacement_id: &str,
+    ) -> Result<(), OutboxError> {
+        let advice = serde_json::json!({
+            "schema": "bloom.solana-restage-advice/1",
+            "reason": "blockhash_expired",
+            "replacement_id": replacement_id,
+            "wallet": &entry.staged.wallet,
+            "chain": &entry.staged.chain,
+        });
+        self.write_artefact(
+            &entry.dir,
+            "restage_advice.json",
+            &serde_json::to_vec_pretty(&advice)?,
+        )?;
+        self.write_artefact(
+            &entry.dir,
+            "restage.md",
+            format!(
+                "The staged blockhash expired. Replacement: `{replacement_id}`. Review its fresh intent and plan before confirming.\n"
+            )
+            .as_bytes(),
+        )
+    }
+
+    /// Cancel a still-pending entry. A locally recorded signature does not
+    /// imply submission, so signed pending entries remain cancellable.
     pub fn cancel(&self, wallet: &str, chain: &str, id: &str) -> Result<(), OutboxError> {
         let entry = self.read_in_state(wallet, chain, id, SolanaOutboxState::Pending)?;
         let mut staged = entry.staged.clone();
@@ -560,11 +658,13 @@ impl SolanaOutbox {
             dir: entry.dir.clone(),
         };
         let new_dir = self.transition(&entry, SolanaOutboxState::Failed)?;
-        fs::write(
-            new_dir.join("intent.json"),
-            serde_json::to_vec_pretty(&staged)?,
+        let mut public = staged;
+        public.signature = None;
+        write_atomic(
+            &new_dir.join("intent.json"),
+            &serde_json::to_vec_pretty(&public)?,
         )?;
-        fs::write(new_dir.join("cancel.txt"), b"cancelled by user")?;
+        write_atomic(&new_dir.join("cancel.txt"), b"cancelled by user")?;
         Ok(())
     }
 
@@ -599,16 +699,21 @@ impl SolanaOutbox {
                     // A signed pending entry may represent a broadcast whose
                     // RPC response was lost. Keep it retryable and visible;
                     // expiry alone must not turn it into a false failure.
-                    if staged.signature.is_none()
-                        && staged.expires_ms != 0
-                        && now_ms >= staged.expires_ms
+                    let entry = SolanaOutboxEntry {
+                        state: SolanaOutboxState::Pending,
+                        staged,
+                        dir: ent.path(),
+                    };
+                    if self.recorded_signature(&entry)?.is_none()
+                        && entry.staged.expires_ms != 0
+                        && now_ms >= entry.staged.expires_ms
                     {
-                        let entry = SolanaOutboxEntry {
-                            state: SolanaOutboxState::Pending,
-                            staged,
-                            dir: ent.path(),
-                        };
-                        self.transition(&entry, SolanaOutboxState::Failed)?;
+                        let mut expired = entry.clone();
+                        expired.staged.status = SolanaTxStatus::Expired;
+                        let dir = self.transition(&expired, SolanaOutboxState::Failed)?;
+                        expired.state = SolanaOutboxState::Failed;
+                        expired.dir = dir;
+                        self.rewrite_intent(&expired)?;
                         count += 1;
                     }
                 }
@@ -622,6 +727,53 @@ fn blake3_hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+fn write_atomic(path: impl AsRef<Path>, body: &[u8]) -> Result<(), OutboxError> {
+    write_atomic_with_mode(path.as_ref(), body, 0o600)
+}
+
+fn write_private_atomic(path: &Path, body: &[u8]) -> Result<(), OutboxError> {
+    write_atomic_with_mode(path, body, 0o600)
+}
+
+fn write_atomic_with_mode(path: &Path, body: &[u8], mode: u32) -> Result<(), OutboxError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| OutboxError::Other("outbox artifact has no parent".into()))?;
+    fs::create_dir_all(parent)?;
+    let mut random = [0_u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut random);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| OutboxError::Other("outbox artifact name is not UTF-8".into()))?;
+    let temporary = parent.join(format!(".{name}.{}.tmp", hex::encode(random)));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    let mut file = options.open(&temporary)?;
+    if let Err(error) = (|| -> Result<(), std::io::Error> {
+        file.write_all(body)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })() {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    sync_dir(parent)?;
+    Ok(())
+}
+
+fn sync_dir(path: &Path) -> Result<(), OutboxError> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
 fn parse_sent_entry(
     wallet: &str,
     chain: &str,
@@ -630,7 +782,16 @@ fn parse_sent_entry(
 ) -> Option<SolanaSentEntry> {
     let bytes = fs::read(intent_path).ok()?;
     let staged: StagedSolanaTransfer = serde_json::from_slice(&bytes).ok()?;
-    let signature = staged.signature.as_ref()?.clone();
+    let signature = fs::read(dir.join(BROADCAST_ATTEMPT_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<SolanaBroadcastAttempt>(&bytes).ok())
+        .map(|attempt| attempt.signature)
+        .or_else(|| {
+            fs::read(dir.join(PRIVATE_SIGNATURE_FILE))
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+        })
+        .or(staged.signature.clone())?;
     let sent_at = fs::metadata(intent_path).ok()?.modified().ok()?;
     let mined = dir.join(RECEIPT_FILE).exists();
     Some(SolanaSentEntry {

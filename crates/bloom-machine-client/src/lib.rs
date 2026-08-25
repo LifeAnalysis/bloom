@@ -51,7 +51,7 @@ use bloom_broker_api::{
     PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse, PolicyUpdateRequest, ProtocolError,
     ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, RevocationState,
     RevokeRequest, SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot,
-    SigningPayloads, SigningResult, SystemUseClaim, Token, TypedRequestMethod,
+    SigningPayloads, SigningResult, SystemUseClaim, Token, TypedRequestMethod, ValueLimit,
     WalletAccountsPublic, WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
 };
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
@@ -740,7 +740,7 @@ impl MachineBrokerClient {
                 max_signatures: DecimalU64::new(1),
                 operation_rate_limits: Vec::new(),
                 signature_rate_limits: Vec::new(),
-                value_limits: Vec::new(),
+                value_limits: request.approval_value_limits,
             },
             activation_mode,
             wallet_revocation_epoch: wallet.wallet_revocation_epoch,
@@ -1652,6 +1652,10 @@ pub struct ExactPayloadSignRequest {
     pub petal_use_claim: Option<PetalUseClaim>,
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance_evidence: Option<Vec<u8>>,
+    /// Value movement authorized by the reviewed exact claim. System callers
+    /// must supply an exact per-asset ceiling; non-value signing leaves this
+    /// empty.
+    pub approval_value_limits: Vec<ValueLimit>,
 }
 
 #[derive(Clone, Debug)]
@@ -3044,6 +3048,7 @@ mod tests {
             petal_use_claim: None,
             system_use_claim: None,
             claim_assurance_evidence: None,
+            approval_value_limits: Vec::new(),
         }
     }
 

@@ -1,5 +1,6 @@
-//! Root-only generation of per-login macOS triad identities and signing
-//! material from public release templates.
+//! Generation of per-login triad identities and signing material from public
+//! release templates. Production installation remains macOS-root-only; the
+//! feature-gated developer harness is supported on Unix hosts.
 
 use std::{
     collections::BTreeMap,
@@ -60,9 +61,6 @@ pub fn run_developer(template_dir: &Path, output_dir: &Path, release_digest: Str
     let gid = rustix::process::getegid().as_raw();
     if uid == 0 {
         bail!("developer enrollment material generation refuses root");
-    }
-    if std::env::consts::OS != "macos" {
-        bail!("developer enrollment material generation requires Darwin");
     }
     let template_dir = fs::canonicalize(template_dir)
         .context("canonicalize developer enrollment template directory")?;

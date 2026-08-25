@@ -1,8 +1,7 @@
 # Solana provenance-catalog entry (operator config)
 
-**Status:** ready-to-use config draft — no code dependency. Consumed once the
-§4 pin bump + `root_key_ref` reconciliation lands and the Solana signing flow
-is wired.
+**Status:** implemented operator contract. The native signing flow consumes
+this record and Broker independently validates the proof-verified System claim.
 
 The Machine/Broker provenance catalog is an installer-signed operator config
 file (loaded via `bloom_machine_client::load_provenance_catalog`, path from
@@ -62,12 +61,12 @@ enrollment signs it locally and installs it as `provenance-catalog.json`.
   catalog membership independently — Machine never supplies a record or
   signature for Broker to accept.
 
-## Open alignment point (decided at signing-flow build, not now)
+## Implemented authorization path
 
-Whether the Solana transfer uses EVM's `System`-subject exact-signing path
-(no `PetalUseClaim`) or a claim-bearing `ProofVerified` path determines how
-`subject.operation_class` is consumed. The entry above is correct for the
-`ProofVerified` claim path (which is the whole point of keeping the
-independent verifier); if the signing flow instead lands on a System-subject
-exact path, the record still authorizes the action but the verifier would
-need an explicit invocation — reconcile this when the flow is wired.
+The transfer uses a System subject plus a `SystemUseClaim` carrying
+`ProofVerified` assurance. Machine supplies the serialized message as
+assurance evidence; Broker verifies its digest and invokes the compiled,
+digest-pinned `solana-system-transfer-v1` verifier before destination policy
+evaluation. This is covered at the full `authority.authorize()` boundary for
+the success case, weak assurance, mismatched evidence, and disallowed
+destination.

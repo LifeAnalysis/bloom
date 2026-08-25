@@ -13,7 +13,7 @@ use bloom_broker_api::{
     AssetId, ClaimAssurance, CryptoSuite, DecimalU64, DecimalU256, DeclaredDebit,
     DeclaredDestination, DeclaredFee, Digest32, OperationId, ProvenanceCatalog, ProvenanceSubject,
     RequestNonce, SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES, SOLANA_SYSTEM_TRANSFER_VERIFIER_ID,
-    SystemChainContext, SystemUseClaim, Token,
+    SystemChainContext, SystemUseClaim, Token, ValueLimit,
 };
 use bloom_machine_client::{ExactPayloadSignOutcome, ExactPayloadSignRequest, MachineBrokerClient};
 use sha2::{Digest as _, Sha256};
@@ -22,6 +22,9 @@ use crate::message::verify_signature;
 
 /// The action class this signer is bound to.
 pub const SOLANA_CONFIRM_ACTION_CLASS: &str = "solana.transfer.confirm";
+const SOLANA_APPROVAL_OPERATION_DOMAIN: &[u8] = b"bloom-solana-approval-operation/v1";
+const SOLANA_SIGNING_OPERATION_DOMAIN: &[u8] = b"bloom-solana-signing-operation/v1";
+const SOLANA_REQUEST_NONCE_DOMAIN: &[u8] = b"bloom-solana-request-nonce/v1";
 
 /// Outcome of one sign attempt.
 #[derive(Debug, Clone)]
@@ -97,7 +100,14 @@ impl SolanaTransferSigner {
     ) -> Result<SolanaSignOutcome, String> {
         let preimage = message_bytes.to_vec();
         let claimed_hash = Digest32::from_bytes(Sha256::digest(&preimage).into());
-        let request_nonce = random_request_nonce();
+        let maximum_native_debit = lamports
+            .checked_add(fee_lamports)
+            .ok_or_else(|| "Solana transfer value plus fee exceeds u64".to_owned())?;
+        // These authority identities must survive the owner-ceremony retry
+        // and an unknown-result process restart. The immutable Solana message
+        // includes its recent blockhash, so domain-separated hashes are both
+        // collision resistant and unique to this staged transfer.
+        let request_nonce = deterministic_request_nonce(message_bytes);
         let system_use_claim = SystemUseClaim {
             component_id: Token::new("bloom-machine").map_err(|e| e.to_string())?,
             action_class: Token::new(SOLANA_CONFIRM_ACTION_CLASS).map_err(|e| e.to_string())?,
@@ -143,8 +153,14 @@ impl SolanaTransferSigner {
             provenance: self.subject.clone(),
             provenance_digest: self.provenance_digest.clone(),
             activation_mode: None,
-            approval_operation_id: random_operation_id(),
-            signing_operation_id: random_operation_id(),
+            approval_operation_id: deterministic_operation_id(
+                SOLANA_APPROVAL_OPERATION_DOMAIN,
+                message_bytes,
+            ),
+            signing_operation_id: deterministic_operation_id(
+                SOLANA_SIGNING_OPERATION_DOMAIN,
+                message_bytes,
+            ),
             request_nonce,
             issued_at_ms: DecimalU64::new(issued_at_ms),
             expires_at_ms: DecimalU64::new(expires_at_ms),
@@ -153,6 +169,15 @@ impl SolanaTransferSigner {
             petal_use_claim: None,
             system_use_claim: Some(system_use_claim),
             claim_assurance_evidence: Some(message_bytes.to_vec()),
+            approval_value_limits: vec![ValueLimit {
+                asset: AssetId {
+                    chain: Token::new("solana").map_err(|e| e.to_string())?,
+                    asset: "native".into(),
+                },
+                lifetime: DecimalU256::parse(maximum_native_debit.to_string())
+                    .map_err(|e| e.to_string())?,
+                rolling_windows: Vec::new(),
+            }],
         };
         match self
             .broker
@@ -200,14 +225,19 @@ fn normalized_ed25519_signature(
         .map_err(|_| format!("Broker returned a {len} byte signature, expected 64"))
 }
 
-fn random_operation_id() -> OperationId {
-    let mut bytes = [0_u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
-    OperationId::from_bytes(bytes)
+fn deterministic_operation_id(domain: &[u8], message: &[u8]) -> OperationId {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(message);
+    OperationId::from_bytes(hasher.finalize().into())
 }
 
-fn random_request_nonce() -> RequestNonce {
+fn deterministic_request_nonce(message: &[u8]) -> RequestNonce {
+    let mut hasher = Sha256::new();
+    hasher.update(SOLANA_REQUEST_NONCE_DOMAIN);
+    hasher.update(message);
+    let digest = hasher.finalize();
     let mut bytes = [0_u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    bytes.copy_from_slice(&digest[..16]);
     RequestNonce::from_bytes(bytes)
 }

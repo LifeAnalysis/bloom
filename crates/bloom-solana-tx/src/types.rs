@@ -12,6 +12,7 @@ pub enum SolanaTxStatus {
     Success,
     Failed,
     Cancelled,
+    Expired,
 }
 
 /// The write-once staged record, persisted as `intent.json`.
@@ -46,8 +47,9 @@ pub struct StagedSolanaTransfer {
     pub message_b64: String,
     /// SHA-256 of the message bytes (hex) — Bloom's payload commitment.
     pub payload_digest_hex: String,
-    /// The transaction signature (base58), stamped at signing time. Absent
-    /// until the signing step runs; scanners skip entries without it.
+    /// Legacy compatibility field. New entries keep the pre-broadcast
+    /// signature in a private sidecar and expose it only in the broadcast
+    /// marker after submission succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub created_ms: u128,

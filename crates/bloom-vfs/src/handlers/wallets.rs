@@ -1865,6 +1865,19 @@ fn solana_state(s: &str) -> Option<bloom_solana_tx::outbox::SolanaOutboxState> {
     bloom_solana_tx::outbox::SolanaOutboxState::parse(s)
 }
 
+fn is_public_solana_outbox_artifact(name: &str) -> bool {
+    matches!(
+        name,
+        "intent.json"
+            | "plan.md"
+            | "simulation.json"
+            | "receipt.json"
+            | "broadcast_attempted.json"
+            | "restage_advice.json"
+            | "restage.md"
+    )
+}
+
 fn solana_outbox_err(e: bloom_solana_tx::outbox::OutboxError) -> HandlerError {
     match e {
         bloom_solana_tx::outbox::OutboxError::NotFound(id) => HandlerError::not_found(id),
@@ -2026,14 +2039,14 @@ impl Handler for WalletsHandler {
     /// broadcast just by stat'ing.
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
         let segs = path.segments();
-        // wallets/<w>/chains/<c>/outbox/pending/<id>/{confirm,confirm.override,replace,cancel}
+        // wallets/<w>/chains/<c>/outbox/pending/<id>/{confirm,confirm.override,replace,cancel,restage}
         if segs.len() == 7
             && segs[1] == "chains"
             && segs[3] == "outbox"
             && segs[4] == "pending"
             && matches!(
                 segs[6].as_str(),
-                "confirm" | "confirm.override" | "replace" | "cancel"
+                "confirm" | "confirm.override" | "replace" | "cancel" | "restage"
             )
         {
             return true;
@@ -2587,11 +2600,14 @@ impl WalletsHandler {
                     .read_in_state(wallet, chain, id, solana_state(state).unwrap())
                     .map_err(solana_outbox_err)?;
                 if solana_state(state) == Some(bloom_solana_tx::outbox::SolanaOutboxState::Pending)
-                    && matches!(fname.as_str(), "confirm" | "cancel")
+                    && matches!(fname.as_str(), "confirm" | "cancel" | "restage")
                 {
                     return Ok(
                         Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms)
                     );
+                }
+                if !is_public_solana_outbox_artifact(fname) {
+                    return Err(HandlerError::not_found(fname));
                 }
                 let fpath = entry.dir.join(fname);
                 if !fpath.exists() {
@@ -2888,6 +2904,9 @@ impl WalletsHandler {
         let _projection = self.wallet_projection(wallet).await?;
         match rest {
             [s, state, id, fname] if s == "outbox" => {
+                if !is_public_solana_outbox_artifact(fname) {
+                    return Err(HandlerError::not_found(fname));
+                }
                 let st = solana_state(state)
                     .ok_or_else(|| HandlerError::not_found(format!("outbox state '{state}'")))?;
                 let entry = engine
@@ -2938,8 +2957,11 @@ impl WalletsHandler {
                 for file in [
                     "intent.json",
                     "plan.md",
+                    "simulation.json",
                     "receipt.json",
                     "broadcast_attempted.json",
+                    "restage_advice.json",
+                    "restage.md",
                 ] {
                     let fpath = entry.dir.join(file);
                     if fpath.exists() {
@@ -2947,9 +2969,13 @@ impl WalletsHandler {
                     }
                 }
                 if st == bloom_solana_tx::outbox::SolanaOutboxState::Pending {
-                    for control in ["confirm", "cancel"] {
+                    for control in ["confirm", "cancel", "restage"] {
                         entries.push(Entry::writable_file(control));
                     }
+                } else if st == bloom_solana_tx::outbox::SolanaOutboxState::Failed
+                    && entry.staged.status == bloom_solana_tx::SolanaTxStatus::Expired
+                {
+                    entries.push(Entry::writable_file("restage"));
                 }
                 Ok(entries)
             }
@@ -2984,10 +3010,25 @@ impl WalletsHandler {
                     "wallet '{wallet}' has no active Solana derived account"
                 ))
             })?;
-        let bytes = account.canonical_public_key.decode();
-        bytes
-            .try_into()
-            .map_err(|_| HandlerError::backend("Solana child public key must be 32 bytes"))
+        if account.key_ref.key_spec != bloom_broker_api::KeySpec::Ed25519
+            || account.public_key_encoding != bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer
+        {
+            return Err(HandlerError::backend(
+                "Solana child must use canonical Ed25519 SPKI DER",
+            ));
+        }
+        const ED25519_SPKI_PREFIX: [u8; 12] = [
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        let spki = account.canonical_public_key.decode();
+        if spki.len() != 44 || spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
+            return Err(HandlerError::backend(
+                "Solana child public key is not canonical Ed25519 SPKI DER",
+            ));
+        }
+        let mut raw = [0_u8; 32];
+        raw.copy_from_slice(&spki[ED25519_SPKI_PREFIX.len()..]);
+        Ok(raw)
     }
 
     async fn write_solana_outbox(
@@ -3055,14 +3096,15 @@ impl WalletsHandler {
                         ceremony_url,
                         ..
                     } => {
-                        let _ = std::fs::write(
-                            entry.dir.join("approval.json"),
-                            serde_json::to_vec_pretty(&serde_json::json!({
-                                "approval_id": approval_id.as_str(),
-                                "ceremony_url": ceremony_url,
-                            }))
-                            .unwrap_or_default(),
-                        );
+                        let approval = serde_json::to_vec_pretty(&serde_json::json!({
+                            "approval_id": approval_id.as_str(),
+                            "ceremony_url": ceremony_url,
+                        }))
+                        .map_err(|error| HandlerError::backend(error.to_string()))?;
+                        engine
+                            .outbox()
+                            .write_approval(&entry, &approval)
+                            .map_err(solana_outbox_err)?;
                         Err(HandlerError::PermissionDenied)
                     }
                     bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. } => {
@@ -3082,6 +3124,36 @@ impl WalletsHandler {
                     .outbox()
                     .cancel(wallet, chain, id)
                     .map_err(solana_outbox_err)?;
+                Ok(())
+            }
+            // outbox/{pending,failed}/<id>/restage — preserve the economic
+            // intent but replace an expired message with a fresh blockhash
+            // and approval. The sweeper moves stale entries to `failed`, so
+            // recovery must remain reachable from that terminal projection.
+            [state, id, fname]
+                if matches!(state.as_str(), "pending" | "failed") && fname == "restage" =>
+            {
+                self.write_permit()?;
+                let restage_text = std::str::from_utf8(data)
+                    .map_err(|_| HandlerError::invalid("non-utf8 restage content"))?
+                    .trim();
+                if restage_text.is_empty() {
+                    return Err(HandlerError::invalid(
+                        "restage requires non-empty content (e.g. 'y')",
+                    ));
+                }
+                let child = self.resolve_solana_child(wallet).await?;
+                let replacement = engine
+                    .restage_expired(wallet, id, &child, now_ms_u128())
+                    .await
+                    .map_err(|error| HandlerError::invalid(error.to_string()))?;
+                tracing::info!(
+                    wallet,
+                    chain,
+                    expired_id = id,
+                    replacement_id = %replacement.id,
+                    "solana_outbox.restaged"
+                );
                 Ok(())
             }
             _ => Err(HandlerError::PermissionDenied),
@@ -3915,13 +3987,17 @@ mod tests {
                     bloom_broker_api::MachineBrokerRequest::WalletAccounts(
                         bloom_broker_api::WalletRequest { wallet_id },
                     ) => {
+                        let mut child_spki = vec![
+                            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+                        ];
+                        child_spki.extend_from_slice(&self.child_pubkey);
                         let child_key_ref = bloom_broker_api::KeyRef {
                             backend: bloom_broker_api::Token::new("local").unwrap(),
                             backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
                             locator: "wallet/derived/solana-0".into(),
                             key_spec: bloom_broker_api::KeySpec::Ed25519,
                             public_key_fingerprint: bloom_broker_api::Digest32::from_bytes(
-                                sha2::Sha256::digest(self.child_pubkey).into(),
+                                sha2::Sha256::digest(&child_spki).into(),
                             ),
                             derivation: None,
                         };
@@ -3937,12 +4013,12 @@ mod tests {
                                         bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
                                     path: "m/44'/501'/0'/0'".into(),
                                     canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(
-                                        &self.child_pubkey,
+                                        &child_spki,
                                     ),
                                     public_key_encoding:
                                         bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
                                     public_key_fingerprint: bloom_broker_api::Digest32::from_bytes(
-                                        sha2::Sha256::digest(self.child_pubkey).into(),
+                                        sha2::Sha256::digest(&child_spki).into(),
                                     ),
                                     supported_crypto_suites: vec![
                                         bloom_broker_api::CryptoSuite::Ed25519Message,
@@ -3990,6 +4066,7 @@ mod tests {
                                 r#"{{"context":{{"slot":1}},"value":{{"blockhash":"{blockhash}","lastValidBlockHeight":100}}}}"#
                             )
                         }
+                        "getBlockHeight" => "1".to_string(),
                         "getFeeForMessage" => r#"{"context":{"slot":1},"value":5000}"#.to_string(),
                         _ => r#"{"code":-32601,"message":"method not found"}"#.to_string(),
                     };
@@ -4190,6 +4267,26 @@ mod tests {
             action_id: None,
         };
         outbox.write_pending(&staged, "plan").unwrap();
+        outbox
+            .record_signature(
+                "alice",
+                "solana-devnet",
+                &staged.id,
+                &bs58::encode([7u8; 64]).into_string(),
+            )
+            .unwrap();
+        let pending = outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                &staged.id,
+                bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+            )
+            .unwrap();
+        outbox
+            .write_approval(&pending, b"secret approval evidence")
+            .unwrap();
+        std::fs::write(pending.dir.join("raw_tx"), b"secret signed transaction").unwrap();
 
         let handler = f.handler.with_solana(std::collections::BTreeMap::from([(
             "solana-devnet".to_string(),
@@ -4222,7 +4319,19 @@ mod tests {
         assert_eq!(parsed["lamports"], 1_000_000);
         assert_eq!(parsed["chain"], "solana-devnet");
 
-        for control in ["confirm", "cancel"] {
+        // The host outbox may contain signing and approval material needed
+        // for crash recovery, but none of it is part of the wallet VFS. Only
+        // explicitly public, sanitized artifacts are addressable there.
+        for private_artifact in [".signature", "approval.json", "raw_tx"] {
+            let path = VfsPath::parse(&format!(
+                "/alice/chains/solana-devnet/outbox/pending/0001-00001/{private_artifact}"
+            ))
+            .unwrap();
+            assert!(handler.lookup(&path).await.is_err());
+            assert!(handler.read(&path).await.is_err());
+        }
+
+        for control in ["confirm", "cancel", "restage"] {
             assert!(
                 handler
                     .lookup(
