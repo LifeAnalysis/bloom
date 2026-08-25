@@ -546,6 +546,9 @@ PY
       if [[ -n "$login_user" && "$login_home" == /* && "$login_home" != "/" ]]; then
         runuser -u "$login_user" -- rm -f -- \
           "$login_home/.config/systemd/user/default.target.wants/bloom-session.service"
+        if [[ "$retain_custody" == false ]]; then
+          runuser -u "$login_user" -- rm -rf -- "$login_home/.bloom"
+        fi
       fi
       systemctl disable --now \
         "bloom-broker@$login_uid.service" \

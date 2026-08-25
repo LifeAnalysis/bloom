@@ -1657,6 +1657,7 @@ fn linux_uninstaller_defaults_to_retaining_custody_and_requires_explicit_purge()
         assert!(wrapper.contains(required), "uninstaller omits {required}");
     }
     assert!(wrapper.contains("mode=\"retain\""));
+    assert!(wrapper.contains("~/.bloom Machine state is also permanently deleted"));
 
     let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
     assert!(installer.contains("uninstall --retain-custody ROOT LOGIN_UID"));
@@ -1664,6 +1665,9 @@ fn linux_uninstaller_defaults_to_retaining_custody_and_requires_explicit_purge()
     assert!(installer.contains("$root/etc/bloom/retained/$login_uid.json"));
     assert!(installer.contains(
         "systemctl --user disable --now bloom-session.service \\\n          2>/dev/null || true"
+    ));
+    assert!(installer.contains(
+        "if [[ \"$retain_custody\" == false ]]; then\n          runuser -u \"$login_user\" -- rm -rf -- \"$login_home/.bloom\""
     ));
     assert!(installer.contains("userdel \"$service_user\""));
     assert!(installer.contains("groupdel \"$service_group\""));

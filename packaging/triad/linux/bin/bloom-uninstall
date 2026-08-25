@@ -9,6 +9,7 @@ usage:
 
 Without --purge, Bloom is disabled and its runtime integration is removed while
 wallet custody and enrollment identities are retained for a future reinstall.
+With --purge, the login's ~/.bloom Machine state is also permanently deleted.
 EOF
   exit 64
 }
