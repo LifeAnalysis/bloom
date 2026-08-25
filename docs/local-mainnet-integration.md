@@ -6,6 +6,9 @@ the kernel-mounted NFS VFS and interactive browser ceremonies with Machine,
 Broker, and Signer running as separate processes.
 
 It is deliberately not a deployment mode and makes no UID-isolation claim.
+The same-UID developer profile supports non-root Linux and macOS. On Linux,
+an explicit kernel mount requires a narrowly scoped sudo policy for only the
+selected NFS mountpoint and its unmount operation.
 The `triad-dev-harness` feature adds only same-UID developer enrollment and
 transport bootstrap; it adds no custody, passkey verification, or signing code
 to Machine. Signer keeps custody, Broker owns the ceremony origin, and normal
@@ -52,14 +55,23 @@ to trade at.
 
 ## Prerequisites
 
-- macOS with the passkey available to the current login's browser/keychain;
-- Rust/Cargo and `jq` (`brew install jq`);
+- macOS with the passkey available to the current login's browser/keychain, or
+  Linux with an active systemd user manager for the eval login;
+- Rust/Cargo and `jq` (`brew install jq` on macOS);
 - a wallet enrolled through a real Broker registration or import ceremony in
   the persistent developer triad root;
 - the migrated local Polymarket and Hyperliquid package checkouts, installed
   only into the disposable Machine overlay;
 - Polymarket onboarding/funding sufficient for the chosen order;
 - no other local process listening on `127.0.0.1:18734`.
+
+Linux launches Broker and Signer through temporary per-user systemd socket and
+service units, exercising the same named-descriptor activation interface as
+production. A dedicated persistent eval account normally needs a one-time
+administrator setup such as `loginctl enable-linger LOGIN_USER`. The launcher
+does not enable linger itself and fails before service startup when the user
+manager is unavailable. Generated unit paths are intentionally restricted to
+ASCII letters, digits, and `_./:@+-`.
 
 The last rule is fail-closed. If the root-installed Broker is active, unload
 only its job before the test:

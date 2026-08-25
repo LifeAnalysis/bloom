@@ -423,6 +423,63 @@ fn triad_developer_launcher_keeps_explicit_mounts_fail_closed() {
 }
 
 #[test]
+fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(launcher.contains("developer harness refuses root"));
+    assert!(launcher.contains("Darwin|Linux)"));
+    assert!(launcher.contains("Linux developer mounts require mount.nfs4"));
+    assert!(launcher.contains("sudo -n -l -- \"$mount_nfs_bin\""));
+    assert!(launcher.contains("sudo -n -l -- \"$umount_bin\" -l -f \"$mount_dir\""));
+    assert!(launcher.contains("Linux developer mount privilege is not installed"));
+    assert!(launcher.contains("packaging/triad/linux/config/${name}"));
+    assert!(launcher.contains("systemctl --user"));
+    assert!(launcher.contains("export LC_ALL=C"));
+    assert!(launcher.contains("Linux developer systemd user unit directory is unsafe"));
+    assert!(launcher.contains("Linux developer systemd unit paths may contain only ASCII"));
+    assert!(launcher.contains("printf 'FileDescriptorName=%s\\n' \"$descriptor\""));
+    assert!(!launcher.contains("signer_socket_unit"));
+    assert!(!launcher.contains("BLOOM_SIGNER_ACTIVATION_NAME"));
+    assert!(!launcher.contains("BLOOM_SIGNER_CONTROL_ACTIVATION_NAME"));
+    assert!(launcher.contains("\"BLOOM_SIGNER_SOCKET=$signer_socket\""));
+    assert!(launcher.contains("\"BLOOM_SIGNER_CONTROL_SOCKET=$signer_control_socket\""));
+    assert!(!launcher.contains("broker_socket_unit"));
+    assert!(!launcher.contains("broker_control_socket_unit"));
+    assert!(!launcher.contains("BLOOM_BROKER_ACTIVATION_NAME"));
+    assert!(!launcher.contains("BLOOM_BROKER_CONTROL_ACTIVATION_NAME"));
+    assert!(launcher.contains("\"BLOOM_BROKER_SOCKET=$broker_socket\""));
+    assert!(launcher.contains("\"BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket\""));
+    assert!(launcher.contains("broker_ceremony_socket_unit"));
+    assert!(launcher.contains("'127.0.0.1:18734' broker-ceremony"));
+    assert!(launcher.contains("BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony"));
+    assert_eq!(
+        launcher
+            .matches("\"BLOOM_AUTHORITY_EDGE_HISTORY=$authority_edge_history\"")
+            .count(),
+        2
+    );
+    assert!(launcher.contains("Linux developer services require an active systemd user manager"));
+    assert!(launcher.contains("BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS"));
+
+    let linux_manifest =
+        fs::read_to_string(workspace().join("packaging/triad/linux/config/edge-manifest.json.in"))
+            .unwrap();
+    assert!(linux_manifest.contains("\"trusted_time_source\": \"linux-chrony-nts\""));
+    assert!(!linux_manifest.contains("macos-managed-timed"));
+}
+
+#[test]
+fn triad_developer_launcher_accepts_explicit_prebuilt_petals() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(launcher.contains("BLOOM_TRIAD_DEV_BUILD_PETALS:-1"));
+    assert!(launcher.contains("BLOOM_TRIAD_DEV_BUILD_PETALS must be 0 or 1"));
+    assert!(launcher.contains("if [ \"$build_integration_petals\" -eq 1 ]; then"));
+    assert!(launcher.contains("triad-enroll-developer-petal-provenance"));
+    assert!(launcher.contains("machine_cli petals install"));
+}
+
+#[test]
 fn triad_developer_launcher_can_leave_machine_developer_managed() {
     let launcher_path = workspace().join("scripts/triad-dev-launch.sh");
     let launcher = fs::read_to_string(&launcher_path).unwrap();
@@ -477,12 +534,14 @@ fn triad_developer_launcher_owns_only_its_service_processes() {
     let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
 
     assert!(launcher.contains("trap cleanup EXIT INT TERM HUP"));
+    assert!(launcher.contains("trap '' INT TERM HUP"));
     assert!(
         launcher.contains(
             "for pid in \"$machine_pid\" \"$broker_pid\" \"$signer_pid\" \"$session_pid\""
         )
     );
     assert!(launcher.contains("rm -f -- \"$ready_file\""));
+    assert!(launcher.contains("rm -f -- \"$machine_socket\""));
     assert!(launcher.contains("die \"$label exited while supervising triad services\""));
 }
 
