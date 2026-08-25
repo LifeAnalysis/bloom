@@ -540,7 +540,8 @@ PY
         runuser -u "$login_user" -- env \
           XDG_RUNTIME_DIR="$user_runtime" \
           DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
-          systemctl --user disable --now bloom-session.service
+          systemctl --user disable --now bloom-session.service \
+          2>/dev/null || true
       fi
       if [[ -n "$login_user" && "$login_home" == /* && "$login_home" != "/" ]]; then
         runuser -u "$login_user" -- rm -f -- \

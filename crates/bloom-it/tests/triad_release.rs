@@ -1662,6 +1662,9 @@ fn linux_uninstaller_defaults_to_retaining_custody_and_requires_explicit_purge()
     assert!(installer.contains("uninstall --retain-custody ROOT LOGIN_UID"));
     assert!(installer.contains("retained_custody=false"));
     assert!(installer.contains("$root/etc/bloom/retained/$login_uid.json"));
+    assert!(installer.contains(
+        "systemctl --user disable --now bloom-session.service \\\n          2>/dev/null || true"
+    ));
     assert!(installer.contains("userdel \"$service_user\""));
     assert!(installer.contains("groupdel \"$service_group\""));
 }
