@@ -2,6 +2,12 @@ target/
 target-docker/
 cache/
 out/
+/evals/harbor/jobs/
+/jobs/
+
+# Generated Python bytecode.
+__pycache__/
+*.py[cod]
 
 .vendor/
 
