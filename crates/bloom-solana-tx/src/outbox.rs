@@ -261,10 +261,10 @@ impl SolanaOutbox {
         let mut public = staged.clone();
         let legacy_signature = public.signature.take();
         write_atomic(
-            &dir.join("intent.json"),
+            dir.join("intent.json"),
             &serde_json::to_vec_pretty(&public)?,
         )?;
-        write_atomic(&dir.join("plan.md"), plan_md.as_bytes())?;
+        write_atomic(dir.join("plan.md"), plan_md.as_bytes())?;
         if let Some(signature) = legacy_signature {
             write_private_atomic(&dir.join(PRIVATE_SIGNATURE_FILE), signature.as_bytes())?;
         }
@@ -362,7 +362,7 @@ impl SolanaOutbox {
         let mut public = entry.staged.clone();
         public.signature = None;
         write_atomic(
-            &entry.dir.join("intent.json"),
+            entry.dir.join("intent.json"),
             &serde_json::to_vec_pretty(&public)?,
         )?;
         Ok(())
@@ -527,7 +527,7 @@ impl SolanaOutbox {
         if name.contains('/') || name.contains('\\') {
             return Err(OutboxError::InvalidId(name.into()));
         }
-        write_atomic(&dir.join(name), body)?;
+        write_atomic(dir.join(name), body)?;
         Ok(())
     }
 
@@ -661,10 +661,10 @@ impl SolanaOutbox {
         let mut public = staged;
         public.signature = None;
         write_atomic(
-            &new_dir.join("intent.json"),
+            new_dir.join("intent.json"),
             &serde_json::to_vec_pretty(&public)?,
         )?;
-        write_atomic(&new_dir.join("cancel.txt"), b"cancelled by user")?;
+        write_atomic(new_dir.join("cancel.txt"), b"cancelled by user")?;
         Ok(())
     }
 

@@ -5855,6 +5855,9 @@ weight = 100
             .record_signature("alice", "solana-devnet", &staged.id, &signature)
             .unwrap();
         outbox
+            .write_broadcast_attempt(&entry, &signature, b"raw", 1)
+            .unwrap();
+        outbox
             .transition(&entry, bloom_solana_tx::outbox::SolanaOutboxState::Sent)
             .unwrap();
 

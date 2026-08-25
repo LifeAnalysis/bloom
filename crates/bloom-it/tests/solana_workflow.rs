@@ -33,6 +33,15 @@ fn tok(s: &str) -> Token {
 fn dig(b: u8) -> Digest32 {
     Digest32::from_bytes([b; 32])
 }
+/// Canonical Ed25519 SubjectPublicKeyInfo DER: the fixed 12-byte prefix
+/// followed by the raw 32-byte key. Matches what the real Signer publishes.
+fn spki(pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut out = vec![
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    out.extend_from_slice(pubkey);
+    out
+}
 
 // ---------------------------------------------------------------- broker ---
 
@@ -82,7 +91,7 @@ impl SolanaBroker {
         KeyPublic {
             key_ref: self.key_ref.clone(),
             role: KeyRole::Derived,
-            canonical_public_key: Base64UrlBytes::from_bytes(&self.pubkey),
+            canonical_public_key: Base64UrlBytes::from_bytes(&spki(&self.pubkey)),
             addresses: vec![bs58::encode(self.pubkey).into_string()],
             supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
         }
@@ -97,9 +106,11 @@ impl SolanaBroker {
                 wallet_seed_profile: WalletSeedProfile::Bip39MulticurveV1,
                 derivation_profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
                 path: "m/44'/501'/0'/0'".into(),
-                canonical_public_key: Base64UrlBytes::from_bytes(&self.pubkey),
+                canonical_public_key: Base64UrlBytes::from_bytes(&spki(&self.pubkey)),
                 public_key_encoding: PublicKeyEncoding::Ed25519SpkiDer,
-                public_key_fingerprint: Digest32::from_bytes(Sha256::digest(self.pubkey).into()),
+                public_key_fingerprint: Digest32::from_bytes(
+                    Sha256::digest(spki(&self.pubkey)).into(),
+                ),
                 supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
                 chain_projections: vec![],
                 lifecycle: AccountLifecycleState::Active,
@@ -263,7 +274,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
             backend_instance: tok("e2e"),
             locator: "wallet/derived/solana-0".into(),
             key_spec: KeySpec::Ed25519,
-            public_key_fingerprint: Digest32::from_bytes(Sha256::digest(pubkey).into()),
+            public_key_fingerprint: Digest32::from_bytes(Sha256::digest(spki(&pubkey)).into()),
             derivation: None,
         },
         approval_active: AtomicBool::new(false),

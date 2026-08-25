@@ -143,6 +143,9 @@ async fn reconciles_success_to_receipt() {
     let s = sent_entry("0001-00001");
     outbox.write_pending(&s, "plan").unwrap();
     let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, s.signature.as_deref().unwrap(), b"raw", 1)
+        .unwrap();
     outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
 
     let registry = SolanaChainRegistry::new();
@@ -169,6 +172,9 @@ async fn reconciles_failure_to_receipt() {
     let s = sent_entry("0001-00001");
     outbox.write_pending(&s, "plan").unwrap();
     let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, s.signature.as_deref().unwrap(), b"raw", 1)
+        .unwrap();
     outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
 
     let registry = SolanaChainRegistry::new();
@@ -193,6 +199,9 @@ async fn unseen_signature_stays_unreconciled() {
     let s = sent_entry("0001-00001");
     outbox.write_pending(&s, "plan").unwrap();
     let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, s.signature.as_deref().unwrap(), b"raw", 1)
+        .unwrap();
     outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
 
     let registry = SolanaChainRegistry::new();
@@ -215,6 +224,9 @@ async fn processed_signature_stays_unreconciled() {
     let s = sent_entry("0001-00001");
     outbox.write_pending(&s, "plan").unwrap();
     let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, s.signature.as_deref().unwrap(), b"raw", 1)
+        .unwrap();
     outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
 
     let registry = SolanaChainRegistry::new();
@@ -237,6 +249,9 @@ async fn unseen_signature_becomes_terminal_after_blockhash_expiry() {
     let s = sent_entry("0001-00001");
     outbox.write_pending(&s, "plan").unwrap();
     let entry = outbox.read("alice", "solana-devnet", "0001-00001").unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, s.signature.as_deref().unwrap(), b"raw", 1)
+        .unwrap();
     outbox.transition(&entry, SolanaOutboxState::Sent).unwrap();
 
     let registry = SolanaChainRegistry::new();

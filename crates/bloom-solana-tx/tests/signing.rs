@@ -138,13 +138,13 @@ impl MachineBrokerService for SolanaBrokerFixture {
                     }))
                 }
                 MachineBrokerRequest::SigningSign(sign_request) => {
-                    if let Some(prepared) = self.prepared_claim.lock().unwrap().as_ref() {
-                        if sign_request.system_use_claim.as_ref() != Some(prepared) {
-                            return Err(ProtocolError::new(
-                                ProtocolErrorCode::ClaimInvalid,
-                                "ceremony retry changed the reviewed Solana claim",
-                            ));
-                        }
+                    if let Some(prepared) = self.prepared_claim.lock().unwrap().as_ref()
+                        && sign_request.system_use_claim.as_ref() != Some(prepared)
+                    {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::ClaimInvalid,
+                            "ceremony retry changed the reviewed Solana claim",
+                        ));
                     }
                     let signature = self.sign_payload(&sign_request)?;
                     Ok(MachineBrokerResponse::SigningSign(SigningResult {
