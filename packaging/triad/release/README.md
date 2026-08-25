@@ -133,9 +133,10 @@ installer fixtures use the following `config/` layout beside the extracted binar
 and `provenance-catalog.json`. The macOS W0 bundle deliberately contains none
 of these private files: its guarded live installer uses the same fresh
 root-owned identity-generation path as the production Unix-principal claim.
-On Linux, the packaged `nts-servers.conf` contains at least two distinct
-reviewed NTS host names, one per line. AWS credentials and
-`aws-kms-ip-allow.conf` are an optional paired site overlay.
+On Linux, Bloom uses the host system clock behind its durable rollback and
+same-boot forward-step guards; it does not install or require a separate time
+daemon. AWS credentials and `aws-kms-ip-allow.conf` are an optional paired
+site overlay.
 
 The v0.1.4 Linux archive generates a complete fresh per-login enrollment from
 packaged public templates and the host CSPRNG; it does not require site-specific
@@ -143,6 +144,14 @@ private identity inputs. It remains an operator-integration prerelease because
 the Linux release lane does not yet prove live installed systemd health on a
 disposable host. The website must remain pinned to v0.1.3 until that acceptance
 lane lands.
+
+A live Linux install must receive `BLOOM_RELEASE_PUBLIC_KEY` pointing to a
+separately obtained, root-owned, non-writable copy of
+`bloom-release-v1.pub`. Before stopping services or writing installation
+state, the installer verifies that pin against `RELEASE_PUBLIC_KEY.pem`,
+verifies the `bloom-release-payload-v1` signature over `SHA256SUMS`, and then
+verifies every listed payload file. The public key is data, not another time
+service or software package.
 
 Linux installs provide `bloom-uninstall`. Its default `--retain-custody` mode
 stops and disables the selected enrollment, removes runtime integration, and

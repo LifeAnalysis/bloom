@@ -16,6 +16,17 @@ EOF
 action="$1"
 shift
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+payload_scratch=""
+enrollment_scratch=""
+
+cleanup_scratch() {
+  for scratch_path in "$payload_scratch" "$enrollment_scratch"; do
+    if [[ -n "$scratch_path" && -d "$scratch_path" ]]; then
+      find "$scratch_path" -depth -delete
+    fi
+  done
+}
+trap cleanup_scratch EXIT
 
 validate_root_uid() {
   root="$1"
@@ -53,6 +64,81 @@ sha256_digest() {
   fi
 }
 
+verify_sha256_manifest() {
+  manifest="$1"
+  manifest_dir="$(dirname "$manifest")"
+  manifest_name="$(basename "$manifest")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$manifest_dir" && sha256sum -c "$manifest_name" >/dev/null)
+  elif command -v shasum >/dev/null 2>&1; then
+    (cd "$manifest_dir" && shasum -a 256 -c "$manifest_name" >/dev/null)
+  else
+    echo "Linux installation requires sha256sum or shasum" >&2
+    return 69
+  fi
+}
+
+verify_release_payload() {
+  payload_to_verify="$1"
+  expected_pin_uid="$2"
+  for signed_path in SHA256SUMS RELEASE_PUBLIC_KEY.pem RELEASE_SIGNATURE; do
+    [[ -f "$payload_to_verify/$signed_path" && \
+      ! -L "$payload_to_verify/$signed_path" ]] || {
+      echo "payload is missing authenticated $signed_path" >&2
+      return 65
+    }
+  done
+
+  pinned_key="${BLOOM_RELEASE_PUBLIC_KEY:-}"
+  [[ -f "$pinned_key" && ! -L "$pinned_key" ]] || {
+    echo "BLOOM_RELEASE_PUBLIC_KEY must name a separately installed public key" >&2
+    return 65
+  }
+  [[ "$(stat -c '%u' "$pinned_key")" == "$expected_pin_uid" ]] || {
+    echo "pinned release key has the wrong owner" >&2
+    return 65
+  }
+  pinned_mode="$(stat -c '%a' "$pinned_key")"
+  [[ "$pinned_mode" =~ ^[0-7]{3,4}$ ]] && \
+    (( (8#$pinned_mode & 022) == 0 )) || {
+    echo "pinned release key must not be group or world writable" >&2
+    return 65
+  }
+  cmp -s "$pinned_key" "$payload_to_verify/RELEASE_PUBLIC_KEY.pem" || {
+    echo "payload release key does not match the pinned key" >&2
+    return 65
+  }
+  read -r key_type key_body key_extra < "$pinned_key"
+  [[ "$key_type" == ssh-ed25519 && -n "$key_body" && -z "${key_extra:-}" ]] || {
+    echo "pinned release key is not a bare ssh-ed25519 public key" >&2
+    return 65
+  }
+  command -v ssh-keygen >/dev/null 2>&1 || {
+    echo "Linux installation requires the system ssh-keygen verifier" >&2
+    return 69
+  }
+
+  allowed_signers="$(mktemp)"
+  chmod 0600 "$allowed_signers"
+  printf 'bloom-release %s %s\n' "$key_type" "$key_body" > "$allowed_signers"
+  if ! ssh-keygen -Y verify \
+    -f "$allowed_signers" \
+    -I bloom-release \
+    -n bloom-release-payload-v1 \
+    -s "$payload_to_verify/RELEASE_SIGNATURE" \
+    < "$payload_to_verify/SHA256SUMS" >/dev/null
+  then
+    rm -f -- "$allowed_signers"
+    echo "payload release signature is invalid" >&2
+    return 65
+  fi
+  rm -f -- "$allowed_signers"
+  verify_sha256_manifest "$payload_to_verify/SHA256SUMS" || {
+    echo "payload file authentication failed" >&2
+    return 65
+  }
+}
+
 case "$action" in
   install)
     [[ $# -eq 4 ]] || usage
@@ -62,6 +148,24 @@ case "$action" in
     if [[ "$root" == "/" && "$(id -u)" -ne 0 ]]; then
       echo "Linux installation requires root" >&2
       exit 77
+    fi
+    if [[ "$root" == "/" ]]; then
+      payload_scratch="$(mktemp -d /var/tmp/bloom-linux-payload.XXXXXX)"
+      chmod 0700 "$payload_scratch"
+      cp -R -- "$payload/." "$payload_scratch/"
+      if find "$payload_scratch" \
+        \( -type l -o \( ! -type f ! -type d \) \) -print -quit | grep -q .
+      then
+        echo "payload contains a symlink or non-regular entry" >&2
+        exit 65
+      fi
+      chown -R 0:0 "$payload_scratch"
+      payload="$payload_scratch"
+      verify_release_payload "$payload" 0
+    elif [[ "${BLOOM_TEST_VERIFY_RELEASE_PAYLOAD:-}" == "true" ]]; then
+      pin_owner_uid=0
+      pin_owner_uid="$(id -u)"
+      verify_release_payload "$payload" "$pin_owner_uid"
     fi
     platform_claim="$(<"$payload/PLATFORM_CLAIM")"
     if [[ "$platform_claim" != "linux" ]] &&
@@ -104,23 +208,27 @@ case "$action" in
       installer/linux/config/broker.json.in \
       installer/linux/config/signer.json.in \
       installer/linux/config/provenance-catalog.unsigned.json \
-      installer/linux/config/nts-servers.conf \
       installer/linux/bin/bloom \
       installer/linux/bin/bloom-uninstall \
       installer/linux/systemd-user/bloom-session.service
     do
-      test -f "$payload/$required" || {
+      [[ -f "$payload/$required" && ! -L "$payload/$required" ]] || {
         echo "payload is missing $required" >&2
         exit 66
       }
     done
     installed_config_root="$root/etc/bloom/$login_uid"
+    installed_state_root="$root/var/lib/bloom/$login_uid"
     fresh_install=true
-    if [[ -e "$installed_config_root/edge-manifest.json" ]]; then
+    if [[ -e "$installed_config_root/edge-manifest.json" || \
+      -L "$installed_config_root/edge-manifest.json" ]]
+    then
       fresh_install=false
       for installed_relative in \
         edge-manifest.json \
+        broker/config.json \
         broker/identity.json \
+        signer/config.json \
         signer/identity.json \
         machine/identity.json \
         machine/revoke-identity.json \
@@ -134,6 +242,11 @@ case "$action" in
           exit 65
         }
       done
+    elif [[ -e "$installed_config_root" || -L "$installed_config_root" || \
+      -e "$installed_state_root" || -L "$installed_state_root" ]]
+    then
+      echo "residual Linux enrollment state exists without a manifest; refusing fresh installation" >&2
+      exit 65
     fi
     if [[ "$root" == "/" ]] && [[ -x "$root/usr/libexec/bloom/bloom-broker" ]]; then
       systemctl stop "bloom-session@$login_uid.path" 2>/dev/null || true
@@ -209,28 +322,6 @@ case "$action" in
     chmod 0644 "$unit_root/bloom-signer@.service.new"
     mv -f "$unit_root/bloom-signer@.service.new" "$unit_root/bloom-signer@.service"
 
-    nts_servers="$payload/installer/linux/config/nts-servers.conf"
-    if grep -Ev '^([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9a-fA-F:]+)$' \
-      "$nts_servers" >/dev/null ||
-      [[ "$(LC_ALL=C sort -u "$nts_servers" | sed '/^$/d' | wc -l | tr -d ' ')" -lt 2 ]]
-    then
-      echo "at least two distinct reviewed NTS server names are required" >&2
-      exit 65
-    fi
-    chrony_target="$root/etc/chrony/conf.d/bloom-nts.conf"
-    mkdir -p "$(dirname "$chrony_target")"
-    {
-      echo "authselectmode require"
-      while IFS= read -r server; do
-        test -n "$server" && printf 'server %s iburst nts\n' "$server"
-      done < "$nts_servers"
-      echo "minsources 2"
-      echo "rtcsync"
-    } > "$chrony_target.new"
-    chmod 0644 "$chrony_target.new"
-    mv -f "$chrony_target.new" "$chrony_target"
-    enrollment_scratch=""
-    trap 'if [[ -n "${enrollment_scratch:-}" && -d "$enrollment_scratch" ]]; then find "$enrollment_scratch" -depth -delete; fi' EXIT
     source_config=""
     release_digest="test-unclaimed"
     if [[ "$root" == "/" ]]; then
@@ -436,9 +527,13 @@ case "$action" in
         "bloom-broker-rpc@$login_uid.socket" \
         "bloom-broker-control@$login_uid.socket" \
         2>/dev/null || true
-      systemctl enable --now \
+      # The fixed ceremony port is per-host, not per login. Keep the socket
+      # demand-started by the selected login's session path rather than
+      # enabling every installed login's socket at boot.
+      systemctl disable --now \
         "bloom-broker-ceremony@$login_uid.socket" \
-        "bloom-session@$login_uid.path"
+        2>/dev/null || true
+      systemctl enable --now "bloom-session@$login_uid.path"
       printf '%s\n' \
         "BLOOM_BIN=/usr/bin/bloom" \
         "BLOOM_INSTALL_MODE=triad-linux-systemd" \
@@ -627,8 +722,7 @@ PY
         "$root/usr/lib/systemd/system/bloom-signer@.service" \
         "$root/usr/lib/systemd/system/bloom-broker-ceremony@.socket" \
         "$root/usr/lib/systemd/system/bloom-session@.path" \
-        "$root/usr/lib/systemd/user/bloom-session.service" \
-        "$root/etc/chrony/conf.d/bloom-nts.conf"
+        "$root/usr/lib/systemd/user/bloom-session.service"
     fi
 
     retained_custody=false

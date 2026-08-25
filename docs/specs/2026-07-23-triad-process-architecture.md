@@ -768,11 +768,13 @@ durations expressed as positive integer milliseconds. Windows include
 reserved, committed, and quarantined entries and exclude only durably released
 known non-effects.
 
-The edge manifest pins the platform time profile. Linux uses monotonic time
-anchored to UTC from its authenticated NTS-backed source. When Linux cannot
-report that source as synchronized, the service starts in a degraded mode
-that serves reads and status but denies new rate-limited signing. Peer-supplied
-time is never authoritative.
+The edge manifest pins the platform time profile. Linux reads the host wall
+clock and persists a nondecreasing floor. During one boot, a suspend-aware
+monotonic anchor detects an unexpected large forward step; across boots Bloom
+accepts nondecreasing elapsed wall time so ordinary powered-off intervals do
+not require repair. Clock rollback or a same-boot discontinuity degrades the
+service and denies new rate-limited signing. Peer-supplied time is never
+authoritative, and no particular host time daemon is required.
 
 The macOS profile uses the host wall clock directly. Changing that clock
 requires administrator authority, and administrator/root compromise is

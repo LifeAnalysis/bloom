@@ -54,11 +54,12 @@ sudo bloom-uninstall --purge "delete-bloom-login-$(id -u)"
 ```
 
 The root-owned edge manifest pins `trusted_time_source` to
-`linux-chrony-nts`. The installer renders `chrony/bloom-nts.conf.in` with at
-least two independently operated NTS servers and refuses an unauthenticated
-source. Broker and Signer query the kernel synchronization status; loss of
-synchronization produces an untrusted reading and degraded rate-limited
-signing rather than a wall-clock fallback.
+`linux-system-clock`. Bloom reads the ordinary host wall clock and protects
+rolling windows with its own durable nondecreasing floor. On the same boot it
+also compares wall-clock progress with a suspend-aware monotonic anchor, so a
+large unexpected forward step degrades rate-limited signing. A later boot may
+legitimately advance by more than the same-boot bound while the machine was
+powered off. Bloom does not require Chrony or another time daemon.
 
 Packaging creates a mode-0700 `audit-checkpoints` directory below each
 service's state root and passes its absolute path through

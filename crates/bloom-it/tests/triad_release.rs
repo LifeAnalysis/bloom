@@ -135,11 +135,17 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
     assert!(workflow.contains("dry_run:"));
     assert!(workflow.contains("if: needs.prepare.outputs.dry_run != 'true'"));
     assert!(workflow.contains("release dry runs require workflow_dispatch"));
+    assert!(workflow.contains(
+        "sign:\n    name: Sign reviewed candidate\n    needs: [prepare, build]\n    if: needs.prepare.outputs.dry_run != 'true'"
+    ));
     assert!(!workflow.contains("--all-features"));
     assert!(!workflow.contains("--clobber"));
     assert!(workflow.contains("umask 077"));
     assert!(workflow.contains("unset RELEASE_SIGNING_KEY"));
     assert!(workflow.contains("published asset $name is immutable"));
+    assert!(workflow.contains("gh release view \"$TAG\" --json assets"));
+    assert!(workflow.contains("grep -Fqx -- \"$name\" \"$existing/names\""));
+    assert!(workflow.contains("gh release upload \"$TAG\" \"$asset\""));
     assert_eq!(
         workflow
             .matches("secrets.TRIAD_RELEASE_SIGNING_KEY")
@@ -207,6 +213,36 @@ fn write_ed25519_public_key(private_key: &Path, public_key: &Path) {
     );
 }
 
+fn authenticate_installer_payload(payload: &Path, private_key: &Path) {
+    write_ed25519_public_key(private_key, &payload.join("RELEASE_PUBLIC_KEY.pem"));
+    let checksums = Command::new("bash")
+        .args([
+            "-c",
+            "cd \"$1\" && find . -type f ! -name SHA256SUMS ! -name RELEASE_SIGNATURE -print | LC_ALL=C sort | xargs sha256sum > SHA256SUMS",
+            "authenticate-installer-payload",
+        ])
+        .arg(payload)
+        .output()
+        .unwrap();
+    assert!(
+        checksums.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checksums.stderr)
+    );
+    let signed = Command::new(release_script("ssh-ed25519-sign.sh"))
+        .arg(private_key)
+        .arg("bloom-release-payload-v1")
+        .arg(payload.join("SHA256SUMS"))
+        .arg(payload.join("RELEASE_SIGNATURE"))
+        .output()
+        .unwrap();
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+}
+
 fn make_staging(root: &Path) -> PathBuf {
     let staging = root.join("staging");
     fs::create_dir_all(staging.join("bin")).unwrap();
@@ -259,7 +295,6 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "config/broker.json.in",
         "config/signer.json.in",
         "config/provenance-catalog.unsigned.json",
-        "config/nts-servers.conf",
         "bin/bloom",
         "bin/bloom-uninstall",
         "systemd-user/bloom-session.service",
@@ -302,11 +337,6 @@ fn make_installer_payload(root: &Path) -> PathBuf {
     fs::write(
         payload.join("credentials/aws-credentials"),
         b"[default]\naws_access_key_id=test\n",
-    )
-    .unwrap();
-    fs::write(
-        payload.join("config/nts-servers.conf"),
-        b"time.cloudflare.com\ntime.nist.gov\n",
     )
     .unwrap();
     payload
@@ -495,7 +525,7 @@ fn triad_developer_launcher_keeps_explicit_mounts_fail_closed() {
         "mount readiness must not issue an unbounded filesystem operation"
     );
     assert!(
-        launcher.contains("[ \"$attempts\" -lt 300 ] || {\n      if [ \"$label\" = machine ] && [ -n \"$mount_dir\" ]; then")
+        launcher.contains("[ \"$attempts\" -lt \"$socket_wait_attempts\" ] || {\n      if [ \"$label\" = machine ] && [ -n \"$mount_dir\" ]; then")
             && launcher.contains("die \"$label did not publish its socket\""),
         "a Machine socket timeout must retain the explicit-mount fallback hint"
     );
@@ -543,7 +573,7 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     let linux_manifest =
         fs::read_to_string(workspace().join("packaging/triad/linux/config/edge-manifest.json.in"))
             .unwrap();
-    assert!(linux_manifest.contains("\"trusted_time_source\": \"linux-chrony-nts\""));
+    assert!(linux_manifest.contains("\"trusted_time_source\": \"linux-system-clock\""));
     assert!(!linux_manifest.contains("macos-managed-timed"));
 }
 
@@ -1466,9 +1496,6 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     let tmpfiles = fs::read_to_string(root.join("usr/lib/tmpfiles.d/bloom-1000.conf")).unwrap();
     assert!(tmpfiles.contains("/var/lib/bloom/1000/machine 0700 1000 1000"));
     assert!(!tmpfiles.contains("@LOGIN_"));
-    let chrony = fs::read_to_string(root.join("etc/chrony/conf.d/bloom-nts.conf")).unwrap();
-    assert!(chrony.contains("server time.cloudflare.com iburst nts"));
-    assert!(chrony.contains("server nts.netnod.se iburst nts"));
     assert_eq!(
         fs::metadata(root.join("etc/bloom/1000/signer/config.json"))
             .unwrap()
@@ -1683,6 +1710,163 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .exists()
     );
     assert!(!root.join("usr/libexec/bloom/bloom-broker").exists());
+}
+
+#[test]
+fn linux_installer_rejects_missing_service_configs_before_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(directory.path());
+    let installer = release_script("install-linux.sh");
+    assert!(
+        Command::new(&installer)
+            .args(["install"])
+            .arg(&root)
+            .args(["1000", "alice"])
+            .arg(&payload)
+            .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let installed_binary = root.join("usr/libexec/bloom/bloom-broker");
+    fs::write(&installed_binary, b"installed-broker").unwrap();
+    fs::write(payload.join("bin/bloom-broker"), b"replacement-broker").unwrap();
+
+    for relative in ["broker/config.json", "signer/config.json"] {
+        let installed_config = root.join("etc/bloom/1000").join(relative);
+        let original = fs::read(&installed_config).unwrap();
+        fs::remove_file(&installed_config).unwrap();
+        let rejected = Command::new(&installer)
+            .args(["install"])
+            .arg(&root)
+            .args(["1000", "alice"])
+            .arg(&payload)
+            .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("installed Linux enrollment is incomplete")
+        );
+        assert_eq!(fs::read(&installed_binary).unwrap(), b"installed-broker");
+        fs::write(installed_config, original).unwrap();
+    }
+
+    let manifest = root.join("etc/bloom/1000/edge-manifest.json");
+    let original_manifest = fs::read(&manifest).unwrap();
+    fs::remove_file(&manifest).unwrap();
+    let missing_manifest = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["1000", "alice"])
+        .arg(&payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .output()
+        .unwrap();
+    assert!(!missing_manifest.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_manifest.stderr)
+            .contains("residual Linux enrollment state exists without a manifest")
+    );
+    assert_eq!(fs::read(&installed_binary).unwrap(), b"installed-broker");
+    fs::write(&manifest, original_manifest).unwrap();
+
+    let state_only_root = directory.path().join("state-only-root");
+    let custody = state_only_root.join("var/lib/bloom/2000/signer/custody.db");
+    fs::create_dir_all(custody.parent().unwrap()).unwrap();
+    fs::write(&custody, b"existing-custody").unwrap();
+    let residual_state = Command::new(&installer)
+        .args(["install"])
+        .arg(&state_only_root)
+        .args(["2000", "bob"])
+        .arg(&payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .output()
+        .unwrap();
+    assert!(!residual_state.status.success());
+    assert!(
+        String::from_utf8_lossy(&residual_state.stderr)
+            .contains("residual Linux enrollment state exists without a manifest")
+    );
+    assert_eq!(fs::read(custody).unwrap(), b"existing-custody");
+    assert!(!state_only_root.join("etc/bloom/2000").exists());
+}
+
+#[test]
+fn linux_installer_authenticates_payload_before_mutating_existing_files() {
+    let installer_source = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    let snapshot = installer_source.find("cp -R -- \"$payload/.\"").unwrap();
+    let verify = installer_source
+        .find("verify_release_payload \"$payload\" 0")
+        .unwrap();
+    let first_mutation = installer_source.find("installed_config_root=").unwrap();
+    assert!(snapshot < verify && verify < first_mutation);
+    assert!(installer_source.contains("payload contains a symlink or non-regular entry"));
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(directory.path());
+    let private_key = directory.path().join("release-key");
+    let pinned_key = directory.path().join("pinned-release-key.pub");
+    generate_ed25519_key(&private_key);
+    write_ed25519_public_key(&private_key, &pinned_key);
+    authenticate_installer_payload(&payload, &private_key);
+
+    let installed_binary = root.join("usr/libexec/bloom/bloom-broker");
+    fs::create_dir_all(installed_binary.parent().unwrap()).unwrap();
+    fs::write(&installed_binary, b"existing-install").unwrap();
+    fs::write(payload.join("bin/bloom-broker"), b"tampered").unwrap();
+    let installer = release_script("install-linux.sh");
+    let tampered = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["1000", "alice"])
+        .arg(&payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_TEST_VERIFY_RELEASE_PAYLOAD", "true")
+        .env("BLOOM_RELEASE_PUBLIC_KEY", &pinned_key)
+        .output()
+        .unwrap();
+    assert!(!tampered.status.success());
+    assert!(
+        String::from_utf8_lossy(&tampered.stderr).contains("payload file authentication failed")
+    );
+    assert_eq!(fs::read(&installed_binary).unwrap(), b"existing-install");
+
+    authenticate_installer_payload(&payload, &private_key);
+    fs::write(payload.join("RELEASE_SIGNATURE"), b"invalid signature").unwrap();
+    let bad_signature = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["1000", "alice"])
+        .arg(&payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_TEST_VERIFY_RELEASE_PAYLOAD", "true")
+        .env("BLOOM_RELEASE_PUBLIC_KEY", &pinned_key)
+        .output()
+        .unwrap();
+    assert!(!bad_signature.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_signature.stderr)
+            .contains("payload release signature is invalid")
+    );
+    assert_eq!(fs::read(&installed_binary).unwrap(), b"existing-install");
+}
+
+#[test]
+fn linux_installer_demand_starts_only_the_active_login_ceremony_socket() {
+    let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    assert!(installer.contains(
+        "systemctl disable --now \\\n        \"bloom-broker-ceremony@$login_uid.socket\""
+    ));
+    assert!(installer.contains("systemctl enable --now \"bloom-session@$login_uid.path\""));
+    assert!(!installer.contains(
+        "systemctl enable --now \\\n        \"bloom-broker-ceremony@$login_uid.socket\""
+    ));
 }
 
 #[test]

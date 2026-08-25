@@ -198,6 +198,7 @@ jobs:
   sign:
     name: Sign reviewed candidate
     needs: [prepare, build]
+    if: needs.prepare.outputs.dry_run != 'true'
     runs-on: ubuntu-24.04
     environment: production-release
     permissions:
@@ -319,13 +320,19 @@ jobs:
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
             existing="$(mktemp -d)"
+            gh release view "$TAG" --json assets --jq '.assets[].name' \
+              > "$existing/names"
             for asset in dist/*; do
               name="$(basename "$asset")"
-              gh release download "$TAG" --pattern "$name" --dir "$existing"
-              cmp "$asset" "$existing/$name" || {
-                echo "::error::published asset $name is immutable and differs from this retry"
-                exit 1
-              }
+              if grep -Fqx -- "$name" "$existing/names"; then
+                gh release download "$TAG" --pattern "$name" --dir "$existing"
+                cmp "$asset" "$existing/$name" || {
+                  echo "::error::published asset $name is immutable and differs from this retry"
+                  exit 1
+                }
+              else
+                gh release upload "$TAG" "$asset"
+              fi
             done
             release_id="$(gh api "repos/$REPOSITORY/releases/tags/$TAG" --jq .id)"
             gh api --method PATCH \
@@ -334,7 +341,7 @@ jobs:
               -f body="$(<"$notes")" \
               -F prerelease=true \
               -f make_latest=false
-            echo "Published assets are byte-identical; leaving them unchanged."
+            echo "Existing assets are byte-identical; missing assets were uploaded."
           else
             gh release create "$TAG" \
               --verify-tag \

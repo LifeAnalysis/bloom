@@ -141,13 +141,12 @@ wire detail. It does not amend that specification.
   `SOURCE_REVISIONS`; it separately executes, scans, installs, and uninstalls
   the extracted production artifacts. A source-suite pass from a different
   revision or a version-only bundle smoke is not accepted.
-- Section 10.3 permits authenticated NTP, NTS, or a platform-managed time
-  daemon. The edge manifest pins one reviewed source ID per platform:
-  `linux-chrony-nts` or `macos-managed-timed`. Linux packaging requires two
-  NTS sources under chrony's `authselectmode require`; the runtime accepts UTC
-  only while the kernel reports a synchronized clock and applies the compiled
-  one-hour forward-step bound. macOS `timed` does not publish a comparable
-  trust state. Because changing the macOS host clock requires administrator
+- Section 10.3 permits platform-managed host time. The edge manifest pins one
+  reviewed source ID per platform: `linux-system-clock` or
+  `macos-managed-timed`. Linux accepts nondecreasing wall time across boots
+  and applies the compiled one-hour forward-step bound against a suspend-aware
+  monotonic anchor during the same boot. It needs no particular time daemon.
+  Because changing the macOS host clock requires administrator
   authority, which can already alter Bloom state, the macOS profile uses the
   host wall clock directly and does not enter the durable discontinuity or
   repair paths. A missing, cross-platform, or peer-supplied source ID still

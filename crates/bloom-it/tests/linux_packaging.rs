@@ -175,10 +175,7 @@ fn service_sandboxes_remove_machine_and_network_authority() {
                 "{name} sandbox is missing {required}"
             );
         }
-        assert!(
-            !unit.contains("ProtectClock="),
-            "{name} must be able to make the read-only adjtimex synchronization query"
-        );
+        assert!(unit.contains("ProtectClock=yes"));
         assert!(
             unit.contains("CapabilityBoundingSet=") && unit.contains("AmbientCapabilities="),
             "{name} must still lack CAP_SYS_TIME after ProtectClock is removed"
@@ -209,22 +206,10 @@ fn service_sandboxes_remove_machine_and_network_authority() {
 }
 
 #[test]
-fn linux_time_policy_requires_multiple_authenticated_sources() {
-    let chrony = source("chrony/bloom-nts.conf.in");
-    assert!(chrony.contains("authselectmode require"));
-    assert!(chrony.contains("minsources 2"));
-    assert_eq!(
-        chrony.lines().filter(|line| line.contains(" nts")).count(),
-        2,
-        "packaging must render at least two authenticated NTS sources"
-    );
-    assert!(
-        !chrony.lines().any(|line| {
-            let line = line.trim_start();
-            (line.starts_with("server ") || line.starts_with("pool ")) && !line.contains(" nts")
-        }),
-        "unauthenticated selectable time source is forbidden"
-    );
+fn linux_time_policy_uses_the_guarded_host_clock_without_a_daemon_dependency() {
+    let manifest = source("config/edge-manifest.json.in");
+    assert!(manifest.contains("\"trusted_time_source\": \"linux-system-clock\""));
+    assert!(!packaging_root().join("chrony").exists());
 }
 
 #[test]

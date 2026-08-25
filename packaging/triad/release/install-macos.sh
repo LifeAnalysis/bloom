@@ -73,7 +73,25 @@ lock_installer() {
   chown root:wheel "$lock"; printf '%s\n' "$$" >"$lock/pid"; chmod 0600 "$lock/pid"
 }
 
-field() { plutil -extract "$2" raw -o - "$1"; }
+field() {
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -extract "$2" raw -o - "$1"
+  elif ! $live && command -v python3 >/dev/null 2>&1; then
+    python3 - "$1" "$2" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())[sys.argv[2]]
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
+PY
+  else
+    die "plutil is required for live macOS installation"
+  fi
+}
 record_exists() { dscl . -read "/$1/$2" >/dev/null 2>&1; }
 next_id() {
   dscl . -list "/$1" "$2" | awk '$NF~/^[0-9]+$/&&$NF>m{m=$NF} END{if(m>=2147483646)exit 1;print m+1}'
@@ -324,7 +342,13 @@ switch_release() {
   $live && chown -h root:wheel "$release_base/current.new.$$"
   # BSD mv otherwise follows a destination symlink to a directory and moves
   # the candidate link inside the old immutable release.
-  mv -fh "$release_base/current.new.$$" "$release_base/current"
+  if [[ "$(uname -s)" == Darwin ]]; then
+    mv -fh "$release_base/current.new.$$" "$release_base/current"
+  else
+    # Staged-root conformance runs on Linux. GNU mv spells the same
+    # no-dereference destination replacement guarantee as -T.
+    mv -fT "$release_base/current.new.$$" "$release_base/current"
+  fi
   machine_binary="$release_base/current/bloom"; broker_binary="$release_base/current/bloom-broker"; signer_binary="$release_base/current/bloom-signer"
 }
 
