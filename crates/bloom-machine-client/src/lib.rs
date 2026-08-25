@@ -1048,6 +1048,7 @@ impl MachineBrokerClient {
             selector: ApprovalSelector::Petal {
                 package_hash: package_hash.clone(),
                 route: route.clone(),
+                route_grants: Vec::new(),
                 allowed_operation_classes: vec![operation_class],
                 required_claim_assurance: claim.claim_assurance.level(),
             },
