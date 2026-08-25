@@ -119,8 +119,11 @@ mod tests {
 
     #[cfg(feature = "live-providers")]
     #[tokio::test]
-    #[ignore = "hits live Flashbots Protect endpoint over the network"]
     async fn health_against_live_endpoint() {
+        if std::env::var_os("BLOOM_RUN_LIVE_TESTS").is_none() {
+            eprintln!("skip: BLOOM_RUN_LIVE_TESTS is not set");
+            return;
+        }
         let p = FlashbotsProvider::default_endpoint().unwrap();
         let status = p.health().await.expect("health probe");
         assert_eq!(status, HealthStatus::Healthy);

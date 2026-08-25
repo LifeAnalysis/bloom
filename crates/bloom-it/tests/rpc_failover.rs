@@ -8,13 +8,7 @@
 //! calls, kills the first anvil mid-loop, and asserts subsequent calls
 //! still succeed via the second endpoint within < 1 s.
 //!
-//! Like the rest of `bloom-it`, the test is gated `#[ignore]` so CI
-//! runs that lack a foundry install (or just don't want to spawn
-//! processes) skip cleanly. Invoke with:
-//!
-//! ```text
-//! cargo test -p bloom-it -- --ignored rpc_failover
-//! ```
+//! Requires `anvil` from Foundry on `$PATH`.
 
 use std::time::{Duration, Instant};
 
@@ -25,7 +19,6 @@ use bloom_proto::ChainSpec;
 use tokio::time::timeout;
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn block_number_failover_when_first_anvil_dies() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

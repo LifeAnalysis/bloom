@@ -1,9 +1,16 @@
 # Petal Platform Expansion for Native-Feature Parity
 
-**Status:** Initial detailed specification  
+**Status:** superseded historical authority design
 **Date:** 10 July 2026  
 **Depends on:** Local Petal Plugins v1, Sealed Approval, Polymarket Petal Parity
 **Scope:** Extend the generic Petal platform so venue and protocol integrations can move out of native Bloom without moving Bloom's security kernel into untrusted Wasm.
+
+> **Authority amendment:** The triad architecture and the 2026-07-31
+> Machine-removal spec supersede every assignment below of custody, approval,
+> signing, delegated keys, or secrets to a generic daemon/kernel. Broker owns
+> authorization and ceremony semantics; Signer owns keys and generic
+> Petal-scoped KeyRefs; Machine remains key-free. Venue-neutral Petal platform
+> discussion is retained as historical design context only.
 
 ## 0. Summary
 

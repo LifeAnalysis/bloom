@@ -2,6 +2,12 @@ target/
 target-docker/
 cache/
 out/
+/evals/harbor/jobs/
+/jobs/
+
+# Generated Python bytecode.
+__pycache__/
+*.py[cod]
 
 .vendor/
 
@@ -28,6 +34,7 @@ docs/research/formal-verification/lit/data/
 # Local-only agent/PR docs — kept on disk, deliberately never committed.
 AGENTS.md
 !examples/local-petal-apps/**/AGENTS.md
+!tests/fixtures/triad-authority-petal/AGENTS.md
 CLAUDE.md
 DIRECTION.md
 PR.md

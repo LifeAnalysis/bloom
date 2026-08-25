@@ -1,6 +1,23 @@
 # Bloom Machine + Petals
 
-**Status:** architecture decision
+> **SUPERSEDED — HISTORICAL ONLY.** Do not implement or follow the operational
+> instructions below. They describe the retired single-process authority
+> model. The normative architecture is
+> [`2026-07-23-triad-process-architecture.md`](../specs/2026-07-23-triad-process-architecture.md):
+> Machine is key-free, Broker owns ceremonies and authorization, and Signer is
+> the only custody/signing authority. Current Petals use payload-bound
+> Machine-to-Broker requests and Signer-held Petal-scoped keys.
+
+Petal sub-keys use a stable 256-bit lineage ID and a Petal-owned key slot as
+their durable identity. The executing package hash and route are host-injected
+and checked against the installer-signed active lineage catalog; they are not
+part of the child-key derivation identity. A signed successor can therefore
+reuse the same public `KeyRef`, while an unrelated, inactive, or superseded
+package fails closed. Scope bounds explicitly enumerate authorized route IDs,
+operation classes, suites, and lifetime. Petal guests never supply package or
+lineage identity and never receive private key material.
+
+**Status:** superseded historical record — not normative
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 Bloom is comprised of:
@@ -44,6 +61,15 @@ archive name, and expected identity. Installation verifies the repository-owned
 `SHA256SUMS` and `petal-release.json`, then validates the package itself before
 recording source provenance. Bloom never follows a floating `latest` Petal
 release and never falls back to compiling default Petal source locally.
+
+Default activation is stricter than catalog presence. Each catalog record also
+pins the archive checksum, package hash, tooling commit, and declared host ABI.
+Gasless, Privacy Pools, and Venice x402 remain recorded but are not
+default-eligible because their published artifacts predate the triad
+payload-signing ABI (Gasless and Venice import the retired hash-signing host
+route). Their triad sibling branches must be merged and released immutably
+before the default list can expand. Initialization fails closed if an
+ineligible entry is explicitly requested.
 
 ## The Grant Envelope
 

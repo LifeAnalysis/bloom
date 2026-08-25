@@ -7,12 +7,11 @@
 //! Openchain is intentionally skipped here to avoid network flakiness;
 //! its coverage lives in the `bloom-revert` unit tests.
 //!
-//! Marked `#[ignore]` and gated on the `bytecode-decompile` feature.
-//! Run with:
+//! Gated on the `bytecode-decompile` feature. Run with:
 //!
 //! ```text
 //! cargo test -p bloom-it --test revert_decoding_fallbacks \
-//!     --features bytecode-decompile -- --ignored --nocapture
+//!     --features bytecode-decompile -- --nocapture
 //! ```
 //!
 //! Requires `anvil` and `cast` from Foundry on `$PATH` (override with
@@ -98,7 +97,6 @@ fn build_chain_client(rpc_url: &str) -> Result<ChainClient> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn anvil_heimdall_recovers_unverified_custom_error() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

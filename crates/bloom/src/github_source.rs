@@ -1,5 +1,6 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bloom_daemon::Daemon;
@@ -14,7 +15,8 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
-const POLYMARKET_PARITY_COMMIT: &str = "e2e898b69046c9f5d905dd2cd66b3a57ef195542";
+// Retain a bounded diagnostic tail for reconciliation after streamed output.
+const SOURCE_BUILD_STREAM_LIMIT: usize = 256 * 1024;
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "08e9bd83786425656bdd87e35031030cb7f3dc14";
 const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
 
@@ -26,16 +28,11 @@ pub(crate) struct PreinstalledPetal {
     pub release_tag: &'static str,
     pub archive: &'static str,
     pub expected_hash: Option<&'static str>,
+    pub archive_sha256: &'static str,
+    pub tooling_commit: &'static str,
+    pub petal_abi: &'static str,
+    pub default_eligible: bool,
 }
-
-const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
-    name: "polymarket",
-    repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
-    commit: POLYMARKET_PARITY_COMMIT,
-    release_tag: "v0.1.3",
-    archive: "polymarket-v0.1.3.petal.tar.gz",
-    expected_hash: Some("02d6d18d773147013c3b1e7129c4694d2db3c93f1e885e755bdb4aa390bf6a5c"),
-};
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     name: "near-intents",
@@ -44,6 +41,10 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.1",
     archive: "near-intents-v0.1.1.petal.tar.gz",
     expected_hash: Some("c3f714c01e17f642b8add45b7501d6675c851a13210ce9e834fd16d23330f166"),
+    archive_sha256: "7f3bcc5b762f7750c2fa9c445491f7be32ffdf233d3f371481e8dc3d0a8116d0",
+    tooling_commit: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6",
+    petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+    default_eligible: true,
 };
 
 const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
@@ -53,6 +54,49 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     release_tag: "v0.1.2",
     archive: "enso-v0.1.2.petal.tar.gz",
     expected_hash: Some("82e541b237cd8dde0a566dfca7f3d20d6e688aacd23f62b1d0f1306f9c76ecb7"),
+    archive_sha256: "16abd73df768b5f9aba45f20b5c56a50c064368d25bf5e8efa31d3564608422e",
+    tooling_commit: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6",
+    petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+    default_eligible: true,
+};
+
+const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
+    name: "gasless",
+    repository: "https://github.com/bloom-directory/bloom-petal-gasless",
+    commit: "73ccf05b4f10d7993fbc8fa453e8f91987564aab",
+    release_tag: "v0.1.1",
+    archive: "gasless-v0.1.1.petal.tar.gz",
+    expected_hash: Some("26c75bd577e6c24c648dd99bd86c124ff602d9134bd5825649b5906851d2724a"),
+    archive_sha256: "df16e4e793be1767fcbeaac4333545ec887f0e95801ce1ac6ec3d3db2f3d75c8",
+    tooling_commit: "b9fc22d6d8211bc41304b38b1ef8b5269c8035bd",
+    petal_abi: "bloom.petal-host/legacy-hash-signing-v1",
+    default_eligible: false,
+};
+
+const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
+    name: "privacy-pools",
+    repository: "https://github.com/bloom-directory/bloom-petal-privacy-pools",
+    commit: "ae01a7d398416af4fa38a985b684ac973e128208",
+    release_tag: "v0.1.2",
+    archive: "privacy-pools-v0.1.2.petal.tar.gz",
+    expected_hash: Some("f86cf4fac3dcd5dc86fa6d60daadeb2377b7d3a655774f64a109a7f5aca446b4"),
+    archive_sha256: "997e946b1e81481ed496d416111d144fb48ab6f44f513b4721363a9507e92df1",
+    tooling_commit: "b9fc22d6d8211bc41304b38b1ef8b5269c8035bd",
+    petal_abi: "bloom.petal-host/pre-triad-v1",
+    default_eligible: false,
+};
+
+const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
+    name: "venice-x402",
+    repository: "https://github.com/bloom-directory/bloom-petal-venice-x402",
+    commit: "f8d6a1b287397b2c66fa11ca777fe2b762640964",
+    release_tag: "v0.1.0",
+    archive: "venice-x402-v0.1.0.petal.tar.gz",
+    expected_hash: Some("473df7e6a3f948480684d4485f07836918f0e36042d1b2105dc82fdb0370bf18"),
+    archive_sha256: "d2901177b345dba3c7819406f9decb9ed0d167ca7b1f4c7b2895cf39729922be",
+    tooling_commit: "6489cb85e7a0f8804fa3dd712c52c37e732ddcea",
+    petal_abi: "bloom.petal-host/legacy-hash-signing-v1",
+    default_eligible: false,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +114,63 @@ pub(crate) struct GitHubInstallOutput {
     pub index: RouteIndex,
     pub consent: PetalConsentSummary,
     pub provenance: PetalSourceProvenance,
+    pub progress: Vec<String>,
+    pub build_stdout: Vec<u8>,
+    pub build_stderr: Vec<u8>,
+    pub completion_progress: Vec<String>,
+}
+
+struct SourceBuildOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct SourceBuildFailure {
+    message: String,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl std::fmt::Display for SourceBuildFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}\nstdout:\n{}\nstderr:\n{}",
+            self.message,
+            String::from_utf8_lossy(&self.stdout),
+            String::from_utf8_lossy(&self.stderr)
+        )
+    }
+}
+
+impl std::error::Error for SourceBuildFailure {}
+
+#[derive(Debug)]
+pub(crate) struct GitHubSourceInstallFailure {
+    pub progress: Vec<String>,
+    pub completion_progress: Vec<String>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub message: String,
+}
+
+impl std::fmt::Display for GitHubSourceInstallFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}\nstdout:\n{}\nstderr:\n{}",
+            self.message,
+            String::from_utf8_lossy(&self.stdout),
+            String::from_utf8_lossy(&self.stderr)
+        )
+    }
+}
+
+impl std::error::Error for GitHubSourceInstallFailure {}
+
+pub(crate) fn source_install_failure(error: &anyhow::Error) -> Option<&GitHubSourceInstallFailure> {
+    error.downcast_ref()
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,13 +258,24 @@ pub(crate) fn parse_github_install_url(input: &str) -> Result<Option<GitHubRepo>
     Ok(None)
 }
 
+#[cfg(test)]
 pub(crate) fn install_github_source(
     home: &HomeDir,
     daemon: &Daemon,
     repo: &GitHubRepo,
     requested_ref: Option<&str>,
 ) -> Result<GitHubInstallOutput> {
-    install_github_source_with_expectation(home, daemon, repo, requested_ref, None)
+    install_github_source_with_expectation(home, daemon, repo, requested_ref, None, None)
+}
+
+pub(crate) fn install_github_source_streaming(
+    home: &HomeDir,
+    daemon: &Daemon,
+    repo: &GitHubRepo,
+    requested_ref: Option<&str>,
+    context: &bloom_daemon::ipc::IpcOperationContext,
+) -> Result<GitHubInstallOutput> {
+    install_github_source_with_expectation(home, daemon, repo, requested_ref, None, Some(context))
 }
 
 fn install_github_source_with_expectation(
@@ -172,8 +284,14 @@ fn install_github_source_with_expectation(
     repo: &GitHubRepo,
     requested_ref: Option<&str>,
     expected: Option<&PreinstalledPetal>,
+    context: Option<&bloom_daemon::ipc::IpcOperationContext>,
 ) -> Result<GitHubInstallOutput> {
-    println!("Resolving {}", repo.canonical_url);
+    let mut progress = Vec::new();
+    record_source_progress(
+        &mut progress,
+        context,
+        format!("Resolving {}", repo.canonical_url),
+    )?;
     let cache = fetch_repo_cache(home, repo)?;
     let resolved = resolve_ref(&cache, repo, requested_ref)?;
     if let Some(expected) = expected
@@ -187,65 +305,133 @@ fn install_github_source_with_expectation(
         );
     }
     if let Some(tag) = &resolved.selected_tag {
-        println!("Selected tag: {tag}");
+        record_source_progress(&mut progress, context, format!("Selected tag: {tag}"))?;
     }
-    println!("Resolved commit: {}", resolved.commit);
+    record_source_progress(
+        &mut progress,
+        context,
+        format!("Resolved commit: {}", resolved.commit),
+    )?;
 
     let tmp = tempfile::tempdir().context("create source checkout tempdir")?;
     checkout_source(&cache, tmp.path(), &resolved.commit)?;
     validate_source_manifest(tmp.path(), repo)?;
 
-    println!("Building source package...");
-    run_source_build(tmp.path())?;
-
-    println!("Validating Petal package...");
-    let package =
-        PreparedPetalPackage::from_dir(tmp.path()).context("validate generated Petal package")?;
-    if let Some(expected) = expected {
-        if package.name != expected.name {
-            bail!(
-                "pre-installed Petal {} built unexpected package name {:?}",
-                expected.name,
-                package.name
-            );
+    record_source_progress(
+        &mut progress,
+        context,
+        "Building source package...".to_owned(),
+    )?;
+    let build_output = match run_source_build_streaming(tmp.path(), context) {
+        Ok(output) => output,
+        Err(error) => {
+            if let Some(failure) = error.downcast_ref::<SourceBuildFailure>() {
+                return Err(anyhow::Error::new(GitHubSourceInstallFailure {
+                    progress,
+                    completion_progress: Vec::new(),
+                    stdout: failure.stdout.clone(),
+                    stderr: failure.stderr.clone(),
+                    message: failure.message.clone(),
+                }));
+            }
+            return Err(anyhow::Error::new(GitHubSourceInstallFailure {
+                progress,
+                completion_progress: Vec::new(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                message: format!("{error:#}"),
+            }));
         }
-        if let Some(expected_hash) = expected.expected_hash
-            && package.hash != expected_hash
-        {
-            bail!(
-                "pre-installed Petal {} package hash {} does not match expected hash {}",
-                expected.name,
-                package.hash,
-                expected_hash
-            );
-        }
-    }
-    let mut consent = petal_consent_summary(&package).context("build app consent summary")?;
-    let bindings = daemon
-        .config
-        .petals
-        .runtime
-        .get(&consent.name)
-        .map(|app| &app.endpoints)
-        .cloned()
-        .unwrap_or_default();
-    bloom_petals::package::apply_petal_consent_endpoint_bindings(&mut consent, &bindings)
-        .context("apply configured Petal endpoint bindings")?;
-    let provenance = PetalSourceProvenance {
-        source_kind: "github".to_string(),
-        url: repo.canonical_url.clone(),
-        owner: repo.owner.clone(),
-        repo: repo.repo.clone(),
-        requested_ref: resolved.requested_ref.clone(),
-        resolved_commit: resolved.commit.clone(),
-        selected_tag: resolved.selected_tag.clone(),
-        package_hash: package.hash.clone(),
     };
-    let (result, meta, index) = daemon
-        .petals
-        .store()
-        .install_prepared_petal_package_with_source(package, Some(provenance.clone()))
-        .context("install generated Petal package")?;
+
+    let mut completion_progress = Vec::new();
+    let installed = (|| -> Result<_> {
+        record_source_progress(
+            &mut completion_progress,
+            context,
+            "Validating Petal package...".to_owned(),
+        )?;
+        let package = PreparedPetalPackage::from_dir(tmp.path())
+            .context("validate generated Petal package")?;
+        if let Some(expected) = expected {
+            if package.name != expected.name {
+                bail!(
+                    "pre-installed Petal {} built unexpected package name {:?}",
+                    expected.name,
+                    package.name
+                );
+            }
+            if let Some(expected_hash) = expected.expected_hash
+                && package.hash != expected_hash
+            {
+                bail!(
+                    "pre-installed Petal {} package hash {} does not match expected hash {}",
+                    expected.name,
+                    package.hash,
+                    expected_hash
+                );
+            }
+        }
+        record_source_progress(
+            &mut completion_progress,
+            context,
+            "Building Petal consent summary...".to_owned(),
+        )?;
+        let mut consent = petal_consent_summary(&package).context("build app consent summary")?;
+        let bindings = daemon
+            .config
+            .petals
+            .runtime
+            .get(&consent.name)
+            .map(|app| &app.endpoints)
+            .cloned()
+            .unwrap_or_default();
+        bloom_petals::package::apply_petal_consent_endpoint_bindings(&mut consent, &bindings)
+            .context("apply configured Petal endpoint bindings")?;
+        let provenance = PetalSourceProvenance {
+            source_kind: "github".to_string(),
+            url: repo.canonical_url.clone(),
+            owner: repo.owner.clone(),
+            repo: repo.repo.clone(),
+            requested_ref: resolved.requested_ref.clone(),
+            resolved_commit: resolved.commit.clone(),
+            selected_tag: resolved.selected_tag.clone(),
+            package_hash: package.hash.clone(),
+        };
+        record_source_progress(
+            &mut completion_progress,
+            context,
+            "Installing Petal package...".to_owned(),
+        )?;
+        ensure_source_install_connected(context)?;
+        let (result, meta, index) = daemon
+            .petals
+            .store()
+            .install_prepared_petal_package_with_source_guarded(
+                package,
+                Some(provenance.clone()),
+                || {
+                    if context.is_some_and(|context| context.is_cancelled()) {
+                        Err(bloom_petals::PetalError::vm(
+                            "Petal source install cancelled by disconnected client",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .context("install generated Petal package")?;
+        Ok((result, meta, index, consent, provenance))
+    })();
+    let (result, meta, index, consent, provenance) = installed.map_err(|error| {
+        anyhow::Error::new(GitHubSourceInstallFailure {
+            progress: progress.clone(),
+            completion_progress: completion_progress.clone(),
+            stdout: build_output.stdout.clone(),
+            stderr: build_output.stderr.clone(),
+            message: format!("{error:#}"),
+        })
+    })?;
 
     Ok(GitHubInstallOutput {
         result,
@@ -253,6 +439,10 @@ fn install_github_source_with_expectation(
         index,
         consent,
         provenance,
+        progress,
+        build_stdout: build_output.stdout,
+        build_stderr: build_output.stderr,
+        completion_progress,
     })
 }
 
@@ -300,6 +490,13 @@ fn ensure_preinstalled_petals_with(
     for name in &daemon.config.petals.preinstalled {
         let entry = resolve(name).ok_or_else(|| anyhow!("unknown pre-installed Petal {name:?}"))?;
         let entry = &entry;
+        if !entry.default_eligible {
+            bail!(
+                "pre-installed Petal {} is not eligible for triad activation: pinned ABI {} is not the triad payload-signing ABI",
+                entry.name,
+                entry.petal_abi
+            );
+        }
         let replacing = match owners.get(name) {
             Some(hash) => {
                 let meta = daemon.petals.store().load_meta(hash).with_context(|| {
@@ -483,6 +680,12 @@ fn validate_release_manifest(
     if manifest.tooling_repository != "bloom-directory/petal" {
         bail!("Petal release manifest names an untrusted tooling repository");
     }
+    if manifest.archive_sha256 != entry.archive_sha256 {
+        bail!("Petal release manifest archive hash does not match the catalog");
+    }
+    if manifest.tooling_commit != entry.tooling_commit {
+        bail!("Petal release manifest tooling commit does not match the catalog");
+    }
     if let Some(expected_hash) = entry.expected_hash
         && manifest.package_hash != expected_hash
     {
@@ -563,14 +766,20 @@ fn install_prebuilt_petal_archive(
         index,
         consent,
         provenance,
+        progress: Vec::new(),
+        build_stdout: Vec::new(),
+        build_stderr: Vec::new(),
+        completion_progress: Vec::new(),
     })
 }
 
 fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPetal> {
     match name {
-        "polymarket" => Some(&PREINSTALLED_POLYMARKET),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
         "enso" => Some(&PREINSTALLED_ENSO),
+        "gasless" => Some(&PREINSTALLED_GASLESS),
+        "privacy-pools" => Some(&PREINSTALLED_PRIVACY_POOLS),
+        "venice-x402" => Some(&PREINSTALLED_VENICE_X402),
         _ => None,
     }
 }
@@ -863,7 +1072,41 @@ fn validate_source_manifest(root: &Path, repo: &GitHubRepo) -> Result<()> {
     Ok(())
 }
 
-fn run_source_build(root: &Path) -> Result<()> {
+fn record_source_progress(
+    retained: &mut Vec<String>,
+    context: Option<&bloom_daemon::ipc::IpcOperationContext>,
+    line: String,
+) -> Result<()> {
+    if let Some(context) = context
+        && !context.emit(
+            bloom_daemon::ipc::IpcOutputStream::Stdout,
+            format!("{line}\n").into_bytes(),
+        )
+    {
+        bail!("Petal source install cancelled by disconnected client");
+    }
+    retained.push(line);
+    Ok(())
+}
+
+fn ensure_source_install_connected(
+    context: Option<&bloom_daemon::ipc::IpcOperationContext>,
+) -> Result<()> {
+    if context.is_some_and(|context| context.is_cancelled()) {
+        bail!("Petal source install cancelled by disconnected client");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn run_source_build(root: &Path) -> Result<SourceBuildOutput> {
+    run_source_build_streaming(root, None)
+}
+
+fn run_source_build_streaming(
+    root: &Path,
+    context: Option<&bloom_daemon::ipc::IpcOperationContext>,
+) -> Result<SourceBuildOutput> {
     let manifest = read_source_manifest(root)?;
     let build = manifest
         .build
@@ -873,20 +1116,131 @@ fn run_source_build(root: &Path) -> Result<()> {
     if !command.is_file() {
         bail!("build command missing: {}", build.command);
     }
-    let status = Command::new(&command)
+    let mut build_command = Command::new(&command);
+    build_command
         .current_dir(root)
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        build_command.process_group(0);
+    }
+    let mut child = build_command
+        .spawn()
         .with_context(|| format!("run build command {}", build.command))?;
+    let stdout = child.stdout.take().context("capture source-build stdout")?;
+    let stderr = child.stderr.take().context("capture source-build stderr")?;
+    let stdout_context = context.cloned();
+    let stderr_context = context.cloned();
+    let stdout_reader = std::thread::spawn(move || {
+        capture_bounded_stream(
+            stdout,
+            stdout_context.as_ref(),
+            bloom_daemon::ipc::IpcOutputStream::Stdout,
+        )
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        capture_bounded_stream(
+            stderr,
+            stderr_context.as_ref(),
+            bloom_daemon::ipc::IpcOutputStream::Stderr,
+        )
+    });
+    let status = loop {
+        if context.is_some_and(|context| context.is_cancelled()) {
+            #[cfg(unix)]
+            if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            }
+            #[cfg(not(unix))]
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_captured_stream(stdout_reader, "stdout");
+            let _ = join_captured_stream(stderr_reader, "stderr");
+            bail!("Petal source build cancelled by disconnected client");
+        }
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("wait for build command {}", build.command))?
+        {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let stdout = join_captured_stream(stdout_reader, "stdout")?;
+    let stderr = join_captured_stream(stderr_reader, "stderr")?;
     if !status.success() {
-        bail!("build command failed: {}", build.command);
+        return Err(anyhow::Error::new(SourceBuildFailure {
+            message: format!(
+                "build command failed: {} (status {})",
+                build.command, status
+            ),
+            stdout,
+            stderr,
+        }));
     }
     for output in build.outputs {
-        validate_repo_relative_path(&output, "build.outputs")?;
+        if let Err(error) = validate_repo_relative_path(&output, "build.outputs") {
+            return Err(anyhow::Error::new(SourceBuildFailure {
+                message: format!("{error:#}"),
+                stdout,
+                stderr,
+            }));
+        }
         if !root.join(&output).is_dir() {
-            bail!("build output missing: {output}");
+            return Err(anyhow::Error::new(SourceBuildFailure {
+                message: format!("build output missing: {output}"),
+                stdout,
+                stderr,
+            }));
         }
     }
-    Ok(())
+    Ok(SourceBuildOutput { stdout, stderr })
+}
+
+fn capture_bounded_stream(
+    mut reader: impl Read,
+    context: Option<&bloom_daemon::ipc::IpcOperationContext>,
+    stream: bloom_daemon::ipc::IpcOutputStream,
+) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::with_capacity(SOURCE_BUILD_STREAM_LIMIT);
+    let mut omitted = 0usize;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if let Some(context) = context
+            && !context.emit(stream, buffer[..read].to_vec())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Petal source output client disconnected",
+            ));
+        }
+        let remaining = SOURCE_BUILD_STREAM_LIMIT.saturating_sub(retained.len());
+        let keep = remaining.min(read);
+        retained.extend_from_slice(&buffer[..keep]);
+        omitted = omitted.saturating_add(read - keep);
+    }
+    if omitted > 0 {
+        retained.extend_from_slice(
+            format!("\n[bloom: output truncated; {omitted} bytes omitted]\n").as_bytes(),
+        );
+    }
+    Ok(retained)
+}
+
+fn join_captured_stream(
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream: &str,
+) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow!("source-build {stream} reader panicked"))?
+        .with_context(|| format!("read source-build {stream}"))
 }
 
 fn read_source_manifest(root: &Path) -> Result<SourcePetalToml> {
@@ -1015,18 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_polymarket_entry_is_immutable_and_catalogued() {
-        let entry = preinstalled_petal("polymarket").unwrap();
-        assert_eq!(entry.name, "polymarket");
-        assert_eq!(entry.commit.len(), 40);
-        assert!(entry.commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert!(entry.repository.ends_with("/bloom-petal-polymarket"));
-        assert!(entry.archive.starts_with("polymarket-"));
-        assert!(entry.archive.ends_with(".petal.tar.gz"));
-        assert_eq!(
-            entry.archive,
-            format!("polymarket-{}.petal.tar.gz", entry.release_tag)
-        );
+    fn built_in_entries_are_immutable_and_incompatible_petals_are_absent() {
         let near = preinstalled_petal("near-intents").unwrap();
         assert_eq!(near.release_tag, "v0.1.1");
         assert_eq!(near.commit.len(), 40);
@@ -1037,30 +1380,39 @@ mod tests {
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
         assert_eq!(enso.archive, "enso-v0.1.2.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
+        for name in ["gasless", "privacy-pools", "venice-x402"] {
+            let entry = preinstalled_petal(name).unwrap();
+            assert_eq!(entry.name, name);
+            assert_eq!(entry.commit.len(), 40);
+            assert!(entry.expected_hash.is_some());
+            assert!(!entry.default_eligible);
+        }
+        assert!(preinstalled_petal("polymarket").is_none());
+        assert!(preinstalled_petal("hyperliquid").is_none());
         assert!(preinstalled_petal("unknown").is_none());
     }
 
     #[test]
     fn existing_preinstalled_package_must_match_source_commit_and_hash() {
-        let entry = preinstalled_petal("polymarket").unwrap();
+        let entry = preinstalled_petal("near-intents").unwrap();
         let hash = entry.expected_hash.unwrap().to_string();
         let mut meta = PetalMeta {
             hash: hash.clone(),
             size: 1,
             installed_at_ms: 1,
-            name: Some("polymarket".into()),
+            name: Some("near-intents".into()),
             caps: Default::default(),
             mode: PetalMode::Local,
             petal: Some(PetalPackageMeta {
-                name: "polymarket".into(),
-                petal_root: "polymarket".into(),
+                name: "near-intents".into(),
+                petal_root: "near-intents".into(),
                 route_index_schema: "test".into(),
             }),
             source: Some(PetalSourceProvenance {
                 source_kind: "github".into(),
                 url: entry.repository.into(),
                 owner: "bloom-directory".into(),
-                repo: "bloom-petal-polymarket".into(),
+                repo: "bloom-petal-near".into(),
                 requested_ref: entry.commit.into(),
                 resolved_commit: entry.commit.into(),
                 selected_tag: None,
@@ -1089,7 +1441,7 @@ mod tests {
             .to_string();
         assert!(err.contains("will not overwrite it automatically"), "{err}");
 
-        meta.source.as_mut().unwrap().repo = "bloom-petal-polymarket".into();
+        meta.source.as_mut().unwrap().repo = "bloom-petal-near".into();
         meta.source.as_mut().unwrap().resolved_commit = entry.commit.into();
         meta.source.as_mut().unwrap().package_hash = "c".repeat(64);
         let err = classify_existing_preinstalled(entry, &meta)
@@ -1186,6 +1538,10 @@ mod tests {
             release_tag,
             archive,
             expected_hash,
+            archive_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+            tooling_commit: "3333333333333333333333333333333333333333",
+            petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+            default_eligible: true,
         }
     }
 
@@ -1487,6 +1843,10 @@ mod tests {
             release_tag: "v0.1.0",
             archive: "unused.petal.tar.gz",
             expected_hash: None,
+            archive_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+            tooling_commit: "3333333333333333333333333333333333333333",
+            petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+            default_eligible: true,
         };
         let release = PetalReleaseManifest {
             schema: "bloom.petal.release.v1".into(),
@@ -1509,6 +1869,93 @@ mod tests {
             daemon.petals.store().list_petal_owners().unwrap(),
             vec![("demo".to_string(), package.hash)]
         );
+    }
+
+    #[test]
+    fn source_build_captures_stdout_and_stderr_instead_of_inheriting_daemon_stdio() {
+        let source = tempfile::tempdir().unwrap();
+        write_source_repo(
+            &source,
+            "bloom-petal-test-output",
+            true,
+            &BuildScript::Output,
+            "output",
+        )
+        .unwrap();
+
+        let output = run_source_build(source.path()).unwrap();
+        assert_eq!(output.stdout, b"{\"routes\": 95}\n");
+        assert_eq!(output.stderr, b"build warning\n");
+    }
+
+    #[test]
+    fn failed_source_build_retains_progress_and_both_output_streams() {
+        let fixture = source_repo_fixture(SourceRepoOptions {
+            repo: "bloom-petal-test-output-failure",
+            tags: vec!["v0.1.0"],
+            include_manifest: true,
+            build_script: BuildScript::OutputFailure,
+        })
+        .unwrap();
+        let repo = source_test_repo(fixture.bare.path(), "bloom-petal-test-output-failure");
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        let daemon = Daemon::from_home(home_dir.clone()).unwrap();
+
+        let error = install_github_source(&home_dir, &daemon, &repo, Some("v0.1.0")).unwrap_err();
+        let failure = source_install_failure(&error).expect("structured source-build failure");
+        assert!(
+            failure
+                .progress
+                .iter()
+                .any(|line| line == "Building source package...")
+        );
+        assert_eq!(failure.stdout, b"partial build output\n");
+        assert_eq!(failure.stderr, b"build exploded\n");
+        assert!(failure.message.contains("status exit status: 42"));
+        assert!(failure.completion_progress.is_empty());
+    }
+
+    #[test]
+    fn successful_build_retains_output_and_full_validation_error_chain() {
+        let fixture = source_repo_fixture(SourceRepoOptions {
+            repo: "bloom-petal-test-invalid-output",
+            tags: vec!["v0.1.0"],
+            include_manifest: true,
+            build_script: BuildScript::InvalidOutput,
+        })
+        .unwrap();
+        let repo = source_test_repo(fixture.bare.path(), "bloom-petal-test-invalid-output");
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        let daemon = Daemon::from_home(home_dir.clone()).unwrap();
+
+        let error = install_github_source(&home_dir, &daemon, &repo, Some("v0.1.0")).unwrap_err();
+        let failure = source_install_failure(&error).expect("structured source-install failure");
+        assert!(String::from_utf8_lossy(&failure.stdout).contains("invalid package generated"));
+        assert!(
+            String::from_utf8_lossy(&failure.stderr).contains("validation should explain this")
+        );
+        assert_eq!(failure.completion_progress, ["Validating Petal package..."]);
+        assert!(failure.message.contains("validate generated Petal package"));
+        assert!(
+            failure.message.contains("invalid wasm"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn captured_build_stream_is_bounded_and_reports_omitted_bytes() {
+        let input = vec![b'x'; SOURCE_BUILD_STREAM_LIMIT + 17];
+        let output = capture_bounded_stream(
+            std::io::Cursor::new(input),
+            None,
+            bloom_daemon::ipc::IpcOutputStream::Stdout,
+        )
+        .unwrap();
+        assert!(output.starts_with(&vec![b'x'; SOURCE_BUILD_STREAM_LIMIT]));
+        assert!(output.ends_with(b"[bloom: output truncated; 17 bytes omitted]\n"));
     }
 
     #[test]
@@ -1547,7 +1994,7 @@ mod tests {
 
     #[test]
     fn release_manifest_is_bound_to_catalog_source_and_artifact() {
-        let entry = preinstalled_petal("polymarket").unwrap();
+        let entry = preinstalled_petal("near-intents").unwrap();
         let repo = parse_github_install_url(entry.repository).unwrap().unwrap();
         let mut manifest = PetalReleaseManifest {
             schema: "bloom.petal.release.v1".into(),
@@ -1556,10 +2003,10 @@ mod tests {
             source_commit: entry.commit.into(),
             release_tag: entry.release_tag.into(),
             archive: entry.archive.into(),
-            archive_sha256: "a".repeat(64),
+            archive_sha256: entry.archive_sha256.into(),
             package_hash: entry.expected_hash.unwrap().into(),
             tooling_repository: "bloom-directory/petal".into(),
-            tooling_commit: "c".repeat(40),
+            tooling_commit: entry.tooling_commit.into(),
         };
         validate_release_manifest(entry, &repo, &manifest).unwrap();
 
@@ -1735,6 +2182,273 @@ mod tests {
             )
             .unwrap();
         assert_eq!(body, b"component");
+    }
+
+    #[tokio::test]
+    async fn source_build_output_streams_early_without_utf8_or_capture_truncation() {
+        #[derive(Clone)]
+        struct FixtureSourceInstaller {
+            home: HomeDir,
+            daemon: Daemon,
+            repo: GitHubRepo,
+        }
+
+        impl bloom_daemon::ipc::PetalSourceInstallService for FixtureSourceInstaller {
+            fn install_source(
+                &self,
+                _params: serde_json::Value,
+                context: bloom_daemon::ipc::IpcOperationContext,
+            ) -> Result<serde_json::Value, String> {
+                let installed = install_github_source_streaming(
+                    &self.home,
+                    &self.daemon,
+                    &self.repo,
+                    Some("v0.1.0"),
+                    &context,
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(serde_json::json!({
+                    "build_stdout_b64": base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &installed.build_stdout,
+                    ),
+                    "build_stderr_b64": base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &installed.build_stderr,
+                    ),
+                }))
+            }
+        }
+
+        let fixture = source_repo_fixture(SourceRepoOptions {
+            repo: "bloom-petal-test-output-ipc",
+            tags: vec!["v0.1.0"],
+            include_manifest: true,
+            build_script: BuildScript::StreamingBinaryOutput,
+        })
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        let daemon = Daemon::from_home(home_dir.clone()).unwrap();
+        let installer = FixtureSourceInstaller {
+            home: home_dir,
+            daemon: daemon.clone(),
+            repo: source_test_repo(fixture.bare.path(), "bloom-petal-test-output-ipc"),
+        };
+        let server = bloom_daemon::ipc::IpcServer::new(daemon.vfs.clone(), "0", vec![])
+            .with_petals(daemon.petals.clone())
+            .with_petal_source_installer(std::sync::Arc::new(installer));
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir.path().join("private-run/bloom.sock");
+        let serving = server.clone();
+        let serving_socket = socket.clone();
+        let task = tokio::spawn(async move { serving.serve(&serving_socket).await.unwrap() });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = bloom_daemon::ipc::IpcClient::new(&socket);
+        let call = tokio::spawn(async move {
+            client
+                .call_streaming(
+                    "petals.install",
+                    serde_json::json!({
+                        "path": "https://github.com/bloom-directory/bloom-petal-test-output-ipc",
+                        "ref": "v0.1.0",
+                    }),
+                    move |event| {
+                        output_tx.send(event).map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "test output receiver closed",
+                            )
+                        })
+                    },
+                )
+                .await
+        });
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let marker = b"\xffbinary-start\n";
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !stdout.windows(marker.len()).any(|window| window == marker) {
+                let event = output_rx.recv().await.expect("streaming output event");
+                match event.stream {
+                    bloom_daemon::ipc::IpcOutputStream::Stdout => {
+                        stdout.extend_from_slice(&event.bytes)
+                    }
+                    bloom_daemon::ipc::IpcOutputStream::Stderr => {
+                        stderr.extend_from_slice(&event.bytes)
+                    }
+                    bloom_daemon::ipc::IpcOutputStream::Data => {
+                        panic!("source build emitted an IPC data stream")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !call.is_finished(),
+            "the first build bytes must arrive while the build is still running"
+        );
+
+        let result = call.await.unwrap().unwrap();
+        while let Ok(event) = output_rx.try_recv() {
+            match event.stream {
+                bloom_daemon::ipc::IpcOutputStream::Stdout => {
+                    stdout.extend_from_slice(&event.bytes)
+                }
+                bloom_daemon::ipc::IpcOutputStream::Stderr => {
+                    stderr.extend_from_slice(&event.bytes)
+                }
+                bloom_daemon::ipc::IpcOutputStream::Data => {
+                    panic!("source build emitted an IPC data stream")
+                }
+            }
+        }
+        assert!(stdout.windows(marker.len()).any(|window| window == marker));
+        assert!(stdout.len() > SOURCE_BUILD_STREAM_LIMIT);
+        assert!(stderr.windows(2).any(|window| window == b"\xfew"));
+        let retained = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            result.result["build_stdout_b64"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(retained.starts_with(marker));
+        assert!(retained.len() < stdout.len());
+
+        server.trigger_shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_cancels_a_blocked_source_build_without_installing() {
+        #[derive(Clone)]
+        struct BlockingFixtureInstaller {
+            home: HomeDir,
+            daemon: Daemon,
+            repo: GitHubRepo,
+            finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl bloom_daemon::ipc::PetalSourceInstallService for BlockingFixtureInstaller {
+            fn install_source(
+                &self,
+                _params: serde_json::Value,
+                context: bloom_daemon::ipc::IpcOperationContext,
+            ) -> Result<serde_json::Value, String> {
+                let result = install_github_source_streaming(
+                    &self.home,
+                    &self.daemon,
+                    &self.repo,
+                    Some("v0.1.0"),
+                    &context,
+                )
+                .map(|_| serde_json::json!({"installed": true}))
+                .map_err(|error| error.to_string());
+                self.finished
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                result
+            }
+        }
+
+        let fixture = source_repo_fixture(SourceRepoOptions {
+            repo: "bloom-petal-test-blocked-ipc",
+            tags: vec!["v0.1.0"],
+            include_manifest: true,
+            build_script: BuildScript::BlockingOutput,
+        })
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let home_dir = HomeDir::at(home.path());
+        let daemon = Daemon::from_home(home_dir.clone()).unwrap();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let installer = BlockingFixtureInstaller {
+            home: home_dir,
+            daemon: daemon.clone(),
+            repo: source_test_repo(fixture.bare.path(), "bloom-petal-test-blocked-ipc"),
+            finished: finished.clone(),
+        };
+        let server = bloom_daemon::ipc::IpcServer::new(daemon.vfs.clone(), "0", vec![])
+            .with_petals(daemon.petals.clone())
+            .with_petal_source_installer(std::sync::Arc::new(installer));
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir.path().join("private-run/bloom.sock");
+        let serving = server.clone();
+        let serving_socket = socket.clone();
+        let server_task =
+            tokio::spawn(async move { serving.serve(&serving_socket).await.unwrap() });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = bloom_daemon::ipc::IpcClient::new(&socket);
+        let call = tokio::spawn(async move {
+            client
+                .call_streaming(
+                    "petals.install",
+                    serde_json::json!({
+                        "path": "https://github.com/bloom-directory/bloom-petal-test-blocked-ipc",
+                        "ref": "v0.1.0",
+                    }),
+                    move |event| {
+                        output_tx.send(event).map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver closed")
+                        })
+                    },
+                )
+                .await
+        });
+        let marker = b"blocking-build-start";
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = output_rx.recv().await.expect("build output event");
+                if event
+                    .bytes
+                    .windows(marker.len())
+                    .any(|window| window == marker)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        call.abort();
+        let _ = call.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            daemon
+                .petals
+                .store()
+                .list_package_hashes()
+                .unwrap()
+                .is_empty()
+        );
+
+        server.trigger_shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -1962,6 +2676,11 @@ mod tests {
 
     enum BuildScript {
         Success,
+        Output,
+        StreamingBinaryOutput,
+        BlockingOutput,
+        OutputFailure,
+        InvalidOutput,
         Failure,
     }
 
@@ -2073,6 +2792,19 @@ summary = "Demo app used by source install tests."
         let script = match build_script {
             BuildScript::Success => format!(
                 "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p petal/{petal_name}\ncp components/route.wasm petal/{petal_name}/hello.txt.wasm\n"
+            ),
+            BuildScript::Output => format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\necho '{{\"routes\": 95}}'\necho 'build warning' >&2\nmkdir -p petal/{petal_name}\ncp components/route.wasm petal/{petal_name}/hello.txt.wasm\n"
+            ),
+            BuildScript::StreamingBinaryOutput => format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\nprintf '\\377binary-start\\n'\nsleep 0.25\nhead -c 300000 /dev/zero | tr '\\000' x\nprintf '\\n'\nprintf '\\376warning\\n' >&2\nmkdir -p petal/{petal_name}\ncp components/route.wasm petal/{petal_name}/hello.txt.wasm\n"
+            ),
+            BuildScript::BlockingOutput => format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\necho 'blocking-build-start'\nsleep 30\nmkdir -p petal/{petal_name}\ncp components/route.wasm petal/{petal_name}/hello.txt.wasm\n"
+            ),
+            BuildScript::OutputFailure => "#!/usr/bin/env bash\nset -euo pipefail\necho 'partial build output'\necho 'build exploded' >&2\nexit 42\n".to_string(),
+            BuildScript::InvalidOutput => format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\necho 'invalid package generated'\necho 'validation should explain this' >&2\nmkdir -p petal/{petal_name}\nprintf 'not wasm' > petal/{petal_name}/broken.wasm\n"
             ),
             BuildScript::Failure => "#!/usr/bin/env bash\nset -euo pipefail\nexit 42\n".to_string(),
         };

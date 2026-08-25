@@ -1,4 +1,4 @@
-//! On-disk layout under `~/.bloom/`.
+//! Machine-owned on-disk layout under `~/.bloom/`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -21,7 +21,7 @@ pub enum HomeError {
     WriteLockHeld { path: PathBuf },
 }
 
-/// Resolves and creates the bloom home directory tree.
+/// Resolves and creates the key-free Machine home directory tree.
 ///
 /// Layout:
 /// ```text
@@ -30,13 +30,6 @@ pub enum HomeError {
 /// ├── audit.jsonl
 /// ├── bloom.sock           # admin socket
 /// ├── events.sock         # streaming events socket
-/// ├── keystore/
-/// │   └── <wallet>/
-/// │       ├── address
-/// │       ├── pubkey
-/// │       ├── kind
-/// │       ├── encrypted.key
-/// │       └── policy.toml
 /// ├── cache/
 /// │   └── cache.db
 /// ├── blobs/
@@ -71,7 +64,6 @@ impl HomeDir {
     pub fn ensure(&self) -> Result<(), HomeError> {
         let dirs = [
             self.root.clone(),
-            self.keystore_dir(),
             self.cache_dir(),
             self.blobs_dir(),
             self.outbox_dir(),
@@ -101,12 +93,6 @@ impl HomeDir {
     }
     pub fn events_socket(&self) -> PathBuf {
         self.root.join("events.sock")
-    }
-    pub fn keystore_dir(&self) -> PathBuf {
-        self.root.join("keystore")
-    }
-    pub fn wallet_dir(&self, name: &str) -> PathBuf {
-        self.keystore_dir().join(name)
     }
     pub fn cache_dir(&self) -> PathBuf {
         self.root.join("cache")
@@ -214,22 +200,11 @@ mod tests {
         assert_eq!(home.audit_path(), td.path().join("audit.jsonl"));
         assert_eq!(home.admin_socket(), td.path().join("bloom.sock"));
         assert_eq!(home.events_socket(), td.path().join("events.sock"));
-        assert_eq!(home.keystore_dir(), td.path().join("keystore"));
         assert_eq!(home.cache_dir(), td.path().join("cache"));
         assert_eq!(home.blobs_dir(), td.path().join("blobs"));
         assert_eq!(home.outbox_dir(), td.path().join("outbox"));
         assert_eq!(home.watch_dir(), td.path().join("watch"));
         assert_eq!(home.logs_dir(), td.path().join("logs"));
-    }
-
-    #[test]
-    fn wallet_dir_joins_under_keystore() {
-        let td = tempdir().unwrap();
-        let home = HomeDir::at(td.path());
-        assert_eq!(
-            home.wallet_dir("alice"),
-            td.path().join("keystore").join("alice")
-        );
     }
 
     #[test]
@@ -241,7 +216,6 @@ mod tests {
         home.ensure().unwrap();
         for d in [
             home.root().to_path_buf(),
-            home.keystore_dir(),
             home.cache_dir(),
             home.blobs_dir(),
             home.outbox_dir(),
@@ -266,6 +240,10 @@ mod tests {
         assert!(!home.audit_path().exists());
         assert!(!home.admin_socket().exists());
         assert!(!home.events_socket().exists());
+        assert!(
+            !home.root().join("keystore").exists(),
+            "ensuring a clean Machine home must not create the legacy keystore"
+        );
     }
 
     #[test]

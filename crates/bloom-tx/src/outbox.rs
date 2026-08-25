@@ -301,11 +301,7 @@ impl Outbox {
         file: &str,
         data: &[u8],
     ) -> Result<(), OutboxError> {
-        if file != "approval_challenge.json"
-            && file != "approval.json"
-            && file != "result.json"
-            && file != "status.json"
-        {
+        if file != "approval_challenge.json" && file != "result.json" && file != "status.json" {
             return Err(OutboxError::Other(format!(
                 "central artifact '{file}' is not runtime-writable"
             )));
@@ -326,11 +322,7 @@ impl Outbox {
         state: OutboxState,
         file: &str,
     ) -> Result<Option<Vec<u8>>, OutboxError> {
-        if file != "approval_challenge.json"
-            && file != "approval.json"
-            && file != "result.json"
-            && file != "status.json"
-        {
+        if file != "approval_challenge.json" && file != "result.json" && file != "status.json" {
             return Err(OutboxError::Other(format!(
                 "central artifact '{file}' is not runtime-readable"
             )));
@@ -1493,7 +1485,7 @@ mod tests {
         let mut a = fake_staged("a");
         a.created_ms = 2_000;
         a.usd_value = Some(999.0); // legacy value must not be trusted
-        a.valuation = Some(bloom_auth_api::ValuationQuote {
+        a.valuation = Some(bloom_proto::ValuationQuote {
             asset_id: "native:anvil".into(),
             amount_base_units: "1".into(),
             usd_micro: 100_000_000,
@@ -1512,7 +1504,7 @@ mod tests {
         b.chain = "base".into();
         b.created_ms = 2_500;
         b.usd_value = Some(999.0); // legacy value must not be trusted
-        b.valuation = Some(bloom_auth_api::ValuationQuote {
+        b.valuation = Some(bloom_proto::ValuationQuote {
             asset_id: "native:base".into(),
             amount_base_units: "1".into(),
             usd_micro: 50_000_000,
@@ -1551,7 +1543,7 @@ mod tests {
     fn sum_usd_since_excludes_current_action_and_failed_legacy_rows() {
         let dir = tempfile::tempdir().unwrap();
         let ob = Outbox::new(dir.path()).unwrap();
-        let quote = |usd_micro| bloom_auth_api::ValuationQuote {
+        let quote = |usd_micro| bloom_proto::ValuationQuote {
             asset_id: "native:anvil".into(),
             amount_base_units: "1".into(),
             usd_micro,
@@ -1830,6 +1822,29 @@ mod tests {
         assert_eq!(files[0].0, "act-final");
         assert_eq!(files[0].1, "sent");
         assert_eq!(files[0].2, "result.json");
+    }
+
+    #[test]
+    fn projection_rejects_legacy_approval_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockProjection::new());
+        let ob = Outbox::new_with_projection(dir.path(), mock.clone()).unwrap();
+
+        let write = ob
+            .write_central_action_artifact(
+                "act-legacy",
+                OutboxState::Pending,
+                "approval.json",
+                b"{}",
+            )
+            .unwrap_err();
+        assert!(write.to_string().contains("not runtime-writable"));
+
+        let read = ob
+            .read_central_action_artifact("act-legacy", OutboxState::Pending, "approval.json")
+            .unwrap_err();
+        assert!(read.to_string().contains("not runtime-readable"));
+        assert!(mock.action_files.lock().unwrap().is_empty());
     }
 
     #[test]

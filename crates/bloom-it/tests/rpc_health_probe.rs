@@ -15,13 +15,7 @@
 //!   either a populated `cooldown_until` or at least one failure
 //!   captured in the rolling window.
 //!
-//! Like the rest of `bloom-it`, the test is gated `#[ignore]` so CI
-//! runs that lack a foundry install (or just don't want to spawn
-//! processes) skip cleanly. Invoke with:
-//!
-//! ```text
-//! cargo test -p bloom-it -- --ignored rpc_health_probe
-//! ```
+//! Requires `anvil` from Foundry on `$PATH`.
 
 use std::time::Duration;
 
@@ -35,7 +29,6 @@ use bloom_proto::ChainSpec;
 const PROBE_WAIT: Duration = Duration::from_secs(17);
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn active_probe_records_success_and_failure() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

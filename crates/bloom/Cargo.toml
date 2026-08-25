@@ -17,24 +17,30 @@ mount = ["bloom-daemon/mount", "dep:bloom-mount"]
 # Pass-through for the heimdall-rs decompile decoder. Build with
 # `cargo build --features bytecode-decompile` to enable.
 bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
-# Development-only private-key loader and approval bypass. Never enable for a
-# production build.
-unsafe-debug-signer = ["bloom-daemon/unsafe-debug-signer"]
+# Out-of-process same-UID integration bootstrap. It adds no custody or signing
+# implementation to Machine and is excluded from release bundles.
+triad-dev-harness = [
+  "bloom-daemon/triad-dev-harness",
+  "bloom-machine-client/triad-dev-harness",
+  "bloom-triad-local-transport/triad-dev-harness",
+]
 
 [dependencies]
 bloom-proto.workspace = true
-bloom-auth-api.workspace = true
 bloom-daemon.workspace = true
+bloom-machine-client.workspace = true
+bloom-triad-local-transport.workspace = true
+bloom-service-activation.workspace = true
+bloom-broker-api.workspace = true
 blake3.workspace = true
 bloom-mount = { workspace = true, optional = true }
-bloom-keystore.workspace = true
 bloom-evm.workspace = true
 bloom-tx.workspace = true
 url.workspace = true
 bloom-vfs.workspace = true
 bloom-update.workspace = true
-bloom-hyperliquid.workspace = true
 bloom-petals.workspace = true
+ed25519-dalek.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
@@ -43,18 +49,24 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_jcs.workspace = true
 toml.workspace = true
 hex.workspace = true
 alloy.workspace = true
 base64.workspace = true
 qrcode.workspace = true
 rand.workspace = true
-rpassword.workspace = true
+rustix.workspace = true
 tempfile.workspace = true
 humantime.workspace = true
-zeroize.workspace = true
 flate2.workspace = true
 sha2.workspace = true
+zeroize.workspace = true
+
+# WebAuthn attestation pulls in OpenSSL. Musl releases cannot link the host's
+# glibc OpenSSL, so build it from source only for musl targets.
+[target.'cfg(target_env = "musl")'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [dev-dependencies]
 assert_cmd = "2"

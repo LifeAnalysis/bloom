@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod address;
+pub mod assurance;
 pub mod audit;
 pub mod audit_ext;
 pub mod capability;
@@ -15,23 +16,22 @@ pub mod chain;
 pub mod config;
 pub mod defi_policy;
 pub mod home;
-pub mod hyperliquid;
-pub mod hyperliquid_policy;
-pub mod hyperliquid_review;
-pub mod hyperliquid_session;
 pub mod intent;
+pub mod petal_identity;
 pub mod plan;
 pub mod policy;
 pub mod polymarket_policy;
 pub mod serde_micro;
 pub mod tokens;
 pub mod units;
+pub mod valuation;
 
 pub use address::{AddressBook, AddressBookError, checksum_address, parse_address};
-pub use audit::{AuditLog, AuditRecord};
+pub use assurance::AssuranceLevel;
+pub use audit::{AuditIdentity, AuditLog, AuditRecord, AuditTrustedPredecessor};
 pub use audit_ext::{append_auth_event, auth_event};
 pub use capability::{CapabilityStatus, CapabilityViewEntry, SigningModel, Venue};
-pub use ceremony::{CeremonyIntent, CeremonyIntentKind, policy_session_mint_intent};
+pub use ceremony::{CeremonyIntent, CeremonyIntentKind};
 pub use chain::{ChainId, ChainRef, ChainSpec, EndpointSpec, default_endpoint_weight};
 pub use config::{
     Backend, BackendsConfig, Config, ConfigError, EnsoConfig, EtherscanConfig, MempoolChainConfig,
@@ -39,16 +39,9 @@ pub use config::{
 };
 pub use defi_policy::{DefiPolicy, DefiRouteCtx, ReceiverClass, evaluate_defi_route};
 pub use home::{HomeDir, HomeError, HomeWritePermit};
-pub use hyperliquid_policy::{
-    HyperliquidActionCtx, HyperliquidPolicy, evaluate_hyperliquid_action,
-};
-pub use hyperliquid_review::{
-    DEFAULT_HYPERLIQUID_AGENT_SESSION_NAME, hyperliquid_write_unlock_intent,
-    resolve_hyperliquid_agent_session_name,
-};
-pub use hyperliquid_session::{BreachAction, HyperliquidSession, SessionStatus};
 pub use intent::{
-    EnsoIntent, GasStrategy, RawIntent, RawIntentBody, ShellIntent, TxIntent, ValueOrToken,
+    EnsoIntent, GasStrategy, INTENT_HASH_DOMAIN, RawIntent, RawIntentBody, ShellIntent, TxIntent,
+    ValueOrToken, intent_hash_of,
 };
 pub use plan::{NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxActionKind, TxStatus};
 pub use policy::{
@@ -60,6 +53,7 @@ pub use policy::{
 };
 pub use polymarket_policy::PolymarketPolicy;
 pub use units::{ParsedAmount, format_units, parse_amount, parse_eth, parse_units};
+pub use valuation::{ValuationError, ValuationPolicy, ValuationQuote};
 
 /// Re-exports of alloy types we use across the workspace.
 pub mod prelude {

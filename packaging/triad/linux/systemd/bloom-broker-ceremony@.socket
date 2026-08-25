@@ -1,0 +1,16 @@
+[Unit]
+Description=Bloom canonical ceremony listener for login UID %i
+
+[Socket]
+ListenStream=127.0.0.1:18734
+FileDescriptorName=broker-ceremony
+Service=bloom-broker@%i.service
+Accept=no
+FreeBind=no
+ReusePort=no
+Backlog=128
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=sockets.target

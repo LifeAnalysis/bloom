@@ -1,7 +1,15 @@
 # Passkey wallets
 
-Status: implemented — passkeys branch
+Status: superseded historical design
 Date: 2026-05-28
+
+> **Superseded:** This document describes the removed pre-triad Machine-local
+> passkey and keystore implementation. Production custody ceremonies are owned
+> by Broker and WebAuthn/PRF verification and all key material are owned by
+> Signer. Machine receives only public projections. See
+> `2026-07-23-triad-process-architecture.md` and
+> `2026-07-31-machine-legacy-authority-removal.md`. Do not implement or operate
+> the endpoints, recovery flow, or filesystem layout below.
 
 ---
 

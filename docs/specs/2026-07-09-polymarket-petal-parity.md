@@ -2,8 +2,15 @@
 
 ## Status
 
-Implementation specification. This document excludes geoblock and jurisdiction
-enforcement from scope.
+Historical implementation specification; authority portions are superseded.
+This document excludes geoblock and jurisdiction enforcement from scope.
+
+> **Authority amendment:** Do not implement the daemon-owned ceremony, grant,
+> `approval.json`, or hash-only `bloom:sign/signing@0.1.0` paths below. They are
+> retired and fail closed. Current Petals use the payload-bearing `@0.2.0`
+> interface through Machine's authenticated Broker client; Broker authorizes
+> and Signer signs. This annotation does not change the pinned Polymarket Petal
+> itself.
 
 ## Objective
 

@@ -1,9 +1,17 @@
 # Bloom Paid HTTP Requests
 
-**Status:** draft  
+**Status:** pre-triad draft; authority sections superseded
 **Date:** 2026-06-15  
 **Owners:** —  
 **Audience:** Bloom engineers, product, protocol collaborators
+
+> **Authority amendment:** Paid-request UX and protocol parsing remain useful
+> context, but all keystore, Machine ceremony, in-memory approval, grant, and
+> host-signing instructions below are superseded. Production Machine stages the
+> exact request; Broker authorizes it; Signer signs the exact credential or
+> transaction payload. Current authority is defined by
+> `2026-07-23-triad-process-architecture.md` and
+> `2026-07-31-machine-legacy-authority-removal.md`.
 
 ## 1. Summary
 

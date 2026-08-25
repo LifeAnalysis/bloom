@@ -1,9 +1,18 @@
 # Sealed Approval Ceremony
 
-**Status:** definitive target spec  
+**Status:** superseded historical design
 **Date:** 2026-07-02  
 **Audience:** Bloom engineers and future implementation agents  
 **Supersedes:** informal "Layer B" auth language  
+
+> **Superseded:** The triad architecture and the Machine legacy-authority
+> removal spec replace this document's Machine-owned ceremony, PRF, grant,
+> policy-signature, and signing model. Broker owns reviews, ceremonies,
+> approvals, reservations, and budgets; Signer owns credentials, keys, and
+> signing. Machine only stages work and projects public state. See
+> `2026-07-23-triad-process-architecture.md` and
+> `2026-07-31-machine-legacy-authority-removal.md`. The flow below is retained
+> only as pre-triad history and is not an implementation or operator contract.
 
 ## 1. Summary
 

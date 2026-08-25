@@ -1,10 +1,8 @@
-//! `bloom` — bloom daemon and CLI.
+//! `bloom` — key-free Bloom Machine CLI and runtime.
 //!
-//! For v1, the CLI drives the same in-process daemon — there's no
-//! separate long-running server. Each invocation builds the daemon,
-//! performs the requested VFS operation, and exits. A `serve` subcommand
-//! exists as a placeholder for the eventual long-running NFS-mounted
-//! daemon.
+//! Machine owns reads, staging, simulation, broadcast, and public projections.
+//! Every production custody, approval, and signing operation crosses its
+//! authenticated Broker edge; Signer alone owns wallet key material.
 
 #![forbid(unsafe_code)]
 
@@ -12,10 +10,12 @@ mod commands {
     pub mod qr;
 }
 mod github_source;
+mod pf_monitor;
+mod session_sentinel;
+mod triad_enrollment;
 
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,21 +25,19 @@ static UPDATE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use bloom_auth_api::{ApprovalChallenge, AssuranceLevel, SignerTransport, UnsignedApproval};
 use bloom_daemon::Daemon;
-use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
-use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork, UsdSendRequest, pretty_json};
-use bloom_proto::{AuditRecord, CeremonyIntent, CeremonyIntentKind, HomeDir, HomeWritePermit};
-use bloom_tx::TxEngineError;
-use bloom_vfs::{
-    VfsPath,
-    handler::{Entry, EntryKind, Handler, HandlerError},
+use bloom_daemon::ipc::{
+    IpcCallResult, IpcClient, IpcClientError, IpcOutputEvent, IpcOutputStream, IpcProtocolRange,
+    IpcServer, MachineCeremonyAction, MachineCommand, MachineCommandFuture, MachineCommandOutput,
+    MachineCommandService, MachineCustodyKind, MachineError, MachineErrorKind,
+    MachineOperationAction, default_socket_path,
 };
+use bloom_machine_client::MachineJournalHeadProvider;
+use bloom_proto::{AuditIdentity, AuditLog, HomeDir, HomeWritePermit};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
-use zeroize::{Zeroize as _, Zeroizing};
 
 #[cfg(target_os = "linux")]
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
@@ -49,19 +47,9 @@ const DEFAULT_MOUNT_PATH: &str = "/Volumes/bloom";
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
 
 const ALPHA_DISCLOSURE: &str = "⚠️  Bloom is experimental, unaudited alpha software. Do not use with funds you cannot afford to lose. Review every generated transaction plan before signing.";
-const PASSKEY_WRITE_UNLOCKED_DISABLED: &str = "write_unlocked is disabled for passkey wallets; \
-stage a Sealed Approval action and sign through PetalHost::sign_hash";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EndpointSource {
-    Default,
-    Explicit,
-}
-
 #[derive(Debug, Clone)]
 struct ResolvedEndpoint {
     socket: PathBuf,
-    source: EndpointSource,
     display: String,
 }
 
@@ -71,7 +59,6 @@ impl ResolvedEndpoint {
         Self {
             display: format!("unix:{}", socket.display()),
             socket,
-            source: EndpointSource::Default,
         }
     }
 
@@ -80,7 +67,6 @@ impl ResolvedEndpoint {
         Ok(Self {
             display: format!("unix:{}", path.display()),
             socket: path,
-            source: EndpointSource::Explicit,
         })
     }
 
@@ -88,12 +74,7 @@ impl ResolvedEndpoint {
         Self {
             display: format!("unix:{}", path.display()),
             socket: path,
-            source: EndpointSource::Explicit,
         }
-    }
-
-    fn is_explicit(&self) -> bool {
-        matches!(self.source, EndpointSource::Explicit)
     }
 }
 
@@ -131,38 +112,1610 @@ fn resolve_server_endpoint(home: &HomeDir, endpoint: Option<&str>) -> Result<Res
     Ok(ResolvedEndpoint::default_for_home(home))
 }
 
+fn configured_broker_client(home: &HomeDir) -> Result<bloom_machine_client::MachineBrokerClient> {
+    configured_broker_client_with_activation(home, false)
+}
+
+fn validate_wallet_name(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            ),
+        "wallet name must be 1-64 ASCII alphanumeric, '-' or '_' characters"
+    );
+    Ok(())
+}
+
+fn configured_broker_client_with_activation(
+    home: &HomeDir,
+    allow_activating: bool,
+) -> Result<bloom_machine_client::MachineBrokerClient> {
+    let client = configured_raw_broker_client_with_activation(allow_activating)?;
+    let identity = client
+        .local_application_identity()
+        .context("authenticated Machine client did not retain its application identity")?;
+    let audit = Arc::new(open_configured_machine_audit_with_activation(
+        home,
+        identity,
+        allow_activating,
+    )?);
+    let checkpoint_root = configured_machine_checkpoint_path_with_activation(allow_activating)?;
+    #[cfg(feature = "triad-dev-harness")]
+    let history_owner = if std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").is_some() {
+        rustix::process::geteuid().as_raw()
+    } else {
+        0
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let history_owner = 0;
+    let authority_history = bloom_machine_client::AuthorityEdgeHistory::load_trusted(
+        configured_authority_edge_history_path_with_activation(allow_activating)?,
+        history_owner,
+    )
+    .map_err(anyhow::Error::new)
+    .context("load packaging-owned authority-edge application-key history")?;
+    client
+        .attach_authority_journal_with_history(
+            Arc::new(ConfiguredMachineAuditHead(audit)),
+            checkpoint_root,
+            rustix::process::geteuid().as_raw(),
+            authority_history,
+        )
+        .map_err(anyhow::Error::new)
+        .context("attach signed Machine authority-edge journal")?;
+    Ok(client)
+}
+
+fn configured_raw_broker_client_with_activation(
+    allow_activating: bool,
+) -> Result<bloom_machine_client::MachineBrokerClient> {
+    let installed = installed_macos_triad_paths_with_activation(allow_activating)?;
+    let broker_socket = std::env::var_os("BLOOM_BROKER_SOCKET")
+        .map(std::path::PathBuf::from)
+        .or_else(|| installed.as_ref().map(|paths| paths.broker_socket.clone()))
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/run/bloom/broker.sock"));
+    let machine_identity = std::env::var_os("BLOOM_MACHINE_IDENTITY")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            installed
+                .as_ref()
+                .map(|paths| paths.machine_identity.clone())
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/run/bloom/machine-identity.json"));
+    let edge_manifest = std::env::var_os("BLOOM_EDGE_MANIFEST")
+        .map(std::path::PathBuf::from)
+        .or_else(|| installed.as_ref().map(|paths| paths.edge_manifest.clone()))
+        .unwrap_or_else(|| std::path::PathBuf::from("/etc/bloom/edge-manifest.json"));
+    #[cfg(feature = "triad-dev-harness")]
+    let client = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
+        Some(root) => bloom_machine_client::MachineBrokerClient::connect_unix_from_developer_files(
+            root,
+            broker_socket.clone(),
+            machine_identity.clone(),
+            edge_manifest.clone(),
+        ),
+        None => bloom_machine_client::MachineBrokerClient::connect_unix_from_files(
+            broker_socket.clone(),
+            machine_identity.clone(),
+            edge_manifest.clone(),
+        ),
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let client = bloom_machine_client::MachineBrokerClient::connect_unix_from_files(
+        broker_socket,
+        machine_identity,
+        edge_manifest,
+    );
+    client.context("load authenticated Machine-to-Broker edge")
+}
+
+async fn installed_triad_health_check(expected_build: &str) -> Result<()> {
+    use bloom_broker_api::{
+        Digest32, Empty, MachineBrokerRequest, MachineBrokerResponse, ReadinessState,
+    };
+
+    let expected_build =
+        Digest32::new(expected_build.to_owned()).context("parse expected release digest")?;
+    let installed = installed_macos_triad_paths_with_activation(true)
+        .ok()
+        .flatten();
+    let home = HomeDir::resolve("~/.bloom").context("resolve Machine home for health check")?;
+    let client = configured_broker_client_with_activation(&home, true)
+        .map_err(|error| enrich_broker_startup_failure(error, installed.as_ref()))?;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.request(MachineBrokerRequest::BrokerReadiness(Empty {})),
+    )
+    .await
+    .context("authenticated Broker readiness timed out")
+    .map_err(|error| enrich_broker_startup_failure(error, installed.as_ref()))?
+    .context("request authenticated Broker readiness")
+    .map_err(|error| enrich_broker_startup_failure(error, installed.as_ref()))?;
+    let readiness = match response {
+        MachineBrokerResponse::BrokerReadiness(readiness) => readiness,
+        _ => bail!("Broker returned the wrong response to broker.readiness"),
+    };
+    if readiness.service_id.as_str() != "bloom-broker"
+        || readiness.build_digest != expected_build
+        || readiness.state != ReadinessState::Ready
+    {
+        bail!(
+            "Broker/Signer triad is not ready on the exact installed build: service_id={}, observed_build={}, expected_build={}, state={:?}, conditions={}",
+            readiness.service_id,
+            readiness.build_digest,
+            expected_build,
+            readiness.state,
+            serde_json::to_string(&readiness.conditions)
+                .unwrap_or_else(|_| "[\"unreportable\"]".into())
+        );
+    }
+    Ok(())
+}
+
+fn configured_broker_connection(
+    _home: &HomeDir,
+) -> Result<(
+    bloom_machine_client::MachineBrokerClient,
+    bloom_broker_api::ProvenanceCatalog,
+)> {
+    // Daemon construction attaches this raw authenticated client to the exact
+    // AuditLog instance it owns before any RPC can be dispatched.
+    let broker = configured_raw_broker_client_with_activation(false)?;
+    let installed = installed_macos_triad_paths()?;
+    let provenance_catalog = std::env::var_os("BLOOM_PROVENANCE_CATALOG")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            installed
+                .as_ref()
+                .map(|paths| paths.provenance_catalog.clone())
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("/etc/bloom/provenance-catalog.json"));
+    #[cfg(feature = "triad-dev-harness")]
+    let catalog = match std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT") {
+        Some(root) => {
+            bloom_machine_client::load_developer_provenance_catalog(root, &provenance_catalog)
+        }
+        None => bloom_machine_client::load_provenance_catalog(&provenance_catalog),
+    }
+    .context("load installer-owned provenance catalog")?;
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let catalog = bloom_machine_client::load_provenance_catalog(provenance_catalog)
+        .context("load installer-owned provenance catalog")?;
+    Ok((broker, catalog))
+}
+
+#[derive(Clone)]
+struct InstalledMacosTriadPaths {
+    broker_socket: PathBuf,
+    machine_identity: PathBuf,
+    edge_manifest: PathBuf,
+    provenance_catalog: PathBuf,
+    machine_audit_history: PathBuf,
+    authority_edge_history: PathBuf,
+    startup_status: PathBuf,
+    broker_uid: u32,
+    machine_broker_gid: u32,
+}
+
+fn installed_macos_triad_paths() -> Result<Option<InstalledMacosTriadPaths>> {
+    installed_macos_triad_paths_with_activation(false)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn enrollment_state_is_usable(state: &str, allow_activating: bool) -> bool {
+    state == "active" || (allow_activating && state == "activating")
+}
+
+fn installed_macos_triad_paths_with_activation(
+    allow_activating: bool,
+) -> Result<Option<InstalledMacosTriadPaths>> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = allow_activating;
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let uid = rustix::process::geteuid().as_raw();
+        let enrollment = PathBuf::from(format!(
+            "/Library/Application Support/BloomTriad/enrollments/{uid}.json"
+        ));
+        let metadata = match std::fs::symlink_metadata(&enrollment) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("inspect installed Bloom enrollment"),
+        };
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o022 != 0
+            || metadata.nlink() != 1
+        {
+            bail!("installed Bloom enrollment has unsafe ownership or type");
+        }
+        let enrollment_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&enrollment)?)
+                .context("decode installed Bloom enrollment")?;
+        if enrollment_value
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            != Some("bloom.macos-enrollment.1")
+            || enrollment_value
+                .get("login_uid")
+                .and_then(serde_json::Value::as_u64)
+                != Some(u64::from(uid))
+        {
+            bail!("installed Bloom enrollment identity does not match this login");
+        }
+        let state = enrollment_value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .context("installed Bloom enrollment has no state")?;
+        if !enrollment_state_is_usable(state, allow_activating) {
+            bail!("installed Bloom enrollment is not active");
+        }
+        let broker_uid = u32::try_from(
+            enrollment_value
+                .get("broker_uid")
+                .and_then(serde_json::Value::as_u64)
+                .context("installed Bloom enrollment has no Broker UID")?,
+        )
+        .context("installed Bloom Broker UID is outside the platform range")?;
+        let machine_broker_gid = u32::try_from(
+            enrollment_value
+                .get("machine_broker_gid")
+                .and_then(serde_json::Value::as_u64)
+                .context("installed Bloom enrollment has no Machine-Broker GID")?,
+        )
+        .context("installed Bloom Machine-Broker GID is outside the platform range")?;
+        let config = PathBuf::from(format!(
+            "/Library/Application Support/BloomTriad/config/{uid}"
+        ));
+        Ok(Some(InstalledMacosTriadPaths {
+            broker_socket: PathBuf::from(format!(
+                "/private/var/run/bloom/{uid}/machine-broker/broker.sock"
+            )),
+            machine_identity: config.join("machine/identity.json"),
+            edge_manifest: config.join("edge-manifest.json"),
+            provenance_catalog: config.join("provenance-catalog.json"),
+            machine_audit_history: config.join("machine-audit-history.json"),
+            authority_edge_history: config.join("authority-edge-history.json"),
+            startup_status: PathBuf::from(format!(
+                "/private/var/run/bloom/{uid}/status/broker-startup.json"
+            )),
+            broker_uid,
+            machine_broker_gid,
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(None)
+}
+
+fn enrich_broker_startup_failure(
+    error: anyhow::Error,
+    installed: Option<&InstalledMacosTriadPaths>,
+) -> anyhow::Error {
+    let Some(diagnostic) = installed.and_then(read_broker_startup_failure) else {
+        return error;
+    };
+    anyhow::anyhow!("{diagnostic}; authenticated Broker readiness failed: {error:#}")
+}
+
+fn read_broker_startup_failure(paths: &InstalledMacosTriadPaths) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(&paths.startup_status).ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != paths.broker_uid
+        || metadata.gid() != paths.machine_broker_gid
+        || metadata.mode() & 0o777 != 0o640
+        || metadata.nlink() != 1
+        || metadata.len() > 1024
+    {
+        return None;
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&paths.startup_status).ok()?).ok()?;
+    if value.as_object().map(serde_json::Map::len) != Some(6)
+        || value.get("schema").and_then(serde_json::Value::as_str) != Some("bloom.broker-startup.1")
+        || value.get("state").and_then(serde_json::Value::as_str) != Some("fatal")
+        || value.get("address").and_then(serde_json::Value::as_str) != Some("127.0.0.1:18734")
+        || value
+            .get("observed_at_ms")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+    {
+        return None;
+    }
+    let incident = value.get("incident").and_then(serde_json::Value::as_str)?;
+    let expected_message = match incident {
+        "another_login_session" => "another login session owns the Bloom ceremony listener",
+        "foreign_or_unverifiable_process" => {
+            "a foreign or unverifiable process owns the Bloom ceremony listener"
+        }
+        _ => return None,
+    };
+    if value.get("message").and_then(serde_json::Value::as_str) != Some(expected_message) {
+        return None;
+    }
+    Some(format!("Bloom Broker startup failed: {expected_message}"))
+}
+
+#[cfg(test)]
+mod broker_startup_failure_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    fn installed_paths(startup_status: PathBuf) -> InstalledMacosTriadPaths {
+        let metadata = std::fs::symlink_metadata(
+            startup_status
+                .parent()
+                .expect("startup status has a parent"),
+        )
+        .expect("status parent metadata");
+        InstalledMacosTriadPaths {
+            broker_socket: PathBuf::new(),
+            machine_identity: PathBuf::new(),
+            edge_manifest: PathBuf::new(),
+            provenance_catalog: PathBuf::new(),
+            machine_audit_history: PathBuf::new(),
+            authority_edge_history: PathBuf::new(),
+            startup_status,
+            broker_uid: metadata.uid(),
+            machine_broker_gid: metadata.gid(),
+        }
+    }
+
+    #[test]
+    fn machine_reports_only_an_exact_authenticated_startup_diagnostic() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let path = temporary.path().join("broker-startup.json");
+        std::fs::write(
+            &path,
+            br#"{"schema":"bloom.broker-startup.1","state":"fatal","incident":"another_login_session","address":"127.0.0.1:18734","message":"another login session owns the Bloom ceremony listener","observed_at_ms":1}"#,
+        )
+        .expect("write startup diagnostic");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("set startup diagnostic permissions");
+        let installed = installed_paths(path.clone());
+
+        assert_eq!(
+            read_broker_startup_failure(&installed).as_deref(),
+            Some(
+                "Bloom Broker startup failed: another login session owns the Bloom ceremony listener"
+            )
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("weaken startup diagnostic permissions");
+        assert!(read_broker_startup_failure(&installed).is_none());
+    }
+}
+
 fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {
     let permit = Arc::new(HomeWritePermit::acquire(&home)?);
-    let daemon = Daemon::from_home_with_permit(home, permit.clone()).context("build daemon")?;
+    // Loading the authenticated edge is local and does not connect to Broker.
+    // Production Machine must retain that application identity even while the
+    // Broker process is down so its own audit journal never falls back to an
+    // unsigned/best-effort mode.
+    let daemon = match configured_broker_connection(&home) {
+        Ok((broker, catalog)) => {
+            Daemon::from_home_with_permit_and_broker(home, permit.clone(), broker, catalog)
+                .context("build daemon")?
+        }
+        Err(error) => {
+            #[cfg(debug_assertions)]
+            {
+                debug!(error = %error, "authenticated Broker edge absent; using key-free debug Machine composition");
+                Daemon::from_home_with_permit_without_broker_for_debug(home, permit.clone())
+                    .context("build key-free debug daemon")?
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                return Err(error).context("load authenticated Machine identity and Broker edge");
+            }
+        }
+    };
     Ok((permit, daemon))
 }
 
-fn set_default_wallet_if_empty(home: &HomeDir, wallet: &str) -> Result<bool> {
-    let path = home.config_path();
-    let mut cfg = bloom_proto::Config::load_or_init(&path)
-        .with_context(|| format!("load config {}", path.display()))?;
-    if cfg
-        .default_wallet
-        .as_deref()
-        .is_none_or(|w| w.trim().is_empty())
-    {
-        cfg.default_wallet = Some(wallet.to_string());
-        cfg.save(&path)
-            .with_context(|| format!("save config {}", path.display()))?;
-        Ok(true)
-    } else {
-        Ok(false)
+fn machine_audit_status(audit: &AuditLog) -> serde_json::Value {
+    let (pending, pending_read_error) = match audit.pending_effect_correlations() {
+        Ok(pending) => (pending, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    let degradation = audit
+        .mutation_degradation()
+        .or_else(|| pending_read_error.clone());
+    let first_pending = pending.first().cloned();
+    serde_json::json!({
+        "service_id": "bloom-machine",
+        "sequence": audit.sequence(),
+        "head": audit.head_hash(),
+        "mutation_degradation": degradation,
+        "pending_effect_correlation": first_pending,
+        "pending_effect_correlations": pending,
+        "pending_effect_read_error": pending_read_error,
+        "required_confirmation": first_pending.as_ref().map(|correlation| {
+            serde_json::json!({
+                "committed": format!("RECONCILE MACHINE AUDIT {correlation} AS COMMITTED"),
+                "aborted": format!("RECONCILE MACHINE AUDIT {correlation} AS ABORTED"),
+            })
+        }),
+    })
+}
+
+fn machine_audit_status_output(audit: &AuditLog) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&machine_audit_status(audit))?)
+}
+
+fn execute_audit_command(command: &AuditCmd, audit: &AuditLog) -> Result<String> {
+    match command {
+        AuditCmd::Status => machine_audit_status_output(audit),
+        AuditCmd::Reconcile {
+            correlation_id,
+            outcome,
+            confirm,
+        } => Ok(serde_json::to_string_pretty(
+            &audit.reconcile_pending_effect(correlation_id, outcome, confirm)?,
+        )?),
     }
+}
+
+fn open_configured_machine_audit_with_activation(
+    home: &HomeDir,
+    identity: bloom_triad_local_transport::LocalIdentity,
+    allow_activating: bool,
+) -> Result<AuditLog> {
+    let history_path = configured_machine_audit_history_path_with_activation(allow_activating)?;
+    open_machine_audit_with_history(home, identity, &history_path)
+}
+
+fn open_machine_audit_with_history(
+    home: &HomeDir,
+    identity: bloom_triad_local_transport::LocalIdentity,
+    history_path: &Path,
+) -> Result<AuditLog> {
+    let (history, history_error) = match AuditLog::load_root_trusted_history(history_path) {
+        Ok(history) => (history, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!(
+                "packaging-pinned Machine audit history is invalid: {error}"
+            )),
+        ),
+    };
+    let audit = AuditLog::open_signed_with_history(
+        home.audit_path(),
+        AuditIdentity::new(
+            identity.service_id.as_str(),
+            identity.application_key_id.as_str(),
+            identity.signing_key,
+        ),
+        &history,
+    )
+    .context("open signed Machine audit journal")?;
+    if let Some(reason) = history_error {
+        audit.latch_mutations(reason);
+    }
+    Ok(audit)
+}
+
+struct ConfiguredMachineAuditHead(Arc<AuditLog>);
+
+impl MachineJournalHeadProvider for ConfiguredMachineAuditHead {
+    fn verified_head(
+        &self,
+    ) -> Result<(u64, bloom_broker_api::Digest32), bloom_broker_api::ProtocolError> {
+        if let Some(reason) = self.0.mutation_degradation() {
+            return Err(bloom_broker_api::ProtocolError::new(
+                bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                format!("Machine audit journal is degraded: {reason}"),
+            ));
+        }
+        let hash = self.0.head_hash();
+        let hash = if hash.is_empty() {
+            "00".repeat(32)
+        } else {
+            hash
+        };
+        Ok((self.0.sequence(), bloom_broker_api::Digest32::new(hash)?))
+    }
+
+    fn latch_mutations(&self, reason: String) {
+        self.0.latch_mutations(reason);
+    }
+}
+
+fn configured_machine_checkpoint_path_with_activation(allow_activating: bool) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    if installed_macos_triad_paths_with_activation(allow_activating)?.is_some() {
+        return Ok(PathBuf::from(format!(
+            "/private/var/db/bloom/{uid}/machine/audit-checkpoints"
+        )));
+    }
+    Ok(PathBuf::from(format!(
+        "/var/lib/bloom/{uid}/machine/audit-checkpoints"
+    )))
+}
+
+fn configured_authority_edge_history_path_with_activation(
+    allow_activating: bool,
+) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("BLOOM_AUTHORITY_EDGE_HISTORY") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(installed) = installed_macos_triad_paths_with_activation(allow_activating)? {
+        return Ok(installed.authority_edge_history);
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    Ok(PathBuf::from(format!(
+        "/etc/bloom/{uid}/authority-edge-history.json"
+    )))
+}
+
+fn configured_machine_audit_history_path_with_activation(
+    allow_activating: bool,
+) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("BLOOM_MACHINE_AUDIT_HISTORY") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(installed) = installed_macos_triad_paths_with_activation(allow_activating)? {
+        return Ok(installed.machine_audit_history);
+    }
+    #[cfg(unix)]
+    let uid = rustix::process::geteuid().as_raw();
+    #[cfg(not(unix))]
+    let uid = 0_u32;
+    Ok(PathBuf::from(format!(
+        "/etc/bloom/{uid}/machine-audit-history.json"
+    )))
+}
+
+async fn launch_custody_ceremony(
+    home: &HomeDir,
+    requested_name: &str,
+    method: bloom_machine_client::CustodyPrepareMethod,
+    ceremony_kind: bloom_broker_api::CeremonyKind,
+    wallet_id: Option<bloom_broker_api::Token>,
+    expected_input_class: &str,
+    legacy_migration: Option<LegacyMigrationLaunch>,
+) -> Result<String> {
+    use rand::RngCore as _;
+    use sha2::Digest as _;
+
+    validate_wallet_name(requested_name).map_err(|error| {
+        machine_error(
+            MachineErrorKind::InvalidParams,
+            format!("requested wallet name must be a safe single path segment: {error:#}"),
+        )
+    })?;
+    let requested_wallet_id =
+        bloom_broker_api::Token::new(requested_name.to_owned()).map_err(|error| {
+            machine_error(
+                MachineErrorKind::InvalidParams,
+                format!("requested wallet name must be a protocol token: {error}"),
+            )
+        })?;
+    let client = configured_broker_client(home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
+        )
+    })?;
+    let (operation_id, exact_terms_digest, legacy_passkey_migration) =
+        if let Some(migration) = legacy_migration {
+            (
+                migration.operation_id,
+                migration.exact_terms_digest,
+                Some(migration.public_terms),
+            )
+        } else {
+            let mut operation_bytes = [0_u8; 32];
+            rand::thread_rng().fill_bytes(&mut operation_bytes);
+            let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
+            let effective_wallet_id = wallet_id
+                .clone()
+                .unwrap_or_else(|| requested_wallet_id.clone());
+            let reviewed_terms = serde_jcs::to_vec(&serde_json::json!({
+                "ceremony_kind": ceremony_kind,
+                "wallet_id": effective_wallet_id,
+            }))
+            .context("canonicalize custody launch terms")?;
+            (
+                operation_id,
+                bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(reviewed_terms).into()),
+                None,
+            )
+        };
+    let response = client
+        .prepare_custody(
+            method,
+            bloom_broker_api::CustodyPrepareRequest {
+                ceremony_kind,
+                custody_operation_id: operation_id,
+                wallet_id: legacy_passkey_migration
+                    .is_none()
+                    .then_some(requested_wallet_id)
+                    .or(wallet_id),
+                key_ref: None,
+                exact_terms_digest,
+                expected_input_class: bloom_broker_api::Token::new(expected_input_class)
+                    .context("custody input class")?,
+                browser_output_recipient_key: None,
+                petal_key_scope: None,
+                legacy_passkey_migration,
+            },
+        )
+        .await
+        .map_err(anyhow::Error::new)
+        .context("prepare Broker custody ceremony")?;
+    let projection = bloom_machine_client::CeremonyProjection::from_custody_prepare(
+        &response,
+        current_unix_ms(),
+    )
+    .map_err(anyhow::Error::new)
+    .context("construct Machine custody projection")?;
+    let projection_path = persist_ceremony_projection(home, &projection)?;
+    Ok(format!(
+        "operation_id: {}\nceremony_kind: {:?}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
+        response.custody_operation_id,
+        response.ceremony_kind,
+        response.ceremony_url,
+        response.ceremony_expires_at_ms.get(),
+        projection_path.display(),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalletRegistrationLaunchProjection {
+    schema: String,
+    requested_name: String,
+    operation_id: bloom_broker_api::OperationId,
+    ceremony_kind: bloom_broker_api::CeremonyKind,
+    ceremony_state: bloom_broker_api::CeremonyState,
+    ceremony_url: Option<String>,
+    ceremony_expires_at_ms: Option<bloom_broker_api::DecimalU64>,
+    signer_contribution_digest: bloom_broker_api::Digest32,
+}
+
+async fn launch_wallet_registration_via_vfs(
+    vfs: &bloom_vfs::Vfs,
+    requested_name: &str,
+) -> Result<String> {
+    validate_wallet_name(requested_name).map_err(|error| {
+        machine_error(
+            MachineErrorKind::InvalidParams,
+            format!("requested wallet name must be a safe single path segment: {error:#}"),
+        )
+    })?;
+    let write_path = bloom_vfs::VfsPath::parse("/wallets/new")?;
+    bloom_vfs::Handler::write(vfs, &write_path, requested_name.as_bytes()).await?;
+
+    let projection_path = format!("/wallets/registrations/{requested_name}/status.json");
+    let projection_path_parsed = bloom_vfs::VfsPath::parse(&projection_path)?;
+    let projection: WalletRegistrationLaunchProjection =
+        serde_json::from_slice(&bloom_vfs::Handler::read(vfs, &projection_path_parsed).await?)
+            .context("decode mounted wallet registration projection")?;
+    let _ = &projection.signer_contribution_digest;
+    if projection.schema != "bloom.machine-wallet-registration-projection.1"
+        || projection.requested_name != requested_name
+        || projection.ceremony_kind != bloom_broker_api::CeremonyKind::WalletRegistration
+        || projection.ceremony_state != bloom_broker_api::CeremonyState::AwaitingUser
+    {
+        return Err(machine_error(
+            MachineErrorKind::Internal,
+            "mounted wallet registration returned a mismatched or non-actionable projection",
+        )
+        .into());
+    }
+    let ceremony_url = projection.ceremony_url.ok_or_else(|| {
+        machine_error(
+            MachineErrorKind::Internal,
+            "mounted wallet registration omitted its ceremony URL",
+        )
+    })?;
+    let ceremony_expires_at_ms = projection.ceremony_expires_at_ms.ok_or_else(|| {
+        machine_error(
+            MachineErrorKind::Internal,
+            "mounted wallet registration omitted its ceremony expiry",
+        )
+    })?;
+    Ok(format!(
+        "operation_id: {}\nceremony_kind: {:?}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
+        projection.operation_id,
+        projection.ceremony_kind,
+        ceremony_url,
+        ceremony_expires_at_ms.get(),
+        projection_path,
+    ))
+}
+
+struct LegacyMigrationLaunch {
+    operation_id: bloom_broker_api::OperationId,
+    exact_terms_digest: bloom_broker_api::Digest32,
+    public_terms: bloom_broker_api::LegacyPasskeyMigrationPublic,
+}
+
+#[derive(Clone)]
+struct DaemonMachineCommands {
+    home: HomeDir,
+    daemon: Daemon,
+}
+
+impl MachineCommandService for DaemonMachineCommands {
+    fn execute(&self, command: MachineCommand) -> MachineCommandFuture<'_> {
+        Box::pin(async move {
+            execute_machine_command(&self.home, &self.daemon, command)
+                .await
+                .map_err(machine_error_from_anyhow)
+        })
+    }
+}
+
+fn machine_error_from_anyhow(error: anyhow::Error) -> MachineError {
+    let message = format!("{error:#}");
+    for cause in error.chain() {
+        if let Some(error) = cause.downcast_ref::<MachineError>() {
+            return MachineError::new(error.kind, error.code.clone(), message);
+        }
+        if let Some(error) = cause.downcast_ref::<bloom_broker_api::ProtocolError>() {
+            return machine_error_from_protocol(error, message);
+        }
+        if let Some(error) = cause.downcast_ref::<bloom_vfs::HandlerError>() {
+            return machine_error_from_handler(error, message);
+        }
+        if cause.downcast_ref::<bloom_vfs::path::PathError>().is_some() {
+            return machine_error(MachineErrorKind::InvalidParams, message);
+        }
+        if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+            return machine_error_from_io(error, message);
+        }
+    }
+    machine_error(MachineErrorKind::Internal, message)
+}
+
+fn machine_error_from_protocol(
+    error: &bloom_broker_api::ProtocolError,
+    message: String,
+) -> MachineError {
+    use bloom_broker_api::ProtocolErrorCode as Code;
+    let kind = match error.code {
+        Code::MalformedFrame
+        | Code::LimitExceededFrame
+        | Code::UnknownField
+        | Code::UnknownMethod
+        | Code::UnsupportedVersion
+        | Code::BackendInvalidRequest => MachineErrorKind::InvalidParams,
+        Code::ApprovalNotFound => MachineErrorKind::NotFound,
+        Code::OperationIdConflict | Code::PolicyBaselineStale | Code::CeremonyReplay => {
+            MachineErrorKind::Conflict
+        }
+        Code::ServiceUnavailable
+        | Code::AssuranceUnavailable
+        | Code::ClockUntrusted
+        | Code::ClockRollback
+        | Code::BackendUnsupported => MachineErrorKind::Unavailable,
+        Code::AmbiguousProviderEffect => MachineErrorKind::Internal,
+        Code::UnauthenticatedPeer
+        | Code::ApprovalExpired
+        | Code::ApprovalRevoked
+        | Code::ApprovalRearmRequired
+        | Code::RevocationEpochUnreconciled
+        | Code::SelectorMismatch
+        | Code::SuiteNotAllowed
+        | Code::KeyrefMismatch
+        | Code::LimitExceededOperations
+        | Code::LimitExceededSignatures
+        | Code::LimitExceededValue
+        | Code::LimitExceededRate
+        | Code::SignerRateBackstopDenied
+        | Code::ClaimInvalid
+        | Code::ProvenanceMismatch
+        | Code::CeremonyRateLimited
+        | Code::CeremonyKindMismatch
+        | Code::QuotaExceeded => MachineErrorKind::PermissionDenied,
+    };
+    machine_error(kind, message)
+}
+
+fn machine_wallet_lookup_error(error: bloom_broker_api::ProtocolError) -> MachineError {
+    use bloom_broker_api::ProtocolErrorCode as Code;
+    let message = error.to_string();
+    match error.code {
+        // The projection reader currently uses BackendInvalidRequest for a
+        // well-formed wallet identifier absent from the authoritative list.
+        // At this operation boundary that is a missing resource, not malformed
+        // command input.
+        Code::BackendInvalidRequest => machine_error(MachineErrorKind::NotFound, message),
+        _ => machine_error_from_protocol(&error, message),
+    }
+}
+
+fn machine_error_from_handler(error: &bloom_vfs::HandlerError, message: String) -> MachineError {
+    let kind = match error {
+        bloom_vfs::HandlerError::NotFound(_) => MachineErrorKind::NotFound,
+        bloom_vfs::HandlerError::PermissionDenied
+        | bloom_vfs::HandlerError::OperationNotPermitted => MachineErrorKind::PermissionDenied,
+        bloom_vfs::HandlerError::Invalid(_)
+        | bloom_vfs::HandlerError::NotADir(_)
+        | bloom_vfs::HandlerError::NotAFile(_)
+        | bloom_vfs::HandlerError::Unsupported(_) => MachineErrorKind::InvalidParams,
+        bloom_vfs::HandlerError::Backend(_) => MachineErrorKind::Internal,
+        bloom_vfs::HandlerError::Io(error) => return machine_error_from_io(error, message),
+    };
+    machine_error(kind, message)
+}
+
+fn machine_error_from_io(error: &std::io::Error, message: String) -> MachineError {
+    let kind = match error.kind() {
+        std::io::ErrorKind::NotFound => MachineErrorKind::NotFound,
+        std::io::ErrorKind::PermissionDenied => MachineErrorKind::PermissionDenied,
+        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::WouldBlock => {
+            MachineErrorKind::Conflict
+        }
+        std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::NotConnected
+        | std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::BrokenPipe => MachineErrorKind::Unavailable,
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+            MachineErrorKind::InvalidParams
+        }
+        _ => MachineErrorKind::Internal,
+    };
+    machine_error(kind, message)
+}
+
+fn machine_error(kind: MachineErrorKind, message: impl Into<String>) -> MachineError {
+    let code = match kind {
+        MachineErrorKind::InvalidParams => "INVALID_ARGUMENT",
+        MachineErrorKind::PermissionDenied => "PERMISSION_DENIED",
+        MachineErrorKind::Unavailable => "UNAVAILABLE",
+        MachineErrorKind::Conflict => "CONFLICT",
+        MachineErrorKind::NotFound => "NOT_FOUND",
+        MachineErrorKind::Internal => "INTERNAL",
+    };
+    MachineError::new(kind, code, message)
+}
+
+async fn execute_machine_command(
+    home: &HomeDir,
+    daemon: &Daemon,
+    command: MachineCommand,
+) -> Result<MachineCommandOutput> {
+    let output = match command {
+        MachineCommand::Status => {
+            let wallets = match daemon.wallet_projections.list_wallets().await {
+                Ok(wallets) => Some(wallets),
+                Err(error)
+                    if error.code == bloom_broker_api::ProtocolErrorCode::ServiceUnavailable =>
+                {
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let mut output = format!(
+                "version: {}\nhome: {}\nchains: {:?}\ndefault_chain: {}\ndefault_wallet: {}\ntry: bloom vfs ls /\n",
+                env!("CARGO_PKG_VERSION"),
+                home.root().display(),
+                daemon.chains.list_names(),
+                daemon.config.default_chain,
+                daemon.config.default_wallet.as_deref().unwrap_or("<none>"),
+            );
+            match wallets {
+                Some(wallets) if wallets.is_empty() => output.push_str("no wallets yet — create one with bloom wallet new main\n"),
+                Some(_) => output.push_str("deposit: bloom wallet address <wallet> --qr\nagent workflow: browse the mounted VFS or use bloom vfs cat/ls/write\n"),
+                None => output.push_str("wallets: unavailable (Broker offline and no cached public projection)\n"),
+            }
+            let mut stderr = String::new();
+            let checker =
+                bloom_update::UpdateChecker::new(env!("CARGO_PKG_VERSION"), home.cache_dir())?;
+            if let Some(snapshot) = checker.quick_check_cached() {
+                let latest = snapshot.latest.as_deref().unwrap_or("?");
+                let available = match snapshot.available() {
+                    bloom_update::UpdateAvailable::OutOfDate => "out_of_date",
+                    bloom_update::UpdateAvailable::UpToDate => "up_to_date",
+                    bloom_update::UpdateAvailable::Unknown => "unknown",
+                };
+                output.push_str(&format!(
+                    "latest_release: {latest}\nupdate_available: {available}\n"
+                ));
+                if matches!(
+                    snapshot.available(),
+                    bloom_update::UpdateAvailable::OutOfDate
+                ) {
+                    let latest_display = latest.strip_prefix('v').unwrap_or(latest);
+                    stderr.push_str(&format!(
+                        "hint: bloom v{latest_display} is available (you have v{}); see /status/update\n",
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                }
+            }
+            return Ok(MachineCommandOutput {
+                stdout: output,
+                stderr,
+                exit_code: 0,
+            });
+        }
+        MachineCommand::AuditStatus => {
+            format!("{}\n", machine_audit_status_output(daemon.audit.as_ref())?)
+        }
+        MachineCommand::AuditReconcile {
+            correlation_id,
+            outcome,
+            confirm,
+        } => format!(
+            "{}\n",
+            execute_audit_command(
+                &AuditCmd::Reconcile {
+                    correlation_id,
+                    outcome,
+                    confirm,
+                },
+                daemon.audit.as_ref(),
+            )?
+        ),
+        MachineCommand::WalletList => {
+            let mut output = String::new();
+            for projection in daemon.wallet_projections.list_wallets().await? {
+                output.push_str(&format!(
+                    "{}\t{}\t{}\n",
+                    projection.wallet.wallet_id,
+                    projection.primary_address()?,
+                    projection.wallet.wallet_kind
+                ));
+            }
+            output
+        }
+        MachineCommand::WalletProjection { name } => {
+            let wallet_id = bloom_broker_api::Token::new(name)?;
+            let projection = daemon
+                .wallet_projections
+                .get_wallet(&wallet_id)
+                .await
+                .map_err(machine_wallet_lookup_error)?;
+            format!("{}\n", serde_json::to_string_pretty(&projection)?)
+        }
+        MachineCommand::WalletAddress { name } => {
+            let wallet_id = bloom_broker_api::Token::new(name)?;
+            let projection = daemon
+                .wallet_projections
+                .get_wallet(&wallet_id)
+                .await
+                .map_err(machine_wallet_lookup_error)?;
+            let address: alloy::primitives::Address = projection.primary_address()?.parse()?;
+            bloom_proto::checksum_address(&address)
+        }
+        MachineCommand::WalletUnlock { name } => {
+            return Err(machine_error(
+                MachineErrorKind::PermissionDenied,
+                format!(
+                    "wallet unlock for '{}' is fail-closed: §17.1 defines wallet.unlock_prepare but §13.1 has no wallet_unlock ceremony_kind",
+                    name
+                ),
+            )
+            .into());
+        }
+        MachineCommand::WalletCustody { name, kind } => {
+            if kind == MachineCustodyKind::New {
+                launch_wallet_registration_via_vfs(&daemon.vfs, &name).await?
+            } else {
+                let (method, ceremony_kind, wallet_id, input_class) = match kind {
+                    MachineCustodyKind::New => {
+                        unreachable!("wallet registration uses the VFS adapter")
+                    }
+                    MachineCustodyKind::Import => (
+                        bloom_machine_client::CustodyPrepareMethod::WalletImport,
+                        bloom_broker_api::CeremonyKind::WalletImport,
+                        None,
+                        "raw-wallet-import",
+                    ),
+                    MachineCustodyKind::Rebind => (
+                        bloom_machine_client::CustodyPrepareMethod::CredentialReplace,
+                        bloom_broker_api::CeremonyKind::CredentialReplace,
+                        Some(bloom_broker_api::Token::new(name.clone())?),
+                        "credential-prf",
+                    ),
+                    MachineCustodyKind::Delete => (
+                        bloom_machine_client::CustodyPrepareMethod::WalletDelete,
+                        bloom_broker_api::CeremonyKind::WalletDelete,
+                        Some(bloom_broker_api::Token::new(name.clone())?),
+                        "none",
+                    ),
+                };
+                launch_custody_ceremony(
+                    home,
+                    &name,
+                    method,
+                    ceremony_kind,
+                    wallet_id,
+                    input_class,
+                    None,
+                )
+                .await?
+            }
+        }
+        MachineCommand::WalletMigrate { receipt } => {
+            let receipt: LegacyMigrationReceiptFile =
+                serde_json::from_value(serde_json::to_value(receipt)?)?;
+            let (name, migration) = receipt.into_launch()?;
+            launch_custody_ceremony(
+                home,
+                &name,
+                bloom_machine_client::CustodyPrepareMethod::WalletImport,
+                bloom_broker_api::CeremonyKind::WalletImport,
+                None,
+                "legacy_passkey_v1_prf",
+                Some(migration),
+            )
+            .await?
+        }
+        MachineCommand::WalletPolicyPrepare {
+            name,
+            policy,
+            assurance_level,
+        } => prepare_policy_update(home, &name, &policy, &assurance_level).await?,
+        MachineCommand::WalletPolicyCommit { operation_id } => {
+            commit_policy_update(home, operation_id).await?
+        }
+        MachineCommand::WalletOutboxCancel {
+            wallet,
+            chain,
+            id,
+            text,
+        } => {
+            execute_wallet_outbox_action(
+                &daemon.vfs,
+                &wallet,
+                &chain,
+                &id,
+                "cancel",
+                text.as_bytes(),
+            )
+            .await?;
+            format!("cancel submitted for {id}\n")
+        }
+        MachineCommand::WalletOutboxReplace {
+            wallet,
+            chain,
+            id,
+            intent,
+        } => {
+            execute_wallet_outbox_action(
+                &daemon.vfs,
+                &wallet,
+                &chain,
+                &id,
+                "replace",
+                intent.as_bytes(),
+            )
+            .await?;
+            format!("replacement submitted for {id}\n")
+        }
+        MachineCommand::Ceremony {
+            action,
+            operation_id,
+        } => {
+            let command = match action {
+                MachineCeremonyAction::Status => CeremonyCmd::Status { operation_id },
+                MachineCeremonyAction::Cancel => CeremonyCmd::Cancel { operation_id },
+                MachineCeremonyAction::Result => CeremonyCmd::Result { operation_id },
+            };
+            handle_ceremony(home, command).await?
+        }
+        MachineCommand::Operation {
+            action,
+            operation_id,
+        } => {
+            let command = match action {
+                MachineOperationAction::Status => OperationCmd::Status { operation_id },
+                MachineOperationAction::Cancel => OperationCmd::Cancel { operation_id },
+            };
+            handle_operation(home, command).await?
+        }
+        MachineCommand::UpdateStatus => handle_update(home, UpdateCmd::Status).await?.0,
+        MachineCommand::UpdateCheck => {
+            let (output, code) = handle_update(home, UpdateCmd::Check).await?;
+            return Ok(MachineCommandOutput {
+                stdout: output,
+                stderr: String::new(),
+                exit_code: code,
+            });
+        }
+        MachineCommand::Completions { shell } => {
+            let shell: Shell = shell
+                .parse()
+                .map_err(|_| machine_error(MachineErrorKind::InvalidParams, "invalid shell"))?;
+            let mut bytes = Vec::new();
+            generate(shell, &mut Cli::command(), "bloom", &mut bytes);
+            String::from_utf8(bytes)?
+        }
+    };
+    Ok(MachineCommandOutput {
+        stdout: output,
+        stderr: String::new(),
+        exit_code: 0,
+    })
+}
+
+async fn execute_wallet_outbox_action(
+    vfs: &bloom_vfs::Vfs,
+    wallet: &str,
+    chain: &str,
+    id: &str,
+    action: &str,
+    body: &[u8],
+) -> Result<()> {
+    for (label, value) in [("wallet", wallet), ("chain", chain), ("id", id)] {
+        if value.is_empty()
+            || value == "."
+            || value == ".."
+            || value
+                .chars()
+                .any(|character| matches!(character, '/' | '\\' | '\0'))
+        {
+            return Err(machine_error(
+                MachineErrorKind::InvalidParams,
+                format!("invalid wallet outbox {label}"),
+            )
+            .into());
+        }
+    }
+    let path = bloom_vfs::VfsPath::parse(&format!(
+        "/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/{action}"
+    ))?;
+    bloom_vfs::Handler::write(vfs, &path, body).await?;
+    Ok(())
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyMigrationReceiptFile {
+    schema: String,
+    operation_id: bloom_broker_api::OperationId,
+    wallet_name: bloom_broker_api::Token,
+    address: String,
+    public_key_fingerprint: bloom_broker_api::Digest32,
+    credential_id_fingerprint: bloom_broker_api::Digest32,
+    legacy_format_version: u8,
+    bundle_digest: bloom_broker_api::Digest32,
+    policy_mode: String,
+    exact_terms_digest: bloom_broker_api::Digest32,
+}
+
+impl LegacyMigrationReceiptFile {
+    fn into_launch(self) -> Result<(String, LegacyMigrationLaunch)> {
+        let public_terms = bloom_broker_api::LegacyPasskeyMigrationPublic {
+            schema: bloom_broker_api::Token::new(self.schema)
+                .context("legacy migration receipt schema")?,
+            wallet_name: self.wallet_name.clone(),
+            address: self.address,
+            public_key_fingerprint: self.public_key_fingerprint,
+            credential_id_fingerprint: self.credential_id_fingerprint,
+            legacy_format_version: self.legacy_format_version,
+            bundle_digest: self.bundle_digest,
+            policy_mode: bloom_broker_api::Token::new(self.policy_mode)
+                .context("legacy migration receipt policy mode")?,
+        };
+        let computed = public_terms
+            .terms_digest(&self.operation_id)
+            .map_err(anyhow::Error::new)
+            .context("validate legacy migration receipt terms")?;
+        if computed != self.exact_terms_digest {
+            anyhow::bail!("legacy migration receipt terms digest does not match its contents");
+        }
+        Ok((
+            self.wallet_name.as_str().to_owned(),
+            LegacyMigrationLaunch {
+                operation_id: self.operation_id,
+                exact_terms_digest: self.exact_terms_digest,
+                public_terms,
+            },
+        ))
+    }
+}
+
+const MAX_POLICY_DOCUMENT_BYTES: u64 = 1024 * 1024;
+
+async fn prepare_policy_update(
+    home: &HomeDir,
+    requested_name: &str,
+    input: &[u8],
+    assurance_level: &str,
+) -> Result<String> {
+    use rand::RngCore as _;
+    use sha2::Digest as _;
+
+    validate_wallet_name(requested_name).map_err(|error| {
+        machine_error(
+            MachineErrorKind::InvalidParams,
+            format!("wallet name must be a safe single path segment: {error:#}"),
+        )
+    })?;
+    let wallet_id = bloom_broker_api::Token::new(requested_name.to_owned())
+        .context("wallet name must be a protocol token")?;
+    let assurance_level = bloom_broker_api::Token::new(assurance_level.to_owned())
+        .context("assurance level must be a protocol token")?;
+    if input.len() as u64 > MAX_POLICY_DOCUMENT_BYTES {
+        return Err(machine_error(
+            MachineErrorKind::InvalidParams,
+            format!(
+                "proposed policy must be a regular file no larger than {MAX_POLICY_DOCUMENT_BYTES} bytes"
+            ),
+        )
+        .into());
+    }
+    let proposed: bloom_broker_api::CanonicalWalletPolicy =
+        serde_json::from_slice(input).map_err(|error| {
+            machine_error(
+                MachineErrorKind::InvalidParams,
+                format!("parse proposed policy as canonical policy JSON: {error}"),
+            )
+        })?;
+    if proposed.wallet_id != wallet_id {
+        return Err(machine_error(
+            MachineErrorKind::InvalidParams,
+            "proposed policy wallet_id does not match requested wallet",
+        )
+        .into());
+    }
+    let proposed_bytes =
+        serde_jcs::to_vec(&proposed).context("canonicalize proposed policy document")?;
+
+    let client = configured_broker_client(home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!("policy update requires the authenticated Machine-to-Broker edge: {error:#}"),
+        )
+    })?;
+    let baseline = client
+        .policy(wallet_id.clone())
+        .await
+        .map_err(anyhow::Error::new)
+        .context("read Signer-authenticated policy baseline from Broker")?;
+    let baseline_bytes = baseline.canonical_policy.decode();
+    anyhow::ensure!(
+        bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&baseline_bytes).into())
+            == baseline.policy_digest,
+        "Broker policy baseline digest does not match its canonical bytes"
+    );
+    let baseline_policy: bloom_broker_api::CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline_bytes).context("parse Broker policy baseline")?;
+    anyhow::ensure!(
+        serde_jcs::to_vec(&baseline_policy).context("canonicalize Broker policy baseline")?
+            == baseline_bytes,
+        "Broker policy baseline is not canonical"
+    );
+    anyhow::ensure!(
+        baseline_policy.wallet_id == wallet_id,
+        "Broker policy baseline names another wallet"
+    );
+
+    let authority_diff_digest =
+        bloom_machine_client::claimed_policy_authority_diff_digest(&baseline_policy, &proposed)
+            .map_err(anyhow::Error::new)
+            .context("digest claimed policy authority diff")?;
+    let mut operation_bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut operation_bytes);
+    let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
+    let request = bloom_broker_api::PolicyUpdateRequest {
+        operation_id,
+        wallet_id,
+        baseline_version: baseline.version,
+        baseline_digest: baseline.policy_digest,
+        proposed_canonical_policy: bloom_broker_api::Base64UrlBytes::from_bytes(&proposed_bytes),
+        proposed_policy_digest: bloom_broker_api::Digest32::from_bytes(
+            sha2::Sha256::digest(&proposed_bytes).into(),
+        ),
+        authority_diff_digest,
+        assurance_level,
+    };
+    let response = client
+        .validate_policy_update(request)
+        .await
+        .map_err(anyhow::Error::new)
+        .context("validate policy update and prepare Broker-originated custody ceremony")?;
+    let projection =
+        bloom_machine_client::CeremonyProjection::from_policy_prepare(&response, current_unix_ms())
+            .map_err(anyhow::Error::new)
+            .context("construct Machine policy-update projection")?;
+    let projection_path = persist_ceremony_projection(home, &projection)?;
+    Ok(format!(
+        "operation_id: {}\nceremony_kind: {:?}\nreview_manifest_digest: {}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
+        response.operation_id,
+        response.ceremony_kind,
+        response.review_manifest_digest,
+        response.ceremony_url,
+        response.ceremony_expires_at_ms.get(),
+        projection_path.display(),
+    ))
+}
+
+async fn commit_policy_update(home: &HomeDir, operation_id: String) -> Result<String> {
+    let operation_id = bloom_broker_api::OperationId::new(operation_id)
+        .context("operation ID must be 64 lowercase hexadecimal characters")?;
+    let client = configured_broker_client(home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!("policy commit requires the authenticated Machine-to-Broker edge: {error:#}"),
+        )
+    })?;
+    let ceremony_receipt = client
+        .custody_result(bloom_broker_api::OperationRequest {
+            operation_id: operation_id.clone(),
+        })
+        .await
+        .map_err(anyhow::Error::new)
+        .context("retrieve completed policy-update ceremony receipt")?;
+    anyhow::ensure!(
+        is_completed_policy_update_receipt(&ceremony_receipt, &operation_id),
+        "policy commit requires the matching completed policy_update ceremony receipt"
+    );
+
+    let receipt = client
+        .commit_policy_update(bloom_broker_api::PolicyCommitUpdateRequest {
+            operation_id: operation_id.clone(),
+            ceremony_receipt,
+        })
+        .await
+        .map_err(anyhow::Error::new)
+        .context("commit policy update through Broker and Signer compare-and-swap")?;
+    anyhow::ensure!(
+        receipt.operation_id == operation_id,
+        "Broker policy commit receipt operation identity mismatch"
+    );
+
+    if let Ok(status) = client.ceremony_status(operation_id.clone()).await {
+        let now_ms = current_unix_ms();
+        let mut projection = match load_ceremony_projection(home, &operation_id)? {
+            Some(mut projection) => {
+                projection
+                    .reconcile_custody(&status, now_ms)
+                    .map_err(anyhow::Error::new)
+                    .context("reconcile committed policy-update projection")?;
+                projection
+            }
+            None => bloom_machine_client::CeremonyProjection::from_custody_status(&status, now_ms)
+                .map_err(anyhow::Error::new)
+                .context("rebuild committed policy-update projection")?,
+        };
+        projection.expire_launch_secret(now_ms);
+        persist_ceremony_projection(home, &projection)?;
+    }
+
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&receipt).context("encode policy commit receipt")?
+    ))
+}
+
+fn is_completed_policy_update_receipt(
+    receipt: &bloom_broker_api::CustodyResult,
+    operation_id: &bloom_broker_api::OperationId,
+) -> bool {
+    receipt.custody_operation_id == *operation_id
+        && receipt.ceremony_kind == bloom_broker_api::CeremonyKind::PolicyUpdate
+        && receipt.public_status == bloom_broker_api::CeremonyState::Succeeded
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn ceremony_projection_path(home: &HomeDir, operation_id: &str) -> PathBuf {
+    home.root()
+        .join("triad")
+        .join("ceremonies")
+        .join(format!("{operation_id}.json"))
+}
+
+fn persist_ceremony_projection(
+    home: &HomeDir,
+    projection: &bloom_machine_client::CeremonyProjection,
+) -> Result<PathBuf> {
+    use std::io::Write as _;
+
+    let operation_id = projection
+        .operation_id()
+        .context("custody projection is missing operation identity")?;
+    let path = ceremony_projection_path(home, operation_id.as_str());
+    let parent = path.parent().context("ceremony projection parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("protect {}", parent.display()))?;
+    }
+    let mut suffix = [0_u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut suffix);
+    let temp_path = parent.join(format!(
+        ".{}.{}.tmp",
+        operation_id.as_str(),
+        hex::encode(suffix)
+    ));
+    let bytes = serde_json::to_vec_pretty(projection).context("encode ceremony projection")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temp_path)
+        .with_context(|| format!("create {}", temp_path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("write {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, &path).with_context(|| format!("publish {}", path.display()))?;
+    Ok(path)
+}
+
+fn load_ceremony_projection(
+    home: &HomeDir,
+    operation_id: &bloom_broker_api::OperationId,
+) -> Result<Option<bloom_machine_client::CeremonyProjection>> {
+    let path = ceremony_projection_path(home, operation_id.as_str());
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let projection = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", path.display()))?;
+            Ok(Some(projection))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+async fn handle_ceremony(home: &HomeDir, command: CeremonyCmd) -> Result<String> {
+    let (operation_id, action) = match command {
+        CeremonyCmd::Status { operation_id } => (operation_id, "status"),
+        CeremonyCmd::Cancel { operation_id } => (operation_id, "cancel"),
+        CeremonyCmd::Result { operation_id } => (operation_id, "result"),
+    };
+    let operation_id = bloom_broker_api::OperationId::new(operation_id)
+        .context("operation ID must be 64 lowercase hexadecimal characters")?;
+    let client = configured_broker_client(home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!(
+                "ceremony operations require the authenticated Machine-to-Broker edge: {error:#}"
+            ),
+        )
+    })?;
+    if action == "result" {
+        let result = client
+            .custody_result(bloom_broker_api::OperationRequest {
+                operation_id: operation_id.clone(),
+            })
+            .await
+            .map_err(anyhow::Error::new)
+            .context("retrieve Broker custody result")?;
+        anyhow::ensure!(
+            result.custody_operation_id == operation_id,
+            "Broker custody result operation identity mismatch"
+        );
+        return Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ceremony_kind": result.ceremony_kind,
+                "operation_id": result.custody_operation_id,
+                "state": result.public_status,
+                "wallet_id": result.wallet_id,
+                "public_key_refs": result.public_key_refs,
+                "credential_summaries": result.credential_summaries,
+                "receipt_digest": result.receipt_digest,
+                "has_encrypted_browser_result": result.encrypted_browser_result.is_some(),
+            }))
+            .context("encode public custody result")?
+        ));
+    }
+
+    let status = if action == "cancel" {
+        client
+            .cancel_ceremony(operation_id.clone())
+            .await
+            .map_err(anyhow::Error::new)
+            .context("cancel Broker ceremony")?
+    } else {
+        client
+            .ceremony_status(operation_id.clone())
+            .await
+            .map_err(anyhow::Error::new)
+            .context("read Broker ceremony status")?
+    };
+    anyhow::ensure!(
+        status.operation_id == operation_id,
+        "Broker ceremony status operation identity mismatch"
+    );
+    let now_ms = current_unix_ms();
+    let mut projection = match load_ceremony_projection(home, &operation_id)? {
+        Some(mut projection) => {
+            projection
+                .reconcile_custody(&status, now_ms)
+                .map_err(anyhow::Error::new)
+                .context("reconcile durable Machine ceremony projection")?;
+            projection
+        }
+        None => bloom_machine_client::CeremonyProjection::from_custody_status(&status, now_ms)
+            .map_err(anyhow::Error::new)
+            .context("rebuild Machine ceremony projection from Broker")?,
+    };
+    projection.expire_launch_secret(now_ms);
+    let path = persist_ceremony_projection(home, &projection)?;
+    Ok(format!(
+        "{}\nprojection: {}\n",
+        serde_json::to_string_pretty(&projection).context("encode ceremony projection")?,
+        path.display(),
+    ))
+}
+
+async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<String> {
+    let (raw_operation_id, cancel) = match command {
+        OperationCmd::Status { operation_id } => (operation_id, false),
+        OperationCmd::Cancel { operation_id } => (operation_id, true),
+    };
+    let operation_id = bloom_broker_api::OperationId::new(raw_operation_id)
+        .context("operation ID must be 64 lowercase hexadecimal characters")?;
+    let client = configured_broker_client(home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!(
+                "operation lifecycle requires the authenticated Machine-to-Broker edge: {error:#}"
+            ),
+        )
+    })?;
+    let status = if cancel {
+        client
+            .cancel_operation(operation_id.clone())
+            .await
+            .map_err(anyhow::Error::new)
+            .context("cancel Broker operation before downstream acceptance")?
+    } else {
+        client
+            .operation_status(operation_id.clone())
+            .await
+            .map_err(anyhow::Error::new)
+            .context("read Broker operation status")?
+    };
+    anyhow::ensure!(
+        status.operation_id == operation_id,
+        "Broker operation status identity mismatch"
+    );
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&status).context("encode Broker operation status")?
+    ))
 }
 
 #[derive(Parser, Debug)]
 #[command(
     name = "bloom",
-    version,
+    disable_version_flag = true,
+    arg_required_else_help = true,
     about = "Bloom — an agentic Ethereum wallet as a virtual filesystem",
     long_about = "Bloom mounts an agentic Ethereum wallet as a directory for agents. EXPERIMENTAL / UNAUDITED ALPHA: do not use with funds you cannot afford to lose, and review every generated transaction plan before signing. Read balances, contracts, ENS, prices, and status with cat/ls; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md, then run bloom init and bloom serve --mount ~/bloom. Use bloom vfs only as a fallback when mounting is unavailable."
 )]
 struct Cli {
+    /// Show CLI, daemon, and negotiated IPC protocol versions.
+    #[arg(long)]
+    version: bool,
+
     /// Override home directory (default: ~/.bloom).
     #[arg(long, env = "BLOOM_HOME")]
     home: Option<PathBuf>,
@@ -185,19 +1738,71 @@ struct Cli {
     quiet: bool,
 
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::enum_variant_names)]
+enum InitInternal {
+    #[cfg(feature = "triad-dev-harness")]
+    #[command(name = "triad-render-developer-enrollment", hide = true)]
+    TriadRenderDeveloperEnrollment {
+        template_dir: PathBuf,
+        output_dir: PathBuf,
+        release_digest: String,
+    },
+    #[cfg(feature = "triad-dev-harness")]
+    #[command(name = "triad-enroll-developer-petal-provenance", hide = true)]
+    TriadEnrollDeveloperPetalProvenance {
+        config_dir: PathBuf,
+        petal_dir: PathBuf,
+    },
+    #[command(name = "triad-render-macos-enrollment", hide = true)]
+    TriadRenderMacosEnrollment {
+        template_dir: PathBuf,
+        output_dir: PathBuf,
+        login_uid: u32,
+        broker_uid: u32,
+        signer_uid: u32,
+        session_socket_gid: u32,
+        release_digest: String,
+    },
+    #[command(name = "triad-render-macos-identity-rotation", hide = true)]
+    TriadRenderMacosIdentityRotation {
+        current_identity: PathBuf,
+        replacement_identity: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServeInternal {
+    #[command(name = "triad-health-check", hide = true)]
+    TriadHealthCheck { expected_build: String },
+    #[command(name = "triad-pf-monitor-once", hide = true)]
+    TriadPfMonitorOnce,
+    #[command(name = "session-sentinel", hide = true)]
+    SessionSentinel,
 }
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Show daemon status (chains configured, version, uptime).
     Status,
+    /// Inspect or explicitly reconcile the Machine-owned audit journal.
+    #[command(subcommand)]
+    Audit(AuditCmd),
     /// VFS path operations (no NFS mount required).
     #[command(subcommand)]
     Vfs(VfsCmd),
     /// Wallet management.
     #[command(subcommand)]
     Wallet(WalletCmd),
+    /// Inspect or cancel a Broker-owned custody ceremony by operation ID.
+    #[command(subcommand)]
+    Ceremony(CeremonyCmd),
+    /// Inspect or cancel a Broker operation before downstream acceptance.
+    #[command(subcommand)]
+    Operation(OperationCmd),
     /// Paid/free HTTP requests via the `/requests` VFS surface.
     #[command(subcommand)]
     Request(RequestCmd),
@@ -221,6 +1826,9 @@ enum Cmd {
             default_missing_value = DEFAULT_MOUNT_PATH
         )]
         mount: Option<PathBuf>,
+
+        #[command(subcommand)]
+        internal: Option<ServeInternal>,
     },
     /// Talk to a running `bloom serve` over its UDS JSON-RPC socket.
     #[command(subcommand)]
@@ -228,18 +1836,33 @@ enum Cmd {
     /// Manage wasm petals: install, app, list, uninstall.
     #[command(subcommand, visible_alias = "petal")]
     Petals(PetalsCmd),
-    /// Hyperliquid HyperCore reads and tightly scoped test actions.
-    #[command(subcommand)]
-    Hyperliquid(HyperliquidCmd),
     /// Check for newer bloom releases on GitHub and inspect the
     /// current update-checker state.
     #[command(subcommand)]
     Update(UpdateCmd),
     /// Initialise ~/.bloom with default config + dirs.
-    Init,
+    Init {
+        #[command(subcommand)]
+        internal: Option<InitInternal>,
+    },
 
     /// Print a shell completion script.
     Completions { shell: Shell },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditCmd {
+    /// Print signed-journal health without performing a mutation.
+    Status,
+    /// Close an unmatched durable intent without redispatching its effect.
+    Reconcile {
+        correlation_id: String,
+        #[arg(long, value_parser = ["committed", "aborted"])]
+        outcome: String,
+        /// Exact confirmation printed by `bloom audit status`.
+        #[arg(long)]
+        confirm: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -250,6 +1873,25 @@ enum IpcCmd {
         #[arg(long)]
         params: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum CeremonyCmd {
+    /// Refresh and print the durable Machine projection from Broker status.
+    Status { operation_id: String },
+    /// Cancel a ceremony before its atomic commit marker.
+    Cancel { operation_id: String },
+    /// Retrieve the signed public custody result. Encrypted Browser output is
+    /// never printed by Machine.
+    Result { operation_id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum OperationCmd {
+    /// Read the Broker's durable public operation state.
+    Status { operation_id: String },
+    /// Cancel only if Broker proves no downstream/backend acceptance occurred.
+    Cancel { operation_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -268,19 +1910,6 @@ enum VfsCmd {
         path: String,
         #[arg(long)]
         data: Option<String>,
-        /// Unlock this wallet and run the write in an in-process daemon — the
-        /// signing key must be unlocked in the same process that signs.
-        /// Required for VFS writes whose handler signs. NOTE: this BYPASSES any
-        /// running `bloom serve` daemon and
-        /// its IPC; without this flag, writes route over IPC to that daemon.
-        /// For passkey wallets it must run in the FOREGROUND — it opens a
-        /// WebAuthn ceremony; backgrounding it will hang.
-        #[arg(long)]
-        unlock_wallet: Option<String>,
-        /// Passphrase for `--unlock-wallet` local wallets. Passkey wallets
-        /// ignore this and open a WebAuthn ceremony instead.
-        #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: Option<String>,
     },
 }
 
@@ -347,16 +1976,6 @@ enum RequestCmd {
         /// sentinel to bypass soft limits. Defaults to `confirm`.
         #[arg(long, default_value = "confirm")]
         text: String,
-        /// Paying wallet to unlock for signing. If omitted, it is read from the
-        /// staged request.
-        #[arg(long)]
-        wallet: Option<String>,
-        /// Alias for `--wallet`, kept for parity with `bloom vfs write`.
-        #[arg(long)]
-        unlock_wallet: Option<String>,
-        /// Passphrase for a local/imported paying wallet (passkey wallets prompt).
-        #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: Option<String>,
     },
     /// Print response body for an id or `latest`.
     Body { id: String },
@@ -375,218 +1994,22 @@ enum UpdateCmd {
 }
 
 #[derive(Subcommand, Debug)]
-enum HyperliquidCmd {
-    /// Print account clearinghouse state.
-    Account {
-        user: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print spot/unified clearinghouse state.
-    SpotState {
-        user: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print open orders.
-    OpenOrders {
-        user: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print user fills.
-    Fills {
-        user: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print user funding history for a coin.
-    Funding {
-        user: String,
-        coin: String,
-        #[arg(long)]
-        start_time: Option<u64>,
-        #[arg(long)]
-        end_time: Option<u64>,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print an L2 order book snapshot.
-    Book {
-        coin: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print candle snapshots for a time range.
-    Candles {
-        coin: String,
-        interval: String,
-        start_time: u64,
-        end_time: u64,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print market metadata.
-    Metadata {
-        #[arg(long, default_value = "perp")]
-        kind: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Manage daemon-held ephemeral API-wallet sessions.
-    Session {
-        #[command(subcommand)]
-        command: HyperliquidSessionCmd,
-    },
-    /// Run the read-only smoke suite for an account.
-    TestReads {
-        user: String,
-        #[arg(long, default_value = "BTC")]
-        coin: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Transfer USDC internally between Hyperliquid accounts (usdSend, Sealed Approval).
-    /// Requires transfer_cap_usd in the wallet [hyperliquid] policy.
-    SendAsset {
-        wallet: String,
-        destination: String,
-        amount: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
-        passphrase: Option<String>,
-    },
-    /// Unlock once, place a far-away post-only perp order, then cancel it if it rests.
-    TestPostOnlyCancel {
-        wallet: String,
-        #[arg(long, default_value = "BTC")]
-        coin: String,
-        /// Perp asset id. BTC is normally 0 on mainnet.
-        #[arg(long, default_value_t = 0)]
-        asset: u32,
-        /// Explicit limit price. Defaults to roughly 50% of current mid.
-        #[arg(long)]
-        price: Option<String>,
-        /// Explicit size. Defaults to a size whose limit notional is just above $10.
-        #[arg(long)]
-        size: Option<String>,
-        /// Refuse if price * size is above this USD cap.
-        #[arg(long, default_value_t = 15.0)]
-        max_notional_usd: f64,
-        /// Make the one passkey policy-session ceremony explicit.
-        #[arg(long)]
-        policy_session: bool,
-        /// Required acknowledgement for a live-order test command.
-        #[arg(long)]
-        danger_accept_live_orders: bool,
-        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
-        passphrase: Option<String>,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum HyperliquidSessionCmd {
-    /// Create an approved ephemeral API-wallet session in the running daemon.
-    Create {
-        wallet: String,
-        #[arg(long)]
-        id: Option<String>,
-        #[arg(long)]
-        agent_name: Option<String>,
-        /// Vault/subaccount address this session trades on. When set, risk
-        /// monitoring and cleanup target this account and every submit must
-        /// carry a matching vaultAddress.
-        #[arg(long)]
-        vault_address: Option<String>,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-        #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: Option<String>,
-    },
-    /// Print session status.
-    Status {
-        wallet: String,
-        id: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Print session audit records.
-    Audit {
-        wallet: String,
-        id: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Stop a session without submitting cleanup orders.
-    Stop {
-        wallet: String,
-        id: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Cancel all open orders for the session account.
-    CancelAll {
-        wallet: String,
-        id: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-    /// Cancel orders and submit reduce-only IOC closes for open positions.
-    CloseAll {
-        wallet: String,
-        id: String,
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum WalletCmd {
-    /// Create a new wallet. Defaults to a passkey (WebAuthn) ceremony; pass
-    /// `--local` for a passphrase-encrypted wallet. Passphrase wallets created
-    /// non-interactively require `--allow-passphrase-wallet` and
-    /// `--passphrase-file`, and a recovery file is written to the keystore.
-    New {
-        name: String,
-        /// Create a passphrase-encrypted local wallet (default is passkey).
-        #[arg(long)]
-        local: bool,
-        /// Acknowledge creating a passphrase wallet non-interactively (no tty).
-        /// Required for `--local` when stdin is not a terminal. Writes a
-        /// recovery file containing the passphrase next to the key.
-        #[arg(long)]
-        allow_passphrase_wallet: bool,
-        /// Read the passphrase from this file instead of an interactive
-        /// prompt. Avoids leaking the passphrase via /proc/<pid>/cmdline.
-        /// Only used with `--local` for non-interactive creation.
-        #[arg(long, value_name = "PATH")]
-        passphrase_file: Option<PathBuf>,
-    },
-    /// Import a wallet from a hex private key. Defaults to passkey; pass
-    /// `--local` for passphrase-encrypted (same passphrase rules as `new`).
-    Import {
-        name: String,
-        private_key: String,
-        #[arg(long)]
-        local: bool,
-        #[arg(long)]
-        allow_passphrase_wallet: bool,
-        #[arg(long, value_name = "PATH")]
-        passphrase_file: Option<PathBuf>,
-    },
+    /// Start a Broker-hosted wallet registration ceremony.
+    New { name: String },
+    /// Start a Broker-hosted wallet import ceremony. The private key is entered
+    /// only in the ceremony browser and never crosses the Machine process.
+    Import { name: String },
+    /// Convert a staged v1 passkey wallet into Signer-owned Triad custody.
+    /// The receipt contains public binding data only; Machine never opens the
+    /// legacy wallet directory.
+    MigratePasskey { receipt: PathBuf },
     /// List configured wallets.
     List,
-    /// Print a table of all wallets with their total portfolio value across
-    /// all connected chains. Queries Hyperliquid clearinghouse state for each
-    /// wallet. Use `--network` to select mainnet (default) or testnet.
-    Portfolio {
-        /// Hyperliquid network to query. Defaults to mainnet.
-        #[arg(long, default_value = "mainnet")]
-        network: String,
-    },
+    /// Print the authenticated, key-free Broker projection for a wallet.
+    /// This contains public keys, public credential descriptors, and the
+    /// signed policy snapshot; it never contains custody material.
+    Projection { name: String },
     /// Print a wallet's deposit address. Default output is the bare checksummed
     /// address (one line, scriptable); `--qr` adds a scannable QR block above it,
     /// and `--qr-out <path>` writes a scannable SVG of the address to a file.
@@ -598,14 +2021,9 @@ enum WalletCmd {
         #[arg(long, value_name = "PATH")]
         qr_out: Option<PathBuf>,
     },
-    /// Unlock a wallet for the lifetime of the process.
-    /// For passkey wallets the passphrase is not needed — a browser
-    /// ceremony is opened instead.
-    Unlock {
-        name: String,
-        #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: Option<String>,
-    },
+    /// Request wallet re-arming. This is currently fail-closed because the
+    /// normative ceremony-kind inventory has no wallet-unlock kind.
+    Unlock { name: String },
     /// Stage a tx by writing an intent file. Convenience for the
     /// outbox flow.
     Stage {
@@ -616,32 +2034,26 @@ enum WalletCmd {
         #[arg(long)]
         intent: Option<String>,
     },
-    /// Unlock then broadcast a staged tx in one shot. Required because
-    /// the v1 CLI rebuilds the daemon per invocation, so a separate
-    /// `unlock` doesn't persist.
+    /// Submit confirmation of a staged transaction through the Machine VFS.
     Confirm {
         wallet: String,
         chain: String,
         id: String,
-        #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: Option<String>,
         /// Confirmation text (default "y"; "override" bypasses soft
         /// policy warnings).
         #[arg(long, default_value = "y")]
         text: String,
     },
-    /// Unlock then submit a same-nonce self-send replacement to cancel a staged tx.
+    /// Submit a same-nonce self-send replacement request for a staged tx.
     Cancel {
         wallet: String,
         chain: String,
         id: String,
-        #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: Option<String>,
         /// Confirmation text. Must be non-empty.
         #[arg(long, default_value = "y")]
         text: String,
     },
-    /// Unlock then submit a same-nonce replacement tx from a new intent body.
+    /// Submit a same-nonce replacement request from a new intent body.
     Replace {
         wallet: String,
         chain: String,
@@ -649,220 +2061,43 @@ enum WalletCmd {
         /// Replacement intent body (JSON, TOML, or shell-style). If omitted, read stdin.
         #[arg(long)]
         intent: Option<String>,
-        #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: Option<String>,
     },
-    /// Unlock once, review a batch of staged txs, then broadcast them in order.
+    /// Sign an ordered batch atomically, then broadcast each transaction in order.
     ///
     /// Each TX is `chain:id`, for example `base:0001-abc`.
     ConfirmBatch {
         wallet: String,
         /// Staged tx references in the exact order to broadcast.
         txs: Vec<String>,
-        #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: Option<String>,
-        /// Confirmation text for each tx. Defaults to `override`, which
-        /// acknowledges soft policy warnings after the aggregate passkey review.
-        #[arg(long, default_value = "override")]
+        /// Confirmation text for each tx.
+        #[arg(long, default_value = "y")]
         text: String,
-        /// Require an aggregate passkey policy-session review for passkey wallets.
-        #[arg(long)]
-        policy_session: bool,
     },
-    /// Sign the current policy.toml for a passkey-gated wallet.
-    /// The wallet must already be unlocked (run `unlock` first).
-    SignPolicy { name: String },
-    /// Re-bind an existing PRF-based passkey wallet to a new passkey
-    /// credential. Unlocks with the current credential first to prove
-    /// ownership, then runs a fresh WebAuthn registration ceremony and
-    /// re-encrypts the private key under the new PRF output. The wallet
-    /// address does not change.
+    /// Validate a proposed policy and prepare its Broker-originated review
+    /// ceremony. The input is JSON and is canonicalized before submission.
+    UpdatePolicy {
+        name: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, default_value = "user_verified")]
+        assurance_level: String,
+    },
+    /// Commit a policy update using its completed policy_update ceremony
+    /// receipt. This never provides a direct commit path.
+    CommitPolicy { operation_id: String },
+    /// Replace a wallet credential through a Broker-originated custody
+    /// ceremony. Signer authenticates the current credential, registers the
+    /// replacement, and updates its credential registry without exposing key
+    /// material to Machine. The wallet address does not change.
     ///
     /// Use this to rotate authenticators (e.g. new YubiKey or new device)
-    /// without moving funds. A recovery key is printed once after rebind.
+    /// without moving funds. Ceremony status and public results are projected
+    /// from Broker.
     RebindPasskey { name: String },
-    /// Permanently delete a wallet. All wallet files are removed from disk.
-    /// This cannot be undone — make sure you have the recovery key or the
-    /// private key stored elsewhere before deleting a passkey wallet.
+    /// Permanently delete a wallet through a Broker-originated custody
+    /// ceremony. Signer deletes custody state after owner authorization;
+    /// Machine removes only its public projection. This cannot be undone.
     Delete { name: String },
-}
-
-/// Print the recovery key to stdout and block until the user types "saved".
-///
-/// All tracing logs go to stderr; this prints to stdout, so it cannot be
-/// buried by ceremony log noise. The loop prevents the terminal from
-/// scrolling past the key unnoticed.
-fn acknowledge_recovery_key(name: &str, key: &str) {
-    use std::io::Write as _;
-    let line = "═".repeat(60);
-    println!("\n{line}");
-    println!("  ⚠  RECOVERY KEY — write this down before continuing.");
-    println!("  bloom will NEVER show this again.\n");
-    println!("  0x{key}\n");
-    println!("  To recover:  bloom wallet import {name} 0x<key>");
-    println!("{line}");
-    loop {
-        print!("\n  Type \"saved\" and press Enter to continue: ");
-        let _ = std::io::stdout().flush();
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap_or(0);
-        if input.trim().eq_ignore_ascii_case("saved") {
-            break;
-        }
-    }
-    println!();
-}
-
-/// Resolve the passphrase for a new/imported local wallet.
-///
-/// Interactive (tty): prompts twice via `rpassword` and requires a match.
-/// Non-interactive: requires `--allow-passphrase-wallet` + `--passphrase-file`
-/// so an agent cannot silently mint a passphrase wallet with a machine-chosen
-/// secret — passkey is the default, and passphrase creation must be explicit.
-fn resolve_new_wallet_passphrase(
-    allow_passphrase_wallet: bool,
-    passphrase_file: Option<&Path>,
-) -> Result<String> {
-    use std::io::IsTerminal;
-    if std::io::stdin().is_terminal() {
-        let p1 = rpassword::prompt_password("Enter passphrase: ")?;
-        if p1.is_empty() {
-            bail!("passphrase must not be empty");
-        }
-        let p2 = rpassword::prompt_password("Confirm passphrase: ")?;
-        if p1 != p2 {
-            bail!("passphrases do not match");
-        }
-        Ok(p1)
-    } else {
-        if !allow_passphrase_wallet {
-            bail!(
-                "creating a passphrase wallet non-interactively requires --allow-passphrase-wallet \
-                 and --passphrase-file <PATH>; passkey is the default — run without --local for a \
-                 WebAuthn ceremony"
-            );
-        }
-        let path = passphrase_file.ok_or_else(|| {
-            anyhow::anyhow!("--passphrase-file <PATH> is required with --allow-passphrase-wallet")
-        })?;
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("read passphrase file {}", path.display()))?;
-        // Strip a single trailing newline pair only — never interior whitespace,
-        // which may be a legitimate part of the passphrase.
-        let pass = raw.trim_end_matches(['\n', '\r']).to_string();
-        if pass.is_empty() {
-            bail!("passphrase file is empty");
-        }
-        Ok(pass)
-    }
-}
-
-/// Write `bytes` to `path` with mode 0600 via a temp file + atomic rename.
-fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let tmp = path.with_extension("tmp");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)?;
-    }
-    Ok(())
-}
-
-/// Record the passphrase for a newly-created local wallet to a 0600
-/// `RECOVERY.txt` next to the key. Surfacing the secret the caller chose is
-/// the last line of defense against silent agent-created passphrase wallets.
-fn write_wallet_recovery(home: &HomeDir, name: &str, passphrase: &str) -> Result<PathBuf> {
-    let path = home.wallet_dir(name).join("RECOVERY.txt");
-    let body = format!(
-        "Bloom passphrase-wallet recovery\n\
-         wallet: {name}\n\
-         \n\
-         passphrase: {passphrase}\n\
-         \n\
-         This wallet was created with a passphrase. Store this file securely or\n\
-         migrate to a passkey wallet (`bloom wallet new {name}` without --local)\n\
-         and then remove this file.\n"
-    );
-    write_secret_file_0600(&path, body.as_bytes())?;
-    Ok(path)
-}
-
-/// Append a first-class `wallet.created` audit entry (kind + source). The CLI
-/// path does not flow through the VFS router, so without this a wallet created
-/// via `bloom wallet new` leaves no audit trail at all.
-fn audit_wallet_created(audit: &bloom_proto::AuditLog, name: &str, kind: &str) {
-    let _ = audit.append(AuditRecord {
-        ts_ms: 0,
-        kind: "wallet.created".into(),
-        wallet: Some(name.into()),
-        chain: None,
-        data: serde_json::json!({"kind": kind, "source": "cli"}),
-        prev: String::new(),
-        digest: String::new(),
-    });
-}
-
-struct WalletPortfolioRow {
-    name: String,
-    address: String,
-    account_value: f64,
-    withdrawable: f64,
-    positions: Vec<String>,
-}
-
-fn print_portfolio_table(rows: &[WalletPortfolioRow], network: &str) {
-    if rows.is_empty() {
-        println!("no wallets found");
-        return;
-    }
-    println!("\n  Bloom Wallet Portfolio — Hyperliquid {network}\n");
-    println!(
-        "  {:<18} {:<44} {:>12} {:>12} POSITIONS",
-        "WALLET", "ADDRESS", "ACCT VALUE", "WITHDRAWABLE"
-    );
-    println!("  {}", "-".repeat(120));
-    for row in rows {
-        let pos_str = if row.positions.is_empty() {
-            "—".to_string()
-        } else {
-            row.positions.join(", ")
-        };
-        println!(
-            "  {:<18} {:<44} ${:>11} ${:>11} {}",
-            row.name.chars().take(18).collect::<String>(),
-            &row.address[..row.address.len().min(44)],
-            format!("{:.4}", row.account_value),
-            format!("{:.4}", row.withdrawable),
-            pos_str
-        );
-    }
-    println!("  {}", "-".repeat(120));
-    let total_value: f64 = rows.iter().map(|r| r.account_value).sum();
-    let total_wd: f64 = rows.iter().map(|r| r.withdrawable).sum();
-    let total_pos: usize = rows.iter().map(|r| r.positions.len()).sum();
-    println!(
-        "  {:<18} {:<44} ${:>11} ${:>11} {} position(s)\n",
-        "TOTAL",
-        "",
-        format!("{:.4}", total_value),
-        format!("{:.4}", total_wd),
-        total_pos
-    );
 }
 
 #[tokio::main]
@@ -895,99 +2130,80 @@ async fn main() -> ExitCode {
     }
 }
 
-fn reject_archive_output_inside_package(package_dir: &str, out: &str) -> Result<()> {
-    let package_dir = std::fs::canonicalize(package_dir)
-        .with_context(|| format!("canonicalize package dir {package_dir}"))?;
-    let out_path = std::path::Path::new(out);
-    let out_parent = out_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let out_parent = std::fs::canonicalize(out_parent)
-        .with_context(|| format!("canonicalize archive parent {out}"))?;
-    let out_abs = out_parent.join(out_path.file_name().unwrap_or_default());
-    if out_abs.starts_with(&package_dir) {
-        bail!(
-            "--out must be outside the package directory so archives are not packaged into future builds"
-        );
-    }
-    Ok(())
-}
-
-/// Returns `None` when no daemon socket is present (daemon not started),
-/// propagating all other errors normally. A stale socket (file exists but
-/// connection refused) is removed and surfaced as an error rather than
-/// silently falling back to in-process — a stale socket almost always
-/// means the daemon crashed and the caller should restart it explicitly.
+/// Calls the configured daemon endpoint. A missing daemon is always an error:
+/// `init` and `serve` are the only CLI commands allowed to execute without the
+/// long-running Machine process.
 async fn try_ipc(
     client: &IpcClient,
     endpoint: &ResolvedEndpoint,
     method: &str,
     params: serde_json::Value,
-) -> std::io::Result<Option<serde_json::Value>> {
+) -> std::io::Result<serde_json::Value> {
     match client.call(method, params).await {
-        Ok(v) => Ok(Some(v)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if endpoint.is_explicit() {
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "explicit Bloom endpoint {} is not available: {e}",
-                        endpoint.display
-                    ),
-                ));
-            }
-            debug!(error = %e, "ipc.no_daemon_fallback");
-            Ok(None)
+        Ok(v) => Ok(v),
+        Err(error) => Err(map_ipc_client_error(endpoint, error)),
+    }
+}
+
+async fn try_ipc_streaming<F>(
+    client: &IpcClient,
+    endpoint: &ResolvedEndpoint,
+    method: &str,
+    params: serde_json::Value,
+    on_output: F,
+) -> std::io::Result<IpcCallResult>
+where
+    F: FnMut(IpcOutputEvent) -> std::io::Result<()>,
+{
+    client
+        .call_streaming(method, params, on_output)
+        .await
+        .map_err(|error| map_ipc_client_error(endpoint, error))
+}
+
+fn map_ipc_client_error(endpoint: &ResolvedEndpoint, error: IpcClientError) -> std::io::Error {
+    match error {
+        IpcClientError::Rpc(error) => std::io::Error::other(error),
+        IpcClientError::Transport(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "Bloom daemon endpoint {} is not available: {e}; start it with 'bloom serve'",
+                    endpoint.display
+                ),
+            )
         }
-        Err(e) if is_endpoint_permission_denial(&e) => {
-            if endpoint.is_explicit() {
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!("explicit Bloom endpoint {} failed: {e}", endpoint.display),
-                ));
-            }
-            debug!(endpoint = %endpoint.display, error = %e, "ipc.permission_fallback");
-            Ok(None)
+        IpcClientError::Transport(e) if is_endpoint_permission_denial(&e) => {
+            endpoint_connection_error(&endpoint.display, e)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            if endpoint.is_explicit() {
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "explicit Bloom endpoint {} is not responding: {e}",
-                        endpoint.display
-                    ),
-                ));
-            }
-            // Only remove if it is actually a socket, not a regular
-            // file or symlink placed by another process.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::FileTypeExt;
-                let removed = std::fs::symlink_metadata(client.socket())
-                    .is_ok_and(|m| m.file_type().is_socket())
-                    && std::fs::remove_file(client.socket()).is_ok();
-                let detail = if removed {
-                    "stale socket removed"
-                } else {
-                    "socket not responding"
-                };
-                Err(std::io::Error::other(format!(
-                    "daemon socket exists but is not responding ({detail}); \
-                     start the daemon with 'bloom serve'",
-                )))
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = std::fs::remove_file(client.socket());
-                return Err(std::io::Error::other(
-                    "daemon socket exists but is not responding (stale socket removed); \
-                     start the daemon with 'bloom serve'",
-                ));
-            }
+        IpcClientError::Transport(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            std::io::Error::other(format!(
+                "Bloom daemon endpoint {} is not responding: {e}; start it with 'bloom serve'",
+                endpoint.display,
+            ))
         }
-        Err(e) => Err(e),
+        IpcClientError::Transport(e) => endpoint_connection_error(&endpoint.display, e),
+        IpcClientError::Protocol(message) => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Bloom daemon endpoint {} returned {message}",
+                endpoint.display
+            ),
+        ),
+        IpcClientError::EndpointSecurity(message) => std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "Bloom daemon endpoint {} is insecure: {message}",
+                endpoint.display
+            ),
+        ),
+        error @ IpcClientError::Incompatible { .. } => std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "Bloom daemon endpoint {} rejected: {error}",
+                endpoint.display
+            ),
+        ),
     }
 }
 
@@ -995,92 +2211,11 @@ fn is_endpoint_permission_denial(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1)
 }
 
-/// True when a daemon IPC call failed because the VFS *handler* returned
-/// `PermissionDenied` (JSON-RPC code `-32007`) — i.e. a Sealed Approval
-/// challenge was staged — rather than a transport/socket-level denial.
-/// [`try_ipc`] only surfaces this as a propagated `Err`, so it is safe to
-/// distinguish it here by the JSON-RPC error payload.
-fn is_ipc_handler_permission_denied(e: &std::io::Error) -> bool {
-    let s = e.to_string();
-    s.contains("-32007") || s.contains("permission denied")
-}
-
-async fn poll_wallet_registration_ipc(
-    client: &IpcClient,
-    client_endpoint: &ResolvedEndpoint,
-    name: &str,
-) -> Result<bloom_auth_api::WalletRegistrationStatus> {
-    let status_path = format!("/wallets/registrations/{name}/status.json");
-    poll_wallet_registration(|| async {
-        let res = try_ipc(
-            client,
-            client_endpoint,
-            "read",
-            serde_json::json!({ "path": status_path }),
-        )
-        .await
-        .with_context(|| format!("ipc read via {}", client_endpoint.display))?
-        .context("daemon disappeared mid-registration")?;
-        let b64 = res
-            .get("bytes_b64")
-            .and_then(|v| v.as_str())
-            .context("ipc read: missing bytes_b64")?;
-        let bytes = B64.decode(b64).context("ipc read: bad base64")?;
-        serde_json::from_slice(&bytes).context("parse registration status.json")
-    })
-    .await
-}
-
-async fn poll_wallet_registration_inproc(
-    coordinator: &Arc<dyn bloom_auth_api::WalletRegistrationCoordinator>,
-    name: &str,
-) -> Result<bloom_auth_api::WalletRegistrationStatus> {
-    poll_wallet_registration(|| async {
-        coordinator
-            .status(name)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
-            .context("registration session disappeared")
-    })
-    .await
-}
-
-async fn poll_wallet_registration<F, Fut>(
-    mut status: F,
-) -> Result<bloom_auth_api::WalletRegistrationStatus>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<bloom_auth_api::WalletRegistrationStatus>>,
-{
-    use bloom_auth_api::WalletRegistrationState::*;
-    let mut printed_url = false;
-    loop {
-        let status = status().await?;
-        if !printed_url && let Some(url) = &status.ceremony_url {
-            eprintln!("[bloom] Open this URL to complete passkey registration: {url}");
-            let _ = bloom_keystore::launch_browser(url);
-            printed_url = true;
-        }
-        match status.state {
-            Completed => return Ok(status),
-            Failed | Expired | Cancelled => {
-                anyhow::bail!(
-                    "passkey registration {}: {}",
-                    status.state.as_str(),
-                    status.error.as_deref().unwrap_or("no further detail")
-                );
-            }
-            AwaitingUser | AwaitingRecoveryAck => {
-                if system_time_to_unix_ms(SystemTime::now()) as u64 > status.expires_at_ms {
-                    anyhow::bail!(
-                        "passkey registration timed out: past its expiry with no terminal \
-                         state (it may be stuck) — try again"
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await
-            }
-        }
-    }
+fn endpoint_connection_error(endpoint: &str, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!("Bloom daemon endpoint {endpoint} failed: {error}; start it with 'bloom serve'"),
+    )
 }
 
 fn system_time_to_unix_ms(time: SystemTime) -> u128 {
@@ -1092,14 +2227,6 @@ fn system_time_to_unix_ms(time: SystemTime) -> u128 {
 fn unix_ms_to_system_time(ms: u128) -> SystemTime {
     let ms = ms.min(u64::MAX as u128) as u64;
     UNIX_EPOCH + std::time::Duration::from_millis(ms)
-}
-
-fn entry_kind_label(kind: EntryKind) -> &'static str {
-    match kind {
-        EntryKind::Dir => "dir",
-        EntryKind::File => "file",
-        EntryKind::Symlink => "symlink",
-    }
 }
 
 fn print_vfs_stat(
@@ -1129,18 +2256,6 @@ fn print_vfs_stat(
     }
 }
 
-fn print_vfs_stat_entry(path: &str, entry: &Entry) {
-    print_vfs_stat(
-        path,
-        &entry.name,
-        entry_kind_label(entry.kind),
-        entry.mode,
-        entry.size,
-        entry.link_target.as_deref(),
-        entry.modified,
-    )
-}
-
 fn print_vfs_stat_json(path: &str, entry: &serde_json::Value) -> Result<()> {
     let name = entry
         .get("name")
@@ -1167,8 +2282,88 @@ fn print_vfs_stat_json(path: &str, entry: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+async fn ipc_read(endpoint: &ResolvedEndpoint, path: &str) -> Result<Vec<u8>> {
+    let mut streamed = Vec::new();
+    let reply = try_ipc_streaming(
+        &IpcClient::new(&endpoint.socket),
+        endpoint,
+        "read",
+        serde_json::json!({ "path": path }),
+        |event| match event.stream {
+            IpcOutputStream::Data => {
+                streamed.extend_from_slice(&event.bytes);
+                Ok(())
+            }
+            IpcOutputStream::Stdout | IpcOutputStream::Stderr => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IPC read returned command output",
+            )),
+        },
+    )
+    .await
+    .with_context(|| format!("ipc read {path} via {}", endpoint.display))?;
+    let result = reply.result;
+    if result.get("streamed").and_then(serde_json::Value::as_bool) == Some(true) {
+        let expected = result
+            .get("len")
+            .and_then(serde_json::Value::as_u64)
+            .context("ipc read: streamed response is missing len")?;
+        anyhow::ensure!(
+            streamed.len() as u64 == expected,
+            "ipc read: streamed byte count mismatch (expected {expected}, received {})",
+            streamed.len()
+        );
+        return Ok(streamed);
+    }
+    anyhow::ensure!(streamed.is_empty(), "ipc read: unexpected streamed data");
+    let encoded = result
+        .get("bytes_b64")
+        .and_then(|value| value.as_str())
+        .context("ipc read: missing bytes_b64")?;
+    B64.decode(encoded).context("ipc read: bad base64")
+}
+
+async fn ipc_read_to_stdout(endpoint: &ResolvedEndpoint, path: &str, context: &str) -> Result<()> {
+    let bytes = ipc_read(endpoint, path)
+        .await
+        .with_context(|| context.to_owned())?;
+    std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+    Ok(())
+}
+
+async fn machine_command(
+    endpoint: &ResolvedEndpoint,
+    command: MachineCommand,
+) -> Result<MachineCommandOutput> {
+    let result = try_ipc(
+        &IpcClient::new(&endpoint.socket),
+        endpoint,
+        "machine.execute",
+        serde_json::to_value(command)?,
+    )
+    .await?;
+    serde_json::from_value(result).context("decode daemon Machine command response")
+}
+
+async fn call_machine_command(endpoint: &ResolvedEndpoint, command: MachineCommand) -> Result<()> {
+    let output = machine_command(endpoint, command).await?;
+    std::io::Write::write_all(&mut std::io::stdout(), output.stdout.as_bytes())?;
+    std::io::Write::write_all(&mut std::io::stderr(), output.stderr.as_bytes())?;
+    if output.exit_code != 0 {
+        UPDATE_EXIT_CODE.store(output.exit_code, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
+}
+
 async fn run(cli: Cli) -> Result<()> {
-    let (connect, ipc_socket) = if cli.connect.is_some() {
+    anyhow::ensure!(
+        !cli.version || cli.cmd.is_none(),
+        "--version cannot be combined with a command"
+    );
+    let lifecycle_command = matches!(cli.cmd.as_ref(), Some(Cmd::Init { .. } | Cmd::Serve { .. }));
+    let (connect, ipc_socket) = if lifecycle_command {
+        (None, None)
+    } else if cli.connect.is_some() {
         (cli.connect, None)
     } else if cli.ipc_socket.is_some() {
         (None, cli.ipc_socket)
@@ -1187,12 +2382,95 @@ async fn run(cli: Cli) -> Result<()> {
         }
         None => HomeDir::resolve("~/.bloom").context("resolving home dir")?,
     };
-    let client_endpoint = resolve_client_endpoint(&home, connect.as_deref(), ipc_socket.as_deref())
-        .context("resolve Bloom endpoint")?;
+    let client_endpoint = if lifecycle_command {
+        ResolvedEndpoint::default_for_home(&home)
+    } else {
+        resolve_client_endpoint(&home, connect.as_deref(), ipc_socket.as_deref())
+            .context("resolve Bloom endpoint")?
+    };
     trace!(cmd = ?cli.cmd, home = %home.root().display(), "cli.dispatch");
 
-    match cli.cmd {
-        Cmd::Init => {
+    if cli.version {
+        let client_protocol = IpcProtocolRange::supported();
+        println!("bloom {}", env!("CARGO_PKG_VERSION"));
+        match IpcClient::new(&client_endpoint.socket)
+            .call_with_protocol("version", serde_json::Value::Null)
+            .await
+        {
+            Ok(reply) => {
+                let daemon_version = reply
+                    .result
+                    .as_str()
+                    .context("daemon version response is not a string")?;
+                println!("bloom-daemon {daemon_version}");
+                println!(
+                    "bloom-ipc {} (compatible; cli {}, daemon {})",
+                    reply.negotiated_protocol, client_protocol, reply.daemon_protocol
+                );
+            }
+            Err(IpcClientError::Transport(_)) => {
+                println!("bloom-daemon unavailable");
+                println!("bloom-ipc {client_protocol} (not negotiated)");
+            }
+            Err(IpcClientError::Incompatible { client, daemon }) => {
+                println!("bloom-daemon incompatible");
+                println!("bloom-ipc incompatible (cli {client}, daemon {daemon})");
+            }
+            Err(error) => {
+                println!("bloom-daemon incompatible");
+                println!("bloom-ipc {client_protocol} (not negotiated: {error})");
+            }
+        }
+        return Ok(());
+    }
+
+    match cli.cmd.context("a command is required")? {
+        Cmd::Init { internal } => {
+            if let Some(internal) = internal {
+                return match internal {
+                    #[cfg(feature = "triad-dev-harness")]
+                    InitInternal::TriadRenderDeveloperEnrollment {
+                        template_dir,
+                        output_dir,
+                        release_digest,
+                    } => {
+                        triad_enrollment::run_developer(&template_dir, &output_dir, release_digest)
+                            .context("Bloom developer triad enrollment generation failed")
+                    }
+                    #[cfg(feature = "triad-dev-harness")]
+                    InitInternal::TriadEnrollDeveloperPetalProvenance {
+                        config_dir,
+                        petal_dir,
+                    } => triad_enrollment::run_developer_petal_provenance(&config_dir, &petal_dir)
+                        .context("Bloom developer Petal provenance enrollment failed"),
+                    InitInternal::TriadRenderMacosEnrollment {
+                        template_dir,
+                        output_dir,
+                        login_uid,
+                        broker_uid,
+                        signer_uid,
+                        session_socket_gid,
+                        release_digest,
+                    } => triad_enrollment::run(
+                        template_dir,
+                        output_dir,
+                        login_uid,
+                        broker_uid,
+                        signer_uid,
+                        session_socket_gid,
+                        release_digest,
+                    )
+                    .context("Bloom macOS enrollment generation failed"),
+                    InitInternal::TriadRenderMacosIdentityRotation {
+                        current_identity,
+                        replacement_identity,
+                    } => triad_enrollment::run_identity_rotation(
+                        &current_identity,
+                        &replacement_identity,
+                    )
+                    .context("Bloom macOS identity rotation generation failed"),
+                };
+            }
             eprintln!("{ALPHA_DISCLOSURE}");
             let (_home_permit, d) = build_write_daemon(home.clone()).context("init daemon")?;
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
@@ -1208,69 +2486,25 @@ async fn run(cli: Cli) -> Result<()> {
             println!("agent setup: https://bloom.directory/SKILL.md");
             Ok(())
         }
-        Cmd::Status => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            println!("version: {}", env!("CARGO_PKG_VERSION"));
-            println!("home: {}", d.home.root().display());
-            println!("chains: {:?}", d.chains.list_names());
-            println!("default_chain: {}", d.config.default_chain);
-            println!(
-                "default_wallet: {}",
-                d.config.default_wallet.as_deref().unwrap_or("<none>")
-            );
-            if d.config.hyperliquid.is_some() {
-                println!("hyperliquid_vfs: enabled (/hyperliquid)");
-                // Which wallets have an actual trading boundary in force.
-                let policed: Vec<String> = d
-                    .keystore
-                    .list()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|w| w.policy.hyperliquid.is_configured())
-                    .map(|w| w.name)
-                    .collect();
-                if policed.is_empty() {
-                    println!(
-                        "hyperliquid_policy: none configured (any wallet can trade unconstrained \
-                         once unlocked — add [hyperliquid] to a wallet policy)"
-                    );
-                } else {
-                    println!("hyperliquid_policy: configured for {}", policed.join(", "));
-                }
-            } else {
-                println!("hyperliquid_vfs: disabled (add [hyperliquid] to config.toml)");
-            }
-            println!("try: bloom vfs ls /");
-            if d.keystore.list()?.is_empty() {
-                println!("no wallets yet — create one with bloom wallet new main");
-            } else {
-                println!("deposit: bloom wallet address <wallet> --qr");
-                println!("agent workflow: browse the mounted VFS or use bloom vfs cat/ls/write");
-            }
-            if let Some(snap) = d.update_checker.quick_check_cached() {
-                let latest = snap.latest.as_deref().unwrap_or("?");
-                let latest_display = latest.strip_prefix('v').unwrap_or(latest);
-                let available = match snap.available() {
-                    bloom_update::UpdateAvailable::OutOfDate => "out_of_date",
-                    bloom_update::UpdateAvailable::UpToDate => "up_to_date",
-                    bloom_update::UpdateAvailable::Unknown => "unknown",
-                };
-                println!("latest_release: {}", latest);
-                println!("update_available: {}", available);
-                if matches!(snap.available(), bloom_update::UpdateAvailable::OutOfDate) {
-                    eprintln!(
-                        "hint: bloom v{} is available (you have v{}); see /status/update",
-                        latest_display,
-                        env!("CARGO_PKG_VERSION")
-                    );
-                }
-            }
-            Ok(())
+        Cmd::Status => call_machine_command(&client_endpoint, MachineCommand::Status).await,
+        Cmd::Audit(command) => {
+            let command = match command {
+                AuditCmd::Status => MachineCommand::AuditStatus,
+                AuditCmd::Reconcile {
+                    correlation_id,
+                    outcome,
+                    confirm,
+                } => MachineCommand::AuditReconcile {
+                    correlation_id,
+                    outcome,
+                    confirm,
+                },
+            };
+            call_machine_command(&client_endpoint, command).await
         }
         Cmd::Vfs(VfsCmd::Cat { path }) => {
-            let p = VfsPath::parse(&path).context("parse path")?;
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            let res = try_ipc(
                 &client,
                 &client_endpoint,
                 "read",
@@ -1278,25 +2512,18 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
             .with_context(|| format!("ipc read via {}", client_endpoint.display))?;
-            let bytes = if let Some(res) = ipc_res {
-                debug!(endpoint = %client_endpoint.display, "cli.vfs.cat.via_ipc");
-                let b64 = res
-                    .get("bytes_b64")
-                    .and_then(|v| v.as_str())
-                    .context("ipc read: missing bytes_b64")?;
-                B64.decode(b64).context("ipc read: bad base64")?
-            } else {
-                debug!("cli.vfs.cat.via_inproc: no daemon socket present");
-                let d = Daemon::from_home(home).context("build daemon")?;
-                d.vfs.read(&p).await.context("vfs read")?
-            };
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.cat.via_ipc");
+            let b64 = res
+                .get("bytes_b64")
+                .and_then(|v| v.as_str())
+                .context("ipc read: missing bytes_b64")?;
+            let bytes = B64.decode(b64).context("ipc read: bad base64")?;
             std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
             Ok(())
         }
         Cmd::Vfs(VfsCmd::Ls { path }) => {
-            let p = VfsPath::parse(&path).context("parse path")?;
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            let res = try_ipc(
                 &client,
                 &client_endpoint,
                 "list",
@@ -1304,32 +2531,22 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
             .with_context(|| format!("ipc list via {}", client_endpoint.display))?;
-            if let Some(res) = ipc_res {
-                debug!(endpoint = %client_endpoint.display, "cli.vfs.ls.via_ipc");
-                let arr = res.as_array().context("ipc list: expected array")?;
-                for e in arr {
-                    let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    let kind = match e.get("kind").and_then(|v| v.as_str()).unwrap_or("file") {
-                        "dir" => "Dir",
-                        "symlink" => "Symlink",
-                        _ => "File",
-                    };
-                    println!("{}\t{}", name, kind);
-                }
-            } else {
-                debug!("cli.vfs.ls.via_inproc: no daemon socket present");
-                let d = Daemon::from_home(home).context("build daemon")?;
-                let entries = d.vfs.list(&p).await.context("vfs list")?;
-                for e in entries {
-                    println!("{}\t{:?}", e.name, e.kind);
-                }
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.ls.via_ipc");
+            let arr = res.as_array().context("ipc list: expected array")?;
+            for e in arr {
+                let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let kind = match e.get("kind").and_then(|v| v.as_str()).unwrap_or("file") {
+                    "dir" => "Dir",
+                    "symlink" => "Symlink",
+                    _ => "File",
+                };
+                println!("{}\t{}", name, kind);
             }
             Ok(())
         }
         Cmd::Vfs(VfsCmd::Stat { path }) => {
-            let p = VfsPath::parse(&path).context("parse path")?;
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            let res = try_ipc(
                 &client,
                 &client_endpoint,
                 "lookup",
@@ -1337,24 +2554,11 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
             .with_context(|| format!("ipc lookup via {}", client_endpoint.display))?;
-            if let Some(res) = ipc_res {
-                debug!(endpoint = %client_endpoint.display, "cli.vfs.stat.via_ipc");
-                print_vfs_stat_json(&path, &res)?;
-            } else {
-                debug!("cli.vfs.stat.via_inproc: no daemon socket present");
-                let d = Daemon::from_home(home).context("build daemon")?;
-                let entry = d.vfs.lookup(&p).await.context("vfs lookup")?;
-                print_vfs_stat_entry(&path, &entry);
-            }
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.stat.via_ipc");
+            print_vfs_stat_json(&path, &res)?;
             Ok(())
         }
-        Cmd::Vfs(VfsCmd::Write {
-            path,
-            data,
-            unlock_wallet,
-            passphrase,
-        }) => {
-            let p = VfsPath::parse(&path).context("parse path")?;
+        Cmd::Vfs(VfsCmd::Write { path, data }) => {
             let body = match data {
                 Some(s) => s.into_bytes(),
                 None => {
@@ -1363,43 +2567,8 @@ async fn run(cli: Cli) -> Result<()> {
                     buf
                 }
             };
-            if let Some(wallet) = unlock_wallet {
-                let client = IpcClient::new(&client_endpoint.socket);
-                let ipc_res = try_ipc(
-                    &client,
-                    &client_endpoint,
-                    "write_unlocked",
-                    serde_json::json!({
-                        "path": path,
-                        "bytes_b64": B64.encode(&body),
-                        "wallet": &wallet,
-                        "passphrase": passphrase.as_deref(),
-                    }),
-                )
-                .await
-                .with_context(|| format!("ipc unlocked write via {}", client_endpoint.display))?;
-                if ipc_res.is_some() {
-                    debug!(endpoint = %client_endpoint.display, "cli.vfs.write_unlocked.via_ipc");
-                    return Ok(());
-                }
-
-                debug!("cli.vfs.write.via_inproc: unlock requested and no daemon socket present");
-                let (_home_permit, d) = build_write_daemon(home)?;
-                let info = d.keystore.info(&wallet)?;
-                match info.kind {
-                    bloom_keystore::WalletKind::PasskeyGated => {
-                        bail!(PASSKEY_WRITE_UNLOCKED_DISABLED);
-                    }
-                    _ => {
-                        d.keystore
-                            .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
-                    }
-                }
-                d.vfs.write(&p, &body).await.context("vfs write")?;
-                return Ok(());
-            }
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            try_ipc(
                 &client,
                 &client_endpoint,
                 "write",
@@ -1407,13 +2576,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
             .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
-            if ipc_res.is_some() {
-                debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
-            } else {
-                debug!("cli.vfs.write.via_inproc: no daemon socket present");
-                let (_home_permit, d) = build_write_daemon(home)?;
-                d.vfs.write(&p, &body).await.context("vfs write")?;
-            }
+            debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
             Ok(())
         }
         Cmd::Request(RequestCmd::New {
@@ -1428,506 +2591,142 @@ async fn run(cli: Cli) -> Result<()> {
                 "/requests/new"
             };
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            try_ipc(
                 &client,
                 &client_endpoint,
-                "write",
-                serde_json::json!({ "path": path, "bytes_b64": B64.encode(body.as_bytes()) }),
+                "write_with_lookup",
+                serde_json::json!({
+                    "path": path,
+                    "bytes_b64": B64.encode(body.as_bytes()),
+                    "projection_path": "/requests/latest",
+                }),
             )
             .await
-            .with_context(|| format!("ipc request new via {}", client_endpoint.display))?;
-            if ipc_res.is_some() {
-                debug!(endpoint = %client_endpoint.display, "cli.request.new.via_ipc");
-                if dry_run {
-                    println!("dry_run: true (unpaid probe/staging only; no spend/signing)");
-                }
-                return Ok(());
-            }
-            debug!("cli.request.new.via_inproc: no daemon socket present");
-            let (_home_permit, d) = build_write_daemon(home)?;
-            d.vfs
-                .write(&VfsPath::parse(path)?, body.as_bytes())
-                .await
-                .context("request new")?;
-            let latest = d
-                .vfs
-                .read(&VfsPath::parse("/requests/latest")?)
-                .await
-                .context("read latest request")?;
-            let latest = String::from_utf8_lossy(&latest);
-            println!("request: {}", latest.trim());
+            .with_context(|| format!("ipc request new via {}", client_endpoint.display))
+            .and_then(|entry| {
+                let target = entry
+                    .get("link_target")
+                    .and_then(serde_json::Value::as_str)
+                    .context("ipc request new: latest projection is missing link_target")?;
+                println!("request: {target}");
+                Ok(entry)
+            })?;
+            debug!(endpoint = %client_endpoint.display, "cli.request.new.via_ipc");
             if dry_run {
                 println!("dry_run: true (unpaid probe/staging only; no spend/signing)");
             }
             Ok(())
         }
         Cmd::Request(RequestCmd::Plan { id }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            let path = VfsPath::parse(&format!("/requests/{id}/plan.md"))?;
-            let bytes = d.vfs.read(&path).await.context("request plan")?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            ipc_read_to_stdout(
+                &client_endpoint,
+                &format!("/requests/{id}/plan.md"),
+                "request plan",
+            )
+            .await?;
             Ok(())
         }
-        Cmd::Request(RequestCmd::Confirm {
-            id,
-            text,
-            wallet,
-            unlock_wallet,
-            passphrase,
-        }) => {
+        Cmd::Request(RequestCmd::Confirm { id, text }) => {
             let path = format!("/requests/{id}/confirm");
-            let p = VfsPath::parse(&path)?;
             let body = text.into_bytes();
             let client = IpcClient::new(&client_endpoint.socket);
-            let wallet = unlock_wallet.or(wallet);
-            let wallet = match wallet {
-                Some(w) => Some(w),
-                None => read_request_wallet(&client, &client_endpoint, &home, &id).await?,
-            };
-            let wallet = wallet.context(
-                "could not determine paying wallet for this request; pass --wallet or --unlock-wallet",
-            )?;
-            // Daemon-backed confirm reaches the VFS handler through a *plain*
-            // `write`, not `write_unlocked`: the requests handler stages a
-            // Sealed Approval challenge and signs the x402/Tempo MPP credential
-            // only under a grant-gated PetalHost signature. `write_unlocked` is
-            // not a passkey signing lane. On a staged-challenge PermissionDenied
-            // we run the request ceremony (writes approval.json to the shared
-            // home) and retry the same plain write so the daemon consumes it.
+            // Confirmation uses the ordinary Machine VFS lane. Any signing
+            // requirement must be satisfied through Broker; the CLI never
+            // accepts an unlock secret or hosts a ceremony.
             let confirm_params = serde_json::json!({
                 "path": path,
                 "bytes_b64": B64.encode(&body),
             });
-            match try_ipc(&client, &client_endpoint, "write", confirm_params.clone()).await {
-                Ok(Some(_)) => {
-                    debug!(endpoint = %client_endpoint.display, "cli.request.confirm.via_ipc");
-                    return Ok(());
-                }
-                Ok(None) => {
-                    debug!("cli.request.confirm.via_inproc: no daemon socket present");
-                    // Fall through to the in-process fallback below.
-                }
-                Err(e) if is_ipc_handler_permission_denied(&e) => {
-                    // The daemon staged a Sealed Approval challenge on the first
-                    // plain write. Build a read-only daemon (the serving daemon
-                    // holds the home write lock) to run the request ceremony,
-                    // which writes approval.json onto the shared home, then retry
-                    // the same plain write so the daemon verifies and consumes it.
-                    let ceremony_daemon = Daemon::from_home(home.clone())
-                        .context("build daemon for request confirm ceremony")?;
-                    let approved = sign_request_sealed_approval_if_challenged(
-                        &ceremony_daemon,
-                        &wallet,
-                        &id,
-                        None,
-                    )
-                    .await
-                    .context("request confirm Sealed Approval ceremony")?;
-                    if !approved {
-                        return Err(anyhow::Error::new(e)).context(
-                            "request confirm denied but no approval challenge was staged",
-                        );
-                    }
-                    let retry = try_ipc(&client, &client_endpoint, "write", confirm_params)
-                        .await
-                        .with_context(|| {
-                            format!("ipc request confirm retry via {}", client_endpoint.display)
-                        })?;
-                    if retry.is_some() {
-                        debug!(endpoint = %client_endpoint.display, "cli.request.confirm.via_ipc.after_ceremony");
-                        return Ok(());
-                    }
-                    bail!("request confirm retry did not reach the daemon after Sealed Approval");
-                }
-                Err(e) => {
-                    return Err(anyhow::Error::new(e)).with_context(|| {
-                        format!("ipc request confirm via {}", client_endpoint.display)
-                    });
-                }
-            }
-            let (_home_permit, d) = build_write_daemon(home)?;
-            let info = d.keystore.info(&wallet)?;
-            let passkey_wallet = matches!(info.kind, bloom_keystore::WalletKind::PasskeyGated);
-            match info.kind {
-                bloom_keystore::WalletKind::PasskeyGated => {}
-                _ => {
-                    d.keystore
-                        .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
-                }
-            }
-            match d.vfs.write(&p, &body).await {
-                Ok(()) => {}
-                Err(first_err)
-                    if passkey_wallet && matches!(first_err, HandlerError::PermissionDenied) =>
-                {
-                    let intent = vfs_write_unlock_intent(
-                        &wallet,
-                        &p,
-                        &body,
-                        Some(bloom_proto::checksum_address(&info.address)),
-                        Some(&d.home.outbox_dir()),
-                        d.keystore
-                            .raw_policy(&wallet)
-                            .ok()
-                            .map(|(p, _)| p)
-                            .as_deref(),
-                    );
-                    if sign_request_sealed_approval_if_challenged(&d, &wallet, &id, Some(intent))
-                        .await?
-                    {
-                        d.vfs
-                            .write(&p, &body)
-                            .await
-                            .context("request confirm after Sealed Approval")?;
-                    } else {
-                        return Err(first_err).context("request confirm");
-                    }
-                }
-                Err(e) => return Err(e).context("request confirm"),
-            }
+            try_ipc(&client, &client_endpoint, "write", confirm_params)
+                .await
+                .with_context(|| format!("ipc request confirm via {}", client_endpoint.display))?;
+            debug!(endpoint = %client_endpoint.display, "cli.request.confirm.via_ipc");
             Ok(())
         }
         Cmd::Request(RequestCmd::Body { id }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            let path = VfsPath::parse(&format!("/requests/{id}/response/body"))?;
-            let bytes = d.vfs.read(&path).await.context("request body")?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            ipc_read_to_stdout(
+                &client_endpoint,
+                &format!("/requests/{id}/response/body"),
+                "request body",
+            )
+            .await?;
             Ok(())
         }
         Cmd::Request(RequestCmd::Receipt { id }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            let path = VfsPath::parse(&format!("/requests/{id}/receipt.json"))?;
-            let bytes = d.vfs.read(&path).await.context("request receipt")?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            ipc_read_to_stdout(
+                &client_endpoint,
+                &format!("/requests/{id}/receipt.json"),
+                "request receipt",
+            )
+            .await?;
             Ok(())
         }
-        Cmd::Wallet(WalletCmd::New {
-            name,
-            local,
-            allow_passphrase_wallet,
-            passphrase_file,
-        }) => {
-            if local {
-                let (_home_permit, d) = build_write_daemon(home)?;
-                let pass = resolve_new_wallet_passphrase(
-                    allow_passphrase_wallet,
-                    passphrase_file.as_deref(),
-                )?;
-                let info = d.keystore.create_local(&name, &pass)?;
-                let recovery = write_wallet_recovery(&d.home, &info.name, &pass)?;
-                eprintln!(
-                    "passphrase recovery file: {} (mode 0600) — store or delete after migrating to passkey",
-                    recovery.display()
-                );
-                audit_wallet_created(&d.audit, &info.name, "local");
-                println!("created wallet '{}': {}", info.name, info.address);
-                if set_default_wallet_if_empty(&d.home, &info.name)? {
-                    println!(
-                        "default_wallet: {} (set in {})",
-                        info.name,
-                        d.home.config_path().display()
-                    );
-                }
-                if let Some(ref key) = info.recovery_key {
-                    acknowledge_recovery_key(&info.name, key);
-                }
-                println!("\n── deposit ──");
-                commands::qr::print_deposit(&bloom_proto::checksum_address(&info.address));
-                return Ok(());
-            }
-
-            // Passkey (default): same asynchronous attempt/completion
-            // implementation as `bloom vfs write /wallets/new` — prefer a
-            // running `bloom serve` over IPC; fall back to a command-scoped
-            // instance of the identical ceremony-server/coordinator
-            // machinery when no daemon is reachable. Never a second,
-            // separate registration implementation.
-            let client = IpcClient::new(&client_endpoint.socket);
-            // Guard against a still-running `bloom serve` started before
-            // this CLI's async registration protocol existed: treating its
-            // `/wallets/new` as if it spoke the current contract would fail
-            // in a confusing way (e.g. racing its own port-18734 bind)
-            // rather than a clear "restart the daemon" error.
-            if let Some(daemon_status) = try_ipc(
-                &client,
+        Cmd::Wallet(WalletCmd::New { name }) => {
+            call_machine_command(
                 &client_endpoint,
-                "read",
-                serde_json::json!({ "path": "/status/daemon.json" }),
-            )
-            .await
-            .with_context(|| format!("ipc read via {}", client_endpoint.display))?
-            {
-                let b64 = daemon_status
-                    .get("bytes_b64")
-                    .and_then(|v| v.as_str())
-                    .context("ipc read: missing bytes_b64")?;
-                let bytes = B64.decode(b64).context("ipc read: bad base64")?;
-                let daemon_info: serde_json::Value =
-                    serde_json::from_slice(&bytes).context("parse status/daemon.json")?;
-                let daemon_protocol_version = daemon_info
-                    .get("wallet_registration_protocol_version")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if daemon_protocol_version
-                    < bloom_auth_api::WALLET_REGISTRATION_PROTOCOL_VERSION as u64
-                {
-                    anyhow::bail!(
-                        "the running `bloom serve` daemon does not speak this CLI's async \
-                         passkey registration protocol — restart `bloom serve` to pick up \
-                         the matching daemon version, then retry"
-                    );
-                }
-            }
-            let ipc_res = try_ipc(
-                &client,
-                &client_endpoint,
-                "write",
-                serde_json::json!({ "path": "/wallets/new", "bytes_b64": B64.encode(name.as_bytes()) }),
-            )
-            .await
-            .with_context(|| format!("ipc write via {}", client_endpoint.display))?;
-
-            let address = if ipc_res.is_some() {
-                debug!(endpoint = %client_endpoint.display, "cli.wallet.new.via_ipc");
-                let status = poll_wallet_registration_ipc(&client, &client_endpoint, &name).await?;
-                status
-                    .address
-                    .context("completed registration status missing address")?
-            } else {
-                debug!("cli.wallet.new.via_inproc: no daemon socket present");
-                let (_home_permit, d) = build_write_daemon(home.clone())?;
-                let ceremony = bloom_daemon::ceremony_server::spawn(&d)
-                    .await
-                    .context("bind local passkey ceremony listener")?;
-                let coordinator = d
-                    .auth_services
-                    .require_registration_coordinator()
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?
-                    .clone();
-                let stage_result = coordinator
-                    .stage(&name, system_time_to_unix_ms(SystemTime::now()) as u64)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()));
-                let result = match stage_result {
-                    Ok(_) => poll_wallet_registration_inproc(&coordinator, &name).await,
-                    Err(e) => Err(e),
-                };
-                ceremony.shutdown().await;
-                let status = result?;
-                status
-                    .address
-                    .context("completed registration status missing address")?
-            };
-
-            println!("created wallet '{name}': {address}");
-            println!(
-                "the recovery key was shown once in the browser during the ceremony; it is \
-                 not available here — store it like a seed phrase."
-            );
-            if set_default_wallet_if_empty(&home, &name)? {
-                println!(
-                    "default_wallet: {} (set in {})",
+                MachineCommand::WalletCustody {
                     name,
-                    home.config_path().display()
-                );
-            }
-            // Show the deposit QR + address right away — a fresh wallet's first
-            // need is to receive funds.
-            println!("\n── deposit ──");
-            commands::qr::print_deposit(&address);
-            Ok(())
+                    kind: MachineCustodyKind::New,
+                },
+            )
+            .await
         }
-        Cmd::Wallet(WalletCmd::Import {
-            name,
-            private_key,
-            local,
-            allow_passphrase_wallet,
-            passphrase_file,
-        }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            if local {
-                let pass = resolve_new_wallet_passphrase(
-                    allow_passphrase_wallet,
-                    passphrase_file.as_deref(),
-                )?;
-                let info = d.keystore.import_hex(&name, &private_key, &pass)?;
-                let recovery = write_wallet_recovery(&d.home, &info.name, &pass)?;
-                eprintln!(
-                    "passphrase recovery file: {} (mode 0600) — store or delete after migrating to passkey",
-                    recovery.display()
-                );
-                audit_wallet_created(&d.audit, &info.name, "local");
-                println!("imported wallet '{}': {}", info.name, info.address);
-                if set_default_wallet_if_empty(&d.home, &info.name)? {
-                    println!(
-                        "default_wallet: {} (set in {})",
-                        info.name,
-                        d.home.config_path().display()
-                    );
-                }
-                if let Some(ref key) = info.recovery_key {
-                    acknowledge_recovery_key(&info.name, key);
-                }
-                return Ok(());
-            }
-
-            // Passkey-import: foreground-only, not routed through the VFS
-            // asynchronous registration coordinator (which does not accept
-            // a caller-supplied private key — see
-            // docs/plans/2026-07-21-async-vfs-passkey-registration.md). The
-            // private key never leaves this process; it is held only in
-            // memory for the duration of the ceremony below.
-            //
-            // Validate explicitly rather than relying on `info_unverified`'s
-            // `.is_ok()` as an existence proxy: `info_unverified` itself
-            // calls `validate_name` first, so an invalid name (`../x`, a
-            // path separator, empty, absolute) makes it return `Err` too —
-            // indistinguishable from "not found" under `.is_ok()`. That let
-            // invalid names flow into `temp_id`, `prepare_passkey_wallet`,
-            // and `root.join(&name)` below, which can escape the keystore
-            // root.
-            bloom_keystore::Keystore::validate_name(&name)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            if d.keystore.info_unverified(&name).is_ok() {
-                bail!("wallet '{name}' already exists");
-            }
-            let private_key = Zeroizing::new(private_key);
-            let key_bytes = bloom_keystore::decode_priv_hex(&private_key)
-                .map_err(|e| anyhow::anyhow!("private key: {e}"))?;
-            let signer = alloy::signers::local::PrivateKeySigner::from_bytes(&(*key_bytes).into())
-                .map_err(|e| anyhow::anyhow!("private key: {e}"))?;
-            drop(key_bytes);
-            drop(private_key);
-            let policy_toml =
-                bloom_keystore::default_passkey_policy_toml().context("default policy")?;
-            let mut prf_salt = [0u8; 32];
-            {
-                use rand::RngCore as _;
-                rand::thread_rng().fill_bytes(&mut prf_salt);
-            }
-            let (credential, prf_output) =
-                bloom_keystore::foreground_registration_ceremony(&name, &prf_salt)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))?;
-            let temp_id = format!("import-{name}");
-            let prepared = bloom_keystore::prepare_passkey_wallet(
-                d.keystore.root(),
-                &temp_id,
-                &name,
-                &signer,
-                &credential,
-                &prf_salt,
-                prf_output,
-                &policy_toml,
-            )?;
-            let final_dir = d.keystore.root().join(&name);
-            if final_dir.exists() {
-                bail!("wallet '{name}' already exists");
-            }
-            let finalized = bloom_keystore::finalize_passkey_wallet(prepared, &final_dir)
-                .map_err(|(_prepared, e)| e)?;
-            let mut recovery_bytes = signer.to_bytes();
-            let recovery_key = Zeroizing::new(hex::encode(&recovery_bytes[..]));
-            recovery_bytes.zeroize();
-            d.keystore.cache_unlocked_signer(&name, signer);
-            audit_wallet_created(&d.audit, &name, "passkey");
-            let address = bloom_proto::checksum_address(&finalized.address);
-            println!("imported wallet '{name}': {address}");
-            if set_default_wallet_if_empty(&d.home, &name)? {
-                println!(
-                    "default_wallet: {} (set in {})",
+        Cmd::Wallet(WalletCmd::Import { name }) => {
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletCustody {
                     name,
-                    d.home.config_path().display()
-                );
+                    kind: MachineCustodyKind::Import,
+                },
+            )
+            .await
+        }
+        Cmd::Wallet(WalletCmd::MigratePasskey { receipt }) => {
+            use std::io::Read as _;
+
+            let descriptor = rustix::fs::open(
+                &receipt,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .with_context(|| format!("open migration receipt {}", receipt.display()))?;
+            let mut file = std::fs::File::from(descriptor);
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("inspect migration receipt {}", receipt.display()))?;
+            if !metadata.file_type().is_file() || metadata.len() > 64 * 1024 {
+                anyhow::bail!("migration receipt must be a regular file no larger than 64 KiB");
             }
-            acknowledge_recovery_key(&name, &recovery_key);
-            Ok(())
+            let mut encoded = Vec::with_capacity(metadata.len() as usize);
+            (&mut file)
+                .take(64 * 1024 + 1)
+                .read_to_end(&mut encoded)
+                .with_context(|| format!("read migration receipt {}", receipt.display()))?;
+            if encoded.len() > 64 * 1024 {
+                anyhow::bail!("migration receipt exceeds 64 KiB");
+            }
+            let receipt: LegacyMigrationReceiptFile =
+                serde_json::from_slice(&encoded).context("parse legacy migration receipt")?;
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletMigrate {
+                    receipt: serde_json::from_value(serde_json::to_value(receipt)?)?,
+                },
+            )
+            .await
         }
         Cmd::Wallet(WalletCmd::List) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            for info in d.keystore.list()? {
-                let kind = match info.kind {
-                    bloom_keystore::WalletKind::Local => "local",
-                    bloom_keystore::WalletKind::Watch => "watch",
-                    bloom_keystore::WalletKind::PasskeyGated => "passkey",
-                };
-                println!("{}\t{}\t{}", info.name, info.address, kind);
-            }
-            Ok(())
+            call_machine_command(&client_endpoint, MachineCommand::WalletList).await
         }
-        Cmd::Wallet(WalletCmd::Portfolio { network }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            let client = hl_client(&d.home, &network)?;
-            let wallets = d.keystore.list()?;
-            let mut set = tokio::task::JoinSet::new();
-            for (idx, info) in wallets.into_iter().enumerate() {
-                let client = client.clone();
-                set.spawn(async move {
-                    let address = format!("{:?}", info.address).to_ascii_lowercase();
-                    let res = client
-                        .info(serde_json::json!({
-                            "type": "clearinghouseState",
-                            "user": address,
-                        }))
-                        .await;
-                    (idx, info, address, res)
-                });
-            }
-            let mut rows: Vec<(usize, WalletPortfolioRow)> = Vec::new();
-            while let Some(joined) = set.join_next().await {
-                let (idx, info, address, ch_result) = joined?;
-                let (account_value, withdrawable, positions) = match ch_result {
-                    Ok(v) => {
-                        let av = v
-                            .get("marginSummary")
-                            .and_then(|m| m.get("accountValue"))
-                            .and_then(|a| a.as_str())
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        let wd = v
-                            .get("withdrawable")
-                            .and_then(|w| w.as_str())
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        let positions: Vec<String> = v
-                            .get("assetPositions")
-                            .and_then(|a| a.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|ap| {
-                                        ap.get("position")
-                                            .and_then(|p| p.get("coin"))
-                                            .and_then(|c| c.as_str())
-                                            .map(|s| s.to_string())
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        (av, wd, positions)
-                    }
-                    Err(_) => (0.0, 0.0, Vec::new()),
-                };
-                rows.push((
-                    idx,
-                    WalletPortfolioRow {
-                        name: info.name,
-                        address,
-                        account_value,
-                        withdrawable,
-                        positions,
-                    },
-                ));
-            }
-            rows.sort_by_key(|(i, _)| *i);
-            let table: Vec<WalletPortfolioRow> = rows.into_iter().map(|(_, r)| r).collect();
-            print_portfolio_table(&table, &network);
-            Ok(())
+        Cmd::Wallet(WalletCmd::Projection { name }) => {
+            call_machine_command(&client_endpoint, MachineCommand::WalletProjection { name }).await
         }
         Cmd::Wallet(WalletCmd::Address { name, qr, qr_out }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            // Read-only: an unsigned/stale passkey policy must not block this.
-            let info = d.keystore.info_unverified(&name)?;
-            let address = bloom_proto::checksum_address(&info.address);
+            let result =
+                machine_command(&client_endpoint, MachineCommand::WalletAddress { name }).await?;
+            let address = result.stdout;
             if let Some(path) = qr_out {
                 match commands::qr::render_qr_svg(&address) {
                     Some(svg) => {
@@ -1944,149 +2743,58 @@ async fn run(cli: Cli) -> Result<()> {
             println!("{address}");
             Ok(())
         }
-        Cmd::Wallet(WalletCmd::Unlock { name, passphrase }) => {
-            let d = Daemon::from_home(home).context("build daemon")?;
-            let info = d.keystore.info(&name)?;
-            match info.kind {
-                bloom_keystore::WalletKind::PasskeyGated => {
-                    d.keystore.unlock_passkey(&name).await?;
-                }
-                _ => {
-                    d.keystore
-                        .unlock(&name, passphrase.as_deref().unwrap_or(""))?;
-                }
-            }
-            println!("unlocked '{}' (in-memory; ends with this process)", name);
-            Ok(())
+        Cmd::Wallet(WalletCmd::Unlock { name }) => {
+            call_machine_command(&client_endpoint, MachineCommand::WalletUnlock { name }).await
         }
-        Cmd::Wallet(WalletCmd::SignPolicy { name }) => {
-            let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
-                &client,
+        Cmd::Wallet(WalletCmd::UpdatePolicy {
+            name,
+            file,
+            assurance_level,
+        }) => {
+            let metadata = std::fs::metadata(&file)
+                .with_context(|| format!("inspect proposed policy {}", file.display()))?;
+            anyhow::ensure!(
+                metadata.is_file() && metadata.len() <= MAX_POLICY_DOCUMENT_BYTES,
+                "proposed policy must be a regular file no larger than {MAX_POLICY_DOCUMENT_BYTES} bytes"
+            );
+            let policy = std::fs::read(&file)
+                .with_context(|| format!("read proposed policy {}", file.display()))?;
+            call_machine_command(
                 &client_endpoint,
-                "wallet.sign_policy",
-                serde_json::json!({ "wallet": &name }),
+                MachineCommand::WalletPolicyPrepare {
+                    name,
+                    policy,
+                    assurance_level,
+                },
             )
             .await
-            .with_context(|| format!("ipc sign-policy via {}", client_endpoint.display))?;
-            if ipc_res.is_some() {
-                println!("policy.toml signed for '{name}'");
-                return Ok(());
-            }
-
-            let (_home_permit, d) = build_write_daemon(home.clone())?;
-            // Read the policy raw — deliberately WITHOUT verifying the old
-            // signature: the only time re-signing is needed is when the file
-            // is modified-but-unsigned, and `info()` would refuse exactly
-            // then. Authorization is the ceremony below, with the exact
-            // content shown first.
-            let (policy_toml, kind) = d.keystore.raw_policy(&name)?;
-            println!("Policy for '{name}' (about to sign exactly this):\n\n{policy_toml}");
-            if kind == bloom_keystore::WalletKind::PasskeyGated {
-                let policy_path = home.keystore_dir().join(&name).join("policy.toml");
-                let address =
-                    std::fs::read_to_string(home.keystore_dir().join(&name).join("address"))
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty());
-                let policy_digest = blake3::hash(policy_toml.as_bytes()).to_hex().to_string();
-                let mut intent = CeremonyIntent::new(
-                    &name,
-                    "Sign Wallet Policy",
-                    CeremonyIntentKind::SignPolicy,
-                );
-                intent.wallet_address = address.clone();
-                intent.summary_lines = vec![
-                    format!("Review rules for wallet '{name}'."),
-                    "This does not move money or place a trade.".into(),
-                    "After approval, Bloom uses these rules to decide what is allowed.".into(),
-                ];
-                // Show the exact policy body on the review page (the "Policy"
-                // section), so the user reviews the contents — not a blind
-                // digest. This is a display-only field, excluded from
-                // `stable_subject_hash`, so it does not perturb the intent hash;
-                // `policy_blake3` in `canonical_subject` stays the anchor.
-                intent.policy_lines = policy_toml.lines().map(str::to_string).collect();
-                intent.risk_lines = vec![
-                    "Approving these rules can change what Bloom allows later.".into(),
-                    "The OS passkey prompt only proves your presence; review the details on this page."
-                        .into(),
-                ];
-                intent.artifact_paths = vec![policy_path.display().to_string()];
-                intent.canonical_subject = serde_json::json!({
-                    "kind": "sign_policy",
-                    "wallet": name,
-                    "policy_path": policy_path,
-                    "policy_blake3": policy_digest,
-                });
-                d.keystore.lock(&name);
-                let reviewed_policy = d
-                    .keystore
-                    .unlock_passkey_with_intent_and_policy_edit(
-                        &name,
-                        Some(intent),
-                        Some(policy_toml.clone()),
-                    )
-                    .await?;
-                let final_policy = reviewed_policy.unwrap_or(policy_toml);
-                toml::from_str::<bloom_proto::Policy>(&final_policy)
-                    .context("reviewed policy.toml is invalid")?;
-                if final_policy != std::fs::read_to_string(&policy_path).unwrap_or_default() {
-                    std::fs::write(&policy_path, final_policy.as_bytes())
-                        .with_context(|| format!("write {}", policy_path.display()))?;
-                }
-                let final_digest = blake3::hash(final_policy.as_bytes()).to_hex().to_string();
-                let mut reviewed_intent = CeremonyIntent::new(
-                    &name,
-                    "Sign Wallet Policy",
-                    CeremonyIntentKind::SignPolicy,
-                );
-                reviewed_intent.wallet_address = address;
-                reviewed_intent.summary_lines = vec![
-                    format!("Review rules for wallet '{name}'."),
-                    "This does not move money or place a trade.".into(),
-                    "After approval, Bloom uses these rules to decide what is allowed.".into(),
-                    format!("Policy digest: {final_digest}"),
-                ];
-                reviewed_intent.policy_lines = final_policy.lines().map(str::to_string).collect();
-                reviewed_intent.risk_lines = vec![
-                    "Approving these rules can change what Bloom allows later.".into(),
-                    "The OS passkey prompt only proves your presence; review the details on this page."
-                        .into(),
-                ];
-                reviewed_intent.artifact_paths = vec![policy_path.display().to_string()];
-                reviewed_intent.canonical_subject = serde_json::json!({
-                    "kind": "sign_policy",
-                    "wallet": name,
-                    "policy_path": policy_path,
-                    "policy_blake3": final_digest,
-                });
-                if let Ok(bytes) = serde_json::to_vec_pretty(&reviewed_intent) {
-                    let review_path = home.keystore_dir().join(&name).join("policy.review.json");
-                    let _ = std::fs::write(&review_path, bytes);
-                }
-            }
-            d.keystore.sign_policy(&name)?;
-            println!("policy.toml signed for '{name}'");
-            Ok(())
+        }
+        Cmd::Wallet(WalletCmd::CommitPolicy { operation_id }) => {
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletPolicyCommit { operation_id },
+            )
+            .await
         }
         Cmd::Wallet(WalletCmd::RebindPasskey { name }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            let info = d.keystore.rebind_passkey(&name).await?;
-            println!(
-                "✓ '{}' rebound to new passkey credential ({})",
-                info.name, info.address
-            );
-            if let Some(ref key) = info.recovery_key {
-                acknowledge_recovery_key(&info.name, key);
-            }
-            Ok(())
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletCustody {
+                    name,
+                    kind: MachineCustodyKind::Rebind,
+                },
+            )
+            .await
         }
         Cmd::Wallet(WalletCmd::Delete { name }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
-            d.keystore.delete(&name)?;
-            println!("✓ wallet '{name}' deleted");
-            Ok(())
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletCustody {
+                    name,
+                    kind: MachineCustodyKind::Delete,
+                },
+            )
+            .await
         }
         Cmd::Wallet(WalletCmd::Stage {
             wallet,
@@ -2103,233 +2811,74 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let path = format!("/wallets/{wallet}/chains/{chain}/outbox/new.tx");
             let client = IpcClient::new(&client_endpoint.socket);
-            let ipc_res = try_ipc(
+            let projection = try_ipc(
                 &client,
                 &client_endpoint,
-                "write",
-                serde_json::json!({ "path": path, "bytes_b64": B64.encode(body.as_bytes()) }),
+                "write_with_lookup",
+                serde_json::json!({
+                    "path": path,
+                    "bytes_b64": B64.encode(body.as_bytes()),
+                    "projection_path": format!("/wallets/{wallet}/chains/{chain}/outbox/latest"),
+                }),
             )
             .await
             .with_context(|| format!("ipc wallet stage via {}", client_endpoint.display))?;
-            if ipc_res.is_some() {
-                debug!(endpoint = %client_endpoint.display, "cli.wallet.stage.via_ipc");
-                return Ok(());
-            }
-            debug!("cli.wallet.stage.via_inproc: no daemon socket present");
-            let (home_permit, d) = build_write_daemon(home)?;
-            let parsed = bloom_tx::intent_parser::parse(&body).context("parse intent")?;
-            let info = d.keystore.info(&wallet)?;
-            let client = d
-                .chains
-                .get(&chain)
-                .with_context(|| format!("chain '{}'", chain))?;
-            let staged = d
-                .tx_engine
-                .stage(
-                    &home_permit,
-                    &wallet,
-                    info.address,
-                    parsed,
-                    &client,
-                    &info.policy,
-                    Some(&d.address_book),
-                )
-                .await?;
-            println!("{}", staged.id);
+            debug!(endpoint = %client_endpoint.display, "cli.wallet.stage.via_ipc");
+            let target = projection
+                .get("link_target")
+                .and_then(serde_json::Value::as_str)
+                .context("ipc wallet stage: latest projection is missing link_target")?;
+            let id = target
+                .strip_prefix("pending/")
+                .context("ipc wallet stage: invalid latest target")?;
+            println!("{id}");
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Confirm {
             wallet,
             chain,
             id,
-            passphrase: _,
             text,
         }) => {
             let path = format!("/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm");
             let body = text.into_bytes();
             let client = IpcClient::new(&client_endpoint.socket);
-            // Daemon-backed confirm must use the plain VFS write lane. The
-            // wallets handler/tx engine stages Sealed Approval challenges and
-            // later consumes approval.json; `write_unlocked` is intentionally
-            // not a passkey signing lane.
-            let confirm_params = serde_json::json!({
-                "path": path,
-                "bytes_b64": B64.encode(&body),
-            });
-            match try_ipc(&client, &client_endpoint, "write", confirm_params.clone()).await {
-                Ok(Some(_)) => {
-                    debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
-                    return Ok(());
-                }
-                Ok(None) => {
-                    debug!("cli.wallet.confirm.via_inproc: no daemon socket present");
-                    // Fall through to the in-process fallback below.
-                }
-                Err(e) if is_ipc_handler_permission_denied(&e) => {
-                    // The serving daemon staged approval_challenge.json on the
-                    // first plain write. Build a read-only daemon in this
-                    // process to run the foreground ceremony against the shared
-                    // home, write approval.json, then retry the same write so
-                    // the serving daemon verifies and broadcasts.
-                    let ceremony_daemon = Daemon::from_home(home.clone())
-                        .context("build daemon for wallet confirm ceremony")?;
-                    let approved = sign_outbox_sealed_approval_if_challenged(
-                        &ceremony_daemon,
-                        &wallet,
-                        &chain,
-                        &id,
-                        None,
-                    )
-                    .await
-                    .context("wallet confirm Sealed Approval ceremony")?;
-                    if !approved {
-                        return Err(anyhow::Error::new(e))
-                            .context("wallet confirm denied but no approval challenge was staged");
-                    }
-                    let retry = try_ipc(&client, &client_endpoint, "write", confirm_params)
-                        .await
-                        .with_context(|| {
-                            format!("ipc wallet confirm retry via {}", client_endpoint.display)
-                        })?;
-                    if retry.is_some() {
-                        debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc.after_ceremony");
-                        return Ok(());
-                    }
-                    bail!("wallet confirm retry did not reach the daemon after Sealed Approval");
-                }
-                Err(e) => {
-                    return Err(anyhow::Error::new(e)).with_context(|| {
-                        format!("ipc wallet confirm via {}", client_endpoint.display)
-                    });
-                }
-            }
-            let text = String::from_utf8(body).expect("wallet confirm text originated as UTF-8");
-            let (home_permit, d) = build_write_daemon(home)?;
-            let info = d.keystore.info(&wallet)?;
-            let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
-            let mut approval_intent: Option<CeremonyIntent> = None;
-            if passkey_wallet {
-                // Build the review intent from the staged outbox entry. An
-                // EVM staged tx is byte-immutable for the user-risking fields
-                // (chain/to/value/data/nonce fixed at stage time), so the
-                // intent faithfully reflects what will be signed.
-                let intent = d
-                    .tx_engine
-                    .outbox
-                    .read(&wallet, &chain, &id)
-                    .ok()
-                    .map(|entry| {
-                        let s = &entry.staged;
-                        let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex();
-                        let mut it = CeremonyIntent::new(
-                            &wallet,
-                            format!("Sign {} Transaction", s.chain),
-                            CeremonyIntentKind::EvmTransaction,
-                        )
-                        .with_address(&s.from)
-                        .summary(format!("Chain: {} (id {})", s.chain, s.chain_id))
-                        .summary(format!("To: {}", s.to))
-                        .summary(format!("Value: {} wei", s.value_wei))
-                        .summary(format!(
-                            "Nonce: {}  data: {}B",
-                            s.nonce,
-                            s.data_hex.len() / 2
-                        ))
-                        .summary(format!("Outbox id: {}", s.id))
-                        .risk("Broadcasts this exact staged transaction.")
-                        .subject(serde_json::json!({
-                            "action": "evm_transaction",
-                            "chain_id": s.chain_id,
-                            "from": s.from,
-                            "to": s.to,
-                            "value_wei": s.value_wei,
-                            "nonce": s.nonce,
-                            "data_blake3": data_hash.to_string(),
-                        }));
-                        for c in &s.policy_checks {
-                            it = it.policy(format!("[{:?}] {}: {}", c.outcome, c.rule, c.message));
-                        }
-                        if let Ok(bytes) = serde_json::to_vec_pretty(&it) {
-                            let _ = d.tx_engine.outbox.write_artefact(
-                                &entry.dir,
-                                "review_intent.json",
-                                &bytes,
-                            );
-                        }
-                        approval_intent = Some(it.clone());
-                        it
-                    });
-                let _ = intent;
-            }
-            let info = d.keystore.info(&wallet)?;
-            let client = d
-                .chains
-                .get(&chain)
-                .with_context(|| format!("chain '{}'", chain))?;
-            let confirm_once = || {
-                d.tx_engine.confirm(
-                    &home_permit,
-                    &wallet,
-                    &chain,
-                    &id,
-                    &client,
-                    &info.policy,
-                    &text,
-                )
-            };
-            let staged = match confirm_once().await {
-                Ok(staged) => staged,
-                Err(TxEngineError::ApprovalRequired(requirement)) if passkey_wallet => {
-                    if sign_outbox_sealed_approval_if_challenged(
-                        &d,
-                        &wallet,
-                        &chain,
-                        &id,
-                        approval_intent.clone(),
-                    )
-                    .await?
-                    {
-                        confirm_once().await?
-                    } else {
-                        return Err(TxEngineError::ApprovalRequired(requirement).into());
-                    }
-                }
-                Err(e) => return Err(e.into()),
-            };
-            println!(
-                "broadcast {} hash={}",
-                staged.id,
-                staged.tx_hash.as_deref().unwrap_or("?")
-            );
+            try_ipc(
+                &client,
+                &client_endpoint,
+                "write",
+                serde_json::json!({
+                    "path": path,
+                    "bytes_b64": B64.encode(&body),
+                }),
+            )
+            .await
+            .with_context(|| format!("ipc wallet confirm via {}", client_endpoint.display))?;
+            debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Cancel {
             wallet,
             chain,
             id,
-            passphrase,
             text,
         }) => {
-            wallet_outbox_action_vfs_write(WalletOutboxActionWrite {
-                home,
-                client_endpoint: &client_endpoint,
-                wallet: wallet.clone(),
-                chain,
-                id: id.clone(),
-                action: "cancel",
-                body: text.into_bytes(),
-                passphrase,
-            })
-            .await?;
-            println!("cancel submitted for {id}");
-            Ok(())
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletOutboxCancel {
+                    wallet,
+                    chain,
+                    id,
+                    text,
+                },
+            )
+            .await
         }
         Cmd::Wallet(WalletCmd::Replace {
             wallet,
             chain,
             id,
             intent,
-            passphrase,
         }) => {
             let body = match intent {
                 Some(s) => s,
@@ -2339,195 +2888,101 @@ async fn run(cli: Cli) -> Result<()> {
                     buf
                 }
             };
-            wallet_outbox_action_vfs_write(WalletOutboxActionWrite {
-                home,
-                client_endpoint: &client_endpoint,
-                wallet,
-                chain,
-                id: id.clone(),
-                action: "replace",
-                body: body.into_bytes(),
-                passphrase,
-            })
-            .await?;
-            println!("replacement submitted for {id}");
-            Ok(())
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::WalletOutboxReplace {
+                    wallet,
+                    chain,
+                    id,
+                    intent: body,
+                },
+            )
+            .await
         }
-        Cmd::Wallet(WalletCmd::ConfirmBatch {
-            wallet,
-            txs,
-            passphrase: _,
-            text,
-            policy_session,
-        }) => {
+        Cmd::Wallet(WalletCmd::ConfirmBatch { wallet, txs, text }) => {
             if txs.is_empty() {
                 bail!("confirm-batch needs at least one tx ref like base:0001-abc");
             }
-            let refs: Vec<(String, String)> = txs
-                .iter()
-                .map(|s| parse_batch_tx_ref(s))
-                .collect::<Result<Vec<_>>>()?;
-            let (home_permit, d) = build_write_daemon(home)?;
-            let info = d.keystore.info(&wallet)?;
-
-            let mut entries = Vec::new();
-            for (chain, id) in &refs {
-                let entry = d
-                    .tx_engine
-                    .outbox
-                    .read(&wallet, chain, id)
-                    .with_context(|| format!("read pending tx {chain}:{id}"))?;
-                if entry.staged.status != bloom_proto::TxStatus::Pending {
-                    bail!(
-                        "tx {}:{} is {}, not pending",
-                        chain,
-                        id,
-                        entry.staged.status
-                    );
-                }
-                entries.push(entry);
+            for tx in &txs {
+                let _ = parse_batch_tx_ref(tx)?;
             }
-
-            let mut approval_intent: Option<CeremonyIntent> = None;
-            let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
-            if info.kind == bloom_keystore::WalletKind::PasskeyGated {
-                if !policy_session {
-                    bail!(
-                        "passkey confirm-batch requires --policy-session so the one ceremony is explicit"
-                    );
-                }
-                let mut intent = CeremonyIntent::new(
-                    &wallet,
-                    "Authorize Batch Transaction Session",
-                    CeremonyIntentKind::EvmTransaction,
-                )
-                .with_address(bloom_proto::checksum_address(&info.address))
-                .summary(format!(
-                    "Broadcast {} staged transaction(s).",
-                    entries.len()
-                ))
-                .summary("Policy is rechecked for every transaction before broadcast.")
-                .risk("One passkey approval unlocks this process to sign this exact batch.")
-                .risk("If a transaction fails, later transactions are not attempted.");
-
-                let mut subjects = Vec::new();
-                for entry in &entries {
-                    let s = &entry.staged;
-                    let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex().to_string();
-                    intent = intent
-                        .summary(format!(
-                            "{}:{} chain={} nonce={} to={} value={} wei data={}B",
-                            s.chain,
-                            s.id,
-                            s.chain_id,
-                            s.nonce,
-                            s.to,
-                            s.value_wei,
-                            s.data_hex.len() / 2
-                        ))
-                        .artifact(entry.dir.display().to_string());
-                    for c in &s.policy_checks {
-                        intent = intent.policy(format!(
-                            "{}:{} [{:?}] {}: {}",
-                            s.chain, s.id, c.outcome, c.rule, c.message
-                        ));
-                    }
-                    subjects.push(serde_json::json!({
-                        "id": s.id,
-                        "chain": s.chain,
-                        "chain_id": s.chain_id,
-                        "from": s.from,
-                        "to": s.to,
-                        "value_wei": s.value_wei,
-                        "nonce": s.nonce,
-                        "data_blake3": data_hash,
-                    }));
-                }
-                intent = intent.subject(serde_json::json!({
-                    "action": "evm_transaction_batch",
-                    "wallet": wallet,
-                    "txs": subjects,
-                    "confirm_text": text,
-                }));
-
-                let review_bytes = serde_json::to_vec_pretty(&intent)?;
-                for entry in &entries {
-                    let _ = d.tx_engine.outbox.write_artefact(
-                        &entry.dir,
-                        "review_intent.json",
-                        &review_bytes,
-                    );
-                }
-                approval_intent = Some(intent);
-            }
-
-            let info = d.keystore.info(&wallet)?;
-            for (chain, id) in refs {
-                let client = d
-                    .chains
-                    .get(&chain)
-                    .with_context(|| format!("chain '{}'", chain))?;
-                let confirm_once = || {
-                    d.tx_engine.confirm(
-                        &home_permit,
-                        &wallet,
-                        &chain,
-                        &id,
-                        &client,
-                        &info.policy,
-                        &text,
-                    )
-                };
-                let staged = match confirm_once().await {
-                    Ok(staged) => staged,
-                    Err(TxEngineError::ApprovalRequired(requirement)) if passkey_wallet => {
-                        if sign_outbox_sealed_approval_if_challenged(
-                            &d,
-                            &wallet,
-                            &chain,
-                            &id,
-                            approval_intent.clone(),
-                        )
-                        .await
-                        .with_context(|| format!("sign Sealed Approval for {chain}:{id}"))?
-                        {
-                            confirm_once()
-                                .await
-                                .with_context(|| format!("confirm {chain}:{id}"))?
-                        } else {
-                            return Err(TxEngineError::ApprovalRequired(requirement).into());
-                        }
-                    }
-                    Err(e) => {
-                        return Err(anyhow::Error::from(e))
-                            .with_context(|| format!("confirm {chain}:{id}"));
-                    }
-                };
-                println!(
-                    "broadcast {}:{} hash={}",
-                    chain,
-                    staged.id,
-                    staged.tx_hash.as_deref().unwrap_or("?")
-                );
-            }
+            let request = bloom_daemon::ipc::BatchConfirmIpcRequest { wallet, txs, text };
+            let client = IpcClient::new(&client_endpoint.socket);
+            let result = try_ipc(
+                &client,
+                &client_endpoint,
+                "confirm_batch",
+                serde_json::to_value(&request)?,
+            )
+            .await
+            .with_context(|| format!("ipc wallet confirm-batch via {}", client_endpoint.display))?;
+            debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm_batch.via_ipc");
+            println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
-        Cmd::Serve { endpoint, mount } => {
+        Cmd::Ceremony(command) => {
+            let (action, operation_id) = match command {
+                CeremonyCmd::Status { operation_id } => {
+                    (MachineCeremonyAction::Status, operation_id)
+                }
+                CeremonyCmd::Cancel { operation_id } => {
+                    (MachineCeremonyAction::Cancel, operation_id)
+                }
+                CeremonyCmd::Result { operation_id } => {
+                    (MachineCeremonyAction::Result, operation_id)
+                }
+            };
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::Ceremony {
+                    action,
+                    operation_id,
+                },
+            )
+            .await
+        }
+        Cmd::Operation(command) => {
+            let (action, operation_id) = match command {
+                OperationCmd::Status { operation_id } => {
+                    (MachineOperationAction::Status, operation_id)
+                }
+                OperationCmd::Cancel { operation_id } => {
+                    (MachineOperationAction::Cancel, operation_id)
+                }
+            };
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::Operation {
+                    action,
+                    operation_id,
+                },
+            )
+            .await
+        }
+        Cmd::Serve {
+            endpoint,
+            mount,
+            internal,
+        } => {
+            if let Some(internal) = internal {
+                return match internal {
+                    ServeInternal::TriadHealthCheck { expected_build } => {
+                        installed_triad_health_check(&expected_build)
+                            .await
+                            .context("Bloom triad health check failed")
+                    }
+                    ServeInternal::TriadPfMonitorOnce => {
+                        pf_monitor::run_once().context("Bloom packet-filter monitor failed")
+                    }
+                    ServeInternal::SessionSentinel => session_sentinel::run()
+                        .await
+                        .context("Bloom session sentinel failed"),
+                };
+            }
             eprintln!("{ALPHA_DISCLOSURE}");
             let (_home_permit, d) = build_write_daemon(home.clone())?;
             github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision configured pre-installed Petals before serving")?;
-            // Spawn the outbox expiry sweeper for the lifetime of the
-            // serve command (fix #3). The handle is dropped (and the task
-            // signalled to stop) right before the function returns.
-            let sweeper = d.spawn_background_tasks();
-            // Interaction Mode 3: own and serve the mounted-VFS Sealed Approval
-            // ceremony endpoint (`ceremony_url` in approval_challenge.json).
-            // The daemon never opens a browser; it only serves the URL a
-            // deliberate client opens.
-            let ceremony = bloom_daemon::ceremony_server::spawn(&d)
-                .await
-                .context("bind sealed approval ceremony server")?;
             let mount_handle = mount_bloom(&d, mount.as_deref()).await?;
             let chains: Vec<String> = d.chains.list_names();
             println!(
@@ -2545,10 +3000,30 @@ async fn run(cli: Cli) -> Result<()> {
             println!("ipc socket: {}", socket.display());
             info!(home = %d.home.root().display(), chains = ?chains, endpoint = %endpoint.display, socket = %socket.display(), mount = ?mount, "cli.serve.starting");
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains)
-                .with_keystore(d.keystore.clone())
                 .with_petals(d.petals.clone())
-                .with_auth_services(d.auth_services.clone())
-                .with_signer_cache(d.signer_cache.clone());
+                .with_petal_runtime_endpoints(
+                    d.config
+                        .petals
+                        .runtime
+                        .iter()
+                        .map(|(name, runtime)| (name.clone(), runtime.endpoints.clone()))
+                        .collect(),
+                )
+                .with_petal_source_installer(Arc::new(CanonicalPetalSourceInstaller {
+                    home: home.clone(),
+                    daemon: d.clone(),
+                }))
+                .with_batch_confirmation(
+                    d.batch_confirmation_service().map_err(anyhow::Error::msg)?,
+                )
+                .with_machine_commands(Arc::new(DaemonMachineCommands {
+                    home: home.clone(),
+                    daemon: d.clone(),
+                }));
+            // Start audited and durable background effects only after every
+            // fallible serve setup step has succeeded. The handle is shut
+            // down and awaited before the runtime can return.
+            let sweeper = d.spawn_background_tasks();
             let server2 = server.clone();
             // Trigger graceful shutdown on Ctrl-C or SIGTERM.
             let shutdown = tokio::spawn(async move {
@@ -2574,7 +3049,6 @@ async fn run(cli: Cli) -> Result<()> {
             // Stop the outbox expiry sweeper (fix #3) and any other
             // daemon-owned workers (watch executor, etc., fix #6).
             let unmount_result = unmount_bloom(mount_handle).await;
-            ceremony.shutdown().await;
             sweeper.shutdown().await;
             d.shutdown().await;
             serve_result?;
@@ -2583,16 +3057,23 @@ async fn run(cli: Cli) -> Result<()> {
             println!("shutting down");
             Ok(())
         }
-        Cmd::Hyperliquid(cmd) => handle_hyperliquid(home, &client_endpoint, cmd).await,
-        Cmd::Update(cmd) => handle_update(&home, cmd).await,
-        Cmd::Petals(cmd) => {
-            let _home_permit = HomeWritePermit::acquire(&home)?;
-            run_petals(home, cmd).await
+        Cmd::Update(cmd) => {
+            let command = match cmd {
+                UpdateCmd::Status => MachineCommand::UpdateStatus,
+                UpdateCmd::Check => MachineCommand::UpdateCheck,
+            };
+            call_machine_command(&client_endpoint, command).await
         }
+        Cmd::Petals(cmd) => run_petals(&client_endpoint, cmd).await,
 
         Cmd::Completions { shell } => {
-            generate(shell, &mut Cli::command(), "bloom", &mut std::io::stdout());
-            Ok(())
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::Completions {
+                    shell: shell.to_string(),
+                },
+            )
+            .await
         }
         Cmd::Ipc(IpcCmd::Call { method, params }) => {
             let endpoint = client_endpoint;
@@ -2605,157 +3086,305 @@ async fn run(cli: Cli) -> Result<()> {
                 None => serde_json::Value::Null,
             };
             debug!(%method, endpoint = %endpoint.display, "cli.ipc.call");
-            let result = client
-                .call(&method, v)
-                .await
-                .with_context(|| format!("ipc call to {}", endpoint.display))?;
+            let result = try_ipc(&client, &endpoint, &method, v).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
     }
 }
 
-async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
-    let cmd = match cmd {
-        PetalsCmd::Build { package_dir, out } => {
-            if let Some(out) = out.as_deref() {
-                reject_archive_output_inside_package(&package_dir, out)?;
-            }
-            let package = bloom_petals::package::build_petal_package_dir(&package_dir)
-                .with_context(|| format!("build Petal package {package_dir}"))?;
-            let consent = bloom_petals::package::petal_consent_summary(&package)
-                .context("build Petal consent summary")?;
-            println!("hash: {}", package.hash);
-            println!("contract: {}", bloom_petals::package::ROUTE_PACKAGE);
-            println!(
-                "wit_digest: {}",
-                bloom_petals::package::contract_wit_digest()
-            );
-            println!("petal_mount: petals/{}/", package.name);
-            println!("routes: {}", package.route_index.routes.len());
-            println!("artifacts: {package_dir}/artifacts");
-            print_petal_consent(&consent);
-            if let Some(out) = out {
-                let file =
-                    std::fs::File::create(&out).with_context(|| format!("create archive {out}"))?;
-                package
-                    .write_petal_tar(file)
-                    .with_context(|| format!("write archive {out}"))?;
-                println!("archive: {out}");
-            }
-            return Ok(());
-        }
-        other => other,
-    };
+#[derive(Clone)]
+struct CanonicalPetalSourceInstaller {
+    home: HomeDir,
+    daemon: Daemon,
+}
 
-    let d = Daemon::from_home(home.clone()).context("build daemon")?;
+impl bloom_daemon::ipc::PetalSourceInstallService for CanonicalPetalSourceInstaller {
+    fn install_source(
+        &self,
+        params: serde_json::Value,
+        context: bloom_daemon::ipc::IpcOperationContext,
+    ) -> Result<serde_json::Value, String> {
+        let path = params
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "missing 'path'".to_owned())?;
+        let requested_ref = params.get("ref").and_then(serde_json::Value::as_str);
+        let repo = github_source::parse_github_install_url(path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "trusted source installer requires a GitHub repository URL".to_owned()
+            })?;
+        let installed = match github_source::install_github_source_streaming(
+            &self.home,
+            &self.daemon,
+            &repo,
+            requested_ref,
+            &context,
+        ) {
+            Ok(installed) => installed,
+            Err(error) => {
+                if let Some(failure) = github_source::source_install_failure(&error) {
+                    return Ok(serde_json::json!({
+                        "progress_lines": failure.progress,
+                        "build_stdout_b64": B64.encode(&failure.stdout),
+                        "build_stderr_b64": B64.encode(&failure.stderr),
+                        "completion_progress_lines": failure.completion_progress,
+                        "operation_error": failure.message,
+                    }));
+                }
+                return Err(format!("{error:#}"));
+            }
+        };
+        let selected = installed
+            .provenance
+            .selected_tag
+            .as_deref()
+            .unwrap_or(&installed.provenance.requested_ref);
+        Ok(serde_json::json!({
+            "hash": installed.result.hash,
+            "mode": "petal",
+            "size": installed.result.size,
+            "already_present": installed.result.already_present,
+            "petal_mount": installed.meta.petal.as_ref().map(|petal| format!("petals/{}/", petal.name)),
+            "routes": installed.index.routes.len(),
+            "source": format!("{}/{}@{}", installed.provenance.owner, installed.provenance.repo, selected),
+            "resolved_commit": installed.provenance.resolved_commit,
+            "progress_lines": installed.progress,
+            "build_stdout_b64": B64.encode(&installed.build_stdout),
+            "build_stderr_b64": B64.encode(&installed.build_stderr),
+            "completion_progress_lines": installed.completion_progress,
+            "consent_lines": petal_consent_lines(&installed.consent),
+        }))
+    }
+}
+
+fn required_petal_string<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("ipc petals response: missing {field}"))
+}
+
+fn required_petal_u64(value: &serde_json::Value, field: &str) -> Result<u64> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .with_context(|| format!("ipc petals response: missing {field}"))
+}
+
+fn print_ipc_lines(value: &serde_json::Value, field: &str) -> Result<()> {
+    for line in value
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .with_context(|| format!("ipc petals response: missing {field}"))?
+    {
+        println!(
+            "{}",
+            line.as_str()
+                .with_context(|| format!("ipc petals response: non-string {field}"))?
+        );
+    }
+    Ok(())
+}
+
+fn print_ipc_captured_build_output(value: &serde_json::Value) -> Result<()> {
+    if let Some(stdout) = value
+        .get("build_stdout_b64")
+        .and_then(serde_json::Value::as_str)
+    {
+        let bytes = B64.decode(stdout).context("decode captured build stdout")?;
+        std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+        std::io::Write::flush(&mut std::io::stdout())?;
+    }
+    if let Some(stderr) = value
+        .get("build_stderr_b64")
+        .and_then(serde_json::Value::as_str)
+    {
+        let bytes = B64.decode(stderr).context("decode captured build stderr")?;
+        std::io::Write::write_all(&mut std::io::stderr(), &bytes)?;
+        std::io::Write::flush(&mut std::io::stderr())?;
+    }
+    Ok(())
+}
+
+fn write_ipc_output_event(event: IpcOutputEvent) -> std::io::Result<()> {
+    match event.stream {
+        IpcOutputStream::Stdout => {
+            std::io::Write::write_all(&mut std::io::stdout(), &event.bytes)?;
+            std::io::Write::flush(&mut std::io::stdout())
+        }
+        IpcOutputStream::Stderr => {
+            std::io::Write::write_all(&mut std::io::stderr(), &event.bytes)?;
+            std::io::Write::flush(&mut std::io::stderr())
+        }
+        IpcOutputStream::Data => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "command emitted an unexpected IPC data stream",
+        )),
+    }
+}
+
+fn absolute_cli_path(path: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()
+            .context("resolve CLI working directory")?
+            .join(path))
+    }
+}
+
+fn validate_petal_archive_output(package_dir: &str, out: &str) -> Result<()> {
+    let package_dir = std::fs::canonicalize(package_dir)
+        .with_context(|| format!("resolve Petal package directory {package_dir}"))?;
+    let out_path = Path::new(out);
+    let parent = out_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let output = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolve Petal archive parent {}", parent.display()))?
+        .join(
+            out_path
+                .file_name()
+                .context("Petal archive path has no file name")?,
+        );
+    anyhow::ensure!(
+        !output.starts_with(package_dir),
+        "--out must be outside the package directory so archives are not packaged into future builds"
+    );
+    Ok(())
+}
+
+async fn run_petals(endpoint: &ResolvedEndpoint, cmd: PetalsCmd) -> Result<()> {
+    let client = IpcClient::new(&endpoint.socket);
     match cmd {
         PetalsCmd::Install { path, ref_ } => {
-            if let Some(repo) = github_source::parse_github_install_url(&path)? {
-                let installed =
-                    github_source::install_github_source(&home, &d, &repo, ref_.as_deref())?;
-                println!();
-                println!("hash: {}", installed.result.hash);
-                println!("mode: petal");
-                println!("size: {} bytes", installed.result.size);
-                if installed.result.already_present {
-                    println!("note: already installed");
-                }
-                if let Some(app) = &installed.meta.petal {
-                    println!("petal_mount: petals/{}/", app.name);
-                }
-                println!("routes: {}", installed.index.routes.len());
-                println!(
-                    "source: {}/{}@{}",
-                    installed.provenance.owner,
-                    installed.provenance.repo,
-                    installed
-                        .provenance
-                        .selected_tag
-                        .as_deref()
-                        .unwrap_or(&installed.provenance.requested_ref)
-                );
-                println!("resolved_commit: {}", installed.provenance.resolved_commit);
-                print_petal_consent(&installed.consent);
-                return Ok(());
-            }
-
-            if ref_.is_some() {
-                bail!("--ref is only supported for trusted GitHub source installs");
-            }
-            let path_meta = std::fs::metadata(&path).with_context(|| format!("stat {path}"))?;
-            let is_petal_dir = path_meta.is_dir();
-            if !is_petal_dir && !path.ends_with(".petal.tar") {
-                bail!(
-                    "petals install only accepts Petal package directories, .petal.tar archives, or trusted GitHub source repositories"
-                );
-            }
-            let consent_package = if is_petal_dir {
-                bloom_petals::package::PreparedPetalPackage::from_dir(&path)
-                    .with_context(|| format!("read Petal package dir {path}"))?
+            let params = if path.contains("://") || path.starts_with("git@github.com:") {
+                serde_json::json!({ "path": path, "ref": ref_ })
             } else {
-                bloom_petals::package::PreparedPetalPackage::from_petal_tar(&path)
-                    .with_context(|| format!("read Petal package archive {path}"))?
+                anyhow::ensure!(
+                    ref_.is_none(),
+                    "--ref is only supported for trusted GitHub source installs"
+                );
+                let local = absolute_cli_path(&path)?;
+                serde_json::json!({ "path": local, "ref": null })
             };
-            let mut consent = bloom_petals::package::petal_consent_summary(&consent_package)
-                .context("build app consent summary")?;
-            apply_configured_petal_endpoints(&d, &mut consent)?;
-            let (result, meta, index) = if is_petal_dir {
-                d.petals
-                    .store()
-                    .install_petal_package_dir(&path)
-                    .with_context(|| format!("install Petal package dir {path}"))?
-            } else {
-                d.petals
-                    .store()
-                    .install_petal_package_tar(&path)
-                    .with_context(|| format!("install Petal package archive {path}"))?
-            };
-            println!("hash: {}", result.hash);
+            let reply = try_ipc_streaming(
+                &client,
+                endpoint,
+                "petals.install",
+                params,
+                write_ipc_output_event,
+            )
+            .await
+            .with_context(|| format!("ipc petals install via {}", endpoint.display))?;
+            let result = reply.result;
+            if reply.output_events == 0 && result.get("progress_lines").is_some() {
+                print_ipc_lines(&result, "progress_lines")?;
+            }
+            if reply.output_events == 0 {
+                print_ipc_captured_build_output(&result)?;
+            }
+            if reply.output_events == 0 && result.get("completion_progress_lines").is_some() {
+                print_ipc_lines(&result, "completion_progress_lines")?;
+            }
+            if let Some(error) = result
+                .get("operation_error")
+                .and_then(serde_json::Value::as_str)
+            {
+                bail!("{error}");
+            }
+            println!("hash: {}", required_petal_string(&result, "hash")?);
             println!("mode: petal");
-            println!("size: {} bytes", result.size);
-            if result.already_present {
+            println!("size: {} bytes", required_petal_u64(&result, "size")?);
+            if result["already_present"].as_bool() == Some(true) {
                 println!("note: already installed");
             }
-            if let Some(app) = &meta.petal {
-                println!("petal_mount: petals/{}/", app.name);
+            if let Some(mount) = result["petal_mount"].as_str() {
+                println!("petal_mount: {mount}");
             }
-            println!("routes: {}", index.routes.len());
-            print_petal_consent(&consent);
+            println!("routes: {}", required_petal_u64(&result, "routes")?);
+            if let Some(source) = result["source"].as_str() {
+                println!("source: {source}");
+            }
+            if let Some(commit) = result["resolved_commit"].as_str() {
+                println!("resolved_commit: {commit}");
+            }
+            print_ipc_lines(&result, "consent_lines")?;
             Ok(())
         }
-        PetalsCmd::Build { .. } => {
-            unreachable!("Petal build commands are handled before daemon startup")
+        PetalsCmd::Build { package_dir, out } => {
+            if let Some(out) = out.as_deref() {
+                validate_petal_archive_output(&package_dir, out)?;
+            }
+            let rpc_package_dir = absolute_cli_path(&package_dir)?;
+            let rpc_out = out.as_deref().map(absolute_cli_path).transpose()?;
+            let result = try_ipc(
+                &client,
+                endpoint,
+                "petals.build",
+                serde_json::json!({ "package_dir": rpc_package_dir, "out": rpc_out }),
+            )
+            .await
+            .with_context(|| format!("ipc petals build via {}", endpoint.display))?;
+            for field in ["hash", "contract", "wit_digest", "petal_mount", "routes"] {
+                let value = result
+                    .get(field)
+                    .context("ipc petals build: missing response field")?;
+                println!(
+                    "{field}: {}",
+                    value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), str::to_owned)
+                );
+            }
+            println!("artifacts: {package_dir}/artifacts");
+            print_ipc_lines(&result, "consent_lines")?;
+            if let Some(archive) = out {
+                println!("archive: {archive}");
+            }
+            Ok(())
         }
         PetalsCmd::Ls => {
-            let package_hashes = d
-                .petals
-                .store()
-                .list_package_hashes()
-                .context("list Petal packages")?;
-            if package_hashes.is_empty() {
+            let result = try_ipc(&client, endpoint, "petals.list", serde_json::Value::Null)
+                .await
+                .with_context(|| format!("ipc petals list via {}", endpoint.display))?;
+            let entries = result
+                .as_array()
+                .context("ipc petals list: expected array")?;
+            if entries.is_empty() {
                 println!("(no petals installed)");
                 return Ok(());
             }
-            for h in package_hashes {
-                let meta = d.petals.store().load_meta(&h).context("load meta")?;
-                let app = meta
-                    .petal
-                    .as_ref()
-                    .map(|app| format!("  app=petals/{}/", app.name))
+            for entry in entries {
+                let hash = required_petal_string(entry, "hash")?;
+                let app = entry["petal_mount"]
+                    .as_str()
+                    .map(|mount| format!("  app={mount}"))
                     .unwrap_or_default();
-                let source = meta.source.as_ref().map_or_else(String::new, |source| {
-                    let selected = source
-                        .selected_tag
-                        .as_deref()
-                        .unwrap_or(&source.requested_ref);
-                    format!("  source={}/{}@{}", source.owner, source.repo, selected)
-                });
+                let source = entry["source"]
+                    .as_object()
+                    .map_or_else(String::new, |source| {
+                        let selected = source
+                            .get("selected_tag")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| source.get("requested_ref").and_then(|v| v.as_str()))
+                            .unwrap_or("?");
+                        format!(
+                            "  source={}/{}@{}",
+                            source.get("owner").and_then(|v| v.as_str()).unwrap_or("?"),
+                            source.get("repo").and_then(|v| v.as_str()).unwrap_or("?"),
+                            selected
+                        )
+                    });
                 println!(
                     "{}  {:<7}  {:>7}  caps=[]  name=-{}{}",
-                    &meta.hash[..bloom_petals::store::HASH_PREFIX_LEN],
+                    &hash[..bloom_petals::store::HASH_PREFIX_LEN.min(hash.len())],
                     "app",
-                    meta.size,
+                    required_petal_u64(entry, "size")?,
                     app,
                     source
                 );
@@ -2763,7 +3392,17 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             Ok(())
         }
         PetalsCmd::Uninstall { target } => {
-            let removed = d.petals.uninstall(&target).context("uninstall petal")?;
+            let result = try_ipc(
+                &client,
+                endpoint,
+                "petals.uninstall",
+                serde_json::json!({ "hash": target }),
+            )
+            .await
+            .with_context(|| format!("ipc petals uninstall via {}", endpoint.display))?;
+            let removed = result["removed"]
+                .as_bool()
+                .context("ipc petals uninstall: missing removed")?;
             if removed {
                 println!("removed {target}");
             } else {
@@ -2774,33 +3413,39 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
     }
 }
 
-fn print_petal_consent(summary: &bloom_petals::package::PetalConsentSummary) {
-    println!("consent:");
+fn petal_consent_lines(summary: &bloom_petals::package::PetalConsentSummary) -> Vec<String> {
+    let mut lines = vec!["consent:".to_owned()];
     if let Some(package_summary) = &summary.package_summary {
-        println!("  summary: {package_summary}");
+        lines.push(format!("  summary: {package_summary}"));
     }
-    println!("  docs: {}", summary.docs.join(", "));
+    lines.push(format!("  docs: {}", summary.docs.join(", ")));
     if !summary.capabilities.is_empty() {
-        println!("  capabilities: {}", summary.capabilities.join(", "));
+        lines.push(format!(
+            "  capabilities: {}",
+            summary.capabilities.join(", ")
+        ));
     }
     if !summary.network.is_empty() {
-        println!("  network:");
+        lines.push("  network:".to_owned());
         for rule in &summary.network {
-            println!("{}", format_petal_consent_net_rule(rule));
+            lines.push(format_petal_consent_net_rule(rule));
         }
     }
     if !summary.sign_intents.is_empty() {
-        println!("  signing_intents: {}", summary.sign_intents.join(", "));
+        lines.push(format!(
+            "  signing_intents: {}",
+            summary.sign_intents.join(", ")
+        ));
     }
     if !summary.store_namespaces.is_empty() {
-        println!("  private_store:");
+        lines.push("  private_store:".to_owned());
         for ns in &summary.store_namespaces {
             let visibility = if ns.secret { "secret" } else { "private" };
-            println!("    - {} {}", ns.namespace, visibility);
+            lines.push(format!("    - {} {}", ns.namespace, visibility));
         }
     }
     if !summary.routes.is_empty() {
-        println!("  routes:");
+        lines.push("  routes:".to_owned());
         for route in &summary.routes {
             let ops = route
                 .ops
@@ -2824,34 +3469,22 @@ fn print_petal_consent(summary: &bloom_petals::package::PetalConsentSummary) {
                 route.required_caps.join(",")
             };
             if flags.is_empty() {
-                println!("    - {} ops=[{}] caps=[{}]", route.path, ops, caps);
+                lines.push(format!(
+                    "    - {} ops=[{}] caps=[{}]",
+                    route.path, ops, caps
+                ));
             } else {
-                println!(
+                lines.push(format!(
                     "    - {} ops=[{}] caps=[{}] flags=[{}]",
                     route.path,
                     ops,
                     caps,
                     flags.join(",")
-                );
+                ));
             }
         }
     }
-}
-
-fn apply_configured_petal_endpoints(
-    daemon: &Daemon,
-    summary: &mut bloom_petals::package::PetalConsentSummary,
-) -> Result<()> {
-    let bindings = daemon
-        .config
-        .petals
-        .runtime
-        .get(&summary.name)
-        .map(|app| &app.endpoints)
-        .cloned()
-        .unwrap_or_default();
-    bloom_petals::package::apply_petal_consent_endpoint_bindings(summary, &bindings)
-        .context("apply configured Petal endpoint bindings")
+    lines
 }
 
 fn format_petal_consent_net_rule(rule: &bloom_petals::package::PetalConsentNetRule) -> String {
@@ -2888,436 +3521,6 @@ async fn mount_bloom(
             .with_context(|| format!("mount bloom vfs at {}", path.display())),
         None => Ok(None),
     }
-}
-
-fn vfs_write_unlock_intent(
-    wallet: &str,
-    path: &VfsPath,
-    body: &[u8],
-    wallet_address: Option<String>,
-    outbox_root: Option<&std::path::Path>,
-    wallet_policy_toml: Option<&str>,
-) -> CeremonyIntent {
-    let path_s = path.to_string_path();
-    let segs = path.segments();
-    let is_wallet_policy_write = matches!(
-        segs,
-        [root, w, file] if root == "wallets" && w == wallet && file == "policy.toml"
-    );
-    if is_wallet_policy_write {
-        let policy_text = String::from_utf8_lossy(body);
-        let policy_digest = blake3::hash(body).to_hex().to_string();
-        let mut intent = CeremonyIntent::new(
-            wallet,
-            "Approve Wallet Policy Write",
-            CeremonyIntentKind::SignPolicy,
-        );
-        intent.wallet_address = wallet_address;
-        intent.summary_lines = vec![
-            format!("Review rules for wallet '{wallet}'."),
-            "This does not move money or place a trade.".into(),
-            "After approval, Bloom uses these rules to decide what is allowed.".into(),
-        ];
-        intent.policy_lines = policy_text.lines().map(str::to_string).collect();
-        intent.risk_lines = vec![
-            "Approving these rules can change what Bloom allows later.".into(),
-            "The OS passkey prompt only proves your presence; review the details on this page."
-                .into(),
-        ];
-        intent.artifact_paths = vec![path_s.clone()];
-        intent.canonical_subject = serde_json::json!({
-            "kind": "vfs_policy_write",
-            "wallet": wallet,
-            "path": path_s,
-            "policy_blake3": policy_digest,
-        });
-        return intent;
-    }
-
-    if is_policy_session_new(wallet, path) {
-        let mut intent = bloom_proto::policy_session_mint_intent(wallet, &path_s, body);
-        intent.wallet_address = wallet_address;
-        return intent;
-    }
-
-    if let Some(intent) =
-        outbox_confirm_unlock_intent(wallet, &path_s, segs, wallet_address.clone(), outbox_root)
-    {
-        return intent;
-    }
-
-    if let Some(intent) = bloom_proto::hyperliquid_write_unlock_intent(
-        wallet,
-        &path_s,
-        segs,
-        body,
-        wallet_address.clone(),
-        wallet_policy_toml,
-    ) {
-        return intent;
-    }
-
-    CeremonyIntent::new(
-        wallet,
-        "Approve VFS Wallet Write",
-        CeremonyIntentKind::WalletUnlock,
-    )
-    .summary(format!("Approve one VFS write for wallet '{wallet}'."))
-    .summary(format!("Path: {path_s}"))
-    .risk("This unlock is scoped to the foreground write request.")
-    .risk("The OS passkey prompt will show bloom/localhost, not the VFS path.")
-    .artifact(path_s.clone())
-    .subject(serde_json::json!({
-        "kind": "vfs_write_unlocked",
-        "wallet": wallet,
-        "path": path_s,
-    }))
-}
-
-fn outbox_confirm_unlock_intent(
-    wallet: &str,
-    path_s: &str,
-    segs: &[String],
-    wallet_address: Option<String>,
-    outbox_root: Option<&std::path::Path>,
-) -> Option<CeremonyIntent> {
-    let [root, w, chains, chain, outbox, pending, id, confirm] = segs else {
-        return None;
-    };
-    if root != "wallets"
-        || w != wallet
-        || chains != "chains"
-        || outbox != "outbox"
-        || pending != "pending"
-        || confirm != "confirm"
-    {
-        return None;
-    }
-    let plan_path = outbox_root?
-        .join(wallet)
-        .join(chain)
-        .join("pending")
-        .join(id)
-        .join("plan.md");
-    let plan = std::fs::read_to_string(&plan_path).ok()?;
-    let plan_hash = blake3::hash(plan.as_bytes()).to_hex().to_string();
-    // DeFi session enrichment was removed when the native handler was replaced
-    // by the enso Petal. The ceremony still includes the plan.md transaction
-    // details and standard risk lines.
-    let mut intent = CeremonyIntent::new(
-        wallet,
-        format!("Approve {} Transaction", chain),
-        CeremonyIntentKind::EvmTransaction,
-    );
-    intent.wallet_address = wallet_address;
-    intent.summary_lines.extend(
-        plan.lines()
-            .filter(|line| {
-                line.starts_with("Wallet:")
-                    || line.starts_with("From:")
-                    || line.starts_with("To:")
-                    || line.starts_with("Chain:")
-                    || line.starts_with("Value:")
-                    || line.starts_with("Nonce:")
-                    || line.starts_with("Gas:")
-                    || line.starts_with("Data:")
-            })
-            .map(|line| line.trim().to_string()),
-    );
-    if intent.summary_lines.is_empty() {
-        intent
-            .summary_lines
-            .push(format!("Broadcast staged transaction {id} on {chain}."));
-    }
-    intent.risk_lines = vec![
-        "Approving will sign and broadcast this transaction.".into(),
-        "For cross-chain routes, source-chain confirmation is not destination settlement.".into(),
-        "The OS passkey prompt only proves your presence; review the transaction on this page."
-            .into(),
-    ];
-    intent.policy_lines = plan.lines().map(str::to_string).collect();
-    intent.artifact_paths = vec![path_s.to_string(), plan_path.display().to_string()];
-    intent.canonical_subject = serde_json::json!({
-        "kind": "outbox_confirm",
-        "wallet": wallet,
-        "chain": chain,
-        "outbox_id": id,
-        "path": path_s,
-        "plan_blake3": plan_hash,
-    });
-    Some(intent)
-}
-
-pub(crate) async fn sign_outbox_sealed_approval_if_challenged(
-    d: &Daemon,
-    wallet: &str,
-    chain: &str,
-    id: &str,
-    intent: Option<CeremonyIntent>,
-) -> Result<bool> {
-    let entry = d
-        .tx_engine
-        .outbox
-        .read(wallet, chain, id)
-        .with_context(|| format!("read pending outbox entry {wallet}/{chain}/{id}"))?;
-    let challenge_path = entry.dir.join("approval_challenge.json");
-    if !challenge_path.exists() {
-        return Ok(false);
-    }
-
-    let challenge: ApprovalChallenge = serde_json::from_slice(
-        &std::fs::read(&challenge_path)
-            .with_context(|| format!("read {}", challenge_path.display()))?,
-    )
-    .with_context(|| format!("parse {}", challenge_path.display()))?;
-    // Fail fast if the challenge does not refer to a real sealed action for
-    // this wallet; full binding is re-verified daemon-side at consume time.
-    let sealed = d
-        .auth_services
-        .require_store()
-        .context("Sealed Approval auth store is not wired")?
-        .sealed_intent(&challenge.intent_hash)
-        .await
-        .context("read sealed intent for approval challenge")?;
-    anyhow::ensure!(
-        sealed.envelope.header.wallet == wallet,
-        "approval challenge wallet mismatch: sealed action belongs to '{}'",
-        sealed.envelope.header.wallet
-    );
-
-    let review_session_id = if challenge.assurance == AssuranceLevel::Hardened {
-        let review_session_id = sealed_review_session_id(&challenge);
-        d.auth_services
-            .require_writer()
-            .context("Sealed Approval auth store writer is not wired")?
-            .issue_review_session(
-                &review_session_id,
-                &challenge.surface,
-                &challenge.action_id,
-                challenge.expiry_ms,
-                cli_now_ms(),
-            )
-            .await
-            .context("issue hardened review session")?;
-        Some(review_session_id)
-    } else {
-        None
-    };
-
-    // Echo every daemon-issued challenge field faithfully (§5.7 step 10);
-    // any drift is rejected at consume time.
-    let unsigned = UnsignedApproval::for_challenge(
-        &challenge,
-        SignerTransport::BrowserWebauthn,
-        None,
-        review_session_id,
-    );
-    let (_grant, approval) = bloom_daemon::sealed_ceremony::run_sealed_approval_ceremony(
-        &d.keystore,
-        &d.auth_services,
-        unsigned,
-        intent,
-        cli_now_ms(),
-        d.signer_cache.as_ref(),
-    )
-    .await
-    .context("run sealed approval browser ceremony")?;
-    let approval_path = entry.dir.join("approval.json");
-    std::fs::write(
-        &approval_path,
-        serde_json::to_vec_pretty(&approval).context("encode Sealed Approval")?,
-    )
-    .with_context(|| format!("write {}", approval_path.display()))?;
-    Ok(true)
-}
-
-async fn sign_request_sealed_approval_if_challenged(
-    d: &Daemon,
-    wallet: &str,
-    id: &str,
-    intent: Option<CeremonyIntent>,
-) -> Result<bool> {
-    let id = resolve_pending_request_id(d.home.root(), id)
-        .with_context(|| format!("resolve pending request id {id}"))?;
-    let dir = d.home.root().join("requests").join("pending").join(&id);
-    let challenge_path = dir.join("approval_challenge.json");
-    if !challenge_path.exists() {
-        return Ok(false);
-    }
-
-    let challenge: ApprovalChallenge = serde_json::from_slice(
-        &std::fs::read(&challenge_path)
-            .with_context(|| format!("read {}", challenge_path.display()))?,
-    )
-    .with_context(|| format!("parse {}", challenge_path.display()))?;
-    let sealed = d
-        .auth_services
-        .require_store()
-        .context("Sealed Approval auth store is not wired")?
-        .sealed_intent(&challenge.intent_hash)
-        .await
-        .context("read sealed intent for request approval challenge")?;
-    anyhow::ensure!(
-        sealed.envelope.header.wallet == wallet,
-        "approval challenge wallet mismatch: sealed action belongs to '{}'",
-        sealed.envelope.header.wallet
-    );
-
-    let review_session_id = if challenge.assurance == AssuranceLevel::Hardened {
-        let review_session_id = sealed_review_session_id(&challenge);
-        d.auth_services
-            .require_writer()
-            .context("Sealed Approval auth store writer is not wired")?
-            .issue_review_session(
-                &review_session_id,
-                &challenge.surface,
-                &challenge.action_id,
-                challenge.expiry_ms,
-                cli_now_ms(),
-            )
-            .await
-            .context("issue hardened request review session")?;
-        Some(review_session_id)
-    } else {
-        None
-    };
-
-    let unsigned = UnsignedApproval::for_challenge(
-        &challenge,
-        SignerTransport::BrowserWebauthn,
-        None,
-        review_session_id,
-    );
-    let (_grant, approval) = bloom_daemon::sealed_ceremony::run_sealed_approval_ceremony(
-        &d.keystore,
-        &d.auth_services,
-        unsigned,
-        intent,
-        cli_now_ms(),
-        d.signer_cache.as_ref(),
-    )
-    .await
-    .context("run request sealed approval browser ceremony")?;
-    let approval_path = dir.join("approval.json");
-    std::fs::write(
-        &approval_path,
-        serde_json::to_vec_pretty(&approval).context("encode request Sealed Approval")?,
-    )
-    .with_context(|| format!("write {}", approval_path.display()))?;
-    Ok(true)
-}
-
-fn resolve_pending_request_id(home: &Path, id: &str) -> Result<String> {
-    if id != "latest" {
-        return Ok(id.to_string());
-    }
-    let latest_path = home.join("requests").join("latest");
-    let latest = std::fs::read_to_string(&latest_path)
-        .with_context(|| format!("read {}", latest_path.display()))?;
-    let (state, id) = latest
-        .trim()
-        .split_once('/')
-        .context("requests/latest should be formatted as state/id")?;
-    if state != "pending" {
-        bail!("latest request is {state}/{id}, not pending");
-    }
-    Ok(id.to_string())
-}
-
-pub(crate) fn sealed_review_session_id(challenge: &ApprovalChallenge) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"bloom.review_session.v1");
-    hasher.update(challenge.surface.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(challenge.action_id.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(challenge.intent_hash.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(challenge.server_nonce.as_bytes());
-    format!("review-{}", hasher.finalize().to_hex())
-}
-
-fn cli_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn is_policy_session_new(wallet: &str, path: &VfsPath) -> bool {
-    matches!(
-        path.segments(),
-        [root, w, ps, leaf]
-            if root == "wallets" && w == wallet && ps == "policy-session" && leaf == "new"
-    )
-}
-
-struct WalletOutboxActionWrite<'a> {
-    home: HomeDir,
-    client_endpoint: &'a ResolvedEndpoint,
-    wallet: String,
-    chain: String,
-    id: String,
-    action: &'a str,
-    body: Vec<u8>,
-    passphrase: Option<String>,
-}
-
-async fn wallet_outbox_action_vfs_write(input: WalletOutboxActionWrite<'_>) -> Result<()> {
-    let WalletOutboxActionWrite {
-        home,
-        client_endpoint,
-        wallet,
-        chain,
-        id,
-        action,
-        body,
-        passphrase,
-    } = input;
-    if !matches!(action, "cancel" | "replace") {
-        bail!("unsupported wallet outbox action '{action}'");
-    }
-    let path = format!("/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/{action}");
-    let client = IpcClient::new(&client_endpoint.socket);
-    let ipc_res = try_ipc(
-        &client,
-        client_endpoint,
-        "write_unlocked",
-        serde_json::json!({
-            "path": path,
-            "bytes_b64": B64.encode(&body),
-            "wallet": &wallet,
-            "passphrase": passphrase.as_deref(),
-        }),
-    )
-    .await
-    .with_context(|| format!("ipc wallet outbox {action} via {}", client_endpoint.display))?;
-    if ipc_res.is_some() {
-        debug!(endpoint = %client_endpoint.display, action, "cli.wallet.outbox_action.via_ipc");
-        return Ok(());
-    }
-
-    debug!(
-        action,
-        "cli.wallet.outbox_action.via_inproc: no daemon socket present"
-    );
-    let p = VfsPath::parse(&path)?;
-    let (_home_permit, d) = build_write_daemon(home)?;
-    let info = d.keystore.info(&wallet)?;
-    match info.kind {
-        bloom_keystore::WalletKind::PasskeyGated => {
-            bail!(PASSKEY_WRITE_UNLOCKED_DISABLED);
-        }
-        _ => {
-            d.keystore
-                .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
-        }
-    }
-    d.vfs
-        .write(&p, &body)
-        .await
-        .with_context(|| format!("wallet outbox {action}"))?;
-    Ok(())
 }
 
 fn request_body_with_wallet(mut request: String, wallet: Option<&str>) -> String {
@@ -3357,166 +3560,13 @@ fn parse_batch_tx_ref(s: &str) -> Result<(String, String)> {
     Ok((chain.to_string(), id.to_string()))
 }
 
-async fn handle_hyperliquid(
-    home: HomeDir,
-    endpoint: &ResolvedEndpoint,
-    cmd: HyperliquidCmd,
-) -> Result<()> {
-    match cmd {
-        HyperliquidCmd::Account { user, network } => {
-            print_hl_info(&home, &network, hl_user_req("clearinghouseState", &user)).await
-        }
-        HyperliquidCmd::SpotState { user, network } => {
-            print_hl_info(
-                &home,
-                &network,
-                hl_user_req("spotClearinghouseState", &user),
-            )
-            .await
-        }
-        HyperliquidCmd::OpenOrders { user, network } => {
-            print_hl_info(&home, &network, hl_user_req("openOrders", &user)).await
-        }
-        HyperliquidCmd::Fills { user, network } => {
-            print_hl_info(&home, &network, hl_user_req("userFills", &user)).await
-        }
-        HyperliquidCmd::Funding {
-            user,
-            coin,
-            start_time,
-            end_time,
-            network,
-        } => {
-            let mut req = serde_json::json!({
-                "type": "userFunding",
-                "user": user.to_ascii_lowercase(),
-                "coin": coin,
-            });
-            let obj = req.as_object_mut().expect("json object");
-            if let Some(start) = start_time {
-                obj.insert("startTime".into(), serde_json::json!(start));
-            }
-            if let Some(end) = end_time {
-                obj.insert("endTime".into(), serde_json::json!(end));
-            }
-            print_hl_info(&home, &network, req).await
-        }
-        HyperliquidCmd::Book { coin, network } => {
-            print_hl_info(
-                &home,
-                &network,
-                serde_json::json!({"type": "l2Book", "coin": coin}),
-            )
-            .await
-        }
-        HyperliquidCmd::Candles {
-            coin,
-            interval,
-            start_time,
-            end_time,
-            network,
-        } => {
-            print_hl_info(
-                &home,
-                &network,
-                serde_json::json!({
-                    "type": "candleSnapshot",
-                    "req": {
-                        "coin": coin,
-                        "interval": interval,
-                        "startTime": start_time,
-                        "endTime": end_time,
-                    }
-                }),
-            )
-            .await
-        }
-        HyperliquidCmd::Metadata { kind, network } => {
-            let body = match kind.as_str() {
-                "perp" => serde_json::json!({"type": "meta"}),
-                "perp-contexts" => serde_json::json!({"type": "metaAndAssetCtxs"}),
-                "spot" => serde_json::json!({"type": "spotMeta"}),
-                "spot-contexts" => serde_json::json!({"type": "spotMetaAndAssetCtxs"}),
-                "mids" => serde_json::json!({"type": "allMids"}),
-                other => bail!(
-                    "unknown metadata kind '{other}' (use perp, perp-contexts, spot, spot-contexts, mids)"
-                ),
-            };
-            print_hl_info(&home, &network, body).await
-        }
-        HyperliquidCmd::Session { command } => handle_hl_session(endpoint, command).await,
-        HyperliquidCmd::SendAsset {
-            wallet,
-            destination,
-            amount,
-            network,
-            passphrase,
-        } => {
-            let path = format!("/hyperliquid/{network}/exchange/{wallet}/send_asset.json");
-            let body = serde_json::to_vec(&UsdSendRequest {
-                destination,
-                amount,
-                nonce: None,
-            })?;
-            if passphrase.is_some() {
-                eprintln!(
-                    "warning: --passphrase is ignored for Hyperliquid Sealed Approval; use the browser ceremony"
-                );
-            }
-            hl_session_ipc_write_with_sealed_approval(endpoint, &path, body, &wallet).await?;
-            let last_response =
-                format!("/hyperliquid/{network}/exchange/{wallet}/last_response.json");
-            match hl_session_ipc_read(endpoint, &last_response).await {
-                Ok(bytes) => std::io::Write::write_all(&mut std::io::stdout(), &bytes)?,
-                Err(_) => println!("usdSend submitted"),
-            }
-            Ok(())
-        }
-        HyperliquidCmd::TestReads {
-            user,
-            coin,
-            network,
-        } => test_hl_reads(&home, &network, &user, &coin).await,
-        HyperliquidCmd::TestPostOnlyCancel {
-            wallet,
-            coin,
-            asset,
-            price,
-            size,
-            max_notional_usd,
-            policy_session,
-            danger_accept_live_orders,
-            passphrase,
-            network,
-        } => {
-            test_hl_post_only_cancel(
-                home,
-                TestPostOnlyCancelArgs {
-                    wallet,
-                    coin,
-                    asset,
-                    price,
-                    size,
-                    max_notional_usd,
-                    policy_session,
-                    danger_accept_live_orders,
-                    passphrase,
-                    network,
-                },
-            )
-            .await
-        }
-    }
-}
-
-async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
+async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<(String, i32)> {
     match cmd {
         UpdateCmd::Status => {
             let installed = env!("CARGO_PKG_VERSION");
             let snap = bloom_update::read_cache_only(installed, &home.cache_dir());
             let json = serde_json::to_string_pretty(&snap).context("serialise update snapshot")?;
-            println!("{json}");
-            Ok(())
+            Ok((format!("{json}\n"), 0))
         }
         UpdateCmd::Check => {
             // An explicit check needs only a checker; avoid constructing
@@ -3526,522 +3576,14 @@ async fn handle_update(home: &HomeDir, cmd: UpdateCmd) -> Result<()> {
                     .context("build update checker")?;
             let snap = checker.refresh().await;
             let json = serde_json::to_string_pretty(&snap).context("serialise update snapshot")?;
-            println!("{json}");
             let code = match snap.available() {
                 bloom_update::UpdateAvailable::OutOfDate => 1,
                 bloom_update::UpdateAvailable::UpToDate => 0,
                 bloom_update::UpdateAvailable::Unknown => 2,
             };
-            if code != 0 {
-                UPDATE_EXIT_CODE.store(code, std::sync::atomic::Ordering::SeqCst);
-            }
-            Ok(())
+            Ok((format!("{json}\n"), code))
         }
     }
-}
-
-async fn handle_hl_session(endpoint: &ResolvedEndpoint, cmd: HyperliquidSessionCmd) -> Result<()> {
-    match cmd {
-        HyperliquidSessionCmd::Create {
-            wallet,
-            id,
-            agent_name,
-            vault_address,
-            network,
-            passphrase,
-        } => {
-            let path = hl_session_wallet_path(&network, &wallet, "new.json");
-            let body = serde_json::json!({
-                "id": id,
-                "agent_name": agent_name,
-                "vault_address": vault_address,
-            });
-            if passphrase.is_some() {
-                eprintln!(
-                    "warning: --passphrase is ignored for Hyperliquid Sealed Approval; use the browser ceremony"
-                );
-            }
-            hl_session_ipc_write_with_sealed_approval(
-                endpoint,
-                &path,
-                serde_json::to_vec(&body)?,
-                &wallet,
-            )
-            .await?;
-            let last_response =
-                format!("/hyperliquid/{network}/exchange/{wallet}/last_response.json");
-            match hl_session_ipc_read(endpoint, &last_response).await {
-                Ok(bytes) => std::io::Write::write_all(&mut std::io::stdout(), &bytes)?,
-                Err(_) => println!("created Hyperliquid agent session"),
-            }
-            Ok(())
-        }
-        HyperliquidSessionCmd::Status {
-            wallet,
-            id,
-            network,
-        } => {
-            let path = hl_session_path(&network, &wallet, &id, "status.json");
-            let bytes = hl_session_ipc_read(endpoint, &path).await?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
-            Ok(())
-        }
-        HyperliquidSessionCmd::Audit {
-            wallet,
-            id,
-            network,
-        } => {
-            let path = hl_session_path(&network, &wallet, &id, "audit.jsonl");
-            let bytes = hl_session_ipc_read(endpoint, &path).await?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
-            Ok(())
-        }
-        HyperliquidSessionCmd::Stop {
-            wallet,
-            id,
-            network,
-        } => {
-            hl_session_ipc_write(
-                endpoint,
-                &hl_session_path(&network, &wallet, &id, "stop"),
-                Vec::new(),
-            )
-            .await
-        }
-        HyperliquidSessionCmd::CancelAll {
-            wallet,
-            id,
-            network,
-        } => {
-            hl_session_ipc_write(
-                endpoint,
-                &hl_session_path(&network, &wallet, &id, "cancel_all"),
-                Vec::new(),
-            )
-            .await
-        }
-        HyperliquidSessionCmd::CloseAll {
-            wallet,
-            id,
-            network,
-        } => {
-            hl_session_ipc_write(
-                endpoint,
-                &hl_session_path(&network, &wallet, &id, "close_all"),
-                Vec::new(),
-            )
-            .await
-        }
-    }
-}
-
-fn hl_session_wallet_path(network: &str, wallet: &str, file: &str) -> String {
-    format!("/hyperliquid/{network}/agent_sessions/{wallet}/{file}")
-}
-
-fn hl_session_path(network: &str, wallet: &str, id: &str, file: &str) -> String {
-    format!("/hyperliquid/{network}/agent_sessions/{wallet}/{id}/{file}")
-}
-
-/// Resolve a staged request's paying wallet from its `request.toml`, IPC-first
-/// with an in-process read fallback. Returns `None` if the field is absent.
-async fn read_request_wallet(
-    client: &IpcClient,
-    endpoint: &ResolvedEndpoint,
-    home: &HomeDir,
-    id: &str,
-) -> Result<Option<String>> {
-    let path = format!("/requests/{id}/request.toml");
-    let bytes = match try_ipc(
-        client,
-        endpoint,
-        "read",
-        serde_json::json!({ "path": path }),
-    )
-    .await
-    .with_context(|| format!("ipc read via {}", endpoint.display))?
-    {
-        Some(res) => {
-            let b64 = res
-                .get("bytes_b64")
-                .and_then(|v| v.as_str())
-                .context("ipc read: missing bytes_b64")?;
-            B64.decode(b64).context("ipc read: bad base64")?
-        }
-        None => {
-            let d = Daemon::from_home(home.clone()).context("build daemon")?;
-            let p = VfsPath::parse(&path)?;
-            d.vfs.read(&p).await.context("read request.toml")?
-        }
-    };
-    let value: serde_json::Value = serde_json::from_slice(&bytes).context("parse request.toml")?;
-    Ok(value
-        .get("wallet")
-        .and_then(|v| v.as_str())
-        .map(str::to_string))
-}
-
-async fn hl_session_ipc_read(endpoint: &ResolvedEndpoint, path: &str) -> Result<Vec<u8>> {
-    let client = IpcClient::new(&endpoint.socket);
-    let Some(res) = try_ipc(
-        &client,
-        endpoint,
-        "read",
-        serde_json::json!({ "path": path }),
-    )
-    .await
-    .with_context(|| format!("ipc read via {}", endpoint.display))?
-    else {
-        bail!("Hyperliquid agent sessions require a running bloom serve daemon");
-    };
-    let b64 = res
-        .get("bytes_b64")
-        .and_then(|v| v.as_str())
-        .context("ipc read: missing bytes_b64")?;
-    B64.decode(b64).context("ipc read: bad base64")
-}
-
-async fn hl_session_ipc_write(
-    endpoint: &ResolvedEndpoint,
-    path: &str,
-    body: Vec<u8>,
-) -> Result<()> {
-    let client = IpcClient::new(&endpoint.socket);
-    let res = try_ipc(
-        &client,
-        endpoint,
-        "write",
-        serde_json::json!({
-            "path": path,
-            "bytes_b64": B64.encode(&body),
-        }),
-    )
-    .await
-    .with_context(|| format!("ipc write via {}", endpoint.display))?;
-    if res.is_none() {
-        bail!("Hyperliquid agent sessions require a running bloom serve daemon");
-    }
-    Ok(())
-}
-
-async fn hl_session_ipc_write_with_sealed_approval(
-    endpoint: &ResolvedEndpoint,
-    path: &str,
-    body: Vec<u8>,
-    wallet: &str,
-) -> Result<()> {
-    match hl_session_ipc_write_once(endpoint, path, &body).await {
-        Ok(()) => return Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("Hyperliquid Sealed Approval requires a running bloom serve daemon");
-        }
-        Err(e) if is_ipc_permission_denied(&e) => {
-            let challenge_path = hyperliquid_challenge_vfs_path(path, &body)
-                .with_context(|| format!("locate Hyperliquid approval challenge for {path}"))?;
-            let challenge = read_hyperliquid_approval_challenge(endpoint, &challenge_path).await?;
-            ensure_hyperliquid_challenge_matches(&challenge, wallet)?;
-            let url = challenge
-                .ceremony_url
-                .clone()
-                .context("Hyperliquid approval challenge is missing ceremony_url")?;
-            eprintln!("Hyperliquid Sealed Approval required.");
-            eprintln!("Opening ceremony URL: {url}");
-            open_ceremony_url(&url);
-            wait_for_hyperliquid_grant(&url)?;
-        }
-        Err(e) => return Err(e).with_context(|| format!("ipc write via {}", endpoint.display)),
-    }
-
-    match hl_session_ipc_write_once(endpoint, path, &body).await {
-        Ok(()) => Ok(()),
-        Err(e) if is_ipc_permission_denied(&e) => {
-            bail!(
-                "Hyperliquid Sealed Approval grant is not active yet; complete the grant ceremony and rerun the command"
-            )
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("Hyperliquid Sealed Approval requires a running bloom serve daemon")
-        }
-        Err(e) => Err(e).with_context(|| format!("ipc write via {}", endpoint.display)),
-    }
-}
-
-async fn hl_session_ipc_write_once(
-    endpoint: &ResolvedEndpoint,
-    path: &str,
-    body: &[u8],
-) -> std::io::Result<()> {
-    let client = IpcClient::new(&endpoint.socket);
-    client
-        .call(
-            "write",
-            serde_json::json!({
-                "path": path,
-                "bytes_b64": B64.encode(body),
-            }),
-        )
-        .await
-        .map(|_| ())
-}
-
-fn is_ipc_permission_denied(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::PermissionDenied
-        || e.to_string().contains("\"code\":-32007")
-        || e.to_string()
-            .to_ascii_lowercase()
-            .contains("permission denied")
-}
-
-fn hyperliquid_challenge_vfs_path(path: &str, body: &[u8]) -> Result<String> {
-    let vfs_path = VfsPath::parse(path)?;
-    let segments = vfs_path.segments();
-    if segments.len() == 5
-        && segments[0] == "hyperliquid"
-        && segments[2] == "exchange"
-        && segments[4] == "send_asset.json"
-    {
-        return Ok(format!(
-            "/hyperliquid/{}/exchange/{}/approval_challenge.json",
-            segments[1], segments[3]
-        ));
-    }
-    if segments.len() == 5
-        && segments[0] == "hyperliquid"
-        && segments[2] == "agent_sessions"
-        && segments[4] == "new.json"
-    {
-        let request: serde_json::Value =
-            serde_json::from_slice(body).context("parse Hyperliquid session create body")?;
-        let id = request
-            .get("id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .context("Hyperliquid session create requires an explicit stable id")?;
-        return Ok(format!(
-            "/hyperliquid/{}/agent_sessions/{}/{id}/approval_challenge.json",
-            segments[1], segments[3]
-        ));
-    }
-    bail!("unsupported Hyperliquid Sealed Approval path {path}");
-}
-
-async fn read_hyperliquid_approval_challenge(
-    endpoint: &ResolvedEndpoint,
-    path: &str,
-) -> Result<ApprovalChallenge> {
-    let bytes = hl_session_ipc_read(endpoint, path)
-        .await
-        .with_context(|| format!("ipc read Hyperliquid approval challenge {path}"))?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse Hyperliquid approval challenge {path}"))
-}
-
-fn ensure_hyperliquid_challenge_matches(challenge: &ApprovalChallenge, wallet: &str) -> Result<()> {
-    if challenge.surface != "hyperliquid" {
-        bail!(
-            "approval challenge surface is {}, expected hyperliquid",
-            challenge.surface
-        );
-    }
-    if challenge.wallet != wallet {
-        bail!(
-            "approval challenge wallet is {}, expected {}",
-            challenge.wallet,
-            wallet
-        );
-    }
-    if challenge.expiry_ms <= cli_now_ms() {
-        bail!("Hyperliquid approval challenge expired; rerun the command to issue a new challenge");
-    }
-    Ok(())
-}
-
-fn open_ceremony_url(url: &str) {
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut cmd = Command::new("open");
-        cmd.arg(url);
-        cmd
-    };
-    #[cfg(target_os = "linux")]
-    let mut cmd = {
-        let mut cmd = Command::new("xdg-open");
-        cmd.arg(url);
-        cmd
-    };
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/C", "start", "", url]);
-        cmd
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let mut cmd = { Command::new("true") };
-    let _ = cmd.status();
-}
-
-fn wait_for_hyperliquid_grant(url: &str) -> Result<()> {
-    if std::io::stdin().is_terminal() {
-        eprintln!("Complete the ceremony in grant mode, then press Enter to retry the write.");
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-    } else {
-        eprintln!(
-            "Complete the ceremony in grant mode, then rerun the command if the automatic retry happens before approval."
-        );
-        eprintln!("Ceremony URL: {url}");
-    }
-    Ok(())
-}
-
-fn hl_network(raw: &str) -> Result<HyperliquidNetwork> {
-    match raw {
-        "mainnet" => Ok(HyperliquidNetwork::Mainnet),
-        "testnet" => Ok(HyperliquidNetwork::Testnet),
-        other => bail!("unknown Hyperliquid network '{other}' (use mainnet or testnet)"),
-    }
-}
-
-fn hl_client(home: &HomeDir, raw: &str) -> Result<HyperliquidClient> {
-    let network = hl_network(raw)?;
-    let mut client = HyperliquidClient::new(network);
-    // Honor [hyperliquid] mainnet_url/testnet_url overrides, same as the daemon
-    // (so local/staging/proxy deployments work from the CLI too).
-    if let Ok(config) = bloom_proto::Config::load_or_init(&home.config_path())
-        && let Some(hl) = config.hyperliquid
-    {
-        let raw_url = match network {
-            HyperliquidNetwork::Mainnet => hl.mainnet_url,
-            HyperliquidNetwork::Testnet => hl.testnet_url,
-        };
-        if let Ok(url) = raw_url.parse::<url::Url>() {
-            client = client.with_base_url(url);
-        }
-    }
-    Ok(client)
-}
-
-fn hl_user_req(kind: &str, user: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": kind,
-        "user": user.to_ascii_lowercase(),
-    })
-}
-
-async fn print_hl_info(home: &HomeDir, network: &str, body: serde_json::Value) -> Result<()> {
-    let client = hl_client(home, network)?;
-    let value = client.info(body).await?;
-    std::io::Write::write_all(&mut std::io::stdout(), &pretty_json(&value))?;
-    Ok(())
-}
-
-async fn test_hl_reads(home: &HomeDir, network: &str, user: &str, coin: &str) -> Result<()> {
-    let client = hl_client(home, network)?;
-    let now = bloom_hyperliquid::now_ms();
-    let start = now.saturating_sub(60 * 60 * 1000);
-    let calls = [
-        ("account", hl_user_req("clearinghouseState", user)),
-        ("spot_state", hl_user_req("spotClearinghouseState", user)),
-        ("open_orders", hl_user_req("openOrders", user)),
-        (
-            "frontend_open_orders",
-            hl_user_req("frontendOpenOrders", user),
-        ),
-        ("fills", hl_user_req("userFills", user)),
-        (
-            "funding",
-            serde_json::json!({
-                "type": "userFunding",
-                "user": user.to_ascii_lowercase(),
-                "coin": coin,
-                "startTime": start,
-                "endTime": now,
-            }),
-        ),
-        ("portfolio", hl_user_req("portfolio", user)),
-        ("rate_limit", hl_user_req("userRateLimit", user)),
-        ("mids", serde_json::json!({"type": "allMids"})),
-        ("perp_meta", serde_json::json!({"type": "meta"})),
-        (
-            "perp_contexts",
-            serde_json::json!({"type": "metaAndAssetCtxs"}),
-        ),
-        ("spot_meta", serde_json::json!({"type": "spotMeta"})),
-        (
-            "spot_contexts",
-            serde_json::json!({"type": "spotMetaAndAssetCtxs"}),
-        ),
-        ("book", serde_json::json!({"type": "l2Book", "coin": coin})),
-        (
-            "candles",
-            serde_json::json!({
-                "type": "candleSnapshot",
-                "req": {
-                    "coin": coin,
-                    "interval": "1m",
-                    "startTime": start,
-                    "endTime": now,
-                }
-            }),
-        ),
-    ];
-
-    let mut out = serde_json::Map::new();
-    for (name, body) in calls {
-        match client.info(body).await {
-            Ok(value) => {
-                out.insert(name.to_string(), value);
-            }
-            Err(e) => {
-                out.insert(
-                    name.to_string(),
-                    serde_json::json!({"error": e.to_string()}),
-                );
-            }
-        }
-    }
-    std::io::Write::write_all(
-        &mut std::io::stdout(),
-        &pretty_json(&serde_json::Value::Object(out)),
-    )?;
-    Ok(())
-}
-
-struct TestPostOnlyCancelArgs {
-    wallet: String,
-    coin: String,
-    asset: u32,
-    price: Option<String>,
-    size: Option<String>,
-    max_notional_usd: f64,
-    policy_session: bool,
-    danger_accept_live_orders: bool,
-    passphrase: Option<String>,
-    network: String,
-}
-
-async fn test_hl_post_only_cancel(_home: HomeDir, args: TestPostOnlyCancelArgs) -> Result<()> {
-    let TestPostOnlyCancelArgs {
-        wallet: _wallet,
-        coin: _coin,
-        asset: _asset,
-        price: _price,
-        size: _size,
-        max_notional_usd,
-        policy_session: _policy_session,
-        danger_accept_live_orders,
-        passphrase: _passphrase,
-        network: _network,
-    } = args;
-    if !danger_accept_live_orders {
-        bail!("refusing live Hyperliquid test order without --danger-accept-live-orders");
-    }
-    if max_notional_usd <= 0.0 {
-        bail!("--max-notional-usd must be positive");
-    }
-    bail!(
-        "direct owner-key Hyperliquid test orders are disabled; create a Sealed Approval agent session and submit through /hyperliquid/<network>/agent_sessions/<wallet>/<session>/order.json"
-    )
 }
 
 #[cfg(not(feature = "mount"))]
@@ -4074,7 +3616,337 @@ async fn unmount_bloom(handle: Option<()>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_petal_consent_net_rule, request_body_with_wallet};
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use clap::Parser as _;
+
+    use super::{
+        Cli, Cmd, LegacyMigrationReceiptFile, WalletCmd, ceremony_projection_path,
+        endpoint_connection_error, enrollment_state_is_usable, execute_audit_command,
+        execute_wallet_outbox_action, format_petal_consent_net_rule,
+        is_completed_policy_update_receipt, launch_wallet_registration_via_vfs,
+        load_ceremony_projection, machine_error_from_anyhow, machine_wallet_lookup_error,
+        open_machine_audit_with_history, persist_ceremony_projection, request_body_with_wallet,
+    };
+
+    #[derive(Default)]
+    struct RecordingOutboxHandler(Mutex<Vec<(String, Vec<u8>)>>);
+
+    #[derive(Default)]
+    struct RecordingRegistrationHandler(Mutex<Vec<(String, Vec<u8>)>>);
+
+    #[async_trait]
+    impl bloom_vfs::Handler for RecordingRegistrationHandler {
+        async fn lookup(
+            &self,
+            path: &bloom_vfs::VfsPath,
+        ) -> Result<bloom_vfs::Entry, bloom_vfs::HandlerError> {
+            match path.segments() {
+                [name] if name == "new" => Ok(bloom_vfs::Entry::writable_file("new")),
+                [_, _, leaf] if leaf == "status.json" => Ok(bloom_vfs::Entry::file("status.json")),
+                _ => Err(bloom_vfs::HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn read(
+            &self,
+            path: &bloom_vfs::VfsPath,
+        ) -> Result<Vec<u8>, bloom_vfs::HandlerError> {
+            if path.to_string_path() != "/registrations/gavin/status.json" {
+                return Err(bloom_vfs::HandlerError::NotFound(path.to_string_path()));
+            }
+            Ok(serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-wallet-registration-projection.1",
+                "requested_name": "gavin",
+                "operation_id": "11".repeat(32),
+                "ceremony_kind": "wallet_registration",
+                "ceremony_state": "AWAITING_USER",
+                "ceremony_url": "http://localhost:18734/ceremony/test-token",
+                "ceremony_expires_at_ms": u64::MAX.to_string(),
+                "signer_contribution_digest": "22".repeat(32),
+            }))
+            .unwrap())
+        }
+
+        async fn write(
+            &self,
+            path: &bloom_vfs::VfsPath,
+            data: &[u8],
+        ) -> Result<(), bloom_vfs::HandlerError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((path.to_string_path(), data.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_new_machine_command_uses_the_mounted_registration_projection() {
+        let handler = std::sync::Arc::new(RecordingRegistrationHandler::default());
+        let vfs = bloom_vfs::Vfs::builder()
+            .mount("wallets", handler.clone())
+            .build();
+
+        let output = launch_wallet_registration_via_vfs(&vfs, "gavin")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *handler.0.lock().unwrap(),
+            vec![("/new".into(), b"gavin".to_vec())]
+        );
+        assert!(output.contains("operation_id: "));
+        assert!(output.contains("ceremony_url: http://localhost:18734/ceremony/test-token\n"));
+        assert!(output.contains("projection: /wallets/registrations/gavin/status.json\n"));
+    }
+
+    #[async_trait]
+    impl bloom_vfs::Handler for RecordingOutboxHandler {
+        async fn lookup(
+            &self,
+            path: &bloom_vfs::VfsPath,
+        ) -> Result<bloom_vfs::Entry, bloom_vfs::HandlerError> {
+            Ok(bloom_vfs::Entry::writable_file(
+                path.segments().last().map(String::as_str).unwrap_or(""),
+            ))
+        }
+
+        async fn write(
+            &self,
+            path: &bloom_vfs::VfsPath,
+            data: &[u8],
+        ) -> Result<(), bloom_vfs::HandlerError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((path.to_string_path(), data.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_owned_wallet_outbox_actions_use_the_canonical_vfs_handler() {
+        let handler = std::sync::Arc::new(RecordingOutboxHandler::default());
+        let vfs = bloom_vfs::Vfs::builder()
+            .mount("wallets", handler.clone())
+            .build();
+
+        execute_wallet_outbox_action(&vfs, "alice", "base", "tx-1", "cancel", b"approve")
+            .await
+            .unwrap();
+        execute_wallet_outbox_action(
+            &vfs,
+            "alice",
+            "base",
+            "tx-1",
+            "replace",
+            b"replacement intent",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *handler.0.lock().unwrap(),
+            vec![
+                (
+                    "/alice/chains/base/outbox/pending/tx-1/cancel".into(),
+                    b"approve".to_vec(),
+                ),
+                (
+                    "/alice/chains/base/outbox/pending/tx-1/replace".into(),
+                    b"replacement intent".to_vec(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_owned_wallet_outbox_actions_reject_path_shaping_params() {
+        let vfs = bloom_vfs::Vfs::new();
+        for invalid in ["bad/segment", "bad\\segment", "bad\0segment"] {
+            for (wallet, chain, id) in [
+                (invalid, "base", "tx-1"),
+                ("alice", invalid, "tx-1"),
+                ("alice", "base", invalid),
+            ] {
+                let error =
+                    execute_wallet_outbox_action(&vfs, wallet, chain, id, "cancel", b"approve")
+                        .await
+                        .unwrap_err();
+                let error = error
+                    .downcast_ref::<bloom_daemon::ipc::MachineError>()
+                    .unwrap();
+                assert_eq!(
+                    error.kind,
+                    bloom_daemon::ipc::MachineErrorKind::InvalidParams,
+                    "{wallet:?} {chain:?} {id:?}"
+                );
+                assert_eq!(error.code, "INVALID_ARGUMENT");
+            }
+        }
+    }
+
+    #[test]
+    fn machine_error_mapping_uses_concrete_causes_not_context_words() {
+        use bloom_broker_api::ProtocolErrorCode as Code;
+        use bloom_daemon::ipc::MachineErrorKind as Kind;
+
+        let cases = [
+            (Code::MalformedFrame, Kind::InvalidParams),
+            (Code::UnauthenticatedPeer, Kind::PermissionDenied),
+            (Code::OperationIdConflict, Kind::Conflict),
+            (Code::ServiceUnavailable, Kind::Unavailable),
+        ];
+        for (code, expected) in cases {
+            let source = bloom_broker_api::ProtocolError::new(code, "typed cause");
+            let mapped = machine_error_from_anyhow(anyhow::Error::new(source));
+            assert_eq!(mapped.kind, expected, "{code:?}");
+        }
+
+        let missing = machine_wallet_lookup_error(bloom_broker_api::ProtocolError::new(
+            Code::BackendInvalidRequest,
+            "wallet absent",
+        ));
+        assert_eq!(missing.kind, Kind::NotFound);
+
+        let refused = machine_error_from_anyhow(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Broker socket refused",
+        )));
+        assert_eq!(refused.kind, Kind::Unavailable);
+
+        let misleading = anyhow::Error::new(bloom_broker_api::ProtocolError::new(
+            Code::ServiceUnavailable,
+            "Broker socket refused",
+        ))
+        .context("permission denied and invalid words in outer context");
+        assert_eq!(
+            machine_error_from_anyhow(misleading).kind,
+            Kind::Unavailable
+        );
+
+        let unexpected = machine_error_from_anyhow(anyhow::anyhow!("unexpected failure"));
+        assert_eq!(unexpected.kind, Kind::Internal);
+
+        let invalid_path = machine_error_from_anyhow(anyhow::Error::new(
+            bloom_vfs::path::PathError::InvalidSegment("bad\\segment".into()),
+        ));
+        assert_eq!(invalid_path.kind, Kind::InvalidParams);
+        assert_eq!(invalid_path.code, "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn legacy_migration_receipt_is_digest_bound_and_cli_is_explicit() {
+        let operation_id = bloom_broker_api::OperationId::from_bytes([81; 32]);
+        let public = bloom_broker_api::LegacyPasskeyMigrationPublic {
+            schema: bloom_broker_api::Token::new("bloom.legacy_passkey_migration_receipt.v1")
+                .unwrap(),
+            wallet_name: bloom_broker_api::Token::new("wallet").unwrap(),
+            address: "0x1111111111111111111111111111111111111111".into(),
+            public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([82; 32]),
+            credential_id_fingerprint: bloom_broker_api::Digest32::from_bytes([83; 32]),
+            legacy_format_version: 1,
+            bundle_digest: bloom_broker_api::Digest32::from_bytes([84; 32]),
+            policy_mode: bloom_broker_api::Token::new("restrictive_current_policy").unwrap(),
+        };
+        let exact_terms_digest = public.terms_digest(&operation_id).unwrap();
+        let receipt = LegacyMigrationReceiptFile {
+            schema: public.schema.as_str().into(),
+            operation_id: operation_id.clone(),
+            wallet_name: public.wallet_name.clone(),
+            address: public.address.clone(),
+            public_key_fingerprint: public.public_key_fingerprint.clone(),
+            credential_id_fingerprint: public.credential_id_fingerprint.clone(),
+            legacy_format_version: public.legacy_format_version,
+            bundle_digest: public.bundle_digest.clone(),
+            policy_mode: public.policy_mode.as_str().into(),
+            exact_terms_digest,
+        };
+        let (wallet_name, launch) = receipt.into_launch().unwrap();
+        assert_eq!(wallet_name, "wallet");
+        assert_eq!(launch.operation_id, operation_id);
+
+        let tampered = LegacyMigrationReceiptFile {
+            schema: public.schema.as_str().into(),
+            operation_id: launch.operation_id,
+            wallet_name: public.wallet_name,
+            address: public.address,
+            public_key_fingerprint: public.public_key_fingerprint,
+            credential_id_fingerprint: public.credential_id_fingerprint,
+            legacy_format_version: 2,
+            bundle_digest: public.bundle_digest,
+            policy_mode: public.policy_mode.as_str().into(),
+            exact_terms_digest: launch.exact_terms_digest,
+        };
+        assert!(tampered.into_launch().is_err());
+
+        let cli =
+            Cli::try_parse_from(["bloom", "wallet", "migrate-passkey", "receipt.json"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Wallet(WalletCmd::MigratePasskey { receipt }))
+                if receipt.as_os_str() == "receipt.json"
+        ));
+    }
+
+    #[test]
+    fn activating_enrollment_is_usable_only_for_installer_health() {
+        assert!(enrollment_state_is_usable("active", false));
+        assert!(enrollment_state_is_usable("active", true));
+        assert!(enrollment_state_is_usable("activating", true));
+        assert!(!enrollment_state_is_usable("activating", false));
+        assert!(!enrollment_state_is_usable("pending", true));
+    }
+
+    #[test]
+    fn audit_status_reports_malformed_evidence_as_degradation() {
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = bloom_proto::HomeDir::at(temp.path());
+        let path = home.audit_path();
+        let identity = bloom_triad_local_transport::LocalIdentity {
+            service_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+            boot_epoch: bloom_broker_api::BootEpoch::from_bytes([7; 16]),
+            application_key_id: bloom_broker_api::Token::new("machine-app").unwrap(),
+            signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7; 32])),
+        };
+        let audit = open_machine_audit_with_history(
+            &home,
+            identity,
+            &temp.path().join("missing-packaging-history.json"),
+        )
+        .unwrap();
+        audit
+            .append(bloom_proto::AuditRecord {
+                ts_ms: 0,
+                kind: "test.valid".into(),
+                wallet: None,
+                chain: None,
+                data: serde_json::json!({}),
+                prev: String::new(),
+                digest: String::new(),
+            })
+            .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "not-json-evidence").unwrap();
+        file.sync_all().unwrap();
+
+        let cli = Cli::try_parse_from(["bloom", "audit", "status"]).unwrap();
+        let Some(Cmd::Audit(command)) = cli.cmd else {
+            panic!("audit status must parse to the audit command handler");
+        };
+        let output = execute_audit_command(&command, &audit).unwrap();
+        let status: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(status["mutation_degradation"].is_string());
+        assert!(status["pending_effect_read_error"].is_string());
+        assert_eq!(status["pending_effect_correlations"], serde_json::json!([]));
+    }
 
     #[test]
     fn petal_consent_network_line_includes_named_binding() {
@@ -4104,51 +3976,242 @@ mod tests {
         assert!(output.starts_with("POST https://api.example.com/data wallet=gavin\n"));
         assert!(output.ends_with("\n\n{\"ok\":true}"));
     }
-}
-
-#[cfg(test)]
-mod hl_cli_tests {
-    use super::*;
 
     #[test]
-    fn post_only_cancel_test_requires_danger_flag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = rt
-            .block_on(test_hl_post_only_cancel(
-                HomeDir::at(tmp.path()),
-                TestPostOnlyCancelArgs {
-                    wallet: "minnow".into(),
-                    coin: "BTC".into(),
-                    asset: 0,
-                    price: None,
-                    size: None,
-                    max_notional_usd: 15.0,
-                    policy_session: false,
-                    danger_accept_live_orders: false,
-                    passphrase: None,
-                    network: "mainnet".into(),
-                },
-            ))
-            .unwrap_err();
-        assert!(err.to_string().contains("--danger-accept-live-orders"));
+    fn custody_projection_persists_atomically_and_without_secret_world_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = bloom_proto::HomeDir::at(temp.path());
+        let operation_id = bloom_broker_api::OperationId::from_bytes([61; 32]);
+        let status = bloom_broker_api::CeremonyPublicStatus {
+            ceremony_id: bloom_broker_api::Digest32::from_bytes([62; 32]),
+            ceremony_kind: bloom_broker_api::CeremonyKind::WalletImport,
+            operation_id: operation_id.clone(),
+            state: bloom_broker_api::CeremonyState::AwaitingUser,
+            expires_at_ms: bloom_broker_api::DecimalU64::new(u64::MAX),
+            ceremony_url: Some("http://localhost:18734/ceremony/owner-readable-secret".into()),
+            receipt_digest: None,
+        };
+        let projection =
+            bloom_machine_client::CeremonyProjection::from_custody_status(&status, 1).unwrap();
+        let path = persist_ceremony_projection(&home, &projection).unwrap();
+        assert_eq!(path, ceremony_projection_path(&home, operation_id.as_str()));
+        assert_eq!(
+            load_ceremony_projection(&home, &operation_id)
+                .unwrap()
+                .unwrap(),
+            projection
+        );
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp"))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
-    fn hl_client_honors_config_endpoint_override() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = HomeDir::at(tmp.path());
-        let mut cfg = bloom_proto::Config::local_default();
-        cfg.hyperliquid = Some(bloom_proto::config::HyperliquidConfig {
-            mainnet_url: "http://localhost:9999/".into(),
-            ..Default::default()
-        });
-        std::fs::write(home.config_path(), toml::to_string(&cfg).unwrap()).unwrap();
-        // Mainnet uses the configured override.
-        let client = hl_client(&home, "mainnet").unwrap();
-        assert_eq!(client.base_url().as_str(), "http://localhost:9999/");
-        // Testnet wasn't overridden → default public endpoint.
-        let tclient = hl_client(&home, "testnet").unwrap();
-        assert!(tclient.base_url().as_str().contains("hyperliquid-testnet"));
+    fn ac26_every_custody_kind_exposes_launch_data_only_while_awaiting() {
+        use bloom_broker_api::{
+            CeremonyKind, CeremonyPublicStatus, CeremonyState, CustodyPrepareResponse, DecimalU64,
+            Digest32, OperationId,
+        };
+
+        let custody_kinds = [
+            CeremonyKind::WalletRegistration,
+            CeremonyKind::WalletImport,
+            CeremonyKind::WalletExport,
+            CeremonyKind::WalletDelete,
+            CeremonyKind::WalletRecovery,
+            CeremonyKind::CredentialAdd,
+            CeremonyKind::CredentialReplace,
+            CeremonyKind::CredentialRemove,
+            CeremonyKind::BackendEnrollment,
+            CeremonyKind::KeyDerive,
+            CeremonyKind::PolicyUpdate,
+        ];
+        let non_actionable_states = [
+            CeremonyState::Prepared,
+            CeremonyState::Verifying,
+            CeremonyState::WalletCommitted,
+            CeremonyState::AwaitingRecoveryAck,
+            CeremonyState::Completed,
+            CeremonyState::ApprovingRootChange,
+            CeremonyState::CreatingCredential,
+            CeremonyState::Committing,
+            CeremonyState::Succeeded,
+            CeremonyState::Cancelled,
+            CeremonyState::Expired,
+            CeremonyState::Failed,
+        ];
+
+        for (ordinal, kind) in custody_kinds.into_iter().enumerate() {
+            let operation_id = OperationId::from_bytes([ordinal as u8 + 1; 32]);
+            let expected_url = format!(
+                "http://localhost:18734/ceremony/ac26-{}",
+                operation_id.as_str()
+            );
+            let prepared = CustodyPrepareResponse {
+                ceremony_kind: kind,
+                custody_operation_id: operation_id.clone(),
+                state: bloom_broker_api::CustodyPrepareState::AwaitingUser,
+                ceremony_url: expected_url.clone(),
+                ceremony_expires_at_ms: DecimalU64::new(10_000),
+                signer_contribution_digest: Digest32::from_bytes([ordinal as u8 + 32; 32]),
+            };
+            let awaiting =
+                bloom_machine_client::CeremonyProjection::from_custody_prepare(&prepared, 1_000)
+                    .unwrap();
+            assert_eq!(
+                awaiting.ceremony_url(),
+                Some(expected_url.as_str()),
+                "{kind:?}"
+            );
+            assert_eq!(awaiting.expires_at_ms(), Some(10_000), "{kind:?}");
+            let awaiting_json = serde_json::to_value(&awaiting).unwrap();
+            assert_eq!(awaiting_json["ceremony_url"], expected_url, "{kind:?}");
+            assert_eq!(awaiting_json["ceremony_expires_at_ms"], "10000", "{kind:?}");
+
+            for state in non_actionable_states {
+                let mut projection = awaiting.clone();
+                projection
+                    .reconcile_custody(
+                        &CeremonyPublicStatus {
+                            ceremony_id: Digest32::from_bytes([ordinal as u8 + 64; 32]),
+                            ceremony_kind: kind,
+                            operation_id: operation_id.clone(),
+                            state,
+                            expires_at_ms: DecimalU64::new(10_000),
+                            // A compromised Broker must not make a non-actionable
+                            // state owner-actionable by retaining a launch URL.
+                            ceremony_url: Some(expected_url.clone()),
+                            receipt_digest: matches!(
+                                state,
+                                CeremonyState::Completed | CeremonyState::Succeeded
+                            )
+                            .then(|| Digest32::from_bytes([ordinal as u8 + 96; 32])),
+                        },
+                        2_000,
+                    )
+                    .unwrap();
+                assert_eq!(projection.ceremony_url(), None, "{kind:?} {state:?}");
+                assert_eq!(projection.expires_at_ms(), None, "{kind:?} {state:?}");
+                let persisted = serde_json::to_value(&projection).unwrap();
+                assert!(persisted["ceremony_url"].is_null(), "{kind:?} {state:?}");
+                assert!(
+                    persisted["ceremony_expires_at_ms"].is_null(),
+                    "{kind:?} {state:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn policy_cli_exposes_prepare_and_receipt_only_commit() {
+        let prepared = Cli::try_parse_from([
+            "bloom",
+            "wallet",
+            "update-policy",
+            "wallet",
+            "--file",
+            "proposed.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            prepared.cmd,
+            Some(Cmd::Wallet(WalletCmd::UpdatePolicy {
+                name,
+                file,
+                assurance_level,
+            })) if name == "wallet"
+                && file.as_os_str() == "proposed.json"
+                && assurance_level == "user_verified"
+        ));
+
+        let committed =
+            Cli::try_parse_from(["bloom", "wallet", "commit-policy", &"ab".repeat(32)]).unwrap();
+        assert!(matches!(
+            committed.cmd,
+            Some(Cmd::Wallet(WalletCmd::CommitPolicy { .. }))
+        ));
+        assert!(
+            Cli::try_parse_from(["bloom", "wallet", "update-policy", "wallet"]).is_err(),
+            "prepare must require explicit proposed bytes"
+        );
+        assert!(
+            Cli::try_parse_from(["bloom", "wallet", "sign-policy", "wallet"]).is_err(),
+            "the legacy direct policy-signing path must stay removed"
+        );
+    }
+
+    #[test]
+    fn policy_commit_accepts_only_matching_completed_generic_custody_receipt() {
+        let operation_id = bloom_broker_api::OperationId::from_bytes([71; 32]);
+        let mut receipt = bloom_broker_api::CustodyResult {
+            ceremony_kind: bloom_broker_api::CeremonyKind::PolicyUpdate,
+            custody_operation_id: operation_id.clone(),
+            public_status: bloom_broker_api::CeremonyState::Succeeded,
+            wallet_id: Some(bloom_broker_api::Token::new("wallet").unwrap()),
+            public_key_refs: Vec::new(),
+            credential_summaries: Vec::new(),
+            initial_policy: None,
+            receipt_digest: bloom_broker_api::Digest32::from_bytes([72; 32]),
+            encrypted_browser_result: None,
+            signer_key_id: bloom_broker_api::Token::new("signer-ceremony-key").unwrap(),
+            signer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[73; 64]),
+        };
+        assert!(is_completed_policy_update_receipt(&receipt, &operation_id));
+
+        receipt.public_status = bloom_broker_api::CeremonyState::Completed;
+        assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
+        receipt.public_status = bloom_broker_api::CeremonyState::Succeeded;
+        receipt.ceremony_kind = bloom_broker_api::CeremonyKind::WalletDelete;
+        assert!(!is_completed_policy_update_receipt(&receipt, &operation_id));
+    }
+
+    #[test]
+    fn production_cli_has_no_in_process_daemon_fallback_call_site() {
+        let source = include_str!("main.rs");
+        let read_fallback = concat!("build_authenticated_", "read_daemon");
+        let in_process_log = concat!("via_", "inproc");
+        let fallback_log = concat!("ipc.no_daemon_", "fallback");
+        let write_builder = concat!("build_write_", "daemon(home.clone())");
+        assert!(
+            !source.contains(read_fallback),
+            "production CLI commands must never construct a read fallback daemon"
+        );
+        assert_eq!(
+            source.matches(write_builder).count(),
+            2,
+            "only init and serve may construct the daemon"
+        );
+        assert!(!source.contains(fallback_log));
+        assert!(!source.contains(in_process_log));
+        let raw_process_args = concat!("std::env::", "args_os()");
+        assert!(
+            !source.contains(raw_process_args),
+            "internal lifecycle protocols must be parsed below init or serve, not before Clap"
+        );
+    }
+
+    #[test]
+    fn permission_denied_endpoint_error_includes_daemon_recovery_instruction() {
+        let error = endpoint_connection_error(
+            "unix:/restricted/bloom.sock",
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        );
+        let message = error.to_string();
+        assert!(message.contains("unix:/restricted/bloom.sock"), "{message}");
+        assert!(message.contains("bloom serve"), "{message}");
     }
 }

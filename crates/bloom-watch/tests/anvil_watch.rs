@@ -2,13 +2,6 @@
 //!
 //! End-to-end test: drive [`WatchExecutor`] against a real anvil node.
 //!
-//! Marked `#[ignore]` so the default `cargo test` does not attempt to
-//! launch a child process. Run via:
-//!
-//! ```text
-//! cargo test -p bloom-watch -- --ignored
-//! ```
-//!
 //! Requires Foundry's `anvil` and `cast` on `$PATH` (or `BLOOM_ANVIL_BIN` /
 //! `BLOOM_CAST_BIN`).
 
@@ -122,7 +115,6 @@ async fn fund(rpc_url: &str, to: &str, value_eth: u64) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn balance_watch_records_transition() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

@@ -5,6 +5,8 @@
 
 use crate::host::HostError;
 
+use serde::{Deserialize, Serialize};
+
 const MAX_STRING_LEN: usize = 64 * 1024;
 const MAX_HEADERS: usize = 256;
 const MAX_LIST_ENTRIES: usize = 8192;
@@ -32,6 +34,58 @@ pub struct SignRequest {
     pub context: Option<PetalRouteContext>,
 }
 
+/// Payload-bearing signing request used by `bloom:sign/signing@0.2.0`.
+///
+/// The guest supplies the final bytes and its complete canonical use claim.
+/// The runner injects `context`; a guest can never select package or route
+/// provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadSignRequest {
+    pub wallet: String,
+    pub preimage: Vec<u8>,
+    pub claimed_hash: [u8; 32],
+    pub signature_algorithm: String,
+    pub operation_class: String,
+    pub petal_use_claim_jcs: Vec<u8>,
+    pub claim_assurance_evidence: Option<Vec<u8>>,
+    pub approval_hint: Option<String>,
+    pub action: Option<Vec<u8>>,
+    pub advisory: Option<Vec<u8>>,
+    /// The guest chooses an exact or reusable approval selector explicitly.
+    pub selector: bloom_broker_api::PetalSignSelector,
+    /// Optional explicit Signer-owned sub-key selected by the current interface.
+    pub key_ref: Option<bloom_broker_api::KeyRef>,
+    pub context: Option<PetalRouteContext>,
+}
+
+/// One exact payload in an atomic v0.2 signing batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadSignItem {
+    pub preimage: Vec<u8>,
+    pub claimed_hash: [u8; 32],
+}
+
+/// Payload-bearing atomic batch used by `bloom:sign/signing@0.2.0`.
+///
+/// All authority and policy fields apply to the complete ordered payload set;
+/// the host must return either one signature per item, in the same order, or a
+/// pending approval. Partial results are not representable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadBatchSignRequest {
+    pub wallet: String,
+    pub payloads: Vec<PayloadSignItem>,
+    pub signature_algorithm: String,
+    pub operation_class: String,
+    pub petal_use_claim_jcs: Vec<u8>,
+    pub claim_assurance_evidence: Option<Vec<u8>>,
+    pub approval_hint: Option<String>,
+    pub action: Option<Vec<u8>>,
+    pub advisory: Option<Vec<u8>>,
+    pub selector: bloom_broker_api::PetalSignSelector,
+    pub key_ref: Option<bloom_broker_api::KeyRef>,
+    pub context: Option<PetalRouteContext>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignBatchRequest {
     pub requests: Vec<SignRequest>,
@@ -49,9 +103,20 @@ pub struct ApprovalRequired {
     pub expires_ms: u64,
 }
 
+/// Safe component-visible pending state used by signing v0.2.
+///
+/// Ceremony URLs remain owner-only and are deliberately absent from this
+/// projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalPending {
+    pub action_id: String,
+    pub expires_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignOutcome {
     Signature(Vec<u8>),
+    ApprovalPending(ApprovalPending),
     ApprovalRequired(ApprovalRequired),
 }
 
@@ -59,6 +124,12 @@ pub enum SignOutcome {
 pub enum SignBatchOutcome {
     Signatures(Vec<Vec<u8>>),
     ApprovalRequired(ApprovalRequired),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadBatchSignOutcome {
+    Signatures(Vec<Vec<u8>>),
+    ApprovalPending(ApprovalPending),
 }
 
 /// A generic EVM transaction prepared by a Petal route. Route provenance is
@@ -104,6 +175,66 @@ pub struct PetalRouteContext {
     pub path: String,
     pub params: Vec<(String, String)>,
     pub actor: Option<String>,
+}
+
+/// Guest-supplied, provenance-free request for a Signer-owned Petal sub-key.
+///
+/// The component ABI carries this as JSON bytes so the interface can evolve
+/// without ever adding package or route fields to the guest-controlled WIT
+/// record. The runner injects [`PetalRouteContext`] after decoding.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PetalKeyGuestRequest {
+    pub wallet_id: String,
+    /// Stable Petal-owned name for this child key (for example, one exchange
+    /// account). Package hashes and lineage are injected by Machine.
+    pub key_slot: String,
+    pub allowed_routes: Vec<String>,
+    pub allowed_operation_classes: Vec<String>,
+    pub allowed_crypto_suites: Vec<String>,
+    pub maximum_lifetime_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PetalKeyRequest {
+    pub wallet_id: String,
+    pub key_slot: String,
+    pub allowed_routes: Vec<String>,
+    pub allowed_operation_classes: Vec<String>,
+    pub allowed_crypto_suites: Vec<String>,
+    pub maximum_lifetime_ms: u64,
+    pub context: Option<PetalRouteContext>,
+}
+
+impl From<PetalKeyGuestRequest> for PetalKeyRequest {
+    fn from(guest: PetalKeyGuestRequest) -> Self {
+        Self {
+            wallet_id: guest.wallet_id,
+            key_slot: guest.key_slot,
+            allowed_routes: guest.allowed_routes,
+            allowed_operation_classes: guest.allowed_operation_classes,
+            allowed_crypto_suites: guest.allowed_crypto_suites,
+            maximum_lifetime_ms: guest.maximum_lifetime_ms,
+            context: None,
+        }
+    }
+}
+
+/// Public-only result of a Petal sub-key request.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PetalKeyOutcome {
+    Pending {
+        operation_id: String,
+        scope_digest: String,
+    },
+    Ready {
+        operation_id: String,
+        scope_digest: String,
+        /// Canonical JSON encoding of the public `KeyRef`.
+        key_ref_jcs: Vec<u8>,
+        addresses: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

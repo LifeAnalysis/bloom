@@ -29,6 +29,9 @@ pub enum Capability {
     /// May stage and confirm generic EVM outbox entries.
     #[serde(rename = "tx.outbox")]
     TxOutbox,
+    /// May request a Signer-owned, provenance-bound Petal sub-key.
+    #[serde(rename = "key.derive")]
+    KeyDerive,
 }
 
 impl Capability {
@@ -41,6 +44,7 @@ impl Capability {
             Capability::Store => "store",
             Capability::Chain => "chain",
             Capability::TxOutbox => "tx.outbox",
+            Capability::KeyDerive => "key.derive",
         }
     }
 
@@ -53,6 +57,7 @@ impl Capability {
             "store" => Some(Capability::Store),
             "chain" => Some(Capability::Chain),
             "tx.outbox" => Some(Capability::TxOutbox),
+            "key.derive" => Some(Capability::KeyDerive),
             _ => None,
         }
     }
@@ -150,6 +155,7 @@ pub fn validate_mode_caps(
                     | Capability::Store
                     | Capability::Chain
                     | Capability::TxOutbox
+                    | Capability::KeyDerive
             )
         );
         if !ok {

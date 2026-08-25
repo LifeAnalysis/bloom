@@ -806,13 +806,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // LIVE integration tests — gated by `--ignored`.
-    // Run with: `cargo test -p bloom-prices -- --ignored`
+    // Live integration tests run only when BLOOM_RUN_LIVE_TESTS is set.
     // -----------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore = "live: hits public DefiLlama"]
     async fn live_current_eth() {
+        if std::env::var_os("BLOOM_RUN_LIVE_TESTS").is_none() {
+            eprintln!("skip: BLOOM_RUN_LIVE_TESTS is not set");
+            return;
+        }
         let client = PricesClient::new();
         let q = client
             .current(CoinId::Symbol("ETH".into()))
@@ -826,8 +828,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "live: hits public DefiLlama"]
     async fn live_current_many_eth_usdc() {
+        if std::env::var_os("BLOOM_RUN_LIVE_TESTS").is_none() {
+            eprintln!("skip: BLOOM_RUN_LIVE_TESTS is not set");
+            return;
+        }
         let client = PricesClient::new();
         let coins = vec![CoinId::Symbol("ETH".into()), CoinId::Symbol("USDC".into())];
         let got = client.current_many(&coins).await.expect("live multi");
@@ -842,8 +847,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "live: hits public DefiLlama"]
     async fn live_change_24h_eth_in_band() {
+        if std::env::var_os("BLOOM_RUN_LIVE_TESTS").is_none() {
+            eprintln!("skip: BLOOM_RUN_LIVE_TESTS is not set");
+            return;
+        }
         let client = PricesClient::new();
         let v = client
             .change_24h(CoinId::Symbol("ETH".into()))

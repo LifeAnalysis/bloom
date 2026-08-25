@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use bloom_auth_api::petal_identity::{
+use crate::petal_identity::{
     FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET,
 };
 
@@ -132,7 +132,7 @@ pub struct StagedTx {
     /// Structured valuation snapshot. `usd_value` remains for compatibility
     /// with older outbox entries and is derived from this field for new txs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub valuation: Option<bloom_auth_api::ValuationQuote>,
+    pub valuation: Option<crate::ValuationQuote>,
     /// Outbox id of a tx on the **same chain** that must mine successfully
     /// before this one may broadcast (e.g. an ERC-20 approve preceding the
     /// route that spends it). `confirm` refuses to broadcast until the

@@ -29,7 +29,8 @@ An agent using Bloom can:
 - inspect live balances, nonces, blocks, gas, contracts, storage, events, NFTs, ENS, prices, and address history through file reads;
 - create or import encrypted local wallets without exposing private keys through the filesystem;
 - stage native ETH, ERC-20, NFT, contract-call, signing, and DeFi intents by writing plain-language or structured files;
-- query Hyperliquid market and account state, and submit bounded signed Hyperliquid exchange and agent-session actions through `/hyperliquid/...`;
+- use installed Petals for venue integrations such as Hyperliquid, with
+  delegated keys confined to Signer and scoped to the installed Petal;
 - read a generated `plan.md` before any transaction is signed;
 - confirm a staged transaction only after user approval;
 - make free or paid HTTP requests through `/requests`, with paid HTTP 402
@@ -52,10 +53,8 @@ bloom vfs cat /docs/README.md
 bloom vfs cat /chains/ethereum/head/number
 bloom vfs cat /prices/spot/eth.usd
 
-# 3. Create a demo wallet. Passkey is the default — a WebAuthn ceremony runs
-# in the browser. For a passphrase wallet in dev, use --local with
-# --allow-passphrase-wallet and --passphrase-file. Private keys stay in the
-# encrypted keystore, not in /bloom.
+# 3. Create a demo wallet. Passkey is the default — Broker launches a WebAuthn
+# ceremony in the browser and Signer retains all private key material.
 bloom wallet new alice
 bloom wallet list
 
@@ -151,32 +150,20 @@ content-type: application/json
 These examples produce pre-trade risk checks, venue-specific wallet
 intelligence, or onchain data routes that can affect a wallet action.
 
-Paid requests are denied by default. Enable them in the paying wallet's
-`policy.toml`, and keep both global and request-local caps tight:
+Paid requests are denied by default. Change them only through the paying
+wallet's canonical `policy.json` custody flow, and keep both global and
+request-local caps tight. Start from the current complete document rather than
+constructing a partial policy:
 
-```toml
-[payments]
-enabled = true
-require_plan = true
-
-[payments.http]
-per_request_usd = 0.05
-per_day_usd = 5.00
-allow_hosts = ["api.example.com"]
-deny_hosts = []
-
-[payments.sessions]
-enabled = true
-max_deposit_usd = 2.00
-max_session_spend_usd = 10.00
-
-[payments.assets]
-allow = ["USDC", "pathUSD"]
-deny = []
-
-[payments.networks]
-allow = ["base", "tempo"]
-deny = []
+```sh
+cat /bloom/wallets/research/policy.json > proposed-policy.json
+# Edit the payments fields in proposed-policy.json while preserving the full
+# canonical policy document, then stage the exact bytes through Broker.
+cp proposed-policy.json /bloom/wallets/research/policy.json
+cat /bloom/wallets/research/policy-updates/latest/status.json
+cat /bloom/wallets/research/policy-updates/latest/approval_challenge.json
+# Complete the projected policy_update ceremony, then retry identical bytes.
+cp proposed-policy.json /bloom/wallets/research/policy.json
 ```
 
 The confirm path re-checks the current wallet policy. Hard denials block the
@@ -184,36 +171,27 @@ request; warnings require the wallet policy's override sentinel instead of a
 plain `confirm` write. Request artifacts redact sensitive headers such as
 `authorization`, API keys, and payment credentials.
 
-The detailed design and current path contract live in
-[`docs/specs/2026-06-15-paid-http-requests.md`](./specs/2026-06-15-paid-http-requests.md).
+The pre-triad paid-request design is retained as historical protocol context in
+[`docs/specs/2026-06-15-paid-http-requests.md`](./specs/2026-06-15-paid-http-requests.md);
+its authority sections are explicitly superseded by the triad architecture.
 
 ## Wallet policy and passkey review
 
-Each wallet has one `policy.toml`. Different sections cover different surfaces:
+Each wallet has one canonical `policy.json`. Different sections cover different
+surfaces:
 
 - `[approval]` decides whether Bloom must ask before each money-moving action or may act later inside signed rules.
 - `[limits]` provides cross-surface USD budgets for autonomous execution.
 - `[caps]` applies broad EVM transaction caps.
-- `[defi]`, `[polymarket]`, `[payments]`, and `[hyperliquid]` add surface-specific limits.
+- `[defi]`, `[polymarket]`, and `[payments]` add surface-specific limits. Petal
+  authority is additionally bound to installer-pinned package and route scope.
 
-For passkey wallets, editing `policy.toml` is not enough. The policy must be
-signed:
-
-```sh
-bloom wallet sign-policy <wallet>
-```
-
-The signing page is intentionally plain-language first. It asks the user to
-choose one of two modes:
-
-- **Ask me every time**: Bloom can prepare actions, but money-moving work needs
-  another passkey review.
-- **Let Bloom use these rules**: Bloom may act later without another passkey
-  prompt only when every signed policy check passes.
-
-Signing a policy does not move money by itself. It changes the rules Bloom will
-use later. Raw TOML, review IDs, and hashes are available in advanced details
-for audit/debugging, but agents should explain the plain-language choice.
+Writing `policy.json` first calls Broker `policy.validate_update`. Broker builds
+the exact review and originates a `policy_update` custody ceremony; Signer
+authenticates its completion. Retrying the exact proposed bytes calls
+`policy.commit_update`, after which Broker carries the completed ceremony and
+validation receipts to Signer's policy compare-and-swap. Changed bytes or a
+changed baseline fail closed. Machine never signs or installs policy itself.
 
 ## Why filesystem-first matters
 

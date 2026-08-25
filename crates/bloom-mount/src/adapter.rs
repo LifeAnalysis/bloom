@@ -161,71 +161,10 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        [root, _network, branch, _wallet, _session, leaf]
-            if root == "hyperliquid"
-                && branch == "agent_sessions"
-                && matches!(leaf.as_str(), "orphan_cancel_all" | "orphan_close_all") =>
-        {
-            true
-        }
-        [root, _network, branch, _wallet, leaf]
-            if root == "hyperliquid"
-                && branch == "exchange"
-                && matches!(
-                    leaf.as_str(),
-                    "order.json"
-                        | "cancel.json"
-                        | "schedule_cancel.json"
-                        | "update_leverage.json"
-                        | "send_asset.json"
-                ) =>
-        {
-            true
-        }
-        // policy.toml and policy-session/new writes flow through to the VFS
-        // wallets handler, which stages a first-party Sealed Approval for passkey
-        // wallets (challenge + grant-gated install/mint) and writes local policy
-        // immediately. They no longer route through the disabled write_unlocked
-        // re-sign lane, so the mount must forward them to `vfs.write` rather than
-        // deny on flush.
-        _ => false,
-    }
-}
-
-/// Command sinks whose supported payloads are deliberately small and are
-/// expected to be submitted by a single userspace write (shell redirect,
-/// `tee`, or equivalent). macOS' NFS client does not reliably send COMMIT or
-/// propagate CLOSE errors for these synthetic files, so leaving an UNSTABLE
-/// write buffered can make a successful command disappear entirely.
-///
-/// Keep this list narrow. Ordinary files still need whole-file buffering
-/// because a first contiguous WRITE is not proof that more chunks will not
-/// follow. Hyperliquid agent-session commands are JSON/control messages well
-/// below the mount's 64 KiB `wsize`; applying their offset-zero WRITE inline is
-/// what makes the documented mount-only workflow usable on macOS.
-fn mount_write_path_is_atomic_command(path: &VfsPath) -> bool {
-    let segs = path.segments();
-    match segs {
-        [root, _network, branch, _wallet, leaf]
-            if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
-        {
-            true
-        }
-        [root, _network, branch, _wallet, _session, leaf]
-            if root == "hyperliquid"
-                && branch == "agent_sessions"
-                && matches!(
-                    leaf.as_str(),
-                    "order.json"
-                        | "cancel.json"
-                        | "schedule_cancel.json"
-                        | "stop"
-                        | "cancel_all"
-                        | "close_all"
-                ) =>
-        {
-            true
-        }
+        // Policy updates and sealed-approval lifecycle writes flow through to
+        // the VFS wallets handler. It delegates authority to Broker and never
+        // routes them through the disabled raw wallet-signer lane, so the mount
+        // must forward them to `vfs.write` rather than deny on flush.
         _ => false,
     }
 }
@@ -265,6 +204,15 @@ fn system_time_to_ts(time: SystemTime) -> Timestamp {
 
 fn stable_attrs(object_type: ObjectType, fileid: u64) -> Attrs {
     let mut attrs = Attrs::new(object_type, fileid);
+    // Report the identity that serves the in-process NFS filesystem. Leaving
+    // embednfs' uid/gid defaults at zero makes owner-writable (0644) command
+    // sinks unwritable when the daemon runs unprivileged: the kernel sees
+    // root ownership, root is squashed by NFS, and the daemon user only gets
+    // the read-only "other" bits. Bloom's VFS already enforces path-level
+    // write policy; these attrs must make its owner mode reachable by the
+    // actual serving process.
+    attrs.uid = rustix::process::geteuid().as_raw();
+    attrs.gid = rustix::process::getegid().as_raw();
     let ts = epoch_ts();
     attrs.atime = ts;
     attrs.mtime = ts;
@@ -977,7 +925,7 @@ impl BloomFs {
     ///
     /// Mode bits are *not* a useful gate here. Many writable files
     /// (mode 0o644) are also legitimately readable — addressbook
-    /// aliases resolve to an address, `policy.toml` reads back the
+    /// aliases resolve to an address, `policy.json` reads back the
     /// committed config, etc. A pure write-only sink (e.g.
     /// `outbox/pending/<id>/confirm`) returns a NotAFile-style error
     /// from `read`; that flows through `render_with_dedup` and falls
@@ -1098,9 +1046,19 @@ impl FileSystem for BloomFs {
                                 e.size
                             }
                             Err(error) => {
-                                self.render_cache.put_error(path, error, RENDER_CACHE_TTL);
-                                warn!(path = %path, ?error, "mount.adapter.getattr.render_failed");
-                                return Err(error);
+                                if e.size > 0 && matches!(error, FsError::Io) {
+                                    // The handler supplied a trustworthy local
+                                    // size hint. Keep filesystem metadata
+                                    // usable when rendering dynamic content
+                                    // fails, and leave the error uncached so
+                                    // an explicit READ can retry the backend.
+                                    warn!(path = %path, ?error, "mount.adapter.getattr.using_size_hint_after_render_failure");
+                                    e.size
+                                } else {
+                                    self.render_cache.put_error(path, error, RENDER_CACHE_TTL);
+                                    warn!(path = %path, ?error, "mount.adapter.getattr.render_failed");
+                                    return Err(error);
+                                }
                             }
                         },
                     }
@@ -1128,7 +1086,7 @@ impl FileSystem for BloomFs {
         // views, wallet metadata, watch outputs). Those entries report
         // mode 0o444 from the VFS; only a small handful of injection
         // points (wallets/new, sign/*, outbox writes, watch/new, defi
-        // intents new+confirm, policy.toml) report 0o644. Reflect that
+        // intents new+confirm, policy.json) report 0o644. Reflect that
         // here so clients see a faithful permission view in `stat` /
         // `access(2)` rather than discovering write rejection only at
         // write-time.
@@ -1372,16 +1330,20 @@ impl FileSystem for BloomFs {
         //
         // Strategy:
         // - Flush eagerly when the request is sync-stable and the buffer is
-        //   contiguous, or for a narrowly-classified atomic command sink at
-        //   offset zero. NFS WRITE does not otherwise carry an EOF/final chunk
-        //   marker, so an ordinary UNSTABLE offset-0 prefix that may grow must
-        //   wait for COMMIT even if it could also be a whole single-RPC write.
+        //   contiguous. For a narrowly-classified asynchronous command sink,
+        //   accept a complete offset-zero write and dispatch it away from the
+        //   NFS request path. Stability for these virtual files means Bloom
+        //   accepted the command; completion is represented by the command's
+        //   durable status/challenge/receipt projection. NFS WRITE does not
+        //   otherwise carry an EOF/final-chunk marker, so ordinary offset-zero
+        //   prefixes wait for COMMIT even when they fit in one RPC.
         // - DATA_SYNC / FILE_SYNC requested but buffer is incomplete
         //   (mid-stream chunk): reject explicitly. Returning a weaker
         //   stability than requested violates embednfs' contract and
         //   surfaces as SERVERFAULT/EREMOTEIO.
         // - UNSTABLE requested: buffer and reply UNSTABLE; a later
         //   COMMIT or read will trigger `flush_path`.
+        let async_command = self.vfs.is_async_write_command(&path);
         let (complete_payload, accepted) = {
             let mut map = self.write_buffers.lock();
             let buf = map.entry(path.clone()).or_insert_with(WriteBuffer::new);
@@ -1394,7 +1356,7 @@ impl FileSystem for BloomFs {
             }
             buf.apply(offset, &data)?;
             let payload = if buf.should_flush_after_write(requested)
-                || (offset == 0 && mount_write_path_is_atomic_command(&path) && buf.is_complete())
+                || (offset == 0 && async_command && buf.is_complete())
             {
                 Some(map.remove(&path).expect("just observed").bytes)
             } else {
@@ -1414,8 +1376,10 @@ impl FileSystem for BloomFs {
         }
 
         let actual_stability = if complete_payload.is_some() {
-            // We persisted the buffer through to the VFS, so we can
-            // honour whatever sync level the kernel asked for.
+            // A normal write is persisted below before this result returns. An
+            // asynchronous command is accepted for dispatch; its virtual file
+            // never represents persisted content, and its outcome is projected
+            // separately by the command handler.
             requested
         } else {
             // Still buffering: only safe to advertise UNSTABLE so the
@@ -1427,27 +1391,32 @@ impl FileSystem for BloomFs {
             if mount_write_path_uses_wallet_signer(&path) {
                 return Err(FsError::PermissionDenied);
             }
-            match self.vfs.write(&path, &payload).await {
-                Ok(()) => {
-                    // Persisted new bytes — invalidate any stale rendered view.
-                    self.invalidate_after_write(&path);
+            if async_command {
+                let vfs = self.vfs.clone();
+                let command_path = path.clone();
+                let runtime = tokio::runtime::Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = runtime.block_on(vfs.write(&command_path, &payload)) {
+                        warn!(
+                            path = %command_path.to_string_path(),
+                            error = %error,
+                            "mount.adapter.async_command_outcome_deferred"
+                        );
+                    }
+                });
+                // The command owns its durable status/challenge/receipt
+                // projection. Invalidate speculative mount views immediately;
+                // subsequent reads will either observe the old status briefly
+                // or the command's published outcome.
+                self.invalidate_after_write(&path);
+            } else {
+                match self.vfs.write(&path, &payload).await {
+                    Ok(()) => {
+                        // Persisted new bytes — invalidate stale rendered views.
+                        self.invalidate_after_write(&path);
+                    }
+                    Err(error) => return Err(map_err(error)),
                 }
-                Err(error) if mount_write_path_is_atomic_command(&path) => {
-                    // macOS can panic in nfs_vinvalbuf2 when a userspace server
-                    // rejects an UNSTABLE WRITE after the kernel has installed
-                    // dirty UBC pages. These command sinks expose their outcome
-                    // through challenge/status/audit/last-response files, so
-                    // acknowledge the transport write after the handler has
-                    // recorded that outcome instead of feeding a deferred NFS
-                    // error back into the kernel's page invalidation path.
-                    warn!(
-                        path = %path.to_string_path(),
-                        error = %error,
-                        "mount.adapter.atomic_command_outcome_deferred"
-                    );
-                    self.invalidate_after_write(&path);
-                }
-                Err(error) => return Err(map_err(error)),
             }
         }
 
@@ -1702,25 +1671,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct AtomicDenyHandler {
-        writes: parking_lot::Mutex<Vec<Vec<u8>>>,
-    }
-
-    #[async_trait]
-    impl Handler for AtomicDenyHandler {
-        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
-            Ok(Entry::writable_file(
-                p.segments().last().map(String::as_str).unwrap_or("command"),
-            ))
-        }
-
-        async fn write(&self, _p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
-            self.writes.lock().push(data.to_vec());
-            Err(HandlerError::PermissionDenied)
-        }
-    }
-
     #[async_trait]
     impl Handler for ChallengeStagingHandler {
         async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
@@ -1769,7 +1719,9 @@ mod tests {
                 return Ok(Entry::dir(""));
             }
             match p.first() {
-                Some("inbox") => Ok(Entry::writable_file("inbox")),
+                Some("inbox" | "command") => Ok(Entry::writable_file(
+                    p.first().expect("matched path segment"),
+                )),
                 Some("readme") => Ok(Entry::file("readme")),
                 Some("run") => Ok(Entry::executable_file("run")),
                 _ => Err(HandlerError::NotFound(p.to_string_path())),
@@ -1785,9 +1737,16 @@ mod tests {
         }
         async fn write(&self, p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
             match p.first() {
-                Some("inbox" | "mainnet") => {
+                Some("inbox" | "command" | "mainnet") => {
+                    if data == b"slow\n" {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                     self.writes.lock().push(data.to_vec());
-                    Ok(())
+                    if data == b"deny\n" {
+                        Err(HandlerError::PermissionDenied)
+                    } else {
+                        Ok(())
+                    }
                 }
                 _ => Err(HandlerError::PermissionDenied),
             }
@@ -1796,12 +1755,17 @@ mod tests {
             if p.is_root() {
                 Ok(vec![
                     Entry::writable_file("inbox"),
+                    Entry::writable_file("command"),
                     Entry::file("readme"),
                     Entry::executable_file("run"),
                 ])
             } else {
                 Err(HandlerError::NotADir(p.to_string_path()))
             }
+        }
+
+        fn is_async_write_command(&self, p: &VfsPath) -> bool {
+            p.first() == Some("command")
         }
     }
 
@@ -1813,6 +1777,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unstable_async_command_dispatches_without_commit() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let command = fs.lookup(&ctx, &dir, "command").await.unwrap();
+
+        let result = fs
+            .write(
+                &ctx,
+                &command,
+                0,
+                Bytes::from_static(b"post\n"),
+                WriteStability::Unstable,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.stability, WriteStability::Unstable);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recorder.write_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("asynchronous command dispatch completes");
+        assert_eq!(recorder.last_write().as_deref(), Some(&b"post\n"[..]));
+    }
+
+    #[tokio::test]
+    async fn async_command_does_not_block_a_sync_nfs_write() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let command = fs.lookup(&ctx, &dir, "command").await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            fs.write(
+                &ctx,
+                &command,
+                0,
+                Bytes::from_static(b"slow\n"),
+                WriteStability::FileSync,
+            ),
+        )
+        .await
+        .expect("NFS write must acknowledge before the command completes")
+        .unwrap();
+        assert_eq!(recorder.write_count(), 0);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recorder.write_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("asynchronous command dispatch completes");
+        assert_eq!(recorder.last_write().as_deref(), Some(&b"slow\n"[..]));
+    }
+
+    #[tokio::test]
+    async fn unstable_async_command_defers_handler_error_to_status_projection() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let command = fs.lookup(&ctx, &dir, "command").await.unwrap();
+
+        let result = fs
+            .write(
+                &ctx,
+                &command,
+                0,
+                Bytes::from_static(b"deny\n"),
+                WriteStability::Unstable,
+            )
+            .await
+            .expect("the NFS transport must not reject a staged command");
+
+        assert_eq!(result.stability, WriteStability::Unstable);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recorder.write_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("asynchronous command dispatch completes");
+        assert_eq!(recorder.last_write().as_deref(), Some(&b"deny\n"[..]));
+    }
+
+    #[tokio::test]
     async fn root_lookup_returns_directory() {
         let vfs = Vfs::builder()
             .mount("echo", Arc::new(StaticHandler))
@@ -1821,28 +1881,6 @@ mod tests {
         let ctx = fake_ctx();
         let attrs = fs.getattr(&ctx, &BloomHandle::Root).await.unwrap();
         assert_eq!(attrs.object_type, ObjectType::Directory);
-    }
-
-    #[tokio::test]
-    async fn mount_write_rejects_signer_consuming_paths() {
-        let fs = BloomFs::new(Vfs::builder().build());
-        let ctx = fake_ctx();
-        let handle = BloomHandle::Path {
-            entry: Entry::file("order.json"),
-            path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow/order.json").unwrap(),
-        };
-
-        let err = fs
-            .write(
-                &ctx,
-                &handle,
-                0,
-                Bytes::from_static(b"{}"),
-                WriteStability::FileSync,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, FsError::PermissionDenied));
     }
 
     #[tokio::test]
@@ -1875,40 +1913,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn mount_create_rejects_signer_consuming_paths() {
-        let fs = BloomFs::new(Vfs::builder().build());
-        let ctx = fake_ctx();
-        let parent = BloomHandle::Path {
-            entry: Entry::dir("minnow"),
-            path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow").unwrap(),
-        };
-
-        let err = fs
-            .create(
-                &ctx,
-                &parent,
-                "order.json",
-                CreateRequest {
-                    kind: CreateKind::File,
-                    attrs: SetAttrs::default(),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, FsError::PermissionDenied));
-    }
-
     #[test]
     fn mount_classifier_forwards_handler_owned_sealed_approval_writes() {
         // Handler-owned Sealed Approval actions must reach the VFS handler, not
-        // be denied at the mount signer lane. policy-session/new now behaves
-        // like policy.toml: the wallets handler enforces Sealed Approval.
+        // be denied at the mount signer lane. Broker remains authoritative.
         for path in [
-            "/wallets/minnow/policy.toml",
-            "/wallets/minnow/policy-session/new",
+            "/wallets/minnow/policy.json",
+            "/wallets/minnow/sealed-approvals/new.json",
+            "/wallets/minnow/sealed-approvals/approval-id/renew",
+            "/wallets/minnow/sealed-approvals/approval-id/revoke",
+            "/wallets/minnow/sealed-approvals/revoke_all",
             "/requests/pending/req_1/confirm",
-            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!mount_write_path_uses_wallet_signer(&p), "{path}");
@@ -1920,83 +1935,10 @@ mod tests {
             "/wallets/minnow/sign/typed_data",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/cancel",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/replace",
-            "/hyperliquid/mainnet/exchange/minnow/order.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(mount_write_path_uses_wallet_signer(&p), "{path}");
         }
-    }
-
-    #[test]
-    fn mount_classifier_flushes_hyperliquid_session_commands_inline() {
-        for path in [
-            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/stop",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/close_all",
-        ] {
-            let p = VfsPath::parse(path).unwrap();
-            assert!(mount_write_path_is_atomic_command(&p), "{path}");
-        }
-
-        for path in [
-            "/hyperliquid/mainnet/mids.json",
-            "/hyperliquid/mainnet/exchange/minnow/order.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/status.json",
-            "/wallets/minnow/policy.toml",
-        ] {
-            let p = VfsPath::parse(path).unwrap();
-            assert!(!mount_write_path_is_atomic_command(&p), "{path}");
-        }
-    }
-
-    #[tokio::test]
-    async fn unstable_hyperliquid_session_command_flushes_inline() {
-        let recorder = RecordingHandler::new();
-        let vfs = Vfs::builder()
-            .mount("hyperliquid", recorder.clone())
-            .build();
-        let fs = BloomFs::new(vfs);
-        let ctx = fake_ctx();
-        let handle = BloomHandle::Path {
-            entry: Entry::file("order.json"),
-            path: VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json")
-                .unwrap(),
-        };
-        let body = Bytes::from_static(br#"{"action":{"type":"order"}}"#);
-
-        let result = fs
-            .write(&ctx, &handle, 0, body.clone(), WriteStability::Unstable)
-            .await
-            .unwrap();
-
-        assert_eq!(result.written, body.len() as u32);
-        assert_eq!(recorder.write_count(), 1);
-        assert_eq!(recorder.last_write(), Some(body.to_vec()));
-    }
-
-    #[tokio::test]
-    async fn unstable_hyperliquid_command_defers_handler_error_to_status_files() {
-        let handler = Arc::new(AtomicDenyHandler::default());
-        let vfs = Vfs::builder().mount("hyperliquid", handler.clone()).build();
-        let fs = BloomFs::new(vfs);
-        let ctx = fake_ctx();
-        let handle = BloomHandle::Path {
-            entry: Entry::file("new.json"),
-            path: VfsPath::parse("/hyperliquid/mainnet/agent_sessions/minnow/new.json").unwrap(),
-        };
-        let body = Bytes::from_static(br#"{"id":"session-1"}"#);
-
-        let result = fs
-            .write(&ctx, &handle, 0, body.clone(), WriteStability::Unstable)
-            .await
-            .expect("atomic command transport acknowledges deferred handler outcome");
-
-        assert_eq!(result.written, body.len() as u32);
-        assert_eq!(*handler.writes.lock(), vec![body.to_vec()]);
     }
 
     #[tokio::test]
@@ -2445,6 +2387,19 @@ mod tests {
         let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
         let attrs = fs.getattr(&ctx, &inbox).await.unwrap();
         assert_eq!(attrs.mode & 0o777, 0o644);
+        assert_eq!(attrs.uid, rustix::process::geteuid().as_raw());
+        assert_eq!(attrs.gid, rustix::process::getegid().as_raw());
+    }
+
+    #[tokio::test]
+    async fn getattr_root_reports_serving_process_owner() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder).build();
+        let fs = BloomFs::new(vfs);
+        let attrs = fs.getattr(&fake_ctx(), &BloomHandle::Root).await.unwrap();
+
+        assert_eq!(attrs.uid, rustix::process::geteuid().as_raw());
+        assert_eq!(attrs.gid, rustix::process::getegid().as_raw());
     }
 
     #[tokio::test]
@@ -3048,7 +3003,7 @@ mod tests {
     }
 
     /// Bug #1 acceptance: a writable file (mode 0o644) whose `read`
-    /// returns content — addressbook aliases, `policy.toml`, etc — is
+    /// returns content — addressbook aliases, `policy.json`, etc — is
     /// rendered at GETATTR so `cat` sees a non-zero size. The old
     /// "skip if writable" gate broke these read-write files; the only
     /// real reason to skip is `is_read_side_effecting`, not the mode
@@ -3121,6 +3076,7 @@ mod tests {
 
     struct ClassifiedReadHandler {
         result: TestReadResult,
+        size_hint: u64,
         reads: parking_lot::Mutex<u32>,
     }
 
@@ -3128,6 +3084,15 @@ mod tests {
         fn new(result: TestReadResult) -> Arc<Self> {
             Arc::new(Self {
                 result,
+                size_hint: 0,
+                reads: parking_lot::Mutex::new(0),
+            })
+        }
+
+        fn with_size_hint(result: TestReadResult, size_hint: u64) -> Arc<Self> {
+            Arc::new(Self {
+                result,
+                size_hint,
                 reads: parking_lot::Mutex::new(0),
             })
         }
@@ -3142,7 +3107,7 @@ mod tests {
         async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
             match p.segments() {
                 [] => Ok(Entry::dir("")),
-                [name] if name == "value" => Ok(Entry::file("value")),
+                [name] if name == "value" => Ok(Entry::file("value").with_size(self.size_hint)),
                 _ => Err(HandlerError::NotFound(p.to_string_path())),
             }
         }
@@ -3158,7 +3123,7 @@ mod tests {
 
         async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
             if p.is_root() {
-                Ok(vec![Entry::file("value")])
+                Ok(vec![Entry::file("value").with_size(self.size_hint)])
             } else {
                 Err(HandlerError::NotADir(p.to_string_path()))
             }
@@ -3181,6 +3146,19 @@ mod tests {
         let error = fs.getattr(&fake_ctx(), &value).await.unwrap_err();
         assert_eq!(error, FsError::Io);
         assert_eq!(handler.read_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn getattr_backend_error_uses_local_size_hint_without_caching_the_error() {
+        let handler = ClassifiedReadHandler::with_size_hint(TestReadResult::Backend, 410);
+        let (fs, value) = classified_read_handle(handler.clone()).await;
+        let attrs = fs.getattr(&fake_ctx(), &value).await.unwrap();
+        assert_eq!(attrs.size, 410);
+        assert_eq!(handler.read_count(), 1);
+
+        let error = fs.read(&fake_ctx(), &value, 0, 1024).await.unwrap_err();
+        assert_eq!(error, FsError::Io);
+        assert_eq!(handler.read_count(), 2);
     }
 
     #[tokio::test]

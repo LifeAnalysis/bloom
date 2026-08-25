@@ -1,0 +1,18 @@
+schema = "bloom.petal.package.v1"
+name = "triad-authority-fixture"
+
+[consent]
+summary = "Developer-only fixture proving mounted Petal child-key custody and payload-bearing signing."
+
+[caps]
+allowed = ["bloom:key.derive", "bloom:sign", "bloom:store"]
+
+[sign]
+allowed_intents = ["fixture.payload", "fixture.unrelated"]
+
+[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+
+[store]
+namespaces = ["fixture-public"]

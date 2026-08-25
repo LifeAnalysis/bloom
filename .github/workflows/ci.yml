@@ -8,6 +8,8 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "crates/**"
+      - "evals/harbor/**"
+      - "packaging/**"
       - "scripts/**"
       - "tests/**"
       - "Dockerfile"
@@ -36,6 +38,15 @@ jobs:
         run: rustup show
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  harbor_eval_static:
+    name: Harbor eval static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - name: Validate bounded Harbor harness
+        run: scripts/test-harbor-evals.sh
 
   clippy:
     name: clippy
@@ -167,8 +178,46 @@ jobs:
           cargo nextest run --archive-file target/nextest-archive.tar.zst
           -E 'package(bloom-it) or package(bloom-watch)'
           --run-ignored ignored-only
+          --no-tests=pass
           --no-fail-fast
 
+  macos_unix_principal_disposable_w0:
+    name: macOS Unix-principal disposable W0
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref_name == 'triad-architecture'
+    uses: ./.github/workflows/macos-unix-w0.yml
+    with:
+      broker_ref: master
+      signer_ref: master
+
+  linux_w0_isolation:
+    name: Linux W0 principal and socket isolation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Verify rendered systemd units
+        run: |
+          unit_dir="$(mktemp -d)"
+          cp packaging/triad/linux/systemd/*.socket "$unit_dir/"
+          for source in packaging/triad/linux/systemd/*.service.in; do
+            destination="$unit_dir/$(basename "${source%.in}")"
+            sed 's|@BLOOM_BROKER_BINARY@|/usr/bin/true|; s|@BLOOM_SIGNER_BINARY@|/usr/bin/true|' \
+              "$source" > "$destination"
+          done
+          mkdir -p "$unit_dir/bloom-signer@1000.service.d"
+          sed 's|@AWS_KMS_IP_ALLOW_DIRECTIVES@|IPAddressAllow=127.0.0.1/32|' \
+            packaging/triad/linux/systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in \
+            > "$unit_dir/bloom-signer@1000.service.d/50-aws-kms.conf"
+          cp "$unit_dir/bloom-signer@.service" "$unit_dir/bloom-signer@1000.service"
+          systemd-analyze verify \
+            "$unit_dir"/*.socket \
+            "$unit_dir"/*.service \
+            "$unit_dir/bloom-signer@1000.service"
+      - name: Run Linux packaging assertions
+        run: cargo test -p bloom-it --test linux_packaging --locked
   e2e_tests:
     name: external e2e tests
     runs-on: ubuntu-latest
@@ -181,6 +230,7 @@ jobs:
     env:
       BLOOM_MAINNET_RPC: ${{ secrets.BLOOM_MAINNET_RPC }}
       BLOOM_ETHERSCAN_KEY: ${{ secrets.BLOOM_ETHERSCAN_KEY }}
+      BLOOM_RUN_LIVE_TESTS: 1
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
@@ -209,15 +259,15 @@ jobs:
         run: |
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom-ens) and binary(live_mainnet)' \
-            --run-ignored ignored-only \
+            --no-tests=pass \
             --no-fail-fast
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'kind(lib) and (package(bloom-etherscan) or package(bloom-prices))' \
-            --run-ignored ignored-only \
+            --no-tests=pass \
             --no-fail-fast
-          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+          BLOOM_RUN_NETWORK_TESTS=1 cargo nextest run \
+            --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom) and test(github_source_install_polymarket_dispatches_route_contract)' \
-            --run-ignored ignored-only \
             --no-fail-fast
 
   # The heavy docker mount suite is opt-in via workflow_dispatch only.

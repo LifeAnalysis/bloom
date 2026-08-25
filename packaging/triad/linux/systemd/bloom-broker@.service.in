@@ -1,0 +1,51 @@
+[Unit]
+Description=Bloom Broker for login UID %i
+Requires=bloom-broker-rpc@%i.socket bloom-broker-control@%i.socket bloom-broker-ceremony@%i.socket bloom-signer-rpc@%i.socket
+After=bloom-signer-rpc@%i.socket bloom-signer-control@%i.socket
+
+[Service]
+Type=simple
+User=bloom-broker-%i
+Group=bloom-broker-%i
+UMask=0077
+ExecStart=@BLOOM_BROKER_BINARY@
+Environment=BLOOM_BROKER_IDENTITY=/etc/bloom/%i/broker/identity.json
+Environment=BLOOM_BROKER_CONFIG=/etc/bloom/%i/broker/config.json
+Environment=BLOOM_EDGE_MANIFEST=/etc/bloom/%i/edge-manifest.json
+Environment=BLOOM_AUTHORITY_EDGE_HISTORY=/etc/bloom/%i/authority-edge-history.json
+Environment=BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/broker/audit-checkpoints
+Environment=BLOOM_BROKER_ACTIVATION_NAME=broker
+Environment=BLOOM_BROKER_CONTROL_ACTIVATION_NAME=broker-control
+Environment=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony
+Sockets=bloom-broker-rpc@%i.socket bloom-broker-control@%i.socket bloom-broker-ceremony@%i.socket
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitCORE=0
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+ReadWritePaths=/var/lib/bloom/%i/broker
+
+[Install]
+WantedBy=multi-user.target

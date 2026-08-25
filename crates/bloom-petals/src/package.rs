@@ -88,6 +88,8 @@ struct PetalToml {
     #[serde(default)]
     sign: SignPolicy,
     #[serde(default)]
+    key: KeyPolicyToml,
+    #[serde(default)]
     store: StorePolicyToml,
     #[serde(default, rename = "source")]
     _source: Option<SourcePolicyToml>,
@@ -132,6 +134,20 @@ struct NetAllowToml {
 struct SignPolicy {
     #[serde(default)]
     allowed_intents: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyPolicyToml {
+    #[serde(default, rename = "derive")]
+    derive_routes: Vec<KeyDerivePolicyToml>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyDerivePolicyToml {
+    route: String,
+    operation_classes: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -316,6 +332,8 @@ pub struct RouteIndexRecord {
     pub params: Vec<String>,
     pub specificity: [usize; 3],
     pub install_metadata: InstallRouteMetadata,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_derive_operation_classes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,6 +488,8 @@ impl PreparedPetalPackage {
                 manifest.name
             )));
         }
+        let key_derive_operation_classes =
+            validate_key_derive_policy(&manifest.key, &route_files, &allowed_sign_intents)?;
         let policy_hash = hex::encode(blake3::hash(manifest_bytes).as_bytes());
         let mut route_index = RouteIndex {
             schema: ROUTE_INDEX_SCHEMA.to_string(),
@@ -555,6 +575,21 @@ impl PreparedPetalPackage {
                 }
                 source_validation
             };
+            let route_key_derive_operation_classes = key_derive_operation_classes
+                .get(&route.pattern)
+                .cloned()
+                .unwrap_or_default();
+            if !route_key_derive_operation_classes.is_empty()
+                && !validation
+                    .required_caps
+                    .iter()
+                    .any(|cap| cap == "bloom:key.derive")
+            {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} does not import bloom:key.derive",
+                    route.pattern
+                )));
+            }
             let (kind, mut ops) = route_kind_and_ops(&source_path);
             if let Some(sidecar) = &sidecar
                 && !sidecar.ops.is_empty()
@@ -599,6 +634,7 @@ impl PreparedPetalPackage {
                 params: route.params,
                 specificity: route.specificity.as_array(),
                 install_metadata,
+                key_derive_operation_classes: route_key_derive_operation_classes,
             });
         }
 
@@ -644,18 +680,34 @@ fn install_metadata_for_route(
         side_effecting_read: validation.abi == RouteAbi::ComponentBloomRoute010
             && !route.params.is_empty(),
         write_async: validation.abi == RouteAbi::ComponentBloomRoute010
-            && validation.has_write_export
-            && !route.params.is_empty(),
+            && validation.has_write_export,
         executable: false,
         required_caps: validation.required_caps.clone(),
         sign_intent: None,
     };
 
-    if validation.abi != RouteAbi::ComponentBloomRoute010 || !route.params.is_empty() {
+    if validation.abi != RouteAbi::ComponentBloomRoute010 {
         return Ok(metadata);
     }
-    let component_metadata =
-        evaluate_static_component_metadata(package_hash, petal_root, route, artifact_bytes)?;
+    if !route.params.is_empty()
+        && !validation
+            .required_caps
+            .iter()
+            .any(|cap| cap == "bloom:sign")
+    {
+        return Ok(metadata);
+    }
+    let component_metadata = evaluate_component_metadata(
+        package_hash,
+        petal_root,
+        &route.pattern,
+        artifact_bytes,
+        route
+            .params
+            .iter()
+            .map(|name| (name.clone(), "provenance".to_string()))
+            .collect(),
+    )?;
     validate_component_metadata_policy(
         &route.route_id,
         route_kind,
@@ -664,25 +716,31 @@ fn install_metadata_for_route(
         allowed_caps,
         allowed_sign_intents,
     )?;
-    metadata.mode = component_metadata.mode;
-    metadata.cache_ttl_ms = component_metadata.cache_ttl_ms;
-    metadata.side_effecting_read = component_metadata.side_effecting_read;
-    metadata.write_async = component_metadata.write_async;
-    metadata.executable = component_metadata.executable;
-    metadata.required_caps = component_metadata
-        .required_caps
-        .into_iter()
-        .filter(|cap| validation.required_caps.contains(cap))
-        .collect();
     if component_metadata.sign_intent.is_some()
-        && !metadata.required_caps.iter().any(|cap| cap == "bloom:sign")
+        && !validation
+            .required_caps
+            .iter()
+            .any(|cap| cap == "bloom:sign")
     {
         return Err(PetalError::InvalidWasm(format!(
             "Petal route {} metadata sign_intent is not backed by a signing import",
             route.route_id
         )));
     }
-    metadata.sign_intent = component_metadata.sign_intent;
+    metadata.sign_intent = component_metadata.sign_intent.clone();
+    if !route.params.is_empty() {
+        return Ok(metadata);
+    }
+    metadata.mode = component_metadata.mode;
+    metadata.cache_ttl_ms = component_metadata.cache_ttl_ms;
+    metadata.side_effecting_read = component_metadata.side_effecting_read;
+    metadata.write_async |= component_metadata.write_async;
+    metadata.executable = component_metadata.executable;
+    metadata.required_caps = component_metadata
+        .required_caps
+        .into_iter()
+        .filter(|cap| validation.required_caps.contains(cap))
+        .collect();
     Ok(metadata)
 }
 
@@ -762,16 +820,17 @@ pub fn narrow_runtime_route_metadata(
     })
 }
 
-fn evaluate_static_component_metadata(
+fn evaluate_component_metadata(
     package_hash: &str,
     petal_root: &str,
-    route: &RouteRecord,
+    path: &str,
     artifact_bytes: &[u8],
+    route_params: Vec<(String, String)>,
 ) -> Result<ComponentRouteMetadata, PetalError> {
     let wasm = artifact_bytes.to_vec();
     let package_hash = package_hash.to_string();
     let petal_root = petal_root.to_string();
-    let path = route.pattern.clone();
+    let path = path.to_string();
     let handle = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -786,7 +845,7 @@ fn evaluate_static_component_metadata(
                     &package_hash,
                     &petal_root,
                     &path,
-                    Vec::new(),
+                    route_params,
                     RunOptions {
                         deterministic_env: true,
                         ..RunOptions::default()
@@ -926,24 +985,96 @@ pub fn store_policy_from_manifest_toml(bytes: &[u8]) -> Result<StoreNamespacePol
 }
 
 pub fn build_petal_package_dir(root: impl AsRef<Path>) -> Result<PreparedPetalPackage, PetalError> {
+    build_petal_package_dir_guarded(root, || Ok(()))
+}
+
+pub fn build_petal_package_dir_guarded<F>(
+    root: impl AsRef<Path>,
+    commit_guard: F,
+) -> Result<PreparedPetalPackage, PetalError>
+where
+    F: FnOnce() -> Result<(), PetalError>,
+{
     let root = root.as_ref();
     PetalPackage::scan_dir(root)?;
     validate_generated_artifact_paths(root)?;
-    remove_generated_artifacts(root)?;
-    let source_package = PreparedPetalPackage::from_dir(root)?;
+    let source_files = collect_package_dir(root)?
+        .into_iter()
+        .filter(|file| {
+            file.path != "artifacts/build-manifest.json"
+                && !file.path.starts_with("artifacts/routes/")
+        })
+        .collect::<Vec<_>>();
+    let source_package = PreparedPetalPackage::from_files(source_files.clone())?;
     let manifest = build_manifest_for_package(&source_package)?;
+    let parent = root
+        .parent()
+        .ok_or_else(|| PetalError::InvalidWasm("Petal package directory has no parent".into()))?;
+    let staged = tempfile::tempdir_in(parent)?;
 
     for route in &source_package.route_index.routes {
         let artifact = route_artifact_bytes(&source_package, route)?;
-        write_package_file(root, &route.artifact_path, &artifact)?;
+        write_package_file(staged.path(), &route.artifact_path, &artifact)?;
     }
     write_package_file(
-        root,
+        staged.path(),
         "artifacts/build-manifest.json",
         &serde_json::to_vec_pretty(&manifest)?,
     )?;
+    let mut final_files = source_files;
+    final_files.extend(collect_package_dir(staged.path())?);
+    let package = PreparedPetalPackage::from_files(final_files)?;
 
-    PreparedPetalPackage::from_dir(root)
+    commit_guard()?;
+    commit_generated_artifacts(root, staged.path())?;
+    Ok(package)
+}
+
+fn commit_generated_artifacts(root: &Path, staged_root: &Path) -> Result<(), PetalError> {
+    let artifacts = root.join("artifacts");
+    std::fs::create_dir_all(&artifacts)?;
+    let backup =
+        tempfile::tempdir_in(root.parent().ok_or_else(|| {
+            PetalError::InvalidWasm("Petal package directory has no parent".into())
+        })?)?;
+    let routes = artifacts.join("routes");
+    let manifest = artifacts.join("build-manifest.json");
+    let backup_routes = backup.path().join("routes");
+    let backup_manifest = backup.path().join("build-manifest.json");
+    let staged_routes = staged_root.join("artifacts/routes");
+    let staged_manifest = staged_root.join("artifacts/build-manifest.json");
+
+    let had_routes = routes.exists();
+    let had_manifest = manifest.exists();
+    if had_routes {
+        std::fs::rename(&routes, &backup_routes)?;
+    }
+    if had_manifest && let Err(error) = std::fs::rename(&manifest, &backup_manifest) {
+        if had_routes {
+            let _ = std::fs::rename(&backup_routes, &routes);
+        }
+        return Err(error.into());
+    }
+
+    let install_result = (|| -> Result<(), std::io::Error> {
+        if staged_routes.exists() {
+            std::fs::rename(&staged_routes, &routes)?;
+        }
+        std::fs::rename(&staged_manifest, &manifest)?;
+        Ok(())
+    })();
+    if let Err(error) = install_result {
+        let _ = std::fs::remove_dir_all(&routes);
+        let _ = std::fs::remove_file(&manifest);
+        if had_routes {
+            let _ = std::fs::rename(&backup_routes, &routes);
+        }
+        if had_manifest {
+            let _ = std::fs::rename(&backup_manifest, &manifest);
+        }
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 pub fn petal_consent_summary(
@@ -1351,35 +1482,6 @@ fn validate_generated_artifact_paths(root: &Path) -> Result<(), PetalError> {
         ));
     }
     Ok(())
-}
-
-fn remove_generated_artifacts(root: &Path) -> Result<(), PetalError> {
-    let artifacts = root.join("artifacts");
-    let routes = artifacts.join("routes");
-    match std::fs::remove_dir_all(&routes) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(PetalError::Io(e)),
-    }?;
-
-    let manifest = artifacts.join("build-manifest.json");
-    match std::fs::remove_file(&manifest) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(PetalError::Io(e)),
-    }?;
-    match std::fs::remove_dir(&artifacts) {
-        Ok(()) => Ok(()),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-            ) =>
-        {
-            Ok(())
-        }
-        Err(e) => Err(PetalError::Io(e)),
-    }
 }
 
 fn route_kind_and_ops(source_path: &str) -> (RouteEntryKind, Vec<RouteOp>) {
@@ -2279,6 +2381,15 @@ fn component_route_type_import(name: &str) -> Option<&'static str> {
 }
 
 fn component_import_caps(name: &str) -> Option<&'static [&'static str]> {
+    if matches!(
+        name,
+        "bloom:sign/signing@0.1.0" | "bloom:sign/signing@0.2.0"
+    ) {
+        return Some(&["bloom:sign"]);
+    }
+    if name == "bloom:key/derive@0.1.0" {
+        return Some(&["bloom:key.derive"]);
+    }
     bloom_petal_contract::capabilities_for_import(name)
 }
 
@@ -2286,7 +2397,9 @@ fn component_import_caps(name: &str) -> Option<&'static [&'static str]> {
 enum ComponentHostInterface {
     HttpFetch,
     StoreKv,
-    SignSigning,
+    SignSigningV1,
+    SignSigningV2,
+    KeyDerive,
     TxOutbox,
     ChainRead,
     VfsReadwrite,
@@ -2294,10 +2407,20 @@ enum ComponentHostInterface {
 }
 
 fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
+    if name == "bloom:sign/signing@0.1.0" {
+        return Some(ComponentHostInterface::SignSigningV1);
+    }
+    if name == "bloom:sign/signing@0.2.0" {
+        return Some(ComponentHostInterface::SignSigningV2);
+    }
+    if name == "bloom:key/derive@0.1.0" {
+        return Some(ComponentHostInterface::KeyDerive);
+    }
     match bloom_petal_contract::host_interface(name)? {
         ContractHostInterface::HttpFetch => Some(ComponentHostInterface::HttpFetch),
         ContractHostInterface::StoreKv => Some(ComponentHostInterface::StoreKv),
-        ContractHostInterface::SignSigning => Some(ComponentHostInterface::SignSigning),
+        ContractHostInterface::SignSigning => Some(ComponentHostInterface::SignSigningV2),
+        ContractHostInterface::KeyDerive => Some(ComponentHostInterface::KeyDerive),
         ContractHostInterface::TxOutbox => Some(ComponentHostInterface::TxOutbox),
         ContractHostInterface::ChainRead => Some(ComponentHostInterface::ChainRead),
         ContractHostInterface::VfsReadwrite => Some(ComponentHostInterface::VfsReadwrite),
@@ -2530,9 +2653,16 @@ enum HostTypeExport {
     StagedTransaction,
     OutboxInspection,
     SignApprovalRequired,
+    SignApprovalPending,
     SignResultStructured,
+    SafeSignResultStructured,
     SignRequestStructured,
+    ScopedPayloadSignRequestStructured,
+    PayloadSignItemStructured,
+    PayloadBatchSignRequestStructured,
+    PetalSignSelector,
     SignBatchResultStructured,
+    PayloadBatchSignResultStructured,
 }
 
 #[derive(Clone, Copy)]
@@ -2546,6 +2676,9 @@ enum HostFuncExport {
     StoreDeleteIfValue,
     SignHashStructured,
     SignHashesStructured,
+    SafeSignPayloadStructured,
+    PayloadBatchSignStructured,
+    PetalKeyRequest,
     EvmTxStage,
     EvmTxConfirm,
     EvmTxInspect,
@@ -2671,16 +2804,37 @@ fn host_type_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
             Some(HostTypeExport::StagedTransaction)
         }
         (ComponentHostInterface::TxOutbox, "inspection") => Some(HostTypeExport::OutboxInspection),
-        (ComponentHostInterface::SignSigning, "approval-required") => {
+        (ComponentHostInterface::SignSigningV1, "approval-required") => {
             Some(HostTypeExport::SignApprovalRequired)
         }
-        (ComponentHostInterface::SignSigning, "sign-result") => {
+        (ComponentHostInterface::SignSigningV1, "sign-result") => {
             Some(HostTypeExport::SignResultStructured)
         }
-        (ComponentHostInterface::SignSigning, "sign-request") => {
+        (ComponentHostInterface::SignSigningV2, "approval-pending") => {
+            Some(HostTypeExport::SignApprovalPending)
+        }
+        (ComponentHostInterface::SignSigningV2, "sign-result") => {
+            Some(HostTypeExport::SafeSignResultStructured)
+        }
+        (ComponentHostInterface::SignSigningV1, "sign-request") => {
             Some(HostTypeExport::SignRequestStructured)
         }
-        (ComponentHostInterface::SignSigning, "sign-batch-result") => {
+        (ComponentHostInterface::SignSigningV2, "payload-sign-request") => {
+            Some(HostTypeExport::ScopedPayloadSignRequestStructured)
+        }
+        (ComponentHostInterface::SignSigningV2, "selector") => {
+            Some(HostTypeExport::PetalSignSelector)
+        }
+        (ComponentHostInterface::SignSigningV2, "payload-sign-item") => {
+            Some(HostTypeExport::PayloadSignItemStructured)
+        }
+        (ComponentHostInterface::SignSigningV2, "payload-batch-sign-request") => {
+            Some(HostTypeExport::PayloadBatchSignRequestStructured)
+        }
+        (ComponentHostInterface::SignSigningV2, "sign-batch-result") => {
+            Some(HostTypeExport::PayloadBatchSignResultStructured)
+        }
+        (ComponentHostInterface::SignSigningV1, "sign-batch-result") => {
             Some(HostTypeExport::SignBatchResultStructured)
         }
         _ => None,
@@ -2698,12 +2852,19 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         (ComponentHostInterface::StoreKv, "delete-if-value") => {
             Some(HostFuncExport::StoreDeleteIfValue)
         }
-        (ComponentHostInterface::SignSigning, "sign-hash") => {
+        (ComponentHostInterface::SignSigningV1, "sign-hash") => {
             Some(HostFuncExport::SignHashStructured)
         }
-        (ComponentHostInterface::SignSigning, "sign-hashes") => {
+        (ComponentHostInterface::SignSigningV1, "sign-hashes") => {
             Some(HostFuncExport::SignHashesStructured)
         }
+        (ComponentHostInterface::SignSigningV2, "sign-payload") => {
+            Some(HostFuncExport::SafeSignPayloadStructured)
+        }
+        (ComponentHostInterface::SignSigningV2, "sign-payload-batch") => {
+            Some(HostFuncExport::PayloadBatchSignStructured)
+        }
+        (ComponentHostInterface::KeyDerive, "request") => Some(HostFuncExport::PetalKeyRequest),
         (ComponentHostInterface::TxOutbox, "stage") => Some(HostFuncExport::EvmTxStage),
         (ComponentHostInterface::TxOutbox, "confirm") => Some(HostFuncExport::EvmTxConfirm),
         (ComponentHostInterface::TxOutbox, "inspect") => Some(HostFuncExport::EvmTxInspect),
@@ -2739,9 +2900,22 @@ fn host_type_export_matches(
         HostTypeExport::StagedTransaction => is_staged_transaction(&ty, types, 0),
         HostTypeExport::OutboxInspection => is_outbox_inspection(&ty, types, 0),
         HostTypeExport::SignApprovalRequired => is_approval_required(&ty, types, 0),
+        HostTypeExport::SignApprovalPending => is_approval_pending(&ty, types, 0),
         HostTypeExport::SignResultStructured => is_sign_result_petal(&ty, types, 0),
+        HostTypeExport::SafeSignResultStructured => is_safe_sign_result_petal(&ty, types, 0),
         HostTypeExport::SignRequestStructured => is_sign_request_petal(&ty, types, 0),
+        HostTypeExport::ScopedPayloadSignRequestStructured => {
+            is_scoped_payload_sign_request_petal(&ty, types, 0)
+        }
+        HostTypeExport::PayloadSignItemStructured => is_payload_sign_item_petal(&ty, types, 0),
+        HostTypeExport::PayloadBatchSignRequestStructured => {
+            is_payload_batch_sign_request_petal(&ty, types, 0)
+        }
+        HostTypeExport::PetalSignSelector => is_exact_reusable_selector(&ty, types, 0),
         HostTypeExport::SignBatchResultStructured => is_sign_batch_result_petal(&ty, types, 0),
+        HostTypeExport::PayloadBatchSignResultStructured => {
+            is_payload_batch_sign_result_petal(&ty, types, 0)
+        }
     }
 }
 
@@ -2836,6 +3010,28 @@ fn host_func_export_matches(
                 })],
             ) && result_matches(&ty.result, types, HostOkType::SignBatchResultStructured)
         }
+        HostFuncExport::SafeSignPayloadStructured => {
+            params_match(
+                params,
+                types,
+                &[("request", is_scoped_payload_sign_request_petal)],
+            ) && result_matches(&ty.result, types, HostOkType::SafeSignResultStructured)
+        }
+        HostFuncExport::PayloadBatchSignStructured => {
+            params_match(
+                params,
+                types,
+                &[("request", is_payload_batch_sign_request_petal)],
+            ) && result_matches(
+                &ty.result,
+                types,
+                HostOkType::PayloadBatchSignResultStructured,
+            )
+        }
+        HostFuncExport::PetalKeyRequest => {
+            params_match(params, types, &[("request", is_byte_list)])
+                && result_matches(&ty.result, types, HostOkType::Bytes)
+        }
         HostFuncExport::EvmTxStage => {
             params_match(params, types, &[("tx", is_evm_transaction)])
                 && result_matches(&ty.result, types, HostOkType::StagedTransaction)
@@ -2929,7 +3125,9 @@ enum HostOkType {
     VfsEntryList,
     U64,
     SignResultStructured,
+    SafeSignResultStructured,
     SignBatchResultStructured,
+    PayloadBatchSignResultStructured,
     StagedTransaction,
     OutboxInspection,
 }
@@ -2960,8 +3158,14 @@ fn result_matches(
             (HostOkType::VfsEntryList, Some(ty)) => is_list_of(ty, types, is_route_entry, depth),
             (HostOkType::U64, Some(ty)) => is_u64(ty, types, depth),
             (HostOkType::SignResultStructured, Some(ty)) => is_sign_result_petal(ty, types, depth),
+            (HostOkType::SafeSignResultStructured, Some(ty)) => {
+                is_safe_sign_result_petal(ty, types, depth)
+            }
             (HostOkType::SignBatchResultStructured, Some(ty)) => {
                 is_sign_batch_result_petal(ty, types, depth)
+            }
+            (HostOkType::PayloadBatchSignResultStructured, Some(ty)) => {
+                is_payload_batch_sign_result_petal(ty, types, depth)
             }
             (HostOkType::StagedTransaction, Some(ty)) => is_staged_transaction(ty, types, depth),
             (HostOkType::OutboxInspection, Some(ty)) => is_outbox_inspection(ty, types, depth),
@@ -2994,6 +3198,29 @@ fn is_sign_result_petal(
     })
 }
 
+fn is_safe_sign_result_petal(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Variant(cases) = defined else {
+            return false;
+        };
+        cases.as_ref().len() == 2
+            && cases[0].name == "signature"
+            && cases[0]
+                .ty
+                .as_ref()
+                .is_some_and(|ty| is_byte_list(ty, types, depth))
+            && cases[1].name == "approval-pending"
+            && cases[1]
+                .ty
+                .as_ref()
+                .is_some_and(|ty| is_approval_pending(ty, types, depth))
+    })
+}
+
 fn is_sign_request_petal(
     ty: &ComponentValType,
     types: &[ComponentTypeEntry<'_>],
@@ -3010,6 +3237,112 @@ fn is_sign_request_petal(
             && is_byte_list(&fields[1].1, types, depth)
             && fields[2].0 == "intent"
             && is_string(&fields[2].1)
+    })
+}
+
+fn is_scoped_payload_sign_request_petal(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        let fields = fields.as_ref();
+        fields.len() == 12
+            && fields[0].0 == "wallet"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "preimage"
+            && is_byte_list(&fields[1].1, types, depth)
+            && fields[2].0 == "claimed-hash"
+            && is_byte_list(&fields[2].1, types, depth)
+            && fields[3].0 == "signature-algorithm"
+            && is_string(&fields[3].1)
+            && fields[4].0 == "operation-class"
+            && is_string(&fields[4].1)
+            && fields[5].0 == "petal-use-claim-jcs"
+            && is_byte_list(&fields[5].1, types, depth)
+            && fields[6].0 == "claim-assurance-evidence"
+            && is_option_of(&fields[6].1, types, is_byte_list, depth)
+            && fields[7].0 == "approval-hint"
+            && is_option_of(&fields[7].1, types, is_string_type, depth)
+            && fields[8].0 == "action"
+            && is_option_of(&fields[8].1, types, is_byte_list, depth)
+            && fields[9].0 == "advisory"
+            && is_option_of(&fields[9].1, types, is_byte_list, depth)
+            && fields[10].0 == "selector"
+            && is_exact_reusable_selector(&fields[10].1, types, depth)
+            && fields[11].0 == "key-ref-jcs"
+            && is_option_of(&fields[11].1, types, is_byte_list, depth)
+    })
+}
+
+fn is_exact_reusable_selector(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, _, _| {
+        matches!(
+            defined,
+            ComponentDefinedType::Enum(names)
+                if names.as_ref() == ["exact", "reusable"]
+        )
+    })
+}
+
+fn is_payload_sign_item_petal(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        let fields = fields.as_ref();
+        fields.len() == 2
+            && fields[0].0 == "preimage"
+            && is_byte_list(&fields[0].1, types, depth)
+            && fields[1].0 == "claimed-hash"
+            && is_byte_list(&fields[1].1, types, depth)
+    })
+}
+
+fn is_payload_batch_sign_request_petal(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        let fields = fields.as_ref();
+        fields.len() == 11
+            && fields[0].0 == "wallet"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "payloads"
+            && is_list_of(&fields[1].1, types, is_payload_sign_item_petal, depth)
+            && fields[2].0 == "signature-algorithm"
+            && is_string(&fields[2].1)
+            && fields[3].0 == "operation-class"
+            && is_string(&fields[3].1)
+            && fields[4].0 == "petal-use-claim-jcs"
+            && is_byte_list(&fields[4].1, types, depth)
+            && fields[5].0 == "claim-assurance-evidence"
+            && is_option_of(&fields[5].1, types, is_byte_list, depth)
+            && fields[6].0 == "approval-hint"
+            && is_option_of(&fields[6].1, types, is_string_type, depth)
+            && fields[7].0 == "action"
+            && is_option_of(&fields[7].1, types, is_byte_list, depth)
+            && fields[8].0 == "advisory"
+            && is_option_of(&fields[8].1, types, is_byte_list, depth)
+            && fields[9].0 == "selector"
+            && is_exact_reusable_selector(&fields[9].1, types, depth)
+            && fields[10].0 == "key-ref-jcs"
+            && is_option_of(&fields[10].1, types, is_byte_list, depth)
     })
 }
 
@@ -3036,6 +3369,29 @@ fn is_sign_batch_result_petal(
     })
 }
 
+fn is_payload_batch_sign_result_petal(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Variant(cases) = defined else {
+            return false;
+        };
+        cases.as_ref().len() == 2
+            && cases[0].name == "signatures"
+            && cases[0]
+                .ty
+                .as_ref()
+                .is_some_and(|ty| is_list_of(ty, types, is_byte_list, depth))
+            && cases[1].name == "approval-pending"
+            && cases[1]
+                .ty
+                .as_ref()
+                .is_some_and(|ty| is_approval_pending(ty, types, depth))
+    })
+}
+
 fn is_approval_required(
     ty: &ComponentValType,
     types: &[ComponentTypeEntry<'_>],
@@ -3052,6 +3408,23 @@ fn is_approval_required(
             && is_string(&fields[1].1)
             && fields[2].0 == "expires-ms"
             && is_u64(&fields[2].1, types, depth)
+    })
+}
+
+fn is_approval_pending(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 2
+            && fields[0].0 == "action-id"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "expires-ms"
+            && is_u64(&fields[1].1, types, depth)
     })
 }
 
@@ -3089,7 +3462,16 @@ fn is_outbox_approval_required(
     types: &[ComponentTypeEntry<'_>],
     depth: usize,
 ) -> bool {
-    is_approval_required(ty, types, depth)
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 2
+            && fields[0].0 == "action-id"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "expires-ms"
+            && is_u64(&fields[1].1, types, depth)
+    })
 }
 
 fn is_staged_transaction(
@@ -3461,6 +3843,58 @@ fn validate_sign_policy(
         validate_sign_intent(intent)?;
     }
     Ok(())
+}
+
+fn validate_key_derive_policy(
+    policy: &KeyPolicyToml,
+    routes: &[RouteRecord],
+    allowed_sign_intents: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<String>>, PetalError> {
+    let route_patterns = routes
+        .iter()
+        .map(|route| route.pattern.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut declarations = BTreeMap::new();
+    for declaration in &policy.derive_routes {
+        if !route_patterns.contains(declaration.route.as_str()) {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] declares unknown route {:?}",
+                declaration.route
+            )));
+        }
+        if declaration.operation_classes.is_empty() {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] route {:?} operation_classes must be non-empty",
+                declaration.route
+            )));
+        }
+
+        let mut classes = BTreeSet::new();
+        for operation_class in &declaration.operation_classes {
+            validate_sign_intent(operation_class)?;
+            if !allowed_sign_intents.contains(operation_class) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] operation class {operation_class:?} is not declared in [sign].allowed_intents"
+                )));
+            }
+            if !classes.insert(operation_class.clone()) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "Petal [[key.derive]] route {:?} has duplicate operation class {operation_class:?}",
+                    declaration.route
+                )));
+            }
+        }
+        if declarations
+            .insert(declaration.route.clone(), classes.into_iter().collect())
+            .is_some()
+        {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[key.derive]] has a duplicate declaration for route {:?}",
+                declaration.route
+            )));
+        }
+    }
+    Ok(declarations)
 }
 
 fn store_policy_from_manifest(manifest: &PetalToml) -> StoreNamespacePolicy {
@@ -4605,6 +5039,37 @@ name = "echo"
         assert_eq!(artifact, source);
     }
 
+    #[test]
+    fn cancelled_petal_build_preserves_existing_generated_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_petal_package(tmp.path());
+        write_package_file(
+            tmp.path(),
+            "artifacts/routes/r000001.wasm",
+            b"previous artifact",
+        );
+        write_package_file(
+            tmp.path(),
+            "artifacts/build-manifest.json",
+            b"previous manifest",
+        );
+
+        let error = build_petal_package_dir_guarded(tmp.path(), || {
+            Err(PetalError::vm("cancelled before commit"))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cancelled before commit"));
+        assert_eq!(
+            std::fs::read(tmp.path().join("artifacts/routes/r000001.wasm")).unwrap(),
+            b"previous artifact"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("artifacts/build-manifest.json")).unwrap(),
+            b"previous manifest"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn petal_build_petal_package_dir_rejects_symlinked_artifacts_without_deleting_target() {
@@ -5298,6 +5763,7 @@ name = "echo"
                 required_caps: vec!["bloom:http".into(), "bloom:store".into()],
                 sign_intent: None,
             },
+            key_derive_operation_classes: Vec::new(),
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -5338,6 +5804,7 @@ name = "echo"
                 required_caps: vec!["bloom:store".into()],
                 sign_intent: None,
             },
+            key_derive_operation_classes: Vec::new(),
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -5613,6 +6080,7 @@ imports = ["components/helper.wasm"]
                 required_caps: Vec::new(),
                 sign_intent: None,
             },
+            key_derive_operation_classes: Vec::new(),
         };
         let metadata = ComponentRouteMetadata {
             kind: ComponentRouteEntryKind::File,
@@ -5775,6 +6243,7 @@ secret_namespaces = ["secrets"]
             ("consent", "summry"),
             ("caps", "allowd"),
             ("sign", "allowed_intent"),
+            ("key", "derivations"),
             ("store", "namespace"),
             ("source", "repo"),
             ("build", "output"),
@@ -5870,29 +6339,115 @@ paths = ["/*"]
     }
 
     #[test]
-    fn petal_component_signing_is_allowed_but_other_versions_fail_closed() {
+    fn petal_component_signing_versions_are_explicit_and_other_versions_fail_closed() {
         assert_eq!(
             component_import_caps("bloom:sign/signing@0.1.0"),
             Some(&["bloom:sign"][..])
         );
         assert!(matches!(
             component_host_interface("bloom:sign/signing@0.1.0"),
-            Some(ComponentHostInterface::SignSigning)
+            Some(ComponentHostInterface::SignSigningV1)
         ));
+        assert_eq!(
+            component_import_caps("bloom:sign/signing@0.2.0"),
+            Some(&["bloom:sign"][..])
+        );
+        assert!(matches!(
+            component_host_interface("bloom:sign/signing@0.2.0"),
+            Some(ComponentHostInterface::SignSigningV2)
+        ));
+        assert!(component_import_caps("bloom:sign/signing@0.3.0").is_none());
+        assert!(component_host_interface("bloom:sign/signing@0.3.0").is_none());
+        assert!(component_import_caps("bloom:sign/signing@0.4.0").is_none());
+        assert!(component_host_interface("bloom:sign/signing@0.4.0").is_none());
         assert!(component_import_caps("bloom:sign/signing@9.9.9").is_none());
         assert!(component_host_interface("bloom:sign/signing@9.9.9").is_none());
     }
 
     #[test]
-    fn petal_component_signing_recognizes_its_exported_nominal_types() {
-        let interface = ComponentHostInterface::SignSigning;
+    fn petal_component_key_derivation_version_and_capability_are_explicit() {
+        assert_eq!(
+            component_import_caps("bloom:key/derive@0.1.0"),
+            Some(&["bloom:key.derive"][..])
+        );
         assert!(matches!(
-            host_type_export(interface, "approval-required"),
-            Some(HostTypeExport::SignApprovalRequired)
+            component_host_interface("bloom:key/derive@0.1.0"),
+            Some(ComponentHostInterface::KeyDerive)
+        ));
+        assert!(component_import_caps("bloom:key/derive@0.2.0").is_none());
+        assert!(component_host_interface("bloom:key/derive@0.2.0").is_none());
+        assert!(host_import_instance_matches(
+            ComponentHostInterface::KeyDerive,
+            r#"(component
+              (type $interface
+                (instance
+                  (type $bytes (list u8))
+                  (type $outcome (result $bytes (error string)))
+                  (type $request
+                    (func (param "request" $bytes) (result $outcome)))
+                  (export "request" (func (type $request)))))
+              (import "bloom:key/derive@0.1.0"
+                (instance (type $interface))))"#,
+        ));
+    }
+
+    #[test]
+    fn petal_component_signing_recognizes_its_exported_nominal_types() {
+        let interface = ComponentHostInterface::SignSigningV2;
+        assert!(matches!(
+            host_type_export(interface, "approval-pending"),
+            Some(HostTypeExport::SignApprovalPending)
         ));
         assert!(matches!(
             host_type_export(interface, "sign-result"),
-            Some(HostTypeExport::SignResultStructured)
+            Some(HostTypeExport::SafeSignResultStructured)
+        ));
+    }
+
+    #[test]
+    fn petal_component_signing_v2_accepts_the_safe_atomic_batch_shape() {
+        assert!(host_import_instance_matches(
+            ComponentHostInterface::SignSigningV2,
+            r#"(component
+              (type $interface
+                (instance
+                  (type $bytes (list u8))
+                  (type $approval (record
+                    (field "action-id" string)
+                    (field "expires-ms" u64)))
+                  (export "approval-pending" (type $approval-export (eq $approval)))
+                  (type $selector (enum "exact" "reusable"))
+                  (export "selector" (type $selector-export (eq $selector)))
+                  (type $item (record
+                    (field "preimage" $bytes)
+                    (field "claimed-hash" $bytes)))
+                  (export "payload-sign-item" (type $item-export (eq $item)))
+                  (type $maybe-bytes (option $bytes))
+                  (type $maybe-string (option string))
+                  (type $request (record
+                    (field "wallet" string)
+                    (field "payloads" (list $item-export))
+                    (field "signature-algorithm" string)
+                    (field "operation-class" string)
+                    (field "petal-use-claim-jcs" $bytes)
+                    (field "claim-assurance-evidence" $maybe-bytes)
+                    (field "approval-hint" $maybe-string)
+                    (field "action" $maybe-bytes)
+                    (field "advisory" $maybe-bytes)
+                    (field "selector" $selector-export)
+                    (field "key-ref-jcs" $maybe-bytes)))
+                  (export "payload-batch-sign-request" (type $request-export (eq $request)))
+                  (type $batch-result (variant
+                    (case "signatures" (list $bytes))
+                    (case "approval-pending" $approval-export)))
+                  (export "sign-batch-result" (type $batch-result-export (eq $batch-result)))
+                  (type $outcome (result $batch-result-export (error string)))
+                  (type $sign (func
+                    (param "request" $request-export)
+                    (result $outcome)))
+                  (export "sign-payload-batch" (func (type $sign)))))
+              (import "bloom:sign/signing@0.2.0"
+                (instance (type $interface))))"#,
         ));
     }
 
@@ -6049,6 +6604,167 @@ allowed_intents = ["test.intent"]
     }
 
     #[test]
+    fn petal_key_derive_policy_is_route_scoped_in_the_immutable_index() {
+        let package = prepared_triad_fixture_with_manifest(
+            br#"schema = "bloom.petal.package.v1"
+name = "triad-authority-fixture"
+[caps]
+allowed = ["bloom:key.derive", "bloom:sign", "bloom:store"]
+
+[sign]
+allowed_intents = ["fixture.unrelated", "fixture.secondary", "fixture.payload"]
+
+[store]
+namespaces = ["fixture-public"]
+
+[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.secondary", "fixture.payload"]
+"#,
+        )
+        .unwrap();
+
+        let route = &package.route_index.routes[0];
+        assert_eq!(route.pattern, "session.json");
+        assert_eq!(
+            route.key_derive_operation_classes,
+            vec![
+                "fixture.payload".to_string(),
+                "fixture.secondary".to_string()
+            ]
+        );
+        assert!(
+            !route
+                .key_derive_operation_classes
+                .contains(&"fixture.unrelated".to_string())
+        );
+
+        let serialized = serde_json::to_value(route).unwrap();
+        assert_eq!(
+            serialized["key_derive_operation_classes"],
+            serde_json::json!(["fixture.payload", "fixture.secondary"])
+        );
+        let mut legacy = serialized;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("key_derive_operation_classes");
+        let legacy: RouteIndexRecord = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.key_derive_operation_classes.is_empty());
+    }
+
+    #[test]
+    fn petal_key_derive_policy_rejects_ambiguous_or_broadened_authority() {
+        let cases = [
+            (
+                "unknown route",
+                r#"[[key.derive]]
+route = "missing.json"
+operation_classes = ["fixture.payload"]
+"#,
+                "unknown route",
+            ),
+            (
+                "duplicate route",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+
+[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload"]
+"#,
+                "duplicate declaration",
+            ),
+            (
+                "empty classes",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = []
+"#,
+                "operation_classes must be non-empty",
+            ),
+            (
+                "duplicate classes",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.payload", "fixture.payload"]
+"#,
+                "duplicate operation class",
+            ),
+            (
+                "invalid class",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture/payload"]
+"#,
+                "unsupported byte",
+            ),
+            (
+                "undeclared class",
+                r#"[[key.derive]]
+route = "session.json"
+operation_classes = ["fixture.undeclared"]
+"#,
+                "is not declared in [sign].allowed_intents",
+            ),
+            (
+                "unknown declaration field",
+                r#"[[key.derive]]
+route = "session.json"
+operation_class = ["fixture.payload"]
+operation_classes = ["fixture.payload"]
+"#,
+                "unknown field `operation_class`",
+            ),
+        ];
+
+        for (label, declaration, expected) in cases {
+            let manifest = format!(
+                r#"schema = "bloom.petal.package.v1"
+name = "triad-authority-fixture"
+[caps]
+allowed = ["bloom:key.derive", "bloom:sign", "bloom:store"]
+
+[sign]
+allowed_intents = ["fixture.payload"]
+
+[store]
+namespaces = ["fixture-public"]
+
+{declaration}"#
+            );
+            let error = prepared_triad_fixture_with_manifest(manifest.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{label}: {error}");
+        }
+
+        let no_import = tempfile::tempdir().unwrap();
+        write_petal_package_with_manifest_and_route(
+            no_import.path(),
+            br#"schema = "bloom.petal.package.v1"
+name = "echo"
+[caps]
+allowed = ["bloom:key.derive"]
+
+[sign]
+allowed_intents = ["fixture.payload"]
+
+[[key.derive]]
+route = "hello.txt"
+operation_classes = ["fixture.payload"]
+"#,
+            route_component_no_imports(),
+        );
+        let error = PreparedPetalPackage::from_dir(no_import.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not import bloom:key.derive"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn petal_store_cap_requires_declared_namespaces() {
         let tmp = tempfile::tempdir().unwrap();
         write_petal_package_with_manifest_and_route(
@@ -6158,6 +6874,20 @@ name = "echo"
         write_package_file(root, "README.md", b"# echo");
         write_package_file(root, "AGENTS.md", b"# echo agents");
         write_package_file(root, "petal/echo/hello.txt.wasm", route);
+    }
+
+    fn prepared_triad_fixture_with_manifest(
+        manifest: &[u8],
+    ) -> Result<PreparedPetalPackage, PetalError> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/triad-authority-petal");
+        let mut files = collect_package_dir(&fixture)?;
+        files
+            .iter_mut()
+            .find(|file| file.path == "petal.toml")
+            .expect("fixture manifest")
+            .bytes = manifest.to_vec();
+        PreparedPetalPackage::from_files(files)
     }
 
     fn route_component_no_imports() -> &'static [u8] {

@@ -50,10 +50,6 @@ pub struct Config {
     /// upper bound.
     #[serde(default)]
     pub petals: PetalsConfig,
-    /// Hyperliquid HyperCore read/write surface. Presence of `[hyperliquid]`
-    /// opts the `hyperliquid/` VFS subtree in.
-    #[serde(default)]
-    pub hyperliquid: Option<HyperliquidConfig>,
     #[serde(default)]
     pub mempool: BTreeMap<String, MempoolChainConfig>,
     #[serde(default)]
@@ -87,11 +83,10 @@ impl Default for PetalsConfig {
 }
 
 fn default_preinstalled_petals() -> Vec<String> {
-    vec![
-        "polymarket".to_string(),
-        "near-intents".to_string(),
-        "enso".to_string(),
-    ]
+    // Authority-bearing Petals are not defaults until an immutable release is
+    // built against the triad payload-signing ABI. They remain valid explicit
+    // names so an upgraded release can be pinned without a config migration.
+    vec!["near-intents".to_string(), "enso".to_string()]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -203,34 +198,6 @@ pub struct EnsoConfig {
     pub api_url: String,
 }
 
-/// Hyperliquid HyperCore API configuration. Every field has a default so a
-/// bare `[hyperliquid]` TOML table uses the official public endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HyperliquidConfig {
-    #[serde(default = "default_hyperliquid_mainnet_url")]
-    pub mainnet_url: String,
-    #[serde(default = "default_hyperliquid_testnet_url")]
-    pub testnet_url: String,
-    /// Bridge2 contract that credits deposits (native USDC on Arbitrum).
-    /// Defaults to the mainnet bridge; not a magic literal in the route code.
-    #[serde(default = "default_hyperliquid_bridge")]
-    pub bridge_address: String,
-    /// Chain whose native USDC the bridge credits (Arbitrum One).
-    #[serde(default = "default_hyperliquid_deposit_chain_id")]
-    pub deposit_chain_id: u64,
-}
-
-impl Default for HyperliquidConfig {
-    fn default() -> Self {
-        Self {
-            mainnet_url: default_hyperliquid_mainnet_url(),
-            testnet_url: default_hyperliquid_testnet_url(),
-            bridge_address: default_hyperliquid_bridge(),
-            deposit_chain_id: default_hyperliquid_deposit_chain_id(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MempoolChainConfig {
     /// Provider id — must match a `bloom_mempool::providers::*` adapter
@@ -266,18 +233,6 @@ fn default_etherscan_url() -> String {
 }
 fn default_enso_url() -> String {
     "https://api.enso.finance".to_string()
-}
-fn default_hyperliquid_mainnet_url() -> String {
-    "https://api.hyperliquid.xyz".to_string()
-}
-fn default_hyperliquid_testnet_url() -> String {
-    "https://api.hyperliquid-testnet.xyz".to_string()
-}
-fn default_hyperliquid_bridge() -> String {
-    crate::hyperliquid::MAINNET_BRIDGE.to_string()
-}
-fn default_hyperliquid_deposit_chain_id() -> u64 {
-    crate::hyperliquid::DEPOSIT_CHAIN_ID
 }
 fn default_max_index_size() -> usize {
     50_000
@@ -441,8 +396,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 }
 
 impl Config {
-    /// An agentic-wallet default: read-ready public EVM networks, Anvil,
-    /// and the Hyperliquid HyperCore VFS using its official public endpoints.
+    /// An agentic-wallet default: read-ready public EVM networks and Anvil.
     ///
     /// Per-chain broadcast is enabled by default. Signing, policy,
     /// confirmation, and Sealed Approval gates still apply to value-moving
@@ -459,7 +413,6 @@ impl Config {
             etherscan: None,
             enso: None,
             petals: PetalsConfig::default(),
-            hyperliquid: Some(HyperliquidConfig::default()),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             backends: BackendsConfig::default(),
@@ -497,26 +450,25 @@ impl Config {
     /// Apply post-load migrations for backwards compatibility.
     ///
     /// Currently infers `op_stack` for well-known OP-stack chain IDs
-    /// (Optimism=10, Base=8453, …) that predate the `op_stack` field.
+    /// (Optimism=10, Base=8453, …) that predate the `op_stack` field and
+    /// removes Polymarket from the exact pre-triad default Petal catalog.
     fn migrate(&mut self, document: &toml::Value) {
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
         }
 
-        // Bloom versions immediately before native Polymarket removal used
-        // `[polymarket] enabled = false` as the persistent opt-out. Preserve
-        // that explicit choice unless the operator has already configured the
-        // replacement `petals.preinstalled` list.
-        let legacy_polymarket_disabled = document
-            .get("polymarket")
-            .and_then(|value| value.get("enabled"))
-            .and_then(toml::Value::as_bool)
-            == Some(false);
-        let preinstalled_is_explicit = document
+        let persisted_preinstalled = document
             .get("petals")
-            .and_then(|value| value.get("preinstalled"))
-            .is_some();
-        if legacy_polymarket_disabled && !preinstalled_is_explicit {
+            .and_then(|petals| petals.get("preinstalled"))
+            .and_then(toml::Value::as_array);
+        let is_legacy_default = persisted_preinstalled.is_some_and(|entries| {
+            entries.iter().map(toml::Value::as_str).eq([
+                Some("polymarket"),
+                Some("near-intents"),
+                Some("enso"),
+            ])
+        });
+        if is_legacy_default {
             self.petals.preinstalled.retain(|name| name != "polymarket");
         }
     }
@@ -596,7 +548,10 @@ impl Config {
         let mut seen_preinstalled = std::collections::BTreeSet::new();
         for name in &self.petals.preinstalled {
             validate_petal_runtime_name("preinstalled entry", name)?;
-            if !matches!(name.as_str(), "polymarket" | "near-intents" | "enso") {
+            if !matches!(
+                name.as_str(),
+                "near-intents" | "enso" | "gasless" | "privacy-pools" | "venice-x402"
+            ) {
                 return Err(ConfigError::Invalid(format!(
                     "unknown preinstalled Petal {name:?}"
                 )));
@@ -675,19 +630,7 @@ mod tests {
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-        assert_eq!(
-            cfg.petals.preinstalled,
-            ["polymarket", "near-intents", "enso"]
-        );
-        let hyperliquid = cfg
-            .hyperliquid
-            .as_ref()
-            .expect("Hyperliquid is enabled by default");
-        assert_eq!(hyperliquid.mainnet_url, "https://api.hyperliquid.xyz");
-        assert_eq!(
-            hyperliquid.testnet_url,
-            "https://api.hyperliquid-testnet.xyz"
-        );
+        assert_eq!(cfg.petals.preinstalled, ["near-intents", "enso"]);
         assert_eq!(cfg.chains.len(), 13);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
@@ -782,6 +725,20 @@ mod tests {
         cfg.petals.preinstalled = vec!["near-intents".into()];
         cfg.validate().unwrap();
 
+        cfg.petals.preinstalled = vec!["hyperliquid".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("unknown preinstalled Petal \"hyperliquid\""),
+            "{err}"
+        );
+
+        cfg.petals.preinstalled = vec!["polymarket".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("unknown preinstalled Petal \"polymarket\""),
+            "{err}"
+        );
+
         cfg.petals.preinstalled = vec!["unknown".into()];
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
@@ -789,10 +746,31 @@ mod tests {
             "{err}"
         );
 
-        cfg.petals.preinstalled = vec!["polymarket".into(), "polymarket".into()];
+        cfg.petals.preinstalled = vec!["near-intents".into(), "near-intents".into()];
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
-            err.contains("duplicate preinstalled Petal \"polymarket\""),
+            err.contains("duplicate preinstalled Petal \"near-intents\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn load_migrates_the_legacy_default_petal_catalog_only() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut cfg = Config::local_default();
+        cfg.petals.preinstalled = vec!["polymarket".into(), "near-intents".into(), "enso".into()];
+        cfg.save(&path).unwrap();
+
+        let migrated = Config::load(&path).unwrap();
+        assert_eq!(migrated.petals.preinstalled, ["near-intents", "enso"]);
+
+        cfg.petals.preinstalled = vec!["polymarket".into()];
+        cfg.save(&path).unwrap();
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown preinstalled Petal \"polymarket\""),
             "{err}"
         );
     }
@@ -814,18 +792,6 @@ mod tests {
         let s = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_configs_equivalent(&cfg, &back);
-    }
-
-    #[test]
-    fn bare_hyperliquid_block_parses_to_public_defaults() {
-        let hl: HyperliquidConfig = toml::from_str("").unwrap();
-        assert_eq!(hl.mainnet_url, "https://api.hyperliquid.xyz");
-        assert_eq!(hl.testnet_url, "https://api.hyperliquid-testnet.xyz");
-
-        let hl: HyperliquidConfig =
-            toml::from_str("mainnet_url = \"http://localhost:3001\"\n").unwrap();
-        assert_eq!(hl.mainnet_url, "http://localhost:3001");
-        assert_eq!(hl.testnet_url, "https://api.hyperliquid-testnet.xyz");
     }
 
     #[test]
@@ -893,32 +859,6 @@ allow_broadcast = false
         let cfg = Config::load_or_init(&path).unwrap();
         assert!(!cfg.chains["anvil"].allow_broadcast);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
-    }
-
-    #[test]
-    fn load_preserves_legacy_polymarket_opt_out_until_new_setting_is_explicit() {
-        let td = tempdir().unwrap();
-        let path = td.path().join("config.toml");
-        let default = toml::to_string_pretty(&Config::local_default()).unwrap();
-        let mut legacy_document: toml::Value = toml::from_str(&default).unwrap();
-        legacy_document
-            .get_mut("petals")
-            .and_then(toml::Value::as_table_mut)
-            .unwrap()
-            .remove("preinstalled");
-        let legacy = toml::to_string_pretty(&legacy_document).unwrap();
-        assert!(!legacy.contains("preinstalled"));
-        std::fs::write(&path, format!("{legacy}\n[polymarket]\nenabled = false\n")).unwrap();
-
-        let migrated = Config::load(&path).unwrap();
-        assert_eq!(migrated.petals.preinstalled, vec!["near-intents", "enso"]);
-
-        std::fs::write(&path, format!("{default}\n[polymarket]\nenabled = false\n")).unwrap();
-        let explicitly_enabled = Config::load(&path).unwrap();
-        assert_eq!(
-            explicitly_enabled.petals.preinstalled,
-            vec!["polymarket", "near-intents", "enso"]
-        );
     }
 
     #[test]

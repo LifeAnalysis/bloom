@@ -13,8 +13,7 @@
 //! 4. Re-spawn anvil on the same port (best-effort; we just confirm
 //!    the executor doesn't panic during the gap).
 //!
-//! Gated `#[ignore]` like the rest of `bloom-it`. The handover is
-//! observed via the live-file content rather than a dedicated channel
+//! The handover is observed via the live-file content rather than a dedicated channel
 //! to keep the test infrastructure-light; the per-event tracing
 //! signals are still emitted at `info`/`warn` and visible under
 //! `RUST_LOG=bloom_watch=debug`.
@@ -32,7 +31,6 @@ use bloom_watch::{WatchKind, WatchRegistry, WatchSpec};
 use tempfile::tempdir;
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn block_watch_falls_back_to_poll_when_anvil_dies() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

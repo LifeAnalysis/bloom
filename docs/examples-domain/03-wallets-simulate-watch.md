@@ -6,57 +6,35 @@ against the mounted filesystem. The runnable flows here use `anvil` or `base`.
 
 ## 1. Wallets
 
-### List, create, import, watch
+### List and create
 
 ```sh
 ls /bloom/wallets/
 ```
 
-`new` is a writable file. The body can be plain text (a wallet name)
-or a TOML spec.
+Writing a plain name to `new` starts an asynchronous Broker custody ceremony;
+it never creates or imports key material in Machine.
 
 ```sh
-# Shorthand: plain name = create a local wallet called 'alice'.
-echo alice > /bloom/wallets/new
-
-# Full TOML form for a fresh local wallet.
-cat <<'EOF' > /bloom/wallets/new
-name = "alice"
-kind = "local"
-passphrase = "devonly"
-EOF
-
-# Import an existing private key (BLOOM_PASSPHRASE applies if 'passphrase' is omitted).
-cat <<'EOF' > /bloom/wallets/new
-name = "imported"
-kind = "import"
-private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-passphrase = "devonly"
-EOF
-
-# Watch-only (no private key, signing is disabled).
-cat <<'EOF' > /bloom/wallets/new
-name = "vitalik"
-kind = "watch"
-address = "0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045"
-EOF
+printf 'alice\n' > /bloom/wallets/new
+cat /bloom/wallets/registrations/alice/status.json
 ```
 
-Wallet names must match `[A-Za-z0-9_-]{1,64}`. Local/import wallets are
-encrypted at rest with argon2id + chacha20poly1305 and are *locked* on
-daemon start; you must `wallet unlock` before signing or confirming.
-The keystore is process-scoped — when you go through the long-running
-`bloom serve` daemon, the unlock survives across VFS calls; a one-shot
-CLI process re-locks every invocation, so the daemon path is what the
-runnable examples assume.
+Wallet names must match `[A-Za-z0-9_-]{1,64}`. The registration projection is
+keyed by the requested wallet petname; verify its `requested_name` before
+opening its `ceremony_url`, polling it, or cancelling it. Complete the
+projected browser ceremony and wait for
+`ceremony_state` to report `COMPLETED` before reading the wallet. Import,
+recovery, rebind, and deletion are likewise Broker custody operations; sensitive
+inputs belong only in the Broker-hosted ceremony.
 
 ### Per-wallet leaves
 
 ```sh
 cat /bloom/wallets/alice/address          # 0x... (EIP-55 checksum)
 cat /bloom/wallets/alice/public_key       # 0x04... uncompressed secp256k1
-cat /bloom/wallets/alice/kind             # local | watch
-cat /bloom/wallets/alice/policy.toml      # current policy
+cat /bloom/wallets/alice/kind             # public backend/kind projection
+cat /bloom/wallets/alice/policy.json      # canonical Broker policy projection
 
 # Per-chain native balance + nonce.
 cat /bloom/wallets/alice/chains/base/balance       # human "0.123 ETH" (display, with symbol)
@@ -65,16 +43,21 @@ cat /bloom/wallets/alice/chains/base/balance.json  # { symbol, decimals, raw, fo
 cat /bloom/wallets/alice/chains/base/nonce
 ```
 
-`policy.toml` can be read through the VFS and may be edited by the wallet
-policy surfaces. For passkey wallets, any policy edit invalidates the previous
-signature until the owner runs:
+`policy.json` is the only writable policy surface. The first exact write calls
+Broker `policy.validate_update` and projects a `policy_update` custody ceremony:
 
 ```sh
-bloom wallet sign-policy <wallet>
+cat /bloom/wallets/alice/policy.json > proposed-policy.json
+# Edit the complete canonical JSON document.
+cp proposed-policy.json /bloom/wallets/alice/policy.json
+cat /bloom/wallets/alice/policy-updates/latest/status.json
+cat /bloom/wallets/alice/policy-updates/latest/approval_challenge.json
+# Complete the ceremony, then commit by retrying the exact bytes.
+cp proposed-policy.json /bloom/wallets/alice/policy.json
 ```
 
-That browser review is where the owner chooses whether Bloom should ask before
-every money-moving action or may act later only when the signed rules allow it.
+Broker carries the completed custody and validation receipts to Signer's
+compare-and-swap. Machine never signs or installs policy.
 
 ERC-20 reads are not under `wallets/` — they live under the
 chain-rooted reader at
@@ -88,60 +71,11 @@ cat /bloom/chains/base/addresses/$ALICE/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b5
 
 ### Signing
 
-All three sign endpoints write the resulting hex signature to a
-`<kind>.sig` file in the keystore directory. The wallet must be unlocked.
-
-```sh
-# EIP-191 personal_sign over a UTF-8 message.
-echo -n 'gm bloom' > /bloom/wallets/alice/sign/message
-cat ~/.bloom/keystore/alice/sign/message.sig
-
-# Raw 32-byte hash (must be 0x-hex, exactly 32 bytes).
-echo -n '0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8' \
-  > /bloom/wallets/alice/sign/hash
-cat ~/.bloom/keystore/alice/sign/hash.sig
-
-# EIP-712 typed data — body is the standard RPC JSON shape. Example:
-# an EIP-2612 permit for USDC on mainnet (chainId 1).
-cat <<'EOF' > /bloom/wallets/alice/sign/typed_data
-{
-  "types": {
-    "EIP712Domain": [
-      {"name":"name","type":"string"},
-      {"name":"version","type":"string"},
-      {"name":"chainId","type":"uint256"},
-      {"name":"verifyingContract","type":"address"}
-    ],
-    "Permit": [
-      {"name":"owner","type":"address"},
-      {"name":"spender","type":"address"},
-      {"name":"value","type":"uint256"},
-      {"name":"nonce","type":"uint256"},
-      {"name":"deadline","type":"uint256"}
-    ]
-  },
-  "primaryType": "Permit",
-  "domain": {
-    "name": "USD Coin",
-    "version": "2",
-    "chainId": 1,
-    "verifyingContract": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-  },
-  "message": {
-    "owner": "0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045",
-    "spender": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-    "value": "1000000",
-    "nonce": "0",
-    "deadline": "1893456000"
-  }
-}
-EOF
-cat ~/.bloom/keystore/alice/sign/typed_data.sig
-```
-
-Permit2 typed data has the same shape — just swap `domain.name` to
-`"Permit2"`, `verifyingContract` to `0x000000000022D473030F116dDEE9F6B43aC78BA3`,
-and use the Permit2-specific `PermitSingle` / `PermitBatch` types.
+Do not read or write signer output under `BLOOM_HOME`. Retained signing entry
+points stage exact payload bytes with Broker and return only the public
+signature and operation/receipt projection after Signer authorization.
+Transaction and Petal workflows below are the preferred bounded signing
+surfaces; arbitrary raw hash signing is denied and is not a fallback.
 
 ## 2. Outbox: stage, review, confirm, broadcast
 
@@ -291,7 +225,9 @@ cat /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/policy_check.json
 
 `confirm`, `replace`, and `cancel` are *virtual* writable files: they
 appear in `ls` of any pending entry even before they exist on disk.
-The wallet must be unlocked. Empty bodies are rejected.
+Empty bodies are rejected. Any signing or fresh approval requirement is routed
+to Broker and Signer and fails closed if that authority edge is unavailable;
+Machine has no wallet unlock state.
 
 ```sh
 # Plain confirm.
@@ -326,7 +262,7 @@ a sent tx — including its receipt — is accessed through
 ### Replace and cancel
 
 Both routes live next to `confirm` on a `pending/<id>/`. Both require a
-non-empty body and require the wallet to be unlocked.
+non-empty body and the same Broker/Signer authorization as confirmation.
 
 ```sh
 # Replace: bumped fees plus a substituted intent body. Same nonce, the
