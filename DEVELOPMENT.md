@@ -83,10 +83,29 @@ scripts/triad-dev-launch.sh \
   --ready-file /tmp/bloom-triad-ready
 ```
 
-The developer profile runs all processes under the current login UID and makes
-no production principal-isolation claim. It still uses authenticated triad
+The developer profile runs all processes under the current non-root login UID
+on Linux or macOS and makes no production principal-isolation claim. On Linux,
+Broker and Signer use temporary per-user systemd socket and service units so
+the unchanged production listener code consumes real named socket-activation
+descriptors. The login must therefore have an active systemd user manager. For
+a dedicated persistent eval account, an administrator can enable it once with
+`loginctl enable-linger LOGIN_USER`; ordinary interactive logins usually
+already have an active user manager. Linux developer paths used by these units
+must contain only ASCII letters, digits, and `_./:@+-`.
+
+Linux kernel mounts additionally require a narrowly scoped noninteractive sudo
+rule for the exact mountpoint; VFS-only and services-only modes need no mount
+privilege. The temporary user units and sockets are removed when the launcher
+exits.
+Linux uses the reviewed `linux-chrony-nts` trusted-time profile and therefore
+requires a synchronized host clock backed by the production two-source NTS
+configuration; the developer harness does not substitute unauthenticated NTP.
+It still uses authenticated triad
 transport, Broker-owned ceremony HTTP, genuine WebAuthn, and Signer-held keys.
 The developer feature is rejected by production release packaging.
+Set `BLOOM_TRIAD_DEV_BUILD_PETALS=0` only when the selected integration Petal
+has already been built from its reviewed revision. Bloom still prepares,
+hashes, provenance-enrolls, and validates the package before installation.
 
 The launcher writes public authenticated connection settings to
 `/tmp/bloom-triad-logs/triad.env`. Source it only in a second developer shell.
