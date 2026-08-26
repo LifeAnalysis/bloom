@@ -2319,6 +2319,7 @@ dependencies = [
  "bloom-proto",
  "bloom-revert",
  "bloom-signer-derive",
+ "bloom-solana-tx",
  "bloom-tx",
  "bloom-vfs",
  "bloom-watch",
