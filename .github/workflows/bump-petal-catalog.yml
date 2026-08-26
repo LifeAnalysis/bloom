@@ -62,7 +62,9 @@ jobs:
 
       - name: Advance verified preinstalled petal pins
         id: resolve
-        run: python3 scripts/bump_petal_catalog.py
+        run: |
+          set -euo pipefail
+          python3 scripts/bump_petal_catalog.py | tee "$RUNNER_TEMP/summary.md"
 
       - name: Detect changes
         id: changes
@@ -81,7 +83,7 @@ jobs:
 
       - name: Run bloom unit tests
         if: steps.changes.outputs.changed == 'true'
-        run: cargo test -p bloom --lib
+        run: cargo test -p bloom --bin bloom
 
       - name: Enforce change scope
         if: steps.changes.outputs.changed == 'true'
@@ -96,8 +98,9 @@ jobs:
           git diff --check
 
       - name: Open or update bump PR
+        if: steps.changes.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${ secrets.RELEASE_PR_TOKEN }
+          GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
