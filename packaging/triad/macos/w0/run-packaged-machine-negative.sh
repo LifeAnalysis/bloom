@@ -268,10 +268,37 @@ installed_broker_socket="/private/var/run/bloom/$login_uid/machine-broker/broker
 [[ "$(stat -f '%u' "$installed_broker_socket")" == "$broker_uid" ]]
 sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
+  BLOOM_BROKER_SOCKET="$installed_broker_socket" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" wallet new ma05-cached \
+  "$machine_binary" --home "$clean_home" serve \
+    --endpoint "unix:$machine_socket" \
+    >"$work/seed-machine-service.log" 2>&1 &
+machine_service_pid=$!
+deadline=$((SECONDS + 15))
+while [[ ! -S "$machine_socket" && $SECONDS -lt $deadline ]]; do
+  kill -0 "$machine_service_pid" 2>/dev/null || {
+    cat "$work/seed-machine-service.log" >&2
+    exit 1
+  }
+  sleep 0.05
+done
+[[ -S "$machine_socket" ]] || {
+  cat "$work/seed-machine-service.log" >&2
+  echo "packaged Machine seeding service did not publish its IPC socket" >&2
+  exit 1
+}
+if ! sudo -H -u "$login_user" env \
+  BLOOM_HOME="$clean_home" \
+  BLOOM_MACHINE_IDENTITY="$machine_identity" \
+  BLOOM_EDGE_MANIFEST="$edge_manifest" \
+  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+    wallet new ma05-cached \
   >"$work/registration.log" 2>&1
+then
+  cat "$work/registration.log" >&2
+  exit 1
+fi
 registration_url="$(sed -n 's/^ceremony_url: //p' "$work/registration.log")"
 [[ "$registration_url" == http://localhost:18734/ceremony/* ]] || {
   cat "$work/registration.log" >&2
@@ -297,7 +324,8 @@ while [[ $SECONDS -lt $deadline ]]; do
     BLOOM_HOME="$clean_home" \
     BLOOM_MACHINE_IDENTITY="$machine_identity" \
     BLOOM_EDGE_MANIFEST="$edge_manifest" \
-    "$machine_binary" --home "$clean_home" wallet projection "$wallet_id" \
+    "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+      wallet projection "$wallet_id" \
     >"$work/live-projection.log" 2>"$work/live-projection.stderr"
   then
     break
@@ -324,7 +352,8 @@ sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" wallet update-policy "$wallet_id" \
+  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+    wallet update-policy "$wallet_id" \
     --file "$work/live-policy.json" >"$work/policy-prepare-live.log" 2>&1
 policy_operation_id="$(sed -n 's/^operation_id: //p' "$work/policy-prepare-live.log")"
 policy_ceremony_url="$(sed -n 's/^ceremony_url: //p' "$work/policy-prepare-live.log")"
@@ -337,13 +366,15 @@ sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" wallet commit-policy "$policy_operation_id" \
+  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+    wallet commit-policy "$policy_operation_id" \
   >"$work/policy-commit-live.log" 2>&1
 sudo -H -u "$login_user" env \
   BLOOM_HOME="$clean_home" \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" wallet projection "$wallet_id" \
+  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+    wallet projection "$wallet_id" \
   >"$work/live-projection.log" 2>"$work/live-projection.stderr"
 jq -e \
   --arg address "$wallet_address" \
@@ -365,6 +396,10 @@ if expected not in policy["allowed_destinations"]:
     raise SystemExit("authenticated policy projection omitted the MA-05 destination")
 PY
 [[ -s "$clean_home/cache/wallet-projections.json" ]]
+kill "$machine_service_pid"
+wait "$machine_service_pid" 2>/dev/null || true
+machine_service_pid=""
+rm -f "$machine_socket"
 cp "$clean_home/cache/wallet-projections.json" "$work/authenticated-projection-cache.json"
 approval_issued_ms="$(($(date +%s) * 1000))"
 approval_expires_ms="$((approval_issued_ms + 600000))"
@@ -455,7 +490,7 @@ run_machine_with_deadline() {
     BLOOM_BROKER_SOCKET="$broker_socket" \
     BLOOM_MACHINE_IDENTITY="$machine_identity" \
     BLOOM_EDGE_MANIFEST="$edge_manifest" \
-    "$machine_binary" "$@" >"$output" 2>&1 &
+    "$machine_binary" --connect "unix:$machine_socket" "$@" >"$output" 2>&1 &
   command_pid=$!
   deadline=$((SECONDS + 8))
   while kill -0 "$command_pid" 2>/dev/null && [[ $SECONDS -lt $deadline ]]; do
@@ -609,7 +644,8 @@ PY
       BLOOM_HOME="$clean_home" \
       BLOOM_MACHINE_IDENTITY="$machine_identity" \
       BLOOM_EDGE_MANIFEST="$edge_manifest" \
-      "$machine_binary" --home "$clean_home" audit status || {
+      "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+        audit status || {
     cat "$work/$label-audit-status.log" >&2
     echo "$label Machine audit signature verification failed" >&2
     exit 1
@@ -658,7 +694,7 @@ fi
 # negatives and proves no legacy authority file remains open in the process.
 run_machine_with_deadline \
   "$work/status.log" \
-  --home "$clean_home" --connect "unix:$machine_socket" status || {
+  --home "$clean_home" status || {
   cat "$work/status.log" >&2
   echo "packaged Machine did not preserve its degraded read/status path" >&2
   exit 1

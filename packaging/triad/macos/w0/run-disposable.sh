@@ -151,25 +151,14 @@ assert_record() {
   name="$2"
   attribute="$3"
   expected="$4"
-  record="$(dscl -plist . -read "/$kind/$name" "$attribute")"
-  if observed="$(
-    plutil -extract "dsAttrTypeStandard:$attribute".0 raw -o - - <<<"$record" 2>/dev/null
-  )"; then
-    attribute_key="dsAttrTypeStandard:$attribute"
-  elif observed="$(
-    plutil -extract "dsAttrTypeNative:$attribute".0 raw -o - - <<<"$record" 2>/dev/null
-  )"; then
-    attribute_key="dsAttrTypeNative:$attribute"
-  else
+  record="$(dscl . -read "/$kind/$name" "$attribute")" || {
     echo "$kind/$name is missing required attribute $attribute" >&2
     exit 1
-  fi
-  if plutil -type "$attribute_key".1 -o - - <<<"$record" >/dev/null 2>&1; then
-    echo "$kind/$name has multiple values for $attribute" >&2
-    exit 1
-  fi
-  [[ "$observed" == "$expected" ]] || {
-    echo "$kind/$name $attribute: expected $expected, observed $observed" >&2
+  }
+  [[ "$record" == "$attribute: $expected" ||
+    "$record" == "dsAttrTypeStandard:$attribute: $expected" ||
+    "$record" == "dsAttrTypeNative:$attribute: $expected" ]] || {
+    echo "$kind/$name $attribute: expected one value $expected, observed $record" >&2
     exit 1
   }
 }
@@ -591,7 +580,7 @@ broker_durable_before="$(
     shasum -a 256 |
     awk '{print $1}'
 )"
-/usr/bin/nc -lk 127.0.0.1 18734 >/dev/null 2>&1 &
+/usr/bin/nc -l 127.0.0.1 18734 >/dev/null 2>&1 &
 foreign_listener_pid=$!
 deadline=$((SECONDS + 10))
 while [[ $SECONDS -lt $deadline ]]; do
@@ -674,7 +663,7 @@ broker_durable_after="$(
   echo "a Broker that lost the canonical listener mutated durable authority state" >&2
   exit 1
 }
-kill "$foreign_listener_pid"
+kill "$foreign_listener_pid" 2>/dev/null || true
 wait "$foreign_listener_pid" 2>/dev/null || true
 foreign_listener_pid=""
 # Multiple fatal starts while the port is occupied can put launchd into a

@@ -143,6 +143,42 @@ fstab_escape_path() {
   printf '%s' "$value"
 }
 
+preserve_file_mode() {
+  local source="$1"
+  local destination="$2"
+  local mode
+
+  if chmod --reference="$source" "$destination" 2>/dev/null; then
+    return 0
+  fi
+  if mode="$(stat -f '%Lp' "$source" 2>/dev/null)"; then
+    chmod "$mode" "$destination"
+    return 0
+  fi
+  if mode="$(stat -c '%a' "$source" 2>/dev/null)"; then
+    chmod "$mode" "$destination"
+    return 0
+  fi
+  echo "unable to preserve file mode for $source" >&2
+  return 69
+}
+
+numeric_file_uid() {
+  if [[ "$(uname -s)" == Darwin ]]; then
+    stat -f '%u' "$1"
+  else
+    stat -c '%u' "$1"
+  fi
+}
+
+numeric_file_mode() {
+  if [[ "$(uname -s)" == Darwin ]]; then
+    stat -f '%Lp' "$1"
+  else
+    stat -c '%a' "$1"
+  fi
+}
+
 install_linux_mount_authorization() {
   local install_root="$1"
   local mount_uid="$2"
@@ -184,7 +220,7 @@ install_linux_mount_authorization() {
     awk -v marker="$marker" \
       'length($0) < length(marker) || substr($0, length($0) - length(marker) + 1) != marker { print }' \
       "$fstab" > "$replacement"
-    chmod --reference="$fstab" "$replacement"
+    preserve_file_mode "$fstab" "$replacement"
   else
     : > "$replacement"
     chmod 0644 "$replacement"
@@ -211,7 +247,7 @@ remove_linux_mount_authorization() {
   awk -v marker="$marker" \
     'length($0) < length(marker) || substr($0, length($0) - length(marker) + 1) != marker { print }' \
     "$fstab" > "$replacement"
-  chmod --reference="$fstab" "$replacement"
+  preserve_file_mode "$fstab" "$replacement"
   mv -f "$replacement" "$fstab"
 }
 
@@ -257,11 +293,11 @@ verify_release_payload() {
     echo "BLOOM_RELEASE_PUBLIC_KEY must name a separately installed public key" >&2
     return 65
   }
-  [[ "$(stat -c '%u' "$pinned_key")" == "$expected_pin_uid" ]] || {
+  [[ "$(numeric_file_uid "$pinned_key")" == "$expected_pin_uid" ]] || {
     echo "pinned release key has the wrong owner" >&2
     return 65
   }
-  pinned_mode="$(stat -c '%a' "$pinned_key")"
+  pinned_mode="$(numeric_file_mode "$pinned_key")"
   [[ "$pinned_mode" =~ ^[0-7]{3,4}$ ]] && \
     (( (8#$pinned_mode & 022) == 0 )) || {
     echo "pinned release key must not be group or world writable" >&2

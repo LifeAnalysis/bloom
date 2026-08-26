@@ -162,6 +162,40 @@ sudo -u "$login_user" \
 
 machine_identity="/Library/Application Support/BloomTriad/config/$login_uid/machine/identity.json"
 edge_manifest="/Library/Application Support/BloomTriad/config/$login_uid/edge-manifest.json"
+broker_label="system/com.bloom.broker.$login_uid"
+signer_label="system/com.bloom.signer.$login_uid"
+broker_plist="/Library/LaunchDaemons/com.bloom.broker.$login_uid.plist"
+signer_plist="/Library/LaunchDaemons/com.bloom.signer.$login_uid.plist"
+broker_state="/private/var/db/bloom/$login_uid/broker"
+signer_state="/private/var/db/bloom/$login_uid/signer"
+runtime_negative_snapshot="$static_work/runtime-negative-state"
+mkdir "$runtime_negative_snapshot"
+launchctl bootout "$broker_label"
+launchctl bootout "$signer_label"
+deadline=$((SECONDS + 20))
+while { pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 ||
+  pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1; } &&
+  [[ $SECONDS -lt $deadline ]]
+do
+  sleep 0.1
+done
+! pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1
+! pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
+ditto "$broker_state" "$runtime_negative_snapshot/broker"
+ditto "$signer_state" "$runtime_negative_snapshot/signer"
+launchctl bootstrap system "$signer_plist"
+launchctl bootstrap system "$broker_plist"
+deadline=$((SECONDS + 20))
+while [[ $SECONDS -lt $deadline ]]; do
+  if sudo -u "$login_user" \
+    "$release_root/bloom" serve triad-health-check "$release_digest"
+  then
+    break
+  fi
+  sleep 1
+done
+sudo -u "$login_user" \
+  "$release_root/bloom" serve triad-health-check "$release_digest"
 "$main_root/packaging/triad/macos/w0/run-packaged-machine-negative.sh" \
   "$release_root/bloom" \
   "$login_uid" \
@@ -172,7 +206,29 @@ edge_manifest="/Library/Application Support/BloomTriad/config/$login_uid/edge-ma
   "$edge_manifest" \
   "$broker_root"
 
-# The runtime negative restores the installed Broker before returning.
+# The runtime negative deliberately exercises real custody before replacing
+# both authority edges with hostile listeners. Restore the stopped, byte-for-
+# byte pre-test authority state so its fixture wallet and peer audit heads do
+# not become part of the candidate subsequently exercised by AC-01..AC-35.
+launchctl bootout "$broker_label"
+launchctl bootout "$signer_label"
+deadline=$((SECONDS + 20))
+while { pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 ||
+  pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1; } &&
+  [[ $SECONDS -lt $deadline ]]
+do
+  sleep 0.1
+done
+! pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1
+! pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
+mv "$broker_state" "$static_work/broker-after-runtime-negative"
+mv "$signer_state" "$static_work/signer-after-runtime-negative"
+ditto "$runtime_negative_snapshot/broker" "$broker_state"
+ditto "$runtime_negative_snapshot/signer" "$signer_state"
+launchctl bootstrap system "$signer_plist"
+launchctl bootstrap system "$broker_plist"
+
+# The restored installed Broker and Signer must return to authenticated health.
 deadline=$((SECONDS + 20))
 while [[ $SECONDS -lt $deadline ]]; do
   if sudo -u "$login_user" \

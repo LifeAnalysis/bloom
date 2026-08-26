@@ -7,25 +7,28 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: 1cbb549bea07f78c564ef1e66e52fb087b5f2ffa
+        default: 5ae1a756b0d23c1a917a5b32cc3ba0ac3696d770
       signer_ref:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: 1a1d52376919fff4cb295207e67c54dff60c745d
+        default: aed142b99b1a5118fa073b28cae83cbef927eb23
   workflow_dispatch:
     inputs:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: 1cbb549bea07f78c564ef1e66e52fb087b5f2ffa
+        default: 5ae1a756b0d23c1a917a5b32cc3ba0ac3696d770
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: 1a1d52376919fff4cb295207e67c54dff60c745d
+        default: aed142b99b1a5118fa073b28cae83cbef927eb23
 
 permissions:
   contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: 1.96.0
 
 jobs:
   build-w0:
@@ -33,35 +36,36 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Check out Machine
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: bloom
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '1cbb549bea07f78c564ef1e66e52fb087b5f2ffa' }}
-          SIGNER_REF: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
+          BROKER_REF: ${{ inputs.broker_ref || '5ae1a756b0d23c1a917a5b32cc3ba0ac3696d770' }}
+          SIGNER_REF: ${{ inputs.signer_ref || 'aed142b99b1a5118fa073b28cae83cbef927eb23' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
       - name: Check out Broker
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '1cbb549bea07f78c564ef1e66e52fb087b5f2ffa' }}
+          ref: ${{ inputs.broker_ref || '5ae1a756b0d23c1a917a5b32cc3ba0ac3696d770' }}
           path: bloom-broker
       - name: Check out Signer
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
+          ref: ${{ inputs.signer_ref || 'aed142b99b1a5118fa073b28cae83cbef927eb23' }}
           path: bloom-signer
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Configure shared W0 build directory
         shell: bash
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/bloom-w0-target" >> "$GITHUB_ENV"
       - name: Restore W0 build cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/bloom-w0-target
           key: >-
@@ -112,7 +116,7 @@ jobs:
             -C "$RUNNER_TEMP/verified"
 
       - name: Upload verified W0 candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-w0-build-${{ github.run_id }}
           path: |
@@ -128,35 +132,36 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Check out Machine
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: bloom
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '1cbb549bea07f78c564ef1e66e52fb087b5f2ffa' }}
-          SIGNER_REF: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
+          BROKER_REF: ${{ inputs.broker_ref || '5ae1a756b0d23c1a917a5b32cc3ba0ac3696d770' }}
+          SIGNER_REF: ${{ inputs.signer_ref || 'aed142b99b1a5118fa073b28cae83cbef927eb23' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
       - name: Check out Broker
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '1cbb549bea07f78c564ef1e66e52fb087b5f2ffa' }}
+          ref: ${{ inputs.broker_ref || '5ae1a756b0d23c1a917a5b32cc3ba0ac3696d770' }}
           path: bloom-broker
       - name: Check out Signer
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || '1a1d52376919fff4cb295207e67c54dff60c745d' }}
+          ref: ${{ inputs.signer_ref || 'aed142b99b1a5118fa073b28cae83cbef927eb23' }}
           path: bloom-signer
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Configure shared W0 acceptance directory
         shell: bash
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/bloom-w0-target" >> "$GITHUB_ENV"
       - name: Restore W0 build cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/bloom-w0-target
           key: >-
@@ -164,7 +169,7 @@ jobs:
             hashFiles('bloom/Cargo.lock', 'bloom-broker/Cargo.lock',
             'bloom-signer/Cargo.lock') }}
       - name: Download verified W0 candidate
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: macos-w0-build-${{ github.run_id }}
           path: ${{ runner.temp }}
@@ -235,7 +240,7 @@ jobs:
 
       - name: Upload W0 subject evidence
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-w0-subject-${{ github.sha }}
           path: ${{ runner.temp }}/macos-w0-subject.txt
@@ -244,7 +249,7 @@ jobs:
 
       - name: Upload digest-bound W0 criteria
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-w0-criteria-${{ github.sha }}
           path: ${{ runner.temp }}/macos-w0-evidence/*.pass
@@ -253,7 +258,7 @@ jobs:
 
       - name: Upload W0 failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-w0-failure-${{ github.sha }}
           path: ${{ runner.temp }}/macos-w0-evidence/*

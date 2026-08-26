@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 const STATUS_SCHEMA: &str = "bloom.macos-platform-status.3";
 const TRUSTED_TIME_SOURCE: &str = "macos-managed-timed";
 const CEREMONY_OWNER_MARKER: &str = "x-bloom-ceremony-owner: bloom-broker-v1";
+const MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Serialize)]
 struct Status {
@@ -35,6 +36,21 @@ struct Status {
     ceremony_listener_bloom_shaped: bool,
     checked_at_unix_ms: u64,
     available: bool,
+}
+
+pub async fn run() -> Result<()> {
+    if geteuid() != Uid::ROOT {
+        bail!("the packet-filter monitor must run as root");
+    }
+    if std::env::consts::OS != "macos" {
+        bail!("the packet-filter monitor requires macOS");
+    }
+    loop {
+        if let Err(error) = run_once() {
+            eprintln!("Bloom packet-filter monitor refresh failed: {error:#}");
+        }
+        tokio::time::sleep(MONITOR_INTERVAL).await;
+    }
 }
 
 pub fn run_once() -> Result<()> {

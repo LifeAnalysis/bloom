@@ -170,8 +170,10 @@ fn root_pf_monitor_has_no_rpc_or_custody_surface_and_services_require_its_attest
     .unwrap();
     assert!(plist.contains("<string>root</string>"));
     assert!(plist.contains("<string>serve</string>"));
-    assert!(plist.contains("<string>triad-pf-monitor-once</string>"));
-    assert!(plist.contains("<key>StartInterval</key>"));
+    assert!(plist.contains("<string>triad-pf-monitor</string>"));
+    assert!(plist.contains("<key>KeepAlive</key>"));
+    assert!(plist.contains("<key>ThrottleInterval</key>"));
+    assert!(!plist.contains("<key>StartInterval</key>"));
     assert!(!plist.contains("<key>Sockets</key>"));
 
     let monitor = fs::read_to_string(workspace().join("crates/bloom/src/pf_monitor.rs")).unwrap();
@@ -409,13 +411,13 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("/private/var/db/bloom-w0-disposable-host"));
     assert!(source.contains("bloom-macos-unix-w0-disposable-v1"));
     assert!(source.contains("macos-unix-principals-w0"));
-    assert!(source.contains("/usr/bin/nc -lk 127.0.0.1 18734"));
+    assert!(source.contains("/usr/bin/nc -l 127.0.0.1 18734"));
     assert!(source.contains("no fallback port will be used"));
     assert!(source.contains("Broker opened a fallback TCP listener"));
     assert!(source.contains("foreign_or_unverifiable_process"));
     assert!(source.contains("Bloom Broker startup failed: a foreign or unverifiable process"));
     let foreign_bind = source
-        .find("/usr/bin/nc -lk 127.0.0.1 18734")
+        .find("/usr/bin/nc -l 127.0.0.1 18734")
         .expect("foreign listener bind");
     let freshness_wait = source[foreign_bind..]
         .find("network_containment.maximum_age_ms")

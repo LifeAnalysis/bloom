@@ -394,6 +394,17 @@ install_config() {
   fi
 }
 
+validate_installed_security_inputs() {
+  local edge_manifest="$config/edge-manifest.json"
+  [[ -e "$edge_manifest" || -L "$edge_manifest" ]] || return 0
+  [[ -f "$edge_manifest" && ! -L "$edge_manifest" ]] ||
+    die "installed edge manifest is missing or substituted"
+  if $live; then
+    [[ "$(stat -f '%u:%Lp:%l' "$edge_manifest")" == 0:644:1 ]] ||
+      die "installed edge manifest has unsafe owner, mode, or link count"
+  fi
+}
+
 install_assets() {
   base="$payload/installer/macos"
   render "$base/launchdaemons/com.bloom.broker.plist.in" "$broker_plist" 0644
@@ -555,6 +566,7 @@ case "$action" in
       [[ "$(field "$enrollment" schema)" == bloom.macos-enrollment.1 ]] || die "unsupported installed enrollment schema"
       fresh=false; load_ids
     fi
+    validate_installed_security_inputs
     if [[ "$fresh" == true && "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" ]]; then
       die "new enrollment cannot change the shared release used by active enrollments"
     fi

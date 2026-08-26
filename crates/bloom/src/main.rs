@@ -1791,6 +1791,8 @@ enum ServeInternal {
     TriadHealthCheck { expected_build: String },
     #[command(name = "triad-pf-monitor-once", hide = true)]
     TriadPfMonitorOnce,
+    #[command(name = "triad-pf-monitor", hide = true)]
+    TriadPfMonitor,
     #[command(name = "session-sentinel", hide = true)]
     SessionSentinel,
 }
@@ -3014,6 +3016,9 @@ async fn run(cli: Cli) -> Result<()> {
                     ServeInternal::TriadPfMonitorOnce => {
                         pf_monitor::run_once().context("Bloom packet-filter monitor failed")
                     }
+                    ServeInternal::TriadPfMonitor => pf_monitor::run()
+                        .await
+                        .context("Bloom packet-filter monitor failed"),
                     ServeInternal::SessionSentinel => session_sentinel::run()
                         .await
                         .context("Bloom session sentinel failed"),

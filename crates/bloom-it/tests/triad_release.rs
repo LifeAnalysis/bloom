@@ -2134,7 +2134,7 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     let containment_plist = root.join("Library/LaunchDaemons/com.bloom.containment.plist");
     let containment_source = fs::read_to_string(&containment_plist).unwrap();
     assert!(containment_source.contains("<string>serve</string>"));
-    assert!(containment_source.contains("<string>triad-pf-monitor-once</string>"));
+    assert!(containment_source.contains("<string>triad-pf-monitor</string>"));
     assert!(!containment_source.contains("@BLOOM_"));
     assert_eq!(
         fs::metadata(&containment_plist)
@@ -2240,6 +2240,20 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     );
     fs::remove_file(&signer_checkpoints).unwrap();
     fs::create_dir(&signer_checkpoints).unwrap();
+
+    let edge_manifest =
+        root.join("Library/Application Support/BloomTriad/config/501/edge-manifest.json");
+    let edge_backup = directory.path().join("edge-manifest.backup.json");
+    fs::rename(&edge_manifest, &edge_backup).unwrap();
+    std::os::unix::fs::symlink(&edge_backup, &edge_manifest).unwrap();
+    let rejected = stage_macos_install(&installer, &root, &payload);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("installed edge manifest is missing or substituted")
+    );
+    fs::remove_file(&edge_manifest).unwrap();
+    fs::rename(&edge_backup, &edge_manifest).unwrap();
 
     assert!(
         Command::new(&installer)

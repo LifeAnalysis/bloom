@@ -25,7 +25,7 @@ for command_name in tart jq sshpass ssh nc git; do
 done
 
 for repository_root in "$main_root" "$broker_root" "$signer_root"; do
-  [[ -d "$repository_root/.git" ]] || {
+  git -C "$repository_root" rev-parse --git-dir >/dev/null 2>&1 || {
     echo "missing local Bloom repository: $repository_root" >&2
     exit 69
   }
