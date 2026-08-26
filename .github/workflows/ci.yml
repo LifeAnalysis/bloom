@@ -177,14 +177,11 @@ jobs:
       # installers, launcher, and release gates. It was previously not run at
       # all, so a launcher change could silently invalidate its assertions.
       #
-      # Two exclusions, both properties of the runner rather than of the code:
-      #   - the macOS installer tests shell out to an installer that uses BSD
-      #     `mv -fh`, which GNU coreutils has no equivalent for. They belong to
-      #     the macOS job.
-      #   - `triad_developer_launcher_can_leave_machine_developer_managed`
-      #     executes triad-dev-launch.sh, which resolves ../bloom-broker and
-      #     ../bloom-signer before it parses any argument. That developer
-      #     layout does not exist in a single-repo checkout.
+      # The macOS installer tests are excluded because that installer uses BSD
+      # `mv -fh`, which GNU coreutils has no equivalent for; they belong to the
+      # macOS job, not this Linux runner. Nothing else is excluded: the
+      # launcher no longer needs a sibling-repo layout to reject a bad
+      # argument, so the whole Linux-capable set runs here.
       - name: Install bsdtar for reproducible bundle packaging
         run: sudo apt-get update && sudo apt-get install -y libarchive-tools
       - name: Run triad release packaging tests from archive
@@ -195,8 +192,7 @@ jobs:
           TAR: bsdtar
         run: >
           cargo nextest run --archive-file target/nextest-archive.tar.zst
-          -E 'package(bloom-it) and binary(triad_release) and not test(/^macos_/)
-          and not test(=triad_developer_launcher_can_leave_machine_developer_managed)'
+          -E 'package(bloom-it) and binary(triad_release) and not test(/^macos_/)'
           --no-fail-fast
       - name: Run ignored local anvil integration tests from archive
         run: >
