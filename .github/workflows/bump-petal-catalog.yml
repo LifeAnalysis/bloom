@@ -7,8 +7,13 @@ name: Bump Petal Catalog
 # Before any pin is rewritten, scripts/bump_petal_catalog.py downloads the
 # release assets, checks them against SHA256SUMS, and validates the
 # petal-release.json provenance manifest (schema, petal name, tag, archive
-# digest, source commit). Petals with a ManualStateMigration upgrade policy
-# are excluded from automatic bumps by design.
+# digest, source commit, package_hash). The catalog pins store the BLAKE3
+# package_hash — the value the installer compares. Petals with a
+# ManualStateMigration upgrade policy are excluded from automatic bumps.
+#
+# The PAT used to open the PR exists only in the token-check and publish
+# steps; provenance download/verification runs with no repository
+# credentials present.
 #
 # RELEASE_PR_TOKEN is the same repository secret used by Propose Release.
 
@@ -31,14 +36,14 @@ jobs:
     name: Open reviewed petal catalog PR
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     env:
-      GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
       BASE: ${{ github.event.repository.default_branch }}
       BRANCH: chore/bump-petal-catalog
     steps:
       - name: Require release PR token
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
         run: |
           set -euo pipefail
           if [[ -z "${GH_TOKEN:-}" ]]; then
@@ -50,7 +55,7 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_PR_TOKEN }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
@@ -90,23 +95,28 @@ jobs:
           fi
           git diff --check
 
-      - name: Open or update catalog PR
-        if: steps.changes.outputs.changed == 'true'
+      - name: Open or update bump PR
+        env:
+          GH_TOKEN: ${ secrets.RELEASE_PR_TOKEN }
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "chore: bump preinstalled petal catalog pins"
+          git config --local http.https://github.com/.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           git push --force origin "HEAD:refs/heads/$BRANCH"
+          git config --local --unset http.https://github.com/.extraheader
 
           NOTES="$(mktemp)"
           {
             echo "## Preinstalled petal catalog bumps"
             echo
+            cat "$RUNNER_TEMP/summary.md"
             echo "Each pin was advanced only after its release archive passed"
             echo "SHA256SUMS verification and petal-release.json provenance"
-            echo "validation (schema, name, tag, digest, source commit)."
+            echo "validation (schema, name, tag, digest, source commit, package_hash)."
             echo
             echo "ManualStateMigration petals are intentionally excluded."
             echo "Review the upstream release notes and the diff below; the"

@@ -5,7 +5,8 @@ For each automatically upgradable preinstalled petal, resolve the latest
 semver release of its source repository, download the release assets,
 verify them against SHA256SUMS and the petal-release.json provenance
 manifest, and only then rewrite the pinned commit, release tag, archive
-name, and expected hash in the source constants.
+name, and expected hash (the BLAKE3 package_hash, which is what the
+installer compares) in the source constants.
 
 Petals whose upgrade policy is ManualStateMigration are never touched:
 their package state is keyed by content hash and requires an explicit
@@ -168,7 +169,14 @@ def verify_release(petal: str, repo: str, tag: str) -> tuple[str, str, str, str]
         if digest != provenance.get("archive_sha256"):
             raise RuntimeError(f"{petal}: archive digest does not match provenance archive_sha256")
 
-        return commit, tag, archive_name, digest
+        # Production compares expected_hash with the manifest package_hash
+        # (BLAKE3 package identity), not the archive SHA-256, so that is the
+        # value the catalog pin must carry.
+        package_hash = provenance.get("package_hash")
+        if not re.fullmatch(r"[0-9a-f]{64}", package_hash or ""):
+            raise RuntimeError(f"{petal}: provenance package_hash is not a 64-hex digest")
+
+        return commit, tag, archive_name, package_hash
 
 
 def main() -> int:
