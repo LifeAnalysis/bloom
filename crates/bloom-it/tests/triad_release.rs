@@ -298,6 +298,7 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "bin/bloom",
         "bin/bloom-uninstall",
         "systemd-user/bloom-session.service",
+        "systemd-user/bloom-machine.service",
     ] {
         let destination = payload.join("installer/linux").join(relative);
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
@@ -661,7 +662,7 @@ fn serve_starts_audited_projection_refresh_after_fallible_setup() {
         .rsplit("Cmd::Serve {")
         .next()
         .expect("serve command arm");
-    let mount = serve.find("let mount_handle = mount_bloom").unwrap();
+    let mount = serve.find("let mount_handle =").unwrap();
     let endpoint = serve
         .find("let endpoint = resolve_server_endpoint")
         .unwrap();
@@ -1496,6 +1497,22 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     let tmpfiles = fs::read_to_string(root.join("usr/lib/tmpfiles.d/bloom-1000.conf")).unwrap();
     assert!(tmpfiles.contains("/var/lib/bloom/1000/machine 0700 1000 1000"));
     assert!(!tmpfiles.contains("@LOGIN_"));
+    let machine_unit =
+        fs::read_to_string(root.join("usr/lib/systemd/user/bloom-machine.service")).unwrap();
+    assert!(machine_unit.contains("ExecStart=/usr/bin/bloom serve --mount %h/bloom"));
+    let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
+    assert!(fstab.contains(
+        "127.0.0.1:/ /home/alice/bloom nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port=18735,rsize=65536,wsize=65536,timeo=10 0 0 # x-bloom.login-uid=1000"
+    ));
+    assert!(root.join("home/alice/bloom").is_dir());
+    assert_eq!(
+        fs::metadata(root.join("home/alice/bloom"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
     assert_eq!(
         fs::metadata(root.join("etc/bloom/1000/signer/config.json"))
             .unwrap()
@@ -1530,6 +1547,13 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
         fs::read(root.join("usr/libexec/bloom/bloom-broker")).unwrap(),
         b"upgraded-broker"
     );
+    assert_eq!(
+        fs::read_to_string(root.join("etc/fstab"))
+            .unwrap()
+            .matches("x-bloom.login-uid=1000")
+            .count(),
+        1
+    );
     assert!(!root.join("etc/bloom/1000/signer/aws-credentials").exists());
     assert!(
         !root
@@ -1559,6 +1583,11 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     assert!(!root.join("etc/bloom/enrollments/1000.json").exists());
     assert!(root.join("etc/bloom/retained/1000.json").is_file());
     assert!(root.join("usr/bin/bloom").is_file());
+    assert!(
+        !fs::read_to_string(root.join("etc/fstab"))
+            .unwrap()
+            .contains("x-bloom.login-uid=1000")
+    );
 
     fs::remove_file(root.join("etc/bloom/enrollments/2000.json")).unwrap();
     assert!(
@@ -1592,6 +1621,11 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     assert!(root.join("etc/bloom/enrollments/1000.json").is_file());
     assert!(!root.join("etc/bloom/retained/1000.json").exists());
     assert!(root.join("usr/bin/bloom").is_file());
+    assert!(
+        fs::read_to_string(root.join("etc/fstab"))
+            .unwrap()
+            .contains("x-bloom.login-uid=1000")
+    );
 
     fs::write(
         payload.join("config/broker-identity.json"),
@@ -1710,6 +1744,16 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .exists()
     );
     assert!(!root.join("usr/libexec/bloom/bloom-broker").exists());
+    assert!(
+        !root
+            .join("usr/lib/systemd/user/bloom-machine.service")
+            .exists()
+    );
+    assert!(
+        !fs::read_to_string(root.join("etc/fstab"))
+            .unwrap()
+            .contains("x-bloom.login-uid=1000")
+    );
 }
 
 #[test]
@@ -1870,6 +1914,105 @@ fn linux_installer_demand_starts_only_the_active_login_ceremony_socket() {
 }
 
 #[test]
+fn linux_installer_materializes_and_checks_service_directories_at_activation() {
+    let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    let numericize = installer
+        .rfind("numericize_linux_tmpfiles_ownership \"$tmpfiles\" \"$login_uid\"")
+        .unwrap();
+    let create = installer
+        .rfind("materialize_linux_layout \"$tmpfiles\" \"$login_uid\"")
+        .unwrap();
+    let activate = installer
+        .find("systemctl enable --now \"bloom-session@$login_uid.path\"")
+        .unwrap();
+
+    assert!(numericize < create && create < activate);
+    assert_eq!(
+        installer
+            .matches("systemd-tmpfiles --create \"$layout_config\"")
+            .count(),
+        1
+    );
+    for required_directory in [
+        "/run/bloom/$layout_uid/broker/rpc",
+        "/run/bloom/$layout_uid/broker/control",
+        "/run/bloom/$layout_uid/signer/rpc",
+        "/run/bloom/$layout_uid/signer/control",
+        "/run/bloom/$layout_uid/session",
+        "/var/lib/bloom/$layout_uid/broker",
+        "/var/lib/bloom/$layout_uid/signer",
+        "/var/lib/bloom/$layout_uid/machine",
+    ] {
+        assert!(
+            installer.contains(required_directory),
+            "installer does not verify {required_directory}"
+        );
+    }
+    assert!(installer.contains("if ($4 == broker_name) $4 = broker_uid"));
+    assert!(installer.contains("if ($5 == broker_signer_name) $5 = broker_signer_gid"));
+    assert!(installer.contains("Linux installation failed to materialize $required_directory"));
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("bloom-1000.conf");
+    fs::write(
+        &config,
+        concat!(
+            "d /run/bloom/1000/broker/rpc 0710 bloom-broker-1000 bloom-machine-broker-1000 -\n",
+            "d /run/bloom/1000/broker/control 0710 bloom-broker-1000 bloom-revoke-1000 -\n",
+            "d /run/bloom/1000/signer/rpc 0710 bloom-signer-1000 bloom-broker-signer-1000 -\n",
+            "d /run/bloom/1000/session 0710 1000 bloom-session-1000 -\n",
+        ),
+    )
+    .unwrap();
+    let transformed = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+id() {
+  case "$1:$2" in
+    -u:bloom-broker-1000) echo 2001 ;;
+    -g:bloom-broker-1000) echo 2101 ;;
+    -u:bloom-signer-1000) echo 2002 ;;
+    -g:bloom-signer-1000) echo 2102 ;;
+    *) return 1 ;;
+  esac
+}
+getent() {
+  case "$2" in
+    bloom-machine-broker-1000) echo "$2:x:2201:" ;;
+    bloom-broker-signer-1000) echo "$2:x:2202:" ;;
+    bloom-revoke-1000) echo "$2:x:2203:" ;;
+    bloom-session-1000) echo "$2:x:2204:" ;;
+    *) return 1 ;;
+  esac
+}
+source <(sed -n '/^numericize_linux_tmpfiles_ownership()/,/^}/p' "$1")
+numericize_linux_tmpfiles_ownership "$2" 1000
+"#,
+        ])
+        .arg("numericize-linux-tmpfiles-test")
+        .arg(release_script("install-linux.sh"))
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        transformed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&transformed.stderr)
+    );
+    let config = fs::read_to_string(config).unwrap();
+    for expected in [
+        "broker/rpc 0710 2001 2201",
+        "broker/control 0710 2001 2203",
+        "signer/rpc 0710 2002 2202",
+        "session 0710 1000 2204",
+    ] {
+        assert!(config.contains(expected), "missing {expected} in {config}");
+    }
+    assert!(!config.contains("bloom-"));
+}
+
+#[test]
 fn linux_installer_uses_the_resolved_numeric_primary_gid() {
     let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
     let identity_validation = installer.find("actual_login_uid=\"$(id -u").unwrap();
@@ -1907,13 +2050,34 @@ fn linux_uninstaller_defaults_to_retaining_custody_and_requires_explicit_purge()
     assert!(installer.contains("retained_custody=false"));
     assert!(installer.contains("$root/etc/bloom/retained/$login_uid.json"));
     assert!(installer.contains(
-        "systemctl --user disable --now bloom-session.service \\\n          2>/dev/null || true"
+        "systemctl --user disable --now \\\n          bloom-machine.service bloom-session.service"
     ));
+    assert!(installer.contains("remove_linux_mount_authorization \"$root\" \"$login_uid\""));
     assert!(installer.contains(
         "if [[ \"$retain_custody\" == false ]]; then\n          runuser -u \"$login_user\" -- rm -rf -- \"$login_home/.bloom\""
     ));
     assert!(installer.contains("userdel \"$service_user\""));
     assert!(installer.contains("groupdel \"$service_group\""));
+
+    let stop_activation_sources = installer
+        .find("# Remove every activation source before stopping Broker or Signer.")
+        .expect("uninstaller must stop activation sources first");
+    let stop_services = installer[stop_activation_sources..]
+        .find("systemctl stop")
+        .map(|offset| stop_activation_sources + offset)
+        .expect("uninstaller must explicitly stop Broker and Signer");
+    let verify_stopped = installer[stop_services..]
+        .find("if systemctl is-active --quiet \"$stopped_unit\"")
+        .map(|offset| stop_services + offset)
+        .expect("uninstaller must verify that every unit stopped");
+    let delete_state = installer[verify_stopped..]
+        .find("rm -rf -- \"$config_target\" \"$state_target\"")
+        .map(|offset| verify_stopped + offset)
+        .expect("uninstaller must eventually delete purged state");
+    assert!(stop_activation_sources < stop_services);
+    assert!(stop_services < verify_stopped);
+    assert!(verify_stopped < delete_state);
+    assert!(installer.contains("refusing to uninstall while $stopped_unit is still active"));
 }
 
 #[test]

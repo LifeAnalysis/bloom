@@ -25,6 +25,24 @@ systemd session is active. A path unit starts Broker and Signer only after that
 session socket exists. A canonical-listener conflict therefore fails the
 `bloom-broker-ceremony@UID.socket` unit and never selects another port.
 
+The user-owned `bloom-machine.service` starts the long-running Machine and
+mounts its VFS at `~/bloom` for the lifetime of the login session. NFS mounts
+normally require privilege, so the installer adds one exact `/etc/fstab`
+authorization from `127.0.0.1:/` to that login's `~/bloom` with
+`noauto,user,nosuid,nodev,noexec` and the complete fixed-port NFS option set.
+The packaged Machine listens only on `127.0.0.1:18735` and asks the existing
+system mount helper to resolve `~/bloom` from fstab; it cannot supply a different
+source, target, port, or mount option. Machine still runs as the login principal
+and receives neither a sudoers rule nor `CAP_SYS_ADMIN`. The service deliberately
+does not block the distribution's setuid mount helper, because that helper is
+what enforces the exact fstab delegation. The unit therefore cannot use systemd
+settings that implicitly enable `NoNewPrivileges` (`RestrictNamespaces`,
+`RestrictRealtime`, `LockPersonality`, `MemoryDenyWriteExecute`,
+`RestrictAddressFamilies`, or `RestrictSUIDSGID`): that would suppress the
+distribution mount helper's reviewed setuid transition. It retains compatible
+hardening (`UMask=0077`, `RemoveIPC=yes`, and `LimitCORE=0`).
+Uninstall stops Machine before removing this per-login fstab entry.
+
 State roots and service configuration live below principal-owned mode-0700
 directories. The edge manifest and binaries are root-owned and not writable by
 any product principal. The local Signer service permits only `AF_UNIX`.

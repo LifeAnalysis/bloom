@@ -32,7 +32,7 @@ pub mod adapter;
 mod server;
 
 #[cfg(feature = "mount")]
-pub use server::{NfsMountHandle, serve_nfs, serve_nfs_with};
+pub use server::{NfsMountHandle, serve_nfs, serve_nfs_from_fstab, serve_nfs_with};
 
 /// Configuration for mounting a bloom VFS over NFS.
 #[derive(Debug, Clone)]

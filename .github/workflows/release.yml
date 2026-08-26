@@ -16,7 +16,7 @@ on:
         default: ''
         type: string
       dry_run:
-        description: 'Build and sign the selected branch without publishing a release.'
+        description: 'Build an ephemeral test-unclaimed candidate without publishing a release.'
         required: false
         default: false
         type: boolean

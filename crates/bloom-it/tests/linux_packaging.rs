@@ -131,6 +131,29 @@ fn login_session_sentinel_is_installed_with_persistent_machine_paths() {
     assert!(sentinel.contains("NoNewPrivileges=yes"));
     assert!(sentinel.contains("RestrictAddressFamilies=AF_UNIX"));
     assert!(!sentinel.contains("ProtectSystem=") && !sentinel.contains("ReadWritePaths="));
+
+    let machine = source("systemd-user/bloom-machine.service");
+    assert!(machine.contains("ExecStart=/usr/bin/bloom serve --mount %h/bloom"));
+    assert!(machine.contains("Environment=BLOOM_NFS_LISTEN=127.0.0.1:18735"));
+    assert!(machine.contains("Environment=BLOOM_MOUNT_FROM_FSTAB=true"));
+    assert!(machine.contains("Wants=bloom-session.service"));
+    assert!(machine.contains("After=bloom-session.service"));
+    assert!(machine.contains("RemoveIPC=yes"));
+    assert!(machine.contains("LimitCORE=0"));
+    assert!(
+        !machine.contains("AmbientCapabilities=") && !machine.contains("CAP_SYS_ADMIN"),
+        "Machine mount service must not receive broad mount capability"
+    );
+    assert!(
+        !machine.contains("NoNewPrivileges=yes")
+            && !machine.contains("RestrictSUIDSGID=yes")
+            && !machine.contains("RestrictNamespaces=")
+            && !machine.contains("RestrictRealtime=")
+            && !machine.contains("LockPersonality=")
+            && !machine.contains("MemoryDenyWriteExecute=")
+            && !machine.contains("RestrictAddressFamilies="),
+        "the exact fstab-authorized setuid mount helper must remain usable"
+    );
     for principal in ["broker", "signer"] {
         let service = source(&format!("systemd/bloom-{principal}@.service.in"));
         assert!(

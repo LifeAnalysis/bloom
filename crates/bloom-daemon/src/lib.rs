@@ -3746,6 +3746,26 @@ impl Daemon {
     ) -> Result<bloom_mount::NfsMountHandle, bloom_mount::MountError> {
         bloom_mount::serve_nfs(self.vfs.clone(), path).await
     }
+
+    /// Mount through the installer-authorized fstab entry. This path uses a
+    /// fixed loopback listener and delegates only the exact predeclared mount
+    /// to the operating system's mount helper.
+    #[cfg(feature = "mount")]
+    pub async fn mount_from_fstab(
+        &self,
+        path: &std::path::Path,
+        nfs_listen: std::net::SocketAddr,
+    ) -> Result<bloom_mount::NfsMountHandle, bloom_mount::MountError> {
+        bloom_mount::serve_nfs_from_fstab(
+            self.vfs.clone(),
+            bloom_mount::MountConfig {
+                mount_path: path.to_path_buf(),
+                nfs_listen,
+                readonly: false,
+            },
+        )
+        .await
+    }
 }
 
 async fn render_next_actions(projections: &dyn WalletProjectionReader) -> Vec<u8> {

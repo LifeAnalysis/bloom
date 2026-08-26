@@ -35,6 +35,7 @@ for required in \
   compatibility-v1.toml \
   installer/release/install-linux.sh \
   installer/linux/bin/bloom-uninstall \
+  installer/linux/systemd-user/bloom-machine.service \
   installer/release/install-macos.sh \
   installer/release/macos-conformance-subject.sh \
   installer/release/sign-macos-conformance-report.sh \

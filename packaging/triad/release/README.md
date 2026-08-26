@@ -94,9 +94,10 @@ The tag workflow publishes the Linux x86_64 artifact as a prerelease so it can
 be validated before anything directs agents to it.
 
 Before merging release-workflow changes, dispatch the branch with
-`dry_run=true`. That path builds and signs the exact branch through the
-protected environment, uploads the signed artifact for inspection, and skips
-the publish job. Normal tag pushes and tag retries cannot select dry-run mode.
+`dry_run=true`. That path builds the exact branch with an ephemeral test key,
+uploads the `test-unclaimed` candidate for inspection, and skips both the
+protected production-signing job and the publish job. Normal tag pushes and tag
+retries cannot select dry-run mode.
 
 Before compiling, `check-machine-authority-boundary.sh --require-clean`
 resolves every entry in `machine-production-feature-sets.tsv` with locked
@@ -140,7 +141,11 @@ site overlay.
 
 The v0.1.4 Linux archive generates a complete fresh per-login enrollment from
 packaged public templates and the host CSPRNG; it does not require site-specific
-private identity inputs. It remains an operator-integration prerelease because
+private identity inputs. It enables a login-user Machine service that maintains
+the `~/bloom` mount without interactive sudo by installing one exact
+`user,nosuid,nodev,noexec` loopback-NFS fstab authorization, including the fixed
+`127.0.0.1:18735` listener and complete NFS option set; no Bloom process is
+given root identity or broad mount capability. It remains an operator-integration prerelease because
 the Linux release lane does not yet prove live installed systemd health on a
 disposable host. The website must remain pinned to v0.1.3 until that acceptance
 lane lands.

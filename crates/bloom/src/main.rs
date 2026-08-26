@@ -14,6 +14,7 @@ mod pf_monitor;
 mod session_sentinel;
 mod triad_enrollment;
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -1709,7 +1710,7 @@ async fn handle_operation(home: &HomeDir, command: OperationCmd) -> Result<Strin
     disable_version_flag = true,
     arg_required_else_help = true,
     about = "Bloom — an agentic Ethereum wallet as a virtual filesystem",
-    long_about = "Bloom mounts an agentic Ethereum wallet as a directory for agents. EXPERIMENTAL / UNAUDITED ALPHA: do not use with funds you cannot afford to lose, and review every generated transaction plan before signing. Read balances, contracts, ENS, prices, and status with cat/ls; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md, then run bloom init and bloom serve --mount ~/bloom. Use bloom vfs only as a fallback when mounting is unavailable."
+    long_about = "Bloom mounts an agentic Ethereum wallet as a directory for agents. EXPERIMENTAL / UNAUDITED ALPHA: do not use with funds you cannot afford to lose, and review every generated transaction plan before signing. Read balances, contracts, ENS, prices, and status with cat/ls; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md. Packaged Linux installs maintain ~/bloom through bloom-machine.service; source and standalone setups run bloom serve --mount ~/bloom. Use bloom vfs only as a fallback when mounting is unavailable."
 )]
 struct Cli {
     /// Show CLI, daemon, and negotiated IPC protocol versions.
@@ -1836,6 +1837,14 @@ enum Cmd {
             default_missing_value = DEFAULT_MOUNT_PATH
         )]
         mount: Option<PathBuf>,
+
+        /// Fixed loopback listener used by the packaged fstab mount.
+        #[arg(long, env = "BLOOM_NFS_LISTEN", value_name = "ADDRESS", hide = true)]
+        mount_nfs_listen: Option<SocketAddr>,
+
+        /// Resolve the mount solely from the installer's exact fstab entry.
+        #[arg(long, env = "BLOOM_MOUNT_FROM_FSTAB", hide = true)]
+        mount_from_fstab: bool,
 
         #[command(subcommand)]
         internal: Option<ServeInternal>,
@@ -2509,7 +2518,8 @@ async fn run(cli: Cli) -> Result<()> {
             println!("preinstalled_petals: {preinstalled:?}");
             println!("next: bloom wallet new main");
             println!("then: bloom wallet address main --qr");
-            println!("mount: mkdir -p ~/bloom && bloom serve --mount ~/bloom");
+            println!("packaged Linux mount: systemctl --user status bloom-machine.service");
+            println!("standalone mount: mkdir -p ~/bloom && bloom serve --mount ~/bloom");
             println!("fallback: bloom vfs cat /docs/README.md");
             println!("agent setup: https://bloom.directory/SKILL.md");
             Ok(())
@@ -2990,6 +3000,8 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Serve {
             endpoint,
             mount,
+            mount_nfs_listen,
+            mount_from_fstab,
             internal,
         } => {
             if let Some(internal) = internal {
@@ -3011,7 +3023,8 @@ async fn run(cli: Cli) -> Result<()> {
             let (_home_permit, d) = build_write_daemon(home.clone())?;
             github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision configured pre-installed Petals before serving")?;
-            let mount_handle = mount_bloom(&d, mount.as_deref()).await?;
+            let mount_handle =
+                mount_bloom(&d, mount.as_deref(), mount_nfs_listen, mount_from_fstab).await?;
             let chains: Vec<String> = d.chains.list_names();
             println!(
                 "bloom serve: home={} chains={:?}",
@@ -3540,13 +3553,33 @@ fn format_petal_consent_net_rule(rule: &bloom_petals::package::PetalConsentNetRu
 async fn mount_bloom(
     daemon: &Daemon,
     mount: Option<&std::path::Path>,
+    nfs_listen: Option<SocketAddr>,
+    from_fstab: bool,
 ) -> Result<Option<bloom_mount::NfsMountHandle>> {
     match mount {
-        Some(path) => daemon
-            .mount(path)
-            .await
-            .map(Some)
-            .with_context(|| format!("mount bloom vfs at {}", path.display())),
+        Some(path) => {
+            let handle = if from_fstab {
+                let listen = nfs_listen.context(
+                    "BLOOM_NFS_LISTEN is required when BLOOM_MOUNT_FROM_FSTAB is enabled",
+                )?;
+                daemon.mount_from_fstab(path, listen).await
+            } else if let Some(listen) = nfs_listen {
+                bloom_mount::serve_nfs_with(
+                    daemon.vfs.clone(),
+                    bloom_mount::MountConfig {
+                        mount_path: path.to_path_buf(),
+                        nfs_listen: listen,
+                        readonly: false,
+                    },
+                )
+                .await
+            } else {
+                daemon.mount(path).await
+            };
+            handle
+                .map(Some)
+                .with_context(|| format!("mount bloom vfs at {}", path.display()))
+        }
         None => Ok(None),
     }
 }

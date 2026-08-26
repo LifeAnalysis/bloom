@@ -52,6 +52,169 @@ atomic_install() {
   mv -f "$temporary" "$destination"
 }
 
+materialize_linux_layout() {
+  layout_config="$1"
+  layout_uid="$2"
+
+  systemd-tmpfiles --create "$layout_config"
+  for required_directory in \
+    "/run/bloom/$layout_uid/broker" \
+    "/run/bloom/$layout_uid/broker/rpc" \
+    "/run/bloom/$layout_uid/broker/control" \
+    "/run/bloom/$layout_uid/signer" \
+    "/run/bloom/$layout_uid/signer/rpc" \
+    "/run/bloom/$layout_uid/signer/control" \
+    "/run/bloom/$layout_uid/session" \
+    "/var/lib/bloom/$layout_uid/broker" \
+    "/var/lib/bloom/$layout_uid/signer" \
+    "/var/lib/bloom/$layout_uid/machine"
+  do
+    if [[ ! -d "$required_directory" || -L "$required_directory" ]]; then
+      echo "Linux installation failed to materialize $required_directory" >&2
+      return 73
+    fi
+  done
+}
+
+numericize_linux_tmpfiles_ownership() {
+  layout_config="$1"
+  layout_uid="$2"
+  broker_name="bloom-broker-$layout_uid"
+  signer_name="bloom-signer-$layout_uid"
+  machine_broker_name="bloom-machine-broker-$layout_uid"
+  broker_signer_name="bloom-broker-signer-$layout_uid"
+  revoke_name="bloom-revoke-$layout_uid"
+  session_name="bloom-session-$layout_uid"
+
+  broker_uid="$(id -u "$broker_name")"
+  broker_gid="$(id -g "$broker_name")"
+  signer_uid="$(id -u "$signer_name")"
+  signer_gid="$(id -g "$signer_name")"
+  machine_broker_gid="$(getent group "$machine_broker_name" | cut -d: -f3)"
+  broker_signer_gid="$(getent group "$broker_signer_name" | cut -d: -f3)"
+  revoke_gid="$(getent group "$revoke_name" | cut -d: -f3)"
+  session_gid="$(getent group "$session_name" | cut -d: -f3)"
+  for numeric_identity in \
+    "$broker_uid" "$broker_gid" "$signer_uid" "$signer_gid" \
+    "$machine_broker_gid" "$broker_signer_gid" "$revoke_gid" "$session_gid"
+  do
+    [[ "$numeric_identity" =~ ^[1-9][0-9]*$ ]] || {
+      echo "Linux service identity allocation failed" >&2
+      return 65
+    }
+  done
+
+  numeric_config="${layout_config}.numeric.$$"
+  awk \
+    -v broker_name="$broker_name" \
+    -v broker_uid="$broker_uid" \
+    -v broker_gid="$broker_gid" \
+    -v signer_name="$signer_name" \
+    -v signer_uid="$signer_uid" \
+    -v signer_gid="$signer_gid" \
+    -v machine_broker_name="$machine_broker_name" \
+    -v machine_broker_gid="$machine_broker_gid" \
+    -v broker_signer_name="$broker_signer_name" \
+    -v broker_signer_gid="$broker_signer_gid" \
+    -v revoke_name="$revoke_name" \
+    -v revoke_gid="$revoke_gid" \
+    -v session_name="$session_name" \
+    -v session_gid="$session_gid" \
+    '{
+      if ($4 == broker_name) $4 = broker_uid
+      if ($5 == broker_name) $5 = broker_gid
+      if ($4 == signer_name) $4 = signer_uid
+      if ($5 == signer_name) $5 = signer_gid
+      if ($5 == machine_broker_name) $5 = machine_broker_gid
+      if ($5 == broker_signer_name) $5 = broker_signer_gid
+      if ($5 == revoke_name) $5 = revoke_gid
+      if ($5 == session_name) $5 = session_gid
+      print
+    }' "$layout_config" > "$numeric_config"
+  chmod 0644 "$numeric_config"
+  mv -f "$numeric_config" "$layout_config"
+}
+
+fstab_escape_path() {
+  local value="$1"
+  value="${value//\\/\\134}"
+  value="${value// /\\040}"
+  value="${value//$'\t'/\\011}"
+  printf '%s' "$value"
+}
+
+install_linux_mount_authorization() {
+  local install_root="$1"
+  local mount_uid="$2"
+  local mount_gid="$3"
+  local login_home="$4"
+  local fstab="$install_root/etc/fstab"
+  local marker="x-bloom.login-uid=$mount_uid"
+  local mount_path="${login_home%/}/bloom"
+  local rooted_mount_path="${install_root%/}$mount_path"
+  local escaped_mount_path
+  local replacement
+
+  [[ "$login_home" == /* && "$login_home" != "/" && \
+    "$login_home" != *$'\n'* && "$login_home" != *$'\r'* ]] || {
+    echo "LOGIN_USER home is not a safe absolute path" >&2
+    return 65
+  }
+  if [[ -L "$rooted_mount_path" || \
+    ( -e "$rooted_mount_path" && ! -d "$rooted_mount_path" ) ]]
+  then
+    echo "Bloom mount path is not a real directory: $mount_path" >&2
+    return 65
+  fi
+  mkdir -p "$rooted_mount_path"
+  # The fstab `user` option delegates this one mount entry to an unprivileged
+  # caller. Keep the target private so only the enrolled login can traverse it.
+  chmod 0700 "$rooted_mount_path"
+  if [[ "$install_root" == "/" ]]; then
+    chown "$mount_uid:$mount_gid" "$rooted_mount_path"
+  fi
+
+  [[ ! -L "$fstab" && ( ! -e "$fstab" || -f "$fstab" ) ]] || {
+    echo "Linux fstab is missing, substituted, or not a regular file" >&2
+    return 65
+  }
+  mkdir -p "$(dirname "$fstab")"
+  replacement="${fstab}.new.$$"
+  if [[ -f "$fstab" ]]; then
+    awk -v marker="$marker" \
+      'length($0) < length(marker) || substr($0, length($0) - length(marker) + 1) != marker { print }' \
+      "$fstab" > "$replacement"
+    chmod --reference="$fstab" "$replacement"
+  else
+    : > "$replacement"
+    chmod 0644 "$replacement"
+  fi
+  escaped_mount_path="$(fstab_escape_path "$mount_path")"
+  printf '127.0.0.1:/ %s nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port=18735,rsize=65536,wsize=65536,timeo=10 0 0 # %s\n' \
+    "$escaped_mount_path" "$marker" >> "$replacement"
+  mv -f "$replacement" "$fstab"
+}
+
+remove_linux_mount_authorization() {
+  local install_root="$1"
+  local mount_uid="$2"
+  local fstab="$install_root/etc/fstab"
+  local marker="x-bloom.login-uid=$mount_uid"
+  local replacement
+
+  [[ -e "$fstab" ]] || return 0
+  [[ -f "$fstab" && ! -L "$fstab" ]] || {
+    echo "Linux fstab is substituted or not a regular file" >&2
+    return 65
+  }
+  replacement="${fstab}.new.$$"
+  awk -v marker="$marker" \
+    'length($0) < length(marker) || substr($0, length($0) - length(marker) + 1) != marker { print }' \
+    "$fstab" > "$replacement"
+  chmod --reference="$fstab" "$replacement"
+  mv -f "$replacement" "$fstab"
+}
+
 sha256_digest() {
   input="$1"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -180,6 +343,7 @@ case "$action" in
       exit 64
     }
     login_gid="$login_uid"
+    login_home="/home/$login_user"
     if [[ "$root" == "/" ]]; then
       actual_login_uid="$(id -u -- "$login_user" 2>/dev/null)" || {
         echo "LOGIN_USER does not resolve to a local account" >&2
@@ -197,7 +361,13 @@ case "$action" in
         echo "LOGIN_USER primary GID is invalid" >&2
         exit 65
       }
+      login_home="$(getent passwd "$login_uid" | cut -d: -f6)"
     fi
+    [[ "$login_home" == /* && "$login_home" != "/" && \
+      "$login_home" != *$'\n'* && "$login_home" != *$'\r'* ]] || {
+      echo "LOGIN_USER home is not a safe absolute path" >&2
+      exit 65
+    }
     for required in \
       bin/bloom \
       bin/bloom-broker \
@@ -210,7 +380,8 @@ case "$action" in
       installer/linux/config/provenance-catalog.unsigned.json \
       installer/linux/bin/bloom \
       installer/linux/bin/bloom-uninstall \
-      installer/linux/systemd-user/bloom-session.service
+      installer/linux/systemd-user/bloom-session.service \
+      installer/linux/systemd-user/bloom-machine.service
     do
       [[ -f "$payload/$required" && ! -L "$payload/$required" ]] || {
         echo "payload is missing $required" >&2
@@ -247,6 +418,12 @@ case "$action" in
     then
       echo "residual Linux enrollment state exists without a manifest; refusing fresh installation" >&2
       exit 65
+    fi
+    if [[ "$root" == "/" && -S "/run/user/$login_uid/bus" ]]; then
+      runuser -u "$login_user" -- env \
+        XDG_RUNTIME_DIR="/run/user/$login_uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$login_uid/bus" \
+        systemctl --user stop bloom-machine.service 2>/dev/null || true
     fi
     if [[ "$root" == "/" ]] && [[ -x "$root/usr/libexec/bloom/bloom-broker" ]]; then
       systemctl stop "bloom-session@$login_uid.path" 2>/dev/null || true
@@ -309,6 +486,10 @@ case "$action" in
       "$payload/installer/linux/systemd-user/bloom-session.service" \
       "$user_unit_root/bloom-session.service" \
       0644
+    atomic_install \
+      "$payload/installer/linux/systemd-user/bloom-machine.service" \
+      "$user_unit_root/bloom-machine.service" \
+      0644
     sed \
       -e "s|@BLOOM_BROKER_BINARY@|/usr/libexec/bloom/bloom-broker|g" \
       "$script_dir/linux/systemd/bloom-broker@.service.in" \
@@ -333,8 +514,13 @@ case "$action" in
     fi
     if [[ "$root" == "/" ]]; then
       systemd-sysusers "$sysusers"
-      systemd-tmpfiles --create "$tmpfiles"
+      # tmpfiles may run before NSS observes identities just created by
+      # sysusers. Persist numeric ownership so no service directory is
+      # silently skipped because a fresh account name is unresolved.
+      numericize_linux_tmpfiles_ownership "$tmpfiles" "$login_uid"
     fi
+    install_linux_mount_authorization \
+      "$root" "$login_uid" "$login_gid" "$login_home"
     if [[ "$fresh_install" == true ]]; then
       if [[ "$root" == "/" ]]; then
         broker_uid="$(id -u "bloom-broker-$login_uid")"
@@ -520,7 +706,7 @@ case "$action" in
       runuser -u "$login_user" -- env \
         XDG_RUNTIME_DIR="$user_runtime" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus" \
-        systemctl --user enable bloom-session.service
+        systemctl --user enable bloom-session.service bloom-machine.service
       systemctl disable --now \
         "bloom-signer-rpc@$login_uid.socket" \
         "bloom-signer-control@$login_uid.socket" \
@@ -533,6 +719,10 @@ case "$action" in
       systemctl disable --now \
         "bloom-broker-ceremony@$login_uid.socket" \
         2>/dev/null || true
+      # Materialize the package-owned runtime and state layout at the final
+      # activation boundary. Nothing between this check and path activation
+      # may remove the directories named by ReadWritePaths in the services.
+      materialize_linux_layout "$tmpfiles" "$login_uid"
       systemctl enable --now "bloom-session@$login_uid.path"
       printf '%s\n' \
         "BLOOM_BIN=/usr/bin/bloom" \
@@ -635,25 +825,47 @@ PY
         runuser -u "$login_user" -- env \
           XDG_RUNTIME_DIR="$user_runtime" \
           DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
-          systemctl --user disable --now bloom-session.service \
+          systemctl --user disable --now \
+          bloom-machine.service bloom-session.service \
           2>/dev/null || true
       fi
       if [[ -n "$login_user" && "$login_home" == /* && "$login_home" != "/" ]]; then
         runuser -u "$login_user" -- rm -f -- \
+          "$login_home/.config/systemd/user/default.target.wants/bloom-machine.service" \
           "$login_home/.config/systemd/user/default.target.wants/bloom-session.service"
         if [[ "$retain_custody" == false ]]; then
           runuser -u "$login_user" -- rm -rf -- "$login_home/.bloom"
         fi
       fi
-      systemctl disable --now \
-        "bloom-broker@$login_uid.service" \
-        "bloom-signer@$login_uid.service" \
-        2>/dev/null || true
+      # Remove every activation source before stopping Broker or Signer. If
+      # the session path remains active while those services stop, it can
+      # immediately start both again and leave Signer alive after its unit and
+      # account have been removed.
       systemctl disable --now \
         "bloom-broker-ceremony@$login_uid.socket" \
         "bloom-session@$login_uid.path" \
         2>/dev/null || true
+      systemctl disable \
+        "bloom-broker@$login_uid.service" \
+        "bloom-signer@$login_uid.service" \
+        2>/dev/null || true
+      systemctl stop \
+        "bloom-broker@$login_uid.service" \
+        "bloom-signer@$login_uid.service" \
+        2>/dev/null || true
+      for stopped_unit in \
+        "bloom-broker-ceremony@$login_uid.socket" \
+        "bloom-session@$login_uid.path" \
+        "bloom-broker@$login_uid.service" \
+        "bloom-signer@$login_uid.service"
+      do
+        if systemctl is-active --quiet "$stopped_unit"; then
+          echo "refusing to uninstall while $stopped_unit is still active" >&2
+          exit 70
+        fi
+      done
     fi
+    remove_linux_mount_authorization "$root" "$login_uid"
     rm -rf -- "$run_target"
     if [[ "$retain_custody" == true ]]; then
       retained_root="$root/etc/bloom/retained"
@@ -722,6 +934,7 @@ PY
         "$root/usr/lib/systemd/system/bloom-signer@.service" \
         "$root/usr/lib/systemd/system/bloom-broker-ceremony@.socket" \
         "$root/usr/lib/systemd/system/bloom-session@.path" \
+        "$root/usr/lib/systemd/user/bloom-machine.service" \
         "$root/usr/lib/systemd/user/bloom-session.service"
     fi
 
