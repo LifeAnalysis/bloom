@@ -9,7 +9,7 @@
 //! (see [`crate::reconcile`]).
 
 use base64::Engine as _;
-use bloom_broker_api::Digest32;
+use bloom_broker_api::{Digest32, KeyRef};
 use bloom_solana::{SolanaClient, SolanaRpcError};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -54,6 +54,15 @@ pub struct SolanaTransferIntent {
     pub destination: String,
     /// Native SOL debit in lamports.
     pub lamports: u64,
+    /// Which derived Solana child to spend from, named by its public-key
+    /// fingerprint (hex) or a unique prefix of one.
+    ///
+    /// Required once the wallet has more than one active Solana child.
+    /// Omitting it stays valid for a single-child wallet, which is
+    /// unambiguous; it is never a request to pick whichever child is listed
+    /// first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_fingerprint: Option<String>,
 }
 
 impl SolanaTransferIntent {
@@ -152,6 +161,7 @@ impl SolanaTransferEngine {
         &self,
         wallet: &str,
         fee_payer: &[u8; 32],
+        account_fingerprint: Option<String>,
         destination: &[u8; 32],
         lamports: u64,
         now_ms: u128,
@@ -186,6 +196,7 @@ impl SolanaTransferEngine {
             wallet: wallet.to_string(),
             chain: self.chain.clone(),
             fee_payer: bs58::encode(fee_payer).into_string(),
+            account_fingerprint,
             destination: bs58::encode(destination).into_string(),
             lamports,
             fee_lamports,
@@ -271,6 +282,10 @@ impl SolanaTransferEngine {
             .stage(
                 wallet,
                 fee_payer,
+                // The replacement is the same transfer from the same account,
+                // so it carries the original pin forward rather than being
+                // re-resolved.
+                entry.staged.account_fingerprint.clone(),
                 &destination,
                 entry.staged.lamports,
                 now_ms,
@@ -306,6 +321,7 @@ impl SolanaTransferEngine {
         wallet: &str,
         id: &str,
         fee_payer: &[u8; 32],
+        account_key_ref: Option<KeyRef>,
         approval_id: Option<Digest32>,
         now_ms: u128,
     ) -> Result<SolanaSignOutcome, EngineError> {
@@ -318,6 +334,7 @@ impl SolanaTransferEngine {
             .decode(&entry.staged.message_b64)
             .map_err(|e| EngineError::Invalid(format!("message base64: {e}")))?;
         validate_staged_message(&entry.staged, fee_payer, &message)?;
+        validate_staged_account(&entry.staged, account_key_ref.as_ref())?;
         let canonical_plan_facts = serde_jcs::to_vec(&entry.staged)
             .map_err(|e| EngineError::Invalid(format!("canonical plan facts: {e}")))?;
         let plan_facts_digest = Digest32::from_bytes(Sha256::digest(&canonical_plan_facts).into());
@@ -327,6 +344,7 @@ impl SolanaTransferEngine {
             .sign_transfer(
                 wallet,
                 fee_payer,
+                account_key_ref,
                 &message,
                 &entry.staged.destination,
                 entry.staged.lamports,
@@ -460,6 +478,39 @@ impl SolanaTransferEngine {
     }
 }
 
+/// The signing key must be the exact derived child the transfer was staged
+/// for.
+///
+/// The staged message bytes commit to one fee payer, and the sealed approval
+/// commits to one `KeyRef`. Re-resolving the wallet's children at signing time
+/// could pick a different active child, which would then be asked to sign a
+/// message it was never staged for, so the pinned fingerprint is checked
+/// rather than trusted.
+///
+/// An entry staged before account selection existed carries no fingerprint. It
+/// is accepted, because it cannot have been staged against a second child, and
+/// `validate_staged_message` has already tied the key to the staged fee payer.
+fn validate_staged_account(
+    staged: &StagedSolanaTransfer,
+    account_key_ref: Option<&bloom_broker_api::KeyRef>,
+) -> Result<(), EngineError> {
+    let Some(pinned) = staged.account_fingerprint.as_deref() else {
+        return Ok(());
+    };
+    let Some(selected) = account_key_ref else {
+        return Err(EngineError::Invalid(
+            "staged transfer pins a derived Solana account but none was selected for signing"
+                .into(),
+        ));
+    };
+    if selected.public_key_fingerprint.as_str() != pinned {
+        return Err(EngineError::Invalid(
+            "selected Solana account differs from the account this transfer was staged for".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_staged_message(
     staged: &StagedSolanaTransfer,
     expected_fee_payer: &[u8; 32],
@@ -506,6 +557,59 @@ fn validate_staged_message(
 mod tests {
     use super::*;
 
+    fn key_ref_with(fingerprint: &str) -> KeyRef {
+        KeyRef {
+            backend: bloom_broker_api::Token::new("local").unwrap(),
+            backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
+            locator: "wallet/derived/0".into(),
+            key_spec: bloom_broker_api::KeySpec::Ed25519,
+            public_key_fingerprint: Digest32::new(fingerprint.to_owned()).unwrap(),
+            derivation: None,
+        }
+    }
+
+    #[test]
+    fn a_pinned_account_must_be_reselected_exactly_to_sign() {
+        let (mut staged, _, _) = staged_fixture();
+        let pinned = "aa".repeat(32);
+        staged.account_fingerprint = Some(pinned.clone());
+
+        // The account the transfer was staged for.
+        validate_staged_account(&staged, Some(&key_ref_with(&pinned)))
+            .expect("the pinned account signs its own staged transfer");
+
+        // A different active child must not be able to sign a message that
+        // was built for, and approved against, another account.
+        let other = "bb".repeat(32);
+        let error = validate_staged_account(&staged, Some(&key_ref_with(&other)))
+            .expect_err("a substituted account must fail closed");
+        assert!(
+            matches!(&error, EngineError::Invalid(message) if message.contains("differs from the account")),
+            "{error:?}"
+        );
+
+        // Dropping the selector entirely must not silently fall back to
+        // resolving the wallet's children by order.
+        let error = validate_staged_account(&staged, None)
+            .expect_err("a pinned transfer must not sign without its account");
+        assert!(
+            matches!(&error, EngineError::Invalid(message) if message.contains("none was selected")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_entry_staged_before_selection_existed_still_signs() {
+        let (staged, _, _) = staged_fixture();
+        assert!(staged.account_fingerprint.is_none());
+        // No pin to enforce, and such an entry cannot have been staged against
+        // a second child. `validate_staged_message` still ties the key to the
+        // staged fee payer.
+        validate_staged_account(&staged, None).expect("legacy entries keep working");
+        validate_staged_account(&staged, Some(&key_ref_with(&"cc".repeat(32))))
+            .expect("legacy entries do not constrain the selector");
+    }
+
     fn staged_fixture() -> (StagedSolanaTransfer, [u8; 32], Vec<u8>) {
         let payer = [0x11; 32];
         let destination = [0x22; 32];
@@ -516,6 +620,7 @@ mod tests {
             wallet: "wallet".into(),
             chain: "solana-devnet".into(),
             fee_payer: bs58::encode(payer).into_string(),
+            account_fingerprint: None,
             destination: bs58::encode(destination).into_string(),
             lamports: 1_000_000,
             fee_lamports: 5_000,

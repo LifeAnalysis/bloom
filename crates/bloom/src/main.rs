@@ -824,6 +824,14 @@ async fn launch_account_allocation(
         .into());
     }
 
+    // Authenticated Machine→Broker edge for the allocation request below.
+    let client = configured_broker_client(&daemon.home).map_err(|error| {
+        machine_error(
+            MachineErrorKind::Unavailable,
+            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
+        )
+    })?;
+
     let mut operation_bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut operation_bytes);
     let operation_id = bloom_broker_api::OperationId::from_bytes(operation_bytes);
@@ -831,7 +839,15 @@ async fn launch_account_allocation(
         derivation_profile,
         requested_role: bloom_broker_api::Token::new(requested_role)
             .map_err(|error| machine_error(MachineErrorKind::InvalidParams, error.to_string()))?,
-        account: Some(0),
+        // EVM allocates successive address indices within account 0. Solana
+        // has no address-index path component, so `None` delegates automatic,
+        // never-reusing account selection to the authoritative Signer registry
+        // transaction (which sees active, retired, and tombstoned rows).
+        account: (!matches!(
+            derivation_profile,
+            DerivationProfile::Bip44SolanaSlip10Ed25519V1
+        ))
+        .then_some(0),
     };
     let expires_at_ms = current_unix_ms().saturating_add(30 * 60 * 1_000);
     let terms = AccountTerms {
@@ -852,12 +868,6 @@ async fn launch_account_allocation(
             .map_err(|error| machine_error(MachineErrorKind::InvalidParams, error.to_string()))?,
     };
     let exact_terms_digest = terms.request_digest().map_err(anyhow::Error::new)?;
-    let client = configured_broker_client(&daemon.home).map_err(|error| {
-        machine_error(
-            MachineErrorKind::Unavailable,
-            format!("custody requires the authenticated Machine-to-Broker edge: {error:#}"),
-        )
-    })?;
     let response = client
         .account_allocate(bloom_broker_api::CustodyPrepareRequest {
             ceremony_kind: bloom_broker_api::CeremonyKind::AccountAllocate,
@@ -1328,7 +1338,11 @@ async fn execute_machine_command(
             let prepared = launch_account_retirement(daemon, &wallet_id, &fingerprint).await?;
             format!("{}\n", serde_json::to_string_pretty(&prepared)?)
         }
-        MachineCommand::WalletAddress { name, profile } => {
+        MachineCommand::WalletAddress {
+            name,
+            profile,
+            fingerprint,
+        } => {
             let wallet_id = bloom_broker_api::Token::new(name)?;
             if let Some(profile) = profile {
                 let (derivation_profile, allocation_profile) = match profile.as_str() {
@@ -1362,25 +1376,30 @@ async fn execute_machine_command(
                     .wallet_accounts(wallet_id.clone())
                     .await
                     .map_err(machine_wallet_lookup_error)?;
-                let account = accounts
-                    .accounts
-                    .iter()
-                    .find(|account| {
-                        account.derivation_profile == derivation_profile
-                            && account.lifecycle
-                                == bloom_broker_api::AccountLifecycleState::Active
-                    })
-                    .ok_or_else(|| {
-                        machine_error(
-                            MachineErrorKind::NotFound,
-                            format!(
-                                "wallet '{}' has no active {profile} derived account; allocate one with `bloom wallet account-allocate {} --profile {}`",
-                                wallet_id.as_str(),
-                                wallet_id.as_str(),
-                                allocation_profile,
-                            ),
-                        )
-                    })?;
+                let active = bloom_solana_tx::account::active_accounts(
+                    &accounts.accounts,
+                    derivation_profile,
+                );
+                let account = bloom_solana_tx::account::select(
+                    wallet_id.as_str(),
+                    &active,
+                    fingerprint.as_deref(),
+                )
+                .map_err(|error| match error {
+                    bloom_solana_tx::AccountSelectionError::None { .. } => machine_error(
+                        MachineErrorKind::NotFound,
+                        format!(
+                            "wallet '{}' has no active {profile} derived account; allocate one with `bloom wallet account-allocate {} --profile {}`",
+                            wallet_id.as_str(),
+                            wallet_id.as_str(),
+                            allocation_profile,
+                        ),
+                    ),
+                    bloom_solana_tx::AccountSelectionError::NoMatch { .. } => {
+                        machine_error(MachineErrorKind::NotFound, error.to_string())
+                    }
+                    other => machine_error(MachineErrorKind::InvalidParams, other.to_string()),
+                })?;
                 let projection = account.chain_projections.first().ok_or_else(|| {
                     machine_error(
                         MachineErrorKind::NotFound,
@@ -2079,6 +2098,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::enum_variant_names)]
 enum InitInternal {
     #[cfg(feature = "triad-dev-harness")]
     #[command(name = "triad-render-developer-enrollment", hide = true)]
@@ -2382,6 +2402,11 @@ enum WalletCmd {
         /// account; omit it for the wallet's legacy primary EVM address.
         #[arg(long, value_parser = ["evm", "solana"])]
         profile: Option<String>,
+        /// Which derived account to print, named by its public-key
+        /// fingerprint or a unique prefix of one. Required once the wallet
+        /// has more than one active account for the profile.
+        #[arg(long, value_name = "HEX")]
+        fingerprint: Option<String>,
         #[arg(long)]
         qr: bool,
         /// Write a scannable SVG QR of the deposit address to this path.
@@ -3134,12 +3159,17 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Wallet(WalletCmd::Address {
             name,
             profile,
+            fingerprint,
             qr,
             qr_out,
         }) => {
             let result = machine_command(
                 &client_endpoint,
-                MachineCommand::WalletAddress { name, profile },
+                MachineCommand::WalletAddress {
+                    name,
+                    profile,
+                    fingerprint,
+                },
             )
             .await?;
             let address = result.stdout;

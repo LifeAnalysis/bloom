@@ -284,7 +284,7 @@ async fn stage_refuses_an_already_stale_latest_blockhash() {
         .to_bytes();
     let now_ms = 1_000_000u128;
     let error = engine
-        .stage("wallet", &fee_payer, &destination, 1_000_000, now_ms)
+        .stage("wallet", &fee_payer, None, &destination, 1_000_000, now_ms)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("staged blockhash expired"));
@@ -316,7 +316,7 @@ async fn stage_with_a_fresh_blockhash_is_not_reaped_immediately() {
         .to_bytes();
     let now_ms = 1_000_000u128;
     let staged = engine
-        .stage("wallet", &fee_payer, &destination, 1_000_000, now_ms)
+        .stage("wallet", &fee_payer, None, &destination, 1_000_000, now_ms)
         .await
         .unwrap();
     assert!(
@@ -364,7 +364,7 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
 
     // Stage.
     let staged = engine
-        .stage("wallet", &fee_payer, &destination, 1_000_000, 1_000)
+        .stage("wallet", &fee_payer, None, &destination, 1_000_000, 1_000)
         .await
         .unwrap();
     assert_eq!(staged.status, SolanaTxStatus::Pending);
@@ -373,7 +373,7 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
 
     // First sign attempt prepares the ceremony (no approval id yet).
     let first = engine
-        .sign("wallet", &staged.id, &fee_payer, None, 1_100)
+        .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
         .await
         .unwrap();
     let approval_id = match first {
@@ -399,7 +399,14 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
     // PLAN-SOLANA-PR-FIXES.md: signing alone must never strand an entry in
     // `sent` for a broadcast that hasn't happened yet).
     let signed = engine
-        .sign("wallet", &staged.id, &fee_payer, Some(approval_id), 1_200)
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval_id),
+            1_200,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -618,11 +625,11 @@ async fn stage_and_sign(
         .verifying_key()
         .to_bytes();
     let staged = engine
-        .stage("wallet", &fee_payer, &destination, 1_000_000, 1_000)
+        .stage("wallet", &fee_payer, None, &destination, 1_000_000, 1_000)
         .await
         .unwrap();
     let first = engine
-        .sign("wallet", &staged.id, &fee_payer, None, 1_100)
+        .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
         .await
         .unwrap();
     let approval_id = match first {
@@ -632,7 +639,14 @@ async fn stage_and_sign(
         other => panic!("expected ApprovalRequired, got {other:?}"),
     };
     let signed = engine
-        .sign("wallet", &staged.id, &fee_payer, Some(approval_id), 1_200)
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval_id),
+            1_200,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -767,6 +781,7 @@ async fn signing_and_broadcast_both_refuse_an_expired_blockhash() {
         .stage(
             "wallet",
             &broker.child_pubkey(),
+            None,
             &destination,
             1_000_000,
             1_000,
@@ -775,7 +790,14 @@ async fn signing_and_broadcast_both_refuse_an_expired_blockhash() {
         .unwrap();
     height.store(102, std::sync::atomic::Ordering::SeqCst);
     let sign_error = engine
-        .sign("wallet", &unsigned.id, &broker.child_pubkey(), None, 1_100)
+        .sign(
+            "wallet",
+            &unsigned.id,
+            &broker.child_pubkey(),
+            None,
+            None,
+            1_100,
+        )
         .await
         .unwrap_err();
     assert!(sign_error.to_string().contains("restage the transfer"));
@@ -825,6 +847,7 @@ async fn expired_transfer_restages_with_fresh_facts_and_no_reused_authority() {
         .stage(
             "wallet",
             &broker.child_pubkey(),
+            None,
             &destination,
             1_000_000,
             1_000,

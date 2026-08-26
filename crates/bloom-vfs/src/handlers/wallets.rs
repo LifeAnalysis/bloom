@@ -2983,10 +2983,19 @@ impl WalletsHandler {
         }
     }
 
-    /// Resolve the wallet's active Solana derived child's Ed25519 public key
-    /// (the fee payer / transfer source), from the Broker's `wallet.accounts`
-    /// projection.
-    async fn resolve_solana_child(&self, wallet: &str) -> Result<[u8; 32], HandlerError> {
+    /// Resolve the exact active Solana derived child to transact with, from
+    /// the Broker's `wallet.accounts` projection: its Ed25519 public key (the
+    /// fee payer / transfer source) and the `KeyRef` that names it.
+    ///
+    /// `selector` is a public-key fingerprint, or a unique prefix of one. It
+    /// is required whenever the wallet has more than one active Solana child:
+    /// projection order is not a selection criterion, and silently taking the
+    /// first would spend from an account the user never named.
+    async fn resolve_solana_child(
+        &self,
+        wallet: &str,
+        selector: Option<&str>,
+    ) -> Result<([u8; 32], bloom_broker_api::KeyRef), HandlerError> {
         let broker = self.broker.as_ref().ok_or_else(|| {
             HandlerError::backend("Broker edge is unavailable for Solana transfers")
         })?;
@@ -2997,19 +3006,19 @@ impl WalletsHandler {
             )
             .await
             .map_err(|error| HandlerError::backend(error.to_string()))?;
-        let account = accounts
-            .accounts
-            .iter()
-            .find(|account| {
-                account.derivation_profile
-                    == bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1
-                    && account.lifecycle == bloom_broker_api::AccountLifecycleState::Active
-            })
-            .ok_or_else(|| {
-                HandlerError::not_found(format!(
-                    "wallet '{wallet}' has no active Solana derived account"
-                ))
-            })?;
+        let active = bloom_solana_tx::account::active_accounts(
+            &accounts.accounts,
+            bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+        );
+        let account = bloom_solana_tx::account::select(wallet, &active, selector).map_err(
+            |error| match error {
+                bloom_solana_tx::AccountSelectionError::None { .. }
+                | bloom_solana_tx::AccountSelectionError::NoMatch { .. } => {
+                    HandlerError::not_found(error.to_string())
+                }
+                other => HandlerError::invalid(other.to_string()),
+            },
+        )?;
         if account.key_ref.key_spec != bloom_broker_api::KeySpec::Ed25519
             || account.public_key_encoding != bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer
         {
@@ -3028,7 +3037,7 @@ impl WalletsHandler {
         }
         let mut raw = [0_u8; 32];
         raw.copy_from_slice(&spki[ED25519_SPKI_PREFIX.len()..]);
-        Ok(raw)
+        Ok((raw, account.key_ref.clone()))
     }
 
     async fn write_solana_outbox(
@@ -3046,9 +3055,20 @@ impl WalletsHandler {
                 let intent: bloom_solana_tx::SolanaTransferIntent = serde_json::from_slice(data)
                     .map_err(|e| HandlerError::invalid(format!("invalid Solana intent: {e}")))?;
                 let destination = intent.destination_bytes().map_err(HandlerError::invalid)?;
-                let child = self.resolve_solana_child(wallet).await?;
+                let (child, key_ref) = self
+                    .resolve_solana_child(wallet, intent.account_fingerprint.as_deref())
+                    .await?;
                 let staged = engine
-                    .stage(wallet, &child, &destination, intent.lamports, now_ms_u128())
+                    .stage(
+                        wallet,
+                        &child,
+                        // Pin the full fingerprint, never the user's prefix:
+                        // a prefix could later resolve to a different child.
+                        Some(key_ref.public_key_fingerprint.as_str().to_owned()),
+                        &destination,
+                        intent.lamports,
+                        now_ms_u128(),
+                    )
                     .await
                     .map_err(|e| HandlerError::backend(e.to_string()))?;
                 tracing::info!(wallet, chain, id = %staged.id, "solana_outbox.staged");
@@ -3065,7 +3085,6 @@ impl WalletsHandler {
                         "confirm requires non-empty content (e.g. 'y')",
                     ));
                 }
-                let child = self.resolve_solana_child(wallet).await?;
                 let now = now_ms_u128();
                 // Durable approval state: a prior `ApprovalRequired` stored
                 // the approval id in a sidecar; a retry reuses it.
@@ -3078,6 +3097,12 @@ impl WalletsHandler {
                         bloom_solana_tx::outbox::SolanaOutboxState::Pending,
                     )
                     .map_err(solana_outbox_err)?;
+                // Re-select the exact account this transfer was staged
+                // against. Resolving the wallet's children again would let a
+                // second active child sign a message staged for the first.
+                let (child, key_ref) = self
+                    .resolve_solana_child(wallet, entry.staged.account_fingerprint.as_deref())
+                    .await?;
                 let approval_id = std::fs::read(entry.dir.join("approval.json"))
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -3087,7 +3112,7 @@ impl WalletsHandler {
                             .and_then(|s| bloom_broker_api::Digest32::new(s.to_owned()).ok())
                     });
                 match engine
-                    .sign(wallet, id, &child, approval_id, now)
+                    .sign(wallet, id, &child, Some(key_ref), approval_id, now)
                     .await
                     .map_err(|e| HandlerError::backend(e.to_string()))?
                 {
@@ -3142,7 +3167,21 @@ impl WalletsHandler {
                         "restage requires non-empty content (e.g. 'y')",
                     ));
                 }
-                let child = self.resolve_solana_child(wallet).await?;
+                // A restage rebuilds the message for the same account, so it
+                // reads the pinned fingerprint from the expired entry rather
+                // than resolving the wallet's children afresh.
+                let expired = engine
+                    .outbox()
+                    .read_in_state(
+                        wallet,
+                        chain,
+                        id,
+                        bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+                    )
+                    .map_err(solana_outbox_err)?;
+                let (child, _) = self
+                    .resolve_solana_child(wallet, expired.staged.account_fingerprint.as_deref())
+                    .await?;
                 let replacement = engine
                     .restage_expired(wallet, id, &child, now_ms_u128())
                     .await
@@ -4252,6 +4291,7 @@ mod tests {
             wallet: "alice".into(),
             chain: "solana-devnet".into(),
             fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
+            account_fingerprint: None,
             destination: "DEST111111111111111111111111111111111111111".into(),
             lamports: 1_000_000,
             fee_lamports: 5_000,

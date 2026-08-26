@@ -820,6 +820,7 @@ mod tests {
             wallet: "alice".into(),
             chain: "solana-devnet".into(),
             fee_payer: "11111111111111111111111111111111".into(),
+            account_fingerprint: None,
             destination: "11111111111111111111111111111111".into(),
             lamports: 1,
             fee_lamports: 5000,

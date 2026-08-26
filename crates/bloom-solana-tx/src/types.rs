@@ -30,6 +30,17 @@ pub struct StagedSolanaTransfer {
     pub chain: String,
     /// Fee payer and transfer source, base58.
     pub fee_payer: String,
+    /// Full public-key fingerprint (hex) of the derived Solana child that
+    /// `fee_payer` belongs to, pinned when the message was staged.
+    ///
+    /// The message bytes were built for exactly this account, so signing,
+    /// broadcast, and reconciliation must re-select it rather than resolve the
+    /// wallet's children again — a second active child would otherwise be able
+    /// to sign a message it never authorised. Optional only so that entries
+    /// staged before selection existed still parse; those resolve as before,
+    /// which stays unambiguous because they cannot have had a second child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_fingerprint: Option<String>,
     /// Transfer destination, base58.
     pub destination: String,
     /// Native SOL debit in lamports.

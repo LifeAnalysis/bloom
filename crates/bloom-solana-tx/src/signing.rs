@@ -11,9 +11,9 @@
 
 use bloom_broker_api::{
     AssetId, ClaimAssurance, CryptoSuite, DecimalU64, DecimalU256, DeclaredDebit,
-    DeclaredDestination, DeclaredFee, Digest32, OperationId, ProvenanceCatalog, ProvenanceSubject,
-    RequestNonce, SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES, SOLANA_SYSTEM_TRANSFER_VERIFIER_ID,
-    SystemChainContext, SystemUseClaim, Token, ValueLimit,
+    DeclaredDestination, DeclaredFee, Digest32, KeyRef, OperationId, ProvenanceCatalog,
+    ProvenanceSubject, RequestNonce, SOLANA_SYSTEM_TRANSFER_VERIFIER_DIGEST_BYTES,
+    SOLANA_SYSTEM_TRANSFER_VERIFIER_ID, SystemChainContext, SystemUseClaim, Token, ValueLimit,
 };
 use bloom_machine_client::{ExactPayloadSignOutcome, ExactPayloadSignRequest, MachineBrokerClient};
 use sha2::{Digest as _, Sha256};
@@ -79,6 +79,13 @@ impl SolanaTransferSigner {
     /// child. `fee_payer` is the derived child's Ed25519 public key; the
     /// returned signature is verified over `message_bytes` before returning.
     ///
+    /// `account_key_ref` names that exact child. It is required whenever the
+    /// wallet holds more than one active Solana child, because `fee_payer`
+    /// alone is a public key the Broker would still have to resolve back to a
+    /// key, and resolving it by list order is what this selection exists to
+    /// prevent. It is bound into the sealed approval terms, so an approval
+    /// issued for one account can never authorise a signature from another.
+    ///
     /// `approval_id` is `None` on first attempt (prepares the ceremony) and
     /// the id returned by [`SolanaSignOutcome::ApprovalRequired`] on retry.
     #[allow(clippy::too_many_arguments)]
@@ -86,6 +93,7 @@ impl SolanaTransferSigner {
         &self,
         wallet_id: &str,
         fee_payer: &[u8; 32],
+        account_key_ref: Option<KeyRef>,
         message_bytes: &[u8],
         destination: &str,
         lamports: u64,
@@ -169,6 +177,7 @@ impl SolanaTransferSigner {
             petal_use_claim: None,
             system_use_claim: Some(system_use_claim),
             claim_assurance_evidence: Some(message_bytes.to_vec()),
+            account_key_ref,
             approval_value_limits: vec![ValueLimit {
                 asset: AssetId {
                     chain: Token::new("solana").map_err(|e| e.to_string())?,

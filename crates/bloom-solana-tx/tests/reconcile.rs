@@ -103,6 +103,7 @@ fn sent_entry(id: &str) -> StagedSolanaTransfer {
         wallet: "alice".into(),
         chain: "solana-devnet".into(),
         fee_payer: "FEEPAYER111111111111111111111111111111111".into(),
+        account_fingerprint: None,
         destination: "DEST111111111111111111111111111111111111111".into(),
         lamports: 1,
         fee_lamports: 5_000,

@@ -95,6 +95,49 @@ B. **Faulted ceremony not terminalized.** In `ceremony.rs::complete_session`,
 Full fmt/clippy/test matrices stay green after both fixes (one pre-existing
 parallel-execution flake in the `*_over_real_transport` suite, unrelated).
 
+## Validation status (updated 2026-08-26, fourth pass)
+
+The remaining multi-account defect is fixed and covered at each trust
+boundary:
+
+- Machine requests automatic Solana account selection instead of pinning every
+  allocation to account 0.
+- Signer selects the next never-used Solana BIP-44 account atomically from its
+  authoritative registry, including retired and tombstoned allocations.
+  Idempotent retries recover the original account.
+- Broker accepts automatic selection only when Signer's receipt has the exact
+  frozen hardened path shape `m/44'/501'/<account>'/0'`; explicit accounts stay
+  pinned exactly.
+- A genuine canonical-path collision is now a permanent
+  `OPERATION_ID_CONFLICT` with `retry: never`, rather than a retryable SQLite
+  service error, and the failed transaction does not consume the next account.
+
+Verification completed on the final working trees:
+
+1. Independent `bip_utils`/SLIP-10 cross-check of a real separate-process
+   triad: accounts 0, 1, and 2 exactly matched the Signer results. The harness
+   passed 16/16 assertions.
+2. Signer and Broker full locked all-feature fmt/clippy/test matrices passed.
+   Signer's ceremony test now uses `account: None` twice, so CI exercises real
+   automatic advancement rather than supplying the expected account numbers.
+3. Machine's full Linux workspace suite passed with the four macOS-only tests
+   and the separately-run authority gate excluded. The standalone M6 Machine
+   authority boundary gate passed. Both local-validator ignored suites then
+   passed: transaction stage/sign/broadcast/reconcile and the real Daemon/VFS
+   BIP-39 workflow, each reaching a finalized receipt.
+4. The temporary validator was stopped and its exact ledger removed. `/tmp`
+   has over 9 GiB free; no validator remains listening on port 8899.
+5. A final separate-process Machine→Broker→Signer run retired Solana account 0,
+   automatically allocated account 1
+   (`5frqxtii9LeGq2bz3dSNokvZcEooF483MzeU24JrhcTA`), signed and broadcast from
+   that child, and reconciled a finalized receipt. Independent Ed25519
+   verification accepted the raw staged message and rejected its SHA-256
+   digest. Its validator and dev root were also stopped and removed.
+
+Release integration still requires committing the Signer, Broker, and Machine
+working trees, publishing the dependency commits, pinning their exact revisions
+in the downstream repos, and letting CI/macOS run the platform-specific gates.
+
 ## Known CI environment exceptions
 
 - `triad_release` needs `TAR=bsdtar` on the current Linux runner because its

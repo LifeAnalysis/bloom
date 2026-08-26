@@ -231,6 +231,7 @@ async fn derived_child_signs_transfer_and_signature_verifies() {
         .sign_transfer(
             "wallet",
             &fee_payer,
+            None,
             &message,
             &bs58::encode(destination).into_string(),
             1_000_000,
@@ -281,6 +282,7 @@ async fn first_attempt_returns_approval_required() {
         .sign_transfer(
             "wallet",
             &fee_payer,
+            None,
             &message,
             &bs58::encode(destination).into_string(),
             1,
@@ -315,6 +317,7 @@ async fn ceremony_retry_preserves_claim_and_authority_identity() {
         .sign_transfer(
             "wallet",
             &fee_payer,
+            None,
             &message,
             &bs58::encode(destination).into_string(),
             50,
@@ -336,6 +339,7 @@ async fn ceremony_retry_preserves_claim_and_authority_identity() {
         .sign_transfer(
             "wallet",
             &fee_payer,
+            None,
             &message,
             &bs58::encode(destination).into_string(),
             50,

@@ -244,6 +244,7 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
         .stage(
             "wallet",
             &fee_payer,
+            None,
             &destination,
             transfer_lamports,
             now_ms(),
@@ -252,7 +253,7 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
         .expect("stage against the local validator");
 
     let first = engine
-        .sign("wallet", &staged.id, &fee_payer, None, now_ms())
+        .sign("wallet", &staged.id, &fee_payer, None, None, now_ms())
         .await
         .expect("prepare the signing ceremony");
     let approval_id = match first {
@@ -264,6 +265,7 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
             "wallet",
             &staged.id,
             &fee_payer,
+            None,
             Some(approval_id),
             now_ms(),
         )
