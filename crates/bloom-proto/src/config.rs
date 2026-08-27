@@ -529,6 +529,7 @@ impl Config {
             if spec.allow_broadcast
                 && spec.expected_genesis_hex.as_deref()
                     == Some(crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH)
+                && !crate::canary::config_permits_mainnet_chain(name)
             {
                 return Err(ConfigError::Invalid(format!(
                     "solana chain '{name}' cannot enable broadcast for mainnet-beta"

@@ -2768,6 +2768,14 @@ pub struct Daemon {
 /// An unreachable endpoint is not a configuration error. Keep the chain
 /// admitted so the daemon can boot and expose a degraded/readiness-visible
 /// chain rather than taking unrelated EVM service down with it.
+/// Wall-clock milliseconds, for canary expiry checks at boot.
+fn canary_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(u128::MAX)
+}
+
 fn admit_solana_chain(name: &str, spec: &bloom_proto::SolanaSpec) -> bool {
     if name.to_lowercase().contains("mainnet") {
         debug!(chain = %name, "daemon.solana_chain_name_mentions_mainnet");
@@ -2775,8 +2783,23 @@ fn admit_solana_chain(name: &str, spec: &bloom_proto::SolanaSpec) -> bool {
     match bloom_solana::is_mainnet_beta_blocking(spec) {
         Ok(false) => true,
         Ok(true) => {
-            warn!(chain = %name, "daemon.solana_mainnet_refused_by_genesis");
-            false
+            // Live genesis says mainnet-beta. The second independent refusal,
+            // lifted only for a canary-capable binary holding an authorization
+            // bound to this artifact and chain. Production builds take the
+            // `false` arm unconditionally.
+            match bloom_proto::canary::authorization_for(name, canary_now_ms()) {
+                Some(_) => {
+                    warn!(
+                        chain = %name,
+                        "daemon.solana_mainnet_admitted_under_canary_authorization"
+                    );
+                    true
+                }
+                None => {
+                    warn!(chain = %name, "daemon.solana_mainnet_refused_by_genesis");
+                    false
+                }
+            }
         }
         Err(e) => {
             warn!(chain = %name, error = %e, "daemon.solana_genesis_check_degraded");

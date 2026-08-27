@@ -20,6 +20,10 @@ use std::sync::Arc;
 
 pub use error::SolanaRpcError;
 pub use mainnet_guard::{MAINNET_BETA_GENESIS_HASH, is_mainnet_beta_blocking};
+
+/// The mainnet-beta canary authorization, re-exported so the transfer engine
+/// can enforce its caps without depending on `bloom-proto` directly.
+pub use bloom_proto::canary;
 pub use transport::SolanaRpcClient;
 
 use serde::{Deserialize, Serialize};
@@ -165,9 +169,22 @@ impl SolanaClient {
             });
         }
         if self.inner.allow_broadcast && observed == crate::MAINNET_BETA_GENESIS_HASH {
-            return Err(SolanaRpcError::Invalid(
-                "broadcast to Solana mainnet-beta is disabled".into(),
-            ));
+            // The third independent refusal, checked against the *live*
+            // genesis immediately before the client is used to send. It stands
+            // unless this binary was built with the non-default canary
+            // capability and holds an authorization that is bound to this
+            // artifact, names this chain, has not expired, and has not been
+            // spent. In a production build the call below is a function that
+            // returns `None`, so this refusal is unconditional.
+            if bloom_proto::canary::authorization_for(self.chain_name(), now_ms()).is_none() {
+                return Err(SolanaRpcError::Invalid(
+                    "broadcast to Solana mainnet-beta is disabled".into(),
+                ));
+            }
+            tracing::warn!(
+                chain = %self.chain_name(),
+                "solana.mainnet_canary_broadcast_permitted"
+            );
         }
         Ok(observed)
     }
@@ -337,4 +354,12 @@ impl SolanaClient {
             })
             .collect()
     }
+}
+
+/// Wall-clock milliseconds, for canary expiry checks.
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(u128::MAX)
 }
