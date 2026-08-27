@@ -118,6 +118,9 @@ pub struct RunOptions {
     pub store_namespaces: Option<StoreNamespacePolicy>,
     pub http_response_cap: usize,
     pub private_store_root: Option<PathBuf>,
+    /// Do not provision a private-store root even when dispatching an installed
+    /// package. Used for remotely triggered, zero-authority evaluators.
+    pub disable_private_store: bool,
     /// Force mediated env helpers to deterministic values for install-time checks.
     pub deterministic_env: bool,
     /// Daemon-owned settings exposed read-only through `bloom:env`.
@@ -136,6 +139,7 @@ impl Default for RunOptions {
             store_namespaces: None,
             http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
             private_store_root: None,
+            disable_private_store: false,
             deterministic_env: false,
             runtime_settings: BTreeMap::new(),
             endpoint_bindings: BTreeMap::new(),
