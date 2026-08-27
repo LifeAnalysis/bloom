@@ -137,6 +137,7 @@ assert task["agent"]["timeout_sec"] == 900.0
 PY
 
 bash -n "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh"
+bash -n "${repo_root}/scripts/evals/operate-harbor-hyperliquid.sh"
 bash -n "${task}/tests/test.sh"
 PYTHONPATH="${repo_root}/evals/harbor" python3 -m unittest discover \
   -s "${repo_root}/evals/harbor/harness_tests" -v

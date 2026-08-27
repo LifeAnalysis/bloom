@@ -79,10 +79,23 @@ class HarnessLifecycleTests(unittest.TestCase):
             definition.events.append(f"harbor:{agent.harbor_name}")
             return self.passing_result()
 
-        run_eval(definition, "codex", harbor_runner=runner)
+        timings: dict[str, float] = {}
+        result = run_eval(
+            definition, "codex", harbor_runner=runner, phase_timings=timings
+        )
         self.assertEqual(
             definition.events,
             ["preflight", "provision:codex", "harbor:codex", "cleanup"],
+        )
+        self.assertEqual(result, self.passing_result())
+        self.assertEqual(
+            set(timings),
+            {
+                "preflight_seconds",
+                "authority_provisioning_seconds",
+                "harbor_seconds",
+                "session_cleanup_seconds",
+            },
         )
 
     def test_cleanup_runs_when_provision_fails_after_starting(self) -> None:
@@ -548,6 +561,8 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             return None
 
         counters: list[str] = []
+        committed: list[int] = []
+        self.definition.counter_committed = committed.append
 
         def fake_run(cmd, **kwargs):
             del kwargs
@@ -576,6 +591,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         base = int(self.definition.sign_count_value)
         self.assertEqual(counters, [str(base), str(base + 1), str(base + 2)])
         self.assertEqual(self.definition.next_sign_count, base + 3)
+        self.assertEqual(committed, [base + 1, base + 2, base + 3])
 
     def test_session_route_is_addressed_by_wallet_id_not_owner_address(self) -> None:
         written: list[tuple[Path, bytes]] = []

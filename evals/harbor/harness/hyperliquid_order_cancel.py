@@ -81,7 +81,13 @@ def session_key_slot(session_id: str) -> str:
 class HyperliquidOrderCancelEval(EvalDefinition):
     name = "hyperliquid-order-cancel"
 
-    def __init__(self, repo_root: Path, environ: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        repo_root: Path,
+        environ: dict[str, str] | None = None,
+        *,
+        counter_committed: Callable[[int], None] | None = None,
+    ) -> None:
         self.repo_root = repo_root.resolve()
         self.env = dict(os.environ if environ is None else environ)
         self.wallet = self.env.get("BLOOM_EVAL_WALLET", "")
@@ -124,6 +130,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self.session_id: str | None = None
         self.session_base: Path | None = None
         self.session_created = False
+        self.counter_committed = counter_committed
+        self.phase_timings: dict[str, float] = {}
 
     @property
     def lock_path(self) -> Path:
@@ -801,7 +809,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # Harbor otherwise discovers a missing image only after provision() has
         # created the bounded mainnet session and started its 30-minute clock.
         # Pulling the immutable digest here fails before any authority exists.
+        image_started = time.monotonic()
         self._pull_eval_image()
+        self.phase_timings["image_pull_seconds"] = time.monotonic() - image_started
         self._require_empty_wallet()
 
     def provision(self, agent_name: str) -> EvalRunContext:
@@ -907,6 +917,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             output += (completed.stdout + completed.stderr).decode(errors="replace")
             counter += 1
             self.next_sign_count = counter
+            if self.counter_committed is not None:
+                self.counter_committed(counter)
             if completed.returncode != 0:
                 raise EvalError(
                     f"session ceremony failed at sign count {counter - 1} "
