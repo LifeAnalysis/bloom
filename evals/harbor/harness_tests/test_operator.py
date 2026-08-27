@@ -11,13 +11,17 @@ from unittest import mock
 
 from harness.core import EvalError
 from harness.operator import (
+    DEFAULT_STATE_RELATIVE,
+    STATE_PURPOSE,
     STATE_SCHEMA,
     PolicyLifecycle,
     StateStore,
     atomic_write,
     canonical_json,
     definition_env,
+    handoff_metadata,
     initialize,
+    parser,
     redact,
     require_no_pending_owner_requests,
 )
@@ -28,8 +32,18 @@ class OperatorStateTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.store = StateStore(self.root / "state.json")
+        handoff, recovery = handoff_metadata(self.store)
         self.state = {
             "schema": STATE_SCHEMA,
+            "purpose": STATE_PURPOSE,
+            "handoff": handoff,
+            "field_guide": {
+                "paths": "paths",
+                "lineage": "lineage",
+                "next_sign_count": "counter",
+                "pending_policy_recovery": "recovery marker",
+            },
+            "recovery": recovery,
             "next_sign_count": 7,
             "wallet_id": "eval-wallet",
             "wallet_address": "0x" + "a" * 40,
@@ -61,6 +75,34 @@ class OperatorStateTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob(".state.json.new-*")))
         with self.assertRaisesRegex(EvalError, "non-advancing"):
             self.store.update_counter(8)
+
+    def test_default_handoff_is_repository_local_and_self_describing(self) -> None:
+        args = parser(self.root).parse_args(["status"])
+        self.assertEqual(args.state, self.root / DEFAULT_STATE_RELATIVE)
+        loaded = self.store.read()
+        self.assertEqual(loaded["purpose"], STATE_PURPOSE)
+        self.assertTrue(loaded["handoff"]["agent_readable"])
+        self.assertFalse(loaded["handoff"]["contains_secret_contents"])
+        self.assertEqual(
+            loaded["handoff"]["required_secret_path_fields"],
+            ["paths.authenticator_seed_file"],
+        )
+
+    def test_operator_launcher_uses_only_isolated_uv_python_312(self) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        launcher = (
+            repo_root / "scripts/evals/operate-harbor-hyperliquid.sh"
+        ).read_text()
+        self.assertNotIn("exec python3", launcher)
+        self.assertEqual(launcher.count("exec uv run --isolated --no-project"), 2)
+        self.assertEqual(launcher.count("--python 3.12"), 2)
+
+    def test_state_rejects_stale_recovery_locations(self) -> None:
+        state = self.store.read()
+        state["recovery"]["policy_backup_file"] = str(self.root / "wrong.json")
+        self.store.write(state)
+        with self.assertRaisesRegex(EvalError, "recovery locations"):
+            self.store.read()
 
     def test_state_rejects_broad_permissions_and_symlinks(self) -> None:
         self.store.path.chmod(0o644)
@@ -125,8 +167,18 @@ class PolicyRecoveryTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.store = StateStore(self.root / "state.json")
+        handoff, recovery = handoff_metadata(self.store)
         self.state = {
             "schema": STATE_SCHEMA,
+            "purpose": STATE_PURPOSE,
+            "handoff": handoff,
+            "field_guide": {
+                "paths": "paths",
+                "lineage": "lineage",
+                "next_sign_count": "counter",
+                "pending_policy_recovery": "recovery marker",
+            },
+            "recovery": recovery,
             "next_sign_count": 7,
             "wallet_id": "eval-wallet",
             "package_hash": "b" * 64,

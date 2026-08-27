@@ -16,10 +16,12 @@ export PYTHONPATH="${repo_root}/evals/harbor${PYTHONPATH:+:${PYTHONPATH}}"
 
 case "$command" in
   init|status|recover)
-    exec python3 -m harness.operator "$@"
+    exec uv run --isolated --no-project --python 3.12 \
+      python -m harness.operator "$@"
     ;;
   run)
-    exec uv run --isolated --no-project --with "harbor==${harbor_version}" \
+    exec uv run --isolated --no-project --python 3.12 \
+      --with "harbor==${harbor_version}" \
       python -m harness.operator "$@"
     ;;
   *)

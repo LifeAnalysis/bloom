@@ -138,6 +138,7 @@ PY
 
 bash -n "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh"
 bash -n "${repo_root}/scripts/evals/operate-harbor-hyperliquid.sh"
+git -C "$repo_root" check-ignore -q evals/harbor/operator-state.json
 bash -n "${task}/tests/test.sh"
 PYTHONPATH="${repo_root}/evals/harbor" python3 -m unittest discover \
   -s "${repo_root}/evals/harbor/harness_tests" -v

@@ -27,10 +27,30 @@ from .hyperliquid_order_cancel import (
 
 STATE_SCHEMA = "bloom.eval.operator-state.v1"
 SUMMARY_SCHEMA = "bloom.eval.run-summary.v1"
-DEFAULT_STATE = (
-    Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-    / "bloom/harbor-hyperliquid.json"
+STATE_PURPOSE = (
+    "Protected local handoff for cold-start and repeat-agent Hyperliquid Harbor "
+    "eval operation; contains identifiers and secret paths, never secret contents."
 )
+DEFAULT_STATE_RELATIVE = Path("evals/harbor/operator-state.json")
+SAFE_HANDOFF_FIELDS = [
+    "schema",
+    "purpose",
+    "handoff",
+    "field_guide",
+    "created_at",
+    "updated_at",
+    "wallet_id",
+    "wallet_address",
+    "package_hash",
+    "model",
+    "agent_name",
+    "next_sign_count",
+    "pending_policy_recovery",
+    "paths",
+    "lineage",
+    "binaries",
+    "recovery",
+]
 POLICY_KEYS = {
     "allowed_destinations",
     "allowed_petal_packages",
@@ -73,6 +93,27 @@ def atomic_write(path: Path, value: bytes, mode: int = 0o600) -> None:
             temporary.unlink()
 
 
+def handoff_metadata(store: StateStore) -> tuple[dict[str, Any], dict[str, str]]:
+    return (
+        {
+            "agent_readable": True,
+            "contains_secret_contents": False,
+            "safe_fields": SAFE_HANDOFF_FIELDS,
+            "required_secret_path_fields": ["paths.authenticator_seed_file"],
+            "resume_instruction": (
+                "Run status first; run recover when pending_policy_recovery is "
+                "non-null or the protected policy backup exists; never guess a counter."
+            ),
+        },
+        {
+            "state_file": str(store.path),
+            "policy_backup_file": str(store.backup_path),
+            "summary_directory": str(store.summary_dir),
+            "marker_field": "pending_policy_recovery",
+        },
+    )
+
+
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path.expanduser().resolve()
@@ -100,6 +141,33 @@ class StateStore:
             raise EvalError("operator state is invalid") from error
         if not isinstance(value, dict) or value.get("schema") != STATE_SCHEMA:
             raise EvalError("operator state has an unsupported schema")
+        if value.get("purpose") != STATE_PURPOSE:
+            raise EvalError("operator state is missing its handoff purpose")
+        handoff = value.get("handoff")
+        if (
+            not isinstance(handoff, dict)
+            or handoff.get("contains_secret_contents") is not False
+            or handoff.get("agent_readable") is not True
+            or handoff.get("safe_fields") != SAFE_HANDOFF_FIELDS
+            or handoff.get("required_secret_path_fields")
+            != ["paths.authenticator_seed_file"]
+        ):
+            raise EvalError("operator state has invalid handoff metadata")
+        recovery = value.get("recovery")
+        _, expected_recovery = handoff_metadata(self)
+        if recovery != expected_recovery:
+            raise EvalError("operator state recovery locations are stale or invalid")
+        field_guide = value.get("field_guide")
+        if not isinstance(field_guide, dict) or any(
+            not isinstance(field_guide.get(field), str)
+            for field in (
+                "paths",
+                "lineage",
+                "next_sign_count",
+                "pending_policy_recovery",
+            )
+        ):
+            raise EvalError("operator state is missing its field guide")
         return value
 
     def write(self, value: dict[str, Any]) -> None:
@@ -460,8 +528,32 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
         binaries[name] = {"path": str(path), "sha256": sha256_file(path)}
     if not WALLET_ID.fullmatch(args.wallet_id):
         raise EvalError("wallet id has an invalid shape")
+    handoff, recovery = handoff_metadata(store)
     state = {
         "schema": STATE_SCHEMA,
+        "purpose": STATE_PURPOSE,
+        "handoff": handoff,
+        "field_guide": {
+            "paths": (
+                "Absolute local paths for the triad, mount, source repositories, "
+                "artifacts, and secret material; paths are not secret contents."
+            ),
+            "lineage": (
+                "Exact source revisions and dirty-state observations captured at init."
+            ),
+            "next_sign_count": (
+                "First authenticator counter candidate that has not been reused."
+            ),
+            "pending_policy_recovery": (
+                "Null only when no package-policy restoration is pending."
+            ),
+            "agent_name": (
+                "Optional stable venue agent name override; null uses deterministic derivation."
+            ),
+            "recovery": (
+                "Protected state, policy-backup, summary, and marker locations."
+            ),
+        },
         "created_at": datetime.now(UTC).isoformat(),
         "updated_at": datetime.now(UTC).isoformat(),
         "wallet_id": args.wallet_id,
@@ -487,6 +579,7 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
         },
         "lineage": lineage,
         "binaries": binaries,
+        "recovery": recovery,
     }
     definition = HyperliquidOrderCancelEval(repo_root, definition_env(state))
     if not os.path.ismount(mount):
@@ -664,10 +757,11 @@ def parser(repo_root: Path) -> argparse.ArgumentParser:
         description="Operate the full Bloom Hyperliquid Harbor eval safely"
     )
     commands = value.add_subparsers(dest="command", required=True)
+    default_state = repo_root / DEFAULT_STATE_RELATIVE
     init = commands.add_parser(
         "init", help="discover and validate protected local eval state"
     )
-    init.add_argument("--state", type=Path, default=DEFAULT_STATE)
+    init.add_argument("--state", type=Path, default=default_state)
     init.add_argument("--triad-root", type=Path, required=True)
     init.add_argument("--mount", type=Path, required=True)
     init.add_argument("--wallet-id", required=True)
@@ -695,10 +789,10 @@ def parser(repo_root: Path) -> argparse.ArgumentParser:
     status_command = commands.add_parser(
         "status", help="report read-only readiness without external calls"
     )
-    status_command.add_argument("--state", type=Path, default=DEFAULT_STATE)
+    status_command.add_argument("--state", type=Path, default=default_state)
     for name in ("run", "recover"):
         command = commands.add_parser(name)
-        command.add_argument("--state", type=Path, default=DEFAULT_STATE)
+        command.add_argument("--state", type=Path, default=default_state)
         command.add_argument("--ack", required=True)
     return value
 
