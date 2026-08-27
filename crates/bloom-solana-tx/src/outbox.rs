@@ -906,9 +906,19 @@ mod tests {
     fn a_restageable_entry_is_found_in_pending_and_in_failed() {
         let td = tempdir().unwrap();
         let root = td.path().join(".solana-outbox");
-        place(&root, "0001", SolanaOutboxState::Pending, SolanaTxStatus::Pending);
+        place(
+            &root,
+            "0001",
+            SolanaOutboxState::Pending,
+            SolanaTxStatus::Pending,
+        );
         // The sweeper moves a stale entry here; recovery must still find it.
-        place(&root, "0002", SolanaOutboxState::Failed, SolanaTxStatus::Expired);
+        place(
+            &root,
+            "0002",
+            SolanaOutboxState::Failed,
+            SolanaTxStatus::Expired,
+        );
         let outbox = SolanaOutbox::new(&root).unwrap();
 
         let (pending, found_in) = outbox
@@ -934,7 +944,12 @@ mod tests {
         // A policy refusal also lands in `failed`. The lookup still finds it —
         // refusing to revive it is the engine's decision, made on the status —
         // so that the caller can report why rather than "no such transfer".
-        place(&root, "0003", SolanaOutboxState::Failed, SolanaTxStatus::Failed);
+        place(
+            &root,
+            "0003",
+            SolanaOutboxState::Failed,
+            SolanaTxStatus::Failed,
+        );
         let outbox = SolanaOutbox::new(&root).unwrap();
 
         let (refused, found_in) = outbox
