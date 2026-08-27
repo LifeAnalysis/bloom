@@ -235,27 +235,15 @@ impl SolanaTransferEngine {
         fee_payer: &[u8; 32],
         now_ms: u128,
     ) -> Result<StagedSolanaTransfer, EngineError> {
-        let entry =
-            match self
-                .outbox
-                .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)
-            {
-                Ok(entry) => entry,
-                Err(_) => {
-                    let failed = self.outbox.read_in_state(
-                        wallet,
-                        &self.chain,
-                        id,
-                        SolanaOutboxState::Failed,
-                    )?;
-                    if failed.staged.status != SolanaTxStatus::Expired {
-                        return Err(EngineError::Invalid(
-                            "only an expired failed transfer can be restaged".into(),
-                        ));
-                    }
-                    failed
-                }
-            };
+        let (entry, found_in) = self.outbox.read_restageable(wallet, &self.chain, id)?;
+        // A swept entry is only recoverable if it went stale. Anything else in
+        // `failed` — a policy refusal, say — is a decision, not an accident,
+        // and must not be revived by restaging it.
+        if found_in == SolanaOutboxState::Failed && entry.staged.status != SolanaTxStatus::Expired {
+            return Err(EngineError::Invalid(
+                "only an expired failed transfer can be restaged".into(),
+            ));
+        }
         let current = self.client.get_block_height().await?;
         if current <= entry.staged.last_valid_block_height {
             return Err(EngineError::Invalid(format!(

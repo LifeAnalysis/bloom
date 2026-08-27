@@ -389,6 +389,29 @@ impl SolanaOutbox {
         Err(OutboxError::NotFound(id.into()))
     }
 
+    /// Read `id` from whichever projection can still be restaged, returning
+    /// the entry together with the state it was found in.
+    ///
+    /// A stale transfer is swept from `pending` into `failed`, so recovery has
+    /// to be reachable from both. Callers that only looked in `pending` would
+    /// report a state error for exactly the case the restage path exists to
+    /// serve. This deliberately applies no status policy: *whether* a given
+    /// entry may be restaged is the engine's decision, and keeping the lookup
+    /// in one place stops the two layers from disagreeing about where to look.
+    pub fn read_restageable(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+    ) -> Result<(SolanaOutboxEntry, SolanaOutboxState), OutboxError> {
+        for state in [SolanaOutboxState::Pending, SolanaOutboxState::Failed] {
+            if let Ok(entry) = self.read_in_state(wallet, chain, id, state) {
+                return Ok((entry, state));
+            }
+        }
+        Err(OutboxError::NotFound(id.into()))
+    }
+
     /// Read `id` only if it currently lives in `expected`, mirroring
     /// `bloom-tx`'s fail-closed state check.
     pub fn read_in_state(
@@ -865,5 +888,71 @@ mod tests {
         assert!(evm.join("intent.json").exists());
         let outbox = SolanaOutbox::new(&primary).unwrap();
         assert_eq!(outbox.walk_all_sent().unwrap().len(), 1);
+    }
+
+    /// Place `id` directly into `state` with the given status.
+    fn place(root: &std::path::Path, id: &str, state: SolanaOutboxState, status: SolanaTxStatus) {
+        let dir = root
+            .join("alice/solana-devnet")
+            .join(state.dirname())
+            .join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let mut entry = staged(id);
+        entry.status = status;
+        fs::write(dir.join("intent.json"), serde_json::to_vec(&entry).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_restageable_entry_is_found_in_pending_and_in_failed() {
+        let td = tempdir().unwrap();
+        let root = td.path().join(".solana-outbox");
+        place(&root, "0001", SolanaOutboxState::Pending, SolanaTxStatus::Pending);
+        // The sweeper moves a stale entry here; recovery must still find it.
+        place(&root, "0002", SolanaOutboxState::Failed, SolanaTxStatus::Expired);
+        let outbox = SolanaOutbox::new(&root).unwrap();
+
+        let (pending, found_in) = outbox
+            .read_restageable("alice", "solana-devnet", "0001")
+            .expect("a pending entry is restageable");
+        assert_eq!(found_in, SolanaOutboxState::Pending);
+        assert_eq!(pending.staged.id, "0001");
+
+        // The regression: looking only in `pending` reported a state error for
+        // precisely the swept entry the restage path exists to recover.
+        let (failed, found_in) = outbox
+            .read_restageable("alice", "solana-devnet", "0002")
+            .expect("a swept entry must remain reachable from failed");
+        assert_eq!(found_in, SolanaOutboxState::Failed);
+        assert_eq!(failed.staged.id, "0002");
+        assert_eq!(failed.staged.status, SolanaTxStatus::Expired);
+    }
+
+    #[test]
+    fn the_lookup_applies_no_status_policy_and_reports_an_absent_id() {
+        let td = tempdir().unwrap();
+        let root = td.path().join(".solana-outbox");
+        // A policy refusal also lands in `failed`. The lookup still finds it —
+        // refusing to revive it is the engine's decision, made on the status —
+        // so that the caller can report why rather than "no such transfer".
+        place(&root, "0003", SolanaOutboxState::Failed, SolanaTxStatus::Failed);
+        let outbox = SolanaOutbox::new(&root).unwrap();
+
+        let (refused, found_in) = outbox
+            .read_restageable("alice", "solana-devnet", "0003")
+            .expect("the lookup is state-based, not status-based");
+        assert_eq!(found_in, SolanaOutboxState::Failed);
+        assert_eq!(refused.staged.status, SolanaTxStatus::Failed);
+
+        // `sent` is terminal and is never a restage source.
+        place(&root, "0004", SolanaOutboxState::Sent, SolanaTxStatus::Sent);
+        let outbox = SolanaOutbox::new(&root).unwrap();
+        assert!(matches!(
+            outbox.read_restageable("alice", "solana-devnet", "0004"),
+            Err(OutboxError::NotFound(_))
+        ));
+        assert!(matches!(
+            outbox.read_restageable("alice", "solana-devnet", "nope"),
+            Err(OutboxError::NotFound(_))
+        ));
     }
 }

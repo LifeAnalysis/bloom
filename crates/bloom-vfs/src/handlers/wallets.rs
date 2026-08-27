@@ -3170,14 +3170,16 @@ impl WalletsHandler {
                 // A restage rebuilds the message for the same account, so it
                 // reads the pinned fingerprint from the expired entry rather
                 // than resolving the wallet's children afresh.
-                let expired = engine
+                //
+                // The sweeper moves stale entries to `failed`, so the pin has
+                // to be readable from either projection. Reading only
+                // `pending` here would make the engine's own failed-entry path
+                // unreachable and would report a state error for exactly the
+                // recovery case this sink exists to serve. Which states may
+                // actually be restaged stays the engine's decision.
+                let (expired, _) = engine
                     .outbox()
-                    .read_in_state(
-                        wallet,
-                        chain,
-                        id,
-                        bloom_solana_tx::outbox::SolanaOutboxState::Pending,
-                    )
+                    .read_restageable(wallet, chain, id)
                     .map_err(solana_outbox_err)?;
                 let (child, _) = self
                     .resolve_solana_child(wallet, expired.staged.account_fingerprint.as_deref())
