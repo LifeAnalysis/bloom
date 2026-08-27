@@ -79,7 +79,10 @@ class OperatorStateTests(unittest.TestCase):
     def test_default_handoff_is_repository_local_and_self_describing(self) -> None:
         args = parser(self.root).parse_args(["status"])
         self.assertEqual(args.state, self.root / DEFAULT_STATE_RELATIVE)
+        with self.store.path.open() as handle:
+            directly_ingested = json.load(handle)
         loaded = self.store.read()
+        self.assertEqual(directly_ingested, loaded)
         self.assertEqual(loaded["purpose"], STATE_PURPOSE)
         self.assertTrue(loaded["handoff"]["agent_readable"])
         self.assertFalse(loaded["handoff"]["contains_secret_contents"])
